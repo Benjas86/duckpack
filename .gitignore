@@ -1,0 +1,5 @@
+/target
+*.sql
+*.duckdb
+README.md
+duck-project.toml
