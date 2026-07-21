@@ -6,6 +6,13 @@
 
 DuckPack is a Rust-based CLI and Interactive TUI that completely changes how you manage DuckDB schemas. Instead of writing imperative `UP/DOWN` migration scripts, you simply write your desired database state as raw SQL files, and this engine automatically computes the diff and applies the necessary changes non-destructively.
 
+## NOTE ##
+I've spent time as an education journey into Rust vibe coding this application. I have personal reasons to want to use this application and had never tried to 'vibe code' anything before.
+
+I know this may contain 'sub optimal' or 'vibe code' solutions and code that could be written more elegantly. I've also not fully tested everything yet so expect bugs, I'm fine with this! If you find this useful, want to tinker etc, please do. 
+
+Thanks, Ben.
+
 ## ✨ Features
 
 - **Declarative Schema**: Define your tables, views, and macros as raw `.sql` files. No migration versions to track.
@@ -20,25 +27,25 @@ DuckPack is a Rust-based CLI and Interactive TUI that completely changes how you
 
 ### 1. Installation
 
-Download the latest pre-compiled binary for your operating system directly from the [GitHub Releases](https://github.com/yourusername/duckpack/releases/latest) page, or use the quick-install script below:
+Download the latest pre-compiled binary for your operating system directly from the [GitHub Releases](https://github.com/Benjas86/duckpack/releases/latest) page, or use the quick-install script below:
 
 **Linux:**
 ```bash
-curl -L https://github.com/yourusername/duckpack/releases/latest/download/duckpack-linux-amd64 -o duckpack
+curl -L https://github.com/Benjas86/duckpack/releases/latest/download/duckpack-linux-amd64 -o duckpack
 chmod +x duckpack
 sudo mv duckpack /usr/local/bin/
 ```
 
 **macOS (Intel):**
 ```bash
-curl -L https://github.com/yourusername/duckpack/releases/latest/download/duckpack-macos-amd64 -o duckpack
+curl -L https://github.com/Benjas86/duckpack/releases/latest/download/duckpack-macos-amd64 -o duckpack
 chmod +x duckpack
 sudo mv duckpack /usr/local/bin/
 ```
 
 **macOS (Apple Silicon / M1+):**
 ```bash
-curl -L https://github.com/yourusername/duckpack/releases/latest/download/duckpack-macos-arm64 -o duckpack
+curl -L https://github.com/Benjas86/duckpack/releases/latest/download/duckpack-macos-arm64 -o duckpack
 chmod +x duckpack
 sudo mv duckpack /usr/local/bin/
 ```
