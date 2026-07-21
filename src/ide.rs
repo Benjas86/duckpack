@@ -77,6 +77,7 @@ pub fn run_ide_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     conn: &Connection,
     project_dir: &PathBuf,
+    db_path: &str,
 ) -> Result<()> {
     let mut tabs: Vec<EditorTab> = vec![EditorTab::new()];
     let mut active_tab_index: usize = 0;
@@ -215,10 +216,24 @@ pub fn run_ide_loop(
 
     loop {
         terminal.draw(|f| {
+            let main_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+                .split(f.area());
+
+            let top_header_text = vec![
+                Span::styled(format!(" DuckPack v{} - IDE Explorer ", env!("CARGO_PKG_VERSION")), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ];
+            let top_header = Paragraph::new(Line::from(top_header_text))
+                .block(Block::default().borders(Borders::ALL)
+                    .title_top(Line::from(format!(" Target DB: {} ", db_path)).alignment(Alignment::Right).style(Style::default().fg(Color::Cyan)))
+                );
+            f.render_widget(top_header, main_chunks[0]);
+
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
-                .split(f.area());
+                .split(main_chunks[1]);
 
             let right_chunks = Layout::default()
                 .direction(Direction::Vertical)

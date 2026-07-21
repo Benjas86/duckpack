@@ -257,7 +257,7 @@ fn main() -> Result<()> {
                 }
 
                 if let Some(term) = &mut terminal {
-                    match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data)? {
+                    match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data, &db)? {
                         tui::TuiAction::Quit => {
                             break;
                         }
@@ -329,7 +329,7 @@ fn main() -> Result<()> {
                     }
                     tui::TuiAction::Explore => {
                         if let Some(term) = &mut terminal {
-                            ide::run_ide_loop(term, &target_conn, &project_dir)?;
+                            ide::run_ide_loop(term, &target_conn, &project_dir, &db)?;
                             term.clear()?;
                         }
                         continue;
@@ -337,7 +337,7 @@ fn main() -> Result<()> {
                     tui::TuiAction::Apply => {
                         status_msg = "Applying changes...".to_string();
                         if let Some(term) = &mut terminal {
-                            let _ = tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, true, &inspect_data);
+                            let _ = tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, true, &inspect_data, &db);
                         }
 
                         let remote = is_remote(db);
@@ -500,7 +500,7 @@ fn main() -> Result<()> {
                 conn
             };
 
-            ide::run_ide_loop(&mut terminal, &target_conn, &project_dir)?;
+            ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db)?;
 
             ratatui::crossterm::terminal::disable_raw_mode()?;
             ratatui::crossterm::execute!(
