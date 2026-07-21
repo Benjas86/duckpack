@@ -187,6 +187,7 @@ pub fn draw_and_handle_events(
     status_msg: &str,
     draw_only: bool,
     inspect_data: &Option<(String, Vec<String>, Vec<Vec<String>>, i64)>,
+    db_path: &str,
 ) -> Result<TuiAction> {
     sort_diff_items(&mut diff.items);
 
@@ -209,30 +210,40 @@ pub fn draw_and_handle_events(
                 .direction(Direction::Vertical)
                 .margin(1)
                 .constraints([
-                    Constraint::Length(6), // Status & Title
+                    Constraint::Length(3), // Top Header
+                    Constraint::Length(4), // Status Message
                     Constraint::Percentage(50), // List
                     Constraint::Percentage(50), // Details
                     Constraint::Length(3), // Footer
                 ].as_ref())
                 .split(f.area());
 
-            let mut title_text = vec![Span::styled(format!("DuckPack v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))];
+            let top_header_text = vec![
+                Span::styled(format!(" DuckPack v{} - Diff Mode ", env!("CARGO_PKG_VERSION")), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ];
+            let top_header = Paragraph::new(Line::from(top_header_text))
+                .block(Block::default().borders(Borders::ALL)
+                    .title_top(Line::from(format!(" Target DB: {} ", db_path)).alignment(Alignment::Right).style(Style::default().fg(Color::Cyan)))
+                );
+            f.render_widget(top_header, chunks[0]);
+
+            let mut status_text = vec![];
             if force_drop {
-                title_text.push(Span::styled(" [WARNING: DESTRUCTIVE MODE ACTIVE]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD).add_modifier(Modifier::RAPID_BLINK)));
+                status_text.push(Span::styled("[WARNING: DESTRUCTIVE MODE ACTIVE] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD).add_modifier(Modifier::RAPID_BLINK)));
             }
             if !status_msg.is_empty() {
-                title_text.push(Span::styled(format!(" - {}", status_msg), Style::default().fg(Color::Green)));
+                status_text.push(Span::styled(status_msg, Style::default().fg(Color::Green)));
             }
             
-            let title = Paragraph::new(Line::from(title_text))
+            let status_block = Paragraph::new(Line::from(status_text))
                 .block(Block::default().borders(Borders::ALL).title("Status"))
                 .wrap(ratatui::widgets::Wrap { trim: false });
-            f.render_widget(title, chunks[0]);
+            f.render_widget(status_block, chunks[1]);
 
             if diff.is_empty() {
                 let p = Paragraph::new(Span::styled("No schema changes detected. Database is up to date.", Style::default().fg(Color::Green)))
                     .block(Block::default().borders(Borders::ALL));
-                f.render_widget(p, chunks[1]);
+                f.render_widget(p, chunks[4]);
             } else {
                 let items: Vec<ListItem> = visible_items.iter().map(|(_, item)| {
                     let checkbox = if item.locked {
@@ -299,7 +310,7 @@ pub fn draw_and_handle_events(
                     let details_chunks = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-                        .split(chunks[2]);
+                        .split(chunks[4]);
                         
                     let max_scroll = left_lines.len() as u16;
                     scroll_position = scroll_position.min(max_scroll);
@@ -318,7 +329,7 @@ pub fn draw_and_handle_events(
                     f.render_widget(right_pane, details_chunks[1]);
                 } else {
                     let p = Paragraph::new("Select an item to view details").block(Block::default().borders(Borders::ALL).title("Details"));
-                    f.render_widget(p, chunks[2]);
+                    f.render_widget(p, chunks[4]);
                 }
             }
 
@@ -340,7 +351,7 @@ pub fn draw_and_handle_events(
                         Span::styled(" Explorer / IDE ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                     ]).alignment(Alignment::Right))
                 );
-            f.render_widget(footer, chunks[3]);
+            f.render_widget(footer, chunks[4]);
 
             if let Some((obj_name, headers, rows, total_rows)) = inspect_data {
                 let popup_area = ratatui::layout::Rect {
