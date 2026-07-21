@@ -1,5 +1,7 @@
 /target
 *.sql
 *.duckdb
-README.md
+/*/README.md
 duck-project.toml
+*.png
+*.duckpack
