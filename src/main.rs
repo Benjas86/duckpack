@@ -634,12 +634,12 @@ fn apply_diff(conn: &Connection, diff: &diff::DiffResult, force_drop: bool, is_r
             }
         }
 
-        // 2. Main structure changes
+        let mut structure_to_apply = Vec::new();
         for item in &diff.items {
             if !item.selected { continue; }
             match item.item_type {
                 diff::DiffItemType::CreateTable | diff::DiffItemType::AlterTable | diff::DiffItemType::CreateMacro | diff::DiffItemType::RenameTable | diff::DiffItemType::RenameColumn => {
-                    conn.execute_batch(&item.sql)?;
+                    structure_to_apply.push(item.sql.clone());
                 }
                 diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro => {
                     if force_drop {
@@ -658,9 +658,14 @@ fn apply_diff(conn: &Connection, diff: &diff::DiffResult, force_drop: bool, is_r
             }
         }
 
+        if !structure_to_apply.is_empty() {
+            execute_sqls_with_retry(conn, structure_to_apply)?;
+        }
+
+
         // 3. Views
         if !views_to_apply.is_empty() {
-            execute_views_sqls_with_retry(conn, views_to_apply)?;
+            execute_sqls_with_retry(conn, views_to_apply)?;
         }
 
         // 4. Drops
@@ -841,38 +846,35 @@ fn build_shadow_db(project_dir: &PathBuf) -> Result<Connection> {
 
     let views_dir = project_dir.join("views");
     if views_dir.exists() {
-        execute_views_with_retry(&conn, &views_dir)?;
+        execute_directory(&conn, &views_dir)?;
     }
 
     Ok(conn)
 }
 
-/// A helper utility to iterate over a directory of `.sql` files and execute them sequentially against a connection.
+/// A helper utility to iterate over a directory of `.sql` files and execute them against a connection.
+/// This uses a retry loop because tables/views often depend on each other (e.g. foreign keys or nested views).
+/// If one fails, it is pushed to the back of the queue. The loop terminates once all succeed, or if no progress is made.
 fn execute_directory(conn: &Connection, dir: &Path) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    let mut pending_sqls = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.path());
+    
+    for entry in entries {
         let path = entry.path();
         if path.is_file() && path.extension().unwrap_or_default() == "sql" {
-            let sql = diff::read_sql_with_env(&path)?;
-            conn.execute_batch(&sql).with_context(|| format!("Failed to execute {}", path.display()))?;
+            pending_sqls.push(diff::read_sql_with_env(&path)?);
         }
     }
-    Ok(())
-}
-
-/// A specialized execution engine for Views.
-/// Because views often depend on each other, this algorithm continuously loops over the list of views
-/// and attempts to create them. If one fails, it is pushed to the back of the queue.
-/// The loop terminates once all views succeed, or if it completes a full pass without making any progress (circular dependency).
-fn execute_views_sqls_with_retry(conn: &Connection, mut pending_views: Vec<String>) -> Result<()> {
+    
     let mut last_error: Option<anyhow::Error> = None;
     let mut progress_made = true;
 
-    while !pending_views.is_empty() && progress_made {
+    while !pending_sqls.is_empty() && progress_made {
         progress_made = false;
         let mut remaining = Vec::new();
 
-        for sql in pending_views {
+        for sql in pending_sqls {
             match conn.execute_batch(&sql) {
                 Ok(_) => {
                     progress_made = true;
@@ -883,31 +885,51 @@ fn execute_views_sqls_with_retry(conn: &Connection, mut pending_views: Vec<Strin
                 }
             }
         }
-        pending_views = remaining;
+        pending_sqls = remaining;
     }
 
-    if !pending_views.is_empty() {
+    if !pending_sqls.is_empty() {
         if let Some(e) = last_error {
-            return Err(e).context("Failed to compile views due to unresolvable dependencies or syntax errors");
+            return Err(e).context(format!("Failed to compile SQL files in {} due to unresolvable dependencies or syntax errors", dir.display()));
         }
     }
 
     Ok(())
 }
 
-/// Reads `.sql` files from a views directory and delegates them to the `execute_views_sqls_with_retry` algorithm.
-fn execute_views_with_retry(conn: &Connection, dir: &Path) -> Result<()> {
-    let mut pending_views = Vec::new();
-    
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() && path.extension().unwrap_or_default() == "sql" {
-            pending_views.push(diff::read_sql_with_env(&path)?);
+/// A specialized execution engine for arbitrary SQLs.
+/// Because objects often depend on each other, this algorithm continuously loops over the list of statements
+/// and attempts to execute them. If one fails, it is pushed to the back of the queue.
+/// The loop terminates once all succeed, or if it completes a full pass without making any progress (circular dependency).
+fn execute_sqls_with_retry(conn: &Connection, mut pending_sqls: Vec<String>) -> Result<()> {
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut progress_made = true;
+
+    while !pending_sqls.is_empty() && progress_made {
+        progress_made = false;
+        let mut remaining = Vec::new();
+
+        for sql in pending_sqls {
+            match conn.execute_batch(&sql) {
+                Ok(_) => {
+                    progress_made = true;
+                }
+                Err(e) => {
+                    last_error = Some(anyhow::anyhow!("Failed: {}", e));
+                    remaining.push(sql);
+                }
+            }
+        }
+        pending_sqls = remaining;
+    }
+
+    if !pending_sqls.is_empty() {
+        if let Some(e) = last_error {
+            return Err(e).context("Failed to compile SQLs due to unresolvable dependencies or syntax errors");
         }
     }
 
-    execute_views_sqls_with_retry(conn, pending_views)
+    Ok(())
 }
 
 #[cfg(test)]
