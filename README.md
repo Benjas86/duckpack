@@ -153,6 +153,34 @@ By installing this `duckpack` CLI on your remote server as a companion tool, you
    ssh user@production-server "duckpack apply --project-dir /tmp/release_v1.duckpack --db /var/lib/duckdb/prod.duckdb --auto-approve"
    ```
 
+**Wait! What if I don't want to manually install the CLI on my remote server?**
+No problem! Because `duckpack` is a standalone, statically linked binary, it can auto-bootstrap itself!
+
+Instead of running SSH manually, you can just run `deploy` from your local machine (or CI pipeline) with the `--auto-install` flag. The engine will:
+1. Compile your `.duckpack`
+2. SCP the `.duckpack` to your remote server
+3. **SCP its own `duckpack` executable binary** to your remote server
+4. Execute it remotely via SSH
+5. Clean up both temporary files
+
+```bash
+duckpack deploy --project-dir . --remote user@production-server --db /var/lib/duckdb/prod.duckdb --auto-install
+```
+
+### 3. Explore
+Launch the fully featured built-in IDE to query and explore your DuckDB database safely.
+
+```bash
+duckpack explore --project-dir . --db local.duckdb
+```
+
+**Remote Exploration via SSH**
+You can also launch the TUI directly on a remote server over SSH! If you pass the `--remote` flag, `duckpack` will securely launch the IDE on your server and beam the interface back to your local terminal over an interactive SSH session. 
+
+```bash
+duckpack explore --remote user@production-server --db /var/lib/duckdb/prod.duckdb --auto-install
+```
+
 *(Note: The `--auto-approve` flag ensures the CLI bypasses the interactive TUI and runs entirely headless.)*
 
 This architecture completely eliminates network latency during deployment, prevents file-locking issues, and gives you a fully automated, Git-backed declarative pipeline for your embedded database!

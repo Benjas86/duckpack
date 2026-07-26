@@ -99,6 +99,9 @@ enum Commands {
         /// The connection string or path to the target DuckDB database on the remote server
         #[arg(short, long, default_value = "local.duckdb")]
         db: String,
+        /// Automatically install the duckpack CLI binary on the remote server
+        #[arg(long)]
+        auto_install: bool,
     },
     /// Explore a live DuckDB database in the built-in IDE
     Explore {
@@ -109,6 +112,15 @@ enum Commands {
         /// The connection string or path to the target DuckDB database
         #[arg(short, long, default_value = "local.duckdb")]
         db: String,
+        /// The remote server SSH target (e.g. user@10.0.0.5)
+        #[arg(long)]
+        remote: Option<String>,
+        /// The SSH port to use for remote deployment
+        #[arg(short = 'P', long, default_value = "22")]
+        port: String,
+        /// Automatically install the duckpack CLI binary on the remote server
+        #[arg(long)]
+        auto_install: bool,
         /// Quack authentication token
         #[arg(long)]
         quack_token: Option<String>,
@@ -488,7 +500,79 @@ fn main() -> Result<()> {
             }
             println!("Compilation complete! Artifact: {}", out);
         }
-        Commands::Explore { project_dir, db, quack_token } => {
+        Commands::Explore { project_dir, db, remote, port, auto_install, quack_token } => {
+            if let Some(r) = remote {
+                let mut remote_bin = "duckpack".to_string();
+                let mut remote_tmp_bin = None;
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                
+                if *auto_install {
+                    println!("Auto-installing DuckPack companion binary for exploration...");
+                    let current_exe = std::env::current_exe().with_context(|| "Failed to get current executable path")?;
+                    let tmp_bin = format!("/tmp/duckpack_bin_{}", ts);
+                    
+                    let scp_bin_status = std::process::Command::new("scp")
+                        .arg("-P")
+                        .arg(port.to_string())
+                        .arg(&current_exe)
+                        .arg(format!("{}:{}", r, tmp_bin))
+                        .status()?;
+                        
+                    if !scp_bin_status.success() {
+                        anyhow::bail!("Failed to SCP binary to remote server.");
+                    }
+                    
+                    let chmod_status = std::process::Command::new("ssh")
+                        .arg("-p")
+                        .arg(port.to_string())
+                        .arg(r)
+                        .arg(format!("chmod +x {}", tmp_bin))
+                        .status()?;
+                        
+                    if !chmod_status.success() {
+                        anyhow::bail!("Failed to make binary executable on remote server.");
+                    }
+                    
+                    remote_bin = tmp_bin.clone();
+                    remote_tmp_bin = Some(tmp_bin);
+                }
+
+                let remote_tmp_proj = format!("/tmp/duckpack_explore_{}", ts);
+                let _ = std::process::Command::new("ssh")
+                    .arg("-p")
+                    .arg(port.to_string())
+                    .arg(r)
+                    .arg(format!("mkdir -p {}/queries", remote_tmp_proj))
+                    .status();
+                
+                println!("Launching remote TUI over SSH...");
+                let ssh_status = std::process::Command::new("ssh")
+                    .arg("-t") // Force pseudo-terminal for TUI
+                    .arg("-p")
+                    .arg(port.to_string())
+                    .arg(r)
+                    .arg(format!("{} explore --project-dir {} --db {}", remote_bin, remote_tmp_proj, db))
+                    .status()?;
+
+                if !ssh_status.success() {
+                    println!("Remote exploration session ended with error.");
+                }
+
+                println!("Cleaning up remote artifacts...");
+                let mut cleanup_cmd = format!("rm -rf {}", remote_tmp_proj);
+                if let Some(tmp_bin) = remote_tmp_bin {
+                    cleanup_cmd.push_str(&format!(" {}", tmp_bin));
+                }
+                let _ = std::process::Command::new("ssh")
+                    .arg("-p")
+                    .arg(port.to_string())
+                    .arg(r)
+                    .arg(cleanup_cmd)
+                    .status();
+
+                return Ok(());
+            }
+
             let mut project_dir = project_dir.clone();
             if project_dir == std::path::PathBuf::from(".") && !db.starts_with("quack:") && !is_remote(&db) {
                 let db_path = std::path::PathBuf::from(&db);
@@ -551,13 +635,16 @@ fn main() -> Result<()> {
                 ratatui::crossterm::event::DisableMouseCapture
             )?;
         }
-        Commands::Deploy { project_dir, remote, db, port } => {
+        Commands::Deploy { project_dir, remote, db, port, auto_install } => {
             println!("Deploying {} to {} at {}", project_dir.display(), remote, db);
             
-            let tmp_pack = format!("/tmp/duckpack_deploy_{}.duckpack", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let tmp_pack = format!("/tmp/duckpack_deploy_{}.duckpack", ts);
             
             println!("1. Compiling local DuckPack artifact...");
             let out_conn = Connection::open(&tmp_pack).with_context(|| "Failed to create temp .duckpack file")?;
+            let schemas_dir = project_dir.join("schemas");
+            if schemas_dir.exists() { execute_directory(&out_conn, &schemas_dir)?; }
             let tables_dir = project_dir.join("tables");
             if tables_dir.exists() { execute_directory(&out_conn, &tables_dir)?; }
             let views_dir = project_dir.join("views");
@@ -566,7 +653,7 @@ fn main() -> Result<()> {
             if macros_dir.exists() { execute_directory(&out_conn, &macros_dir)?; }
             out_conn.close().map_err(|e| anyhow::anyhow!("Failed to close DuckPack: {:?}", e.1))?;
             
-            let remote_tmp_pack = format!("/tmp/deploy_{}.duckpack", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+            let remote_tmp_pack = format!("/tmp/deploy_{}.duckpack", ts);
             
             println!("2. Transferring artifact to remote server (scp)...");
             let scp_status = std::process::Command::new("scp")
@@ -580,12 +667,47 @@ fn main() -> Result<()> {
                 anyhow::bail!("Failed to SCP artifact to remote server.");
             }
             
+            let mut remote_bin = "duckpack".to_string();
+            let mut remote_tmp_bin = None;
+            
+            if *auto_install {
+                println!("2.5. Auto-installing DuckPack companion binary...");
+                let current_exe = std::env::current_exe().with_context(|| "Failed to get current executable path")?;
+                let tmp_bin = format!("/tmp/duckpack_bin_{}", ts);
+                
+                let scp_bin_status = std::process::Command::new("scp")
+                    .arg("-P")
+                    .arg(port.to_string())
+                    .arg(&current_exe)
+                    .arg(format!("{}:{}", remote, tmp_bin))
+                    .status()?;
+                    
+                if !scp_bin_status.success() {
+                    anyhow::bail!("Failed to SCP binary to remote server.");
+                }
+                
+                // Make the binary executable
+                let chmod_status = std::process::Command::new("ssh")
+                    .arg("-p")
+                    .arg(port.to_string())
+                    .arg(remote)
+                    .arg(format!("chmod +x {}", tmp_bin))
+                    .status()?;
+                    
+                if !chmod_status.success() {
+                    anyhow::bail!("Failed to make binary executable on remote server.");
+                }
+                
+                remote_bin = tmp_bin.clone();
+                remote_tmp_bin = Some(tmp_bin);
+            }
+            
             println!("3. Executing companion CLI via SSH...");
             let ssh_status = std::process::Command::new("ssh")
                 .arg("-p")
                 .arg(port.to_string())
                 .arg(remote)
-                .arg(format!("duckpack apply --project-dir {} --db {} --auto-approve", remote_tmp_pack, db))
+                .arg(format!("{} apply --project-dir {} --db {} --auto-approve", remote_bin, remote_tmp_pack, db))
                 .status()?;
                 
             if !ssh_status.success() {
@@ -596,11 +718,17 @@ fn main() -> Result<()> {
             
             println!("4. Cleaning up temporary artifacts...");
             let _ = std::fs::remove_file(&tmp_pack);
+            
+            let mut cleanup_cmd = format!("rm -f {}", remote_tmp_pack);
+            if let Some(tmp_bin) = remote_tmp_bin {
+                cleanup_cmd.push_str(&format!(" {}", tmp_bin));
+            }
+            
             let _ = std::process::Command::new("ssh")
                 .arg("-p")
                 .arg(port.to_string())
                 .arg(remote)
-                .arg(format!("rm {}", remote_tmp_pack))
+                .arg(cleanup_cmd)
                 .status();
         }
     }
@@ -827,6 +955,10 @@ duckpack explore --project-dir . --db local.duckdb
 /// Compiles all local `.sql` files into an in-memory DuckDB connection.
 /// This acts as the "Desired State" or "Shadow DB" used for validation and diff generation.
 fn build_shadow_db(project_dir: &PathBuf) -> Result<Connection> {
+    if project_dir.is_file() && project_dir.extension().unwrap_or_default() == "duckpack" {
+        return Connection::open(project_dir).with_context(|| "Failed to open .duckpack artifact");
+    }
+
     let conn = Connection::open_in_memory().with_context(|| "Failed to create Shadow DB")?;
     
     let schemas_dir = project_dir.join("schemas");
