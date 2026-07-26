@@ -69,8 +69,7 @@ CREATE TABLE reporting.${ENV_PREFIX}_sales_${TABLE_SUFFIX} (
     order_id INT,
     product_name VARCHAR,
     sale_amount DECIMAL(10, 2),
-    sale_date DATE,
-    FOREIGN KEY (order_id) REFERENCES ${ENV_PREFIX}_orders_${TABLE_SUFFIX}(order_id)
+    sale_date DATE
 );
 EOF
 
