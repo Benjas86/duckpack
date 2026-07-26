@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, BorderType, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
     Terminal,
 };
 use std::path::PathBuf;
@@ -268,12 +268,12 @@ pub fn run_ide_loop(
                 .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
                 .split(f.area());
 
-            let top_header_text = vec![
-                Span::styled(format!(" DuckPack v{} - IDE Explorer ", env!("CARGO_PKG_VERSION")), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            ];
-            let top_header = Paragraph::new(Line::from(top_header_text))
+            let ssh_prefix = if std::env::var("SSH_CLIENT").is_ok() { "[SSH Remote] " } else { "" };
+            let top_header = Paragraph::new("")
                 .block(Block::default().borders(Borders::ALL)
-                    .title_top(Line::from(format!(" Target DB: {} ", db_path)).alignment(Alignment::Right).style(Style::default().fg(Color::Cyan)))
+                    .border_type(BorderType::Rounded)
+                    .title_top(Line::from(format!(" Target DB: {}{} ", ssh_prefix, db_path)).alignment(Alignment::Right).style(Style::default().fg(Color::Cyan)))
+                    .title_top(Line::from(format!(" DuckPack v{} ", env!("CARGO_PKG_VERSION"))).alignment(Alignment::Center).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
                 );
             f.render_widget(top_header, main_chunks[0]);
 
