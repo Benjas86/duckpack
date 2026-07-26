@@ -153,6 +153,7 @@ pub fn run_ide_loop(
 
     let mut explorer_state = ListState::default();
     let mut explorer_items: Vec<ExplorerNode> = Vec::new();
+    let mut explorer_horizontal_scroll: usize = 0;
 
     if !tables.is_empty() {
         explorer_items.push(ExplorerNode {
@@ -273,6 +274,18 @@ pub fn run_ide_loop(
                 .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Percentage(45), Constraint::Length(2)].as_ref())
                 .split(chunks[1]);
 
+            let max_item_width = explorer_items.iter().map(|item| {
+                let indent = item.level * 2;
+                let expand_indicator = if item.is_expandable { 2 } else { 0 };
+                indent + expand_indicator + item.display.chars().count()
+            }).max().unwrap_or(0);
+            
+            let explorer_inner_width = chunks[0].width.saturating_sub(2) as usize;
+            let max_scroll = max_item_width.saturating_sub(explorer_inner_width);
+            if explorer_horizontal_scroll > max_scroll {
+                explorer_horizontal_scroll = max_scroll;
+            }
+
             // Explorer Pane
             let mut list_items = Vec::new();
             for item in &explorer_items {
@@ -282,7 +295,10 @@ pub fn run_ide_loop(
                 } else {
                     ""
                 };
-                let display_text = format!("{}{}{}", indent, expand_indicator, item.display);
+                let display_text = format!("{}{}{}", indent, expand_indicator, item.display)
+                    .chars()
+                    .skip(explorer_horizontal_scroll)
+                    .collect::<String>();
                 list_items.push(ListItem::new(display_text));
             }
 
@@ -478,42 +494,85 @@ pub fn run_ide_loop(
                         }
                     }
                 } else if mouse.kind == MouseEventKind::ScrollDown {
-                    if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
-                        if let Some(selected) = explorer_state.selected() {
-                            if selected < explorer_items.len().saturating_sub(1) {
-                                explorer_state.select(Some(selected + 1));
-                            }
-                        } else if !explorer_items.is_empty() {
-                            explorer_state.select(Some(0));
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                            explorer_horizontal_scroll += 1;
+                        } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
+                            tabs[active_tab_index].horizontal_scroll += 1;
+                        } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                            tabs[active_tab_index].textarea.scroll((0, 1));
                         }
-                    } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
-                        let active_tab = &mut tabs[active_tab_index];
-                        if let Some(selected) = active_tab.results_state.selected() {
-                            if selected < active_tab.query_results.len().saturating_sub(1) {
-                                active_tab.results_state.select(Some(selected + 1));
+                    } else {
+                        if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                            if let Some(selected) = explorer_state.selected() {
+                                if selected < explorer_items.len().saturating_sub(1) {
+                                    explorer_state.select(Some(selected + 1));
+                                }
+                            } else if !explorer_items.is_empty() {
+                                explorer_state.select(Some(0));
                             }
-                        } else if !active_tab.query_results.is_empty() {
-                            active_tab.results_state.select(Some(0));
+                        } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
+                            let active_tab = &mut tabs[active_tab_index];
+                            if let Some(selected) = active_tab.results_state.selected() {
+                                if selected < active_tab.query_results.len().saturating_sub(1) {
+                                    active_tab.results_state.select(Some(selected + 1));
+                                }
+                            } else if !active_tab.query_results.is_empty() {
+                                active_tab.results_state.select(Some(0));
+                            }
+                        } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                            tabs[active_tab_index].textarea.scroll((1, 0));
                         }
-                    } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
-                        tabs[active_tab_index].textarea.scroll((1, 0));
                     }
                 } else if mouse.kind == MouseEventKind::ScrollUp {
-                    if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
-                        if let Some(selected) = explorer_state.selected() {
-                            if selected > 0 {
-                                explorer_state.select(Some(selected - 1));
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                            if explorer_horizontal_scroll > 0 { explorer_horizontal_scroll -= 1; }
+                        } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
+                            let active_tab = &mut tabs[active_tab_index];
+                            if active_tab.horizontal_scroll > 0 { active_tab.horizontal_scroll -= 1; }
+                        } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                            tabs[active_tab_index].textarea.scroll((0, -1));
+                        }
+                    } else {
+                        if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                            if let Some(selected) = explorer_state.selected() {
+                                if selected > 0 {
+                                    explorer_state.select(Some(selected - 1));
+                                }
                             }
+                        } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
+                            let active_tab = &mut tabs[active_tab_index];
+                            if let Some(selected) = active_tab.results_state.selected() {
+                                if selected > 0 {
+                                    active_tab.results_state.select(Some(selected - 1));
+                                }
+                            }
+                        } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                            tabs[active_tab_index].textarea.scroll((-1, 0));
+                        }
+                    }
+                } else if mouse.kind == MouseEventKind::ScrollLeft {
+                    if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                        if explorer_horizontal_scroll > 0 {
+                            explorer_horizontal_scroll -= 1;
                         }
                     } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
                         let active_tab = &mut tabs[active_tab_index];
-                        if let Some(selected) = active_tab.results_state.selected() {
-                            if selected > 0 {
-                                active_tab.results_state.select(Some(selected - 1));
-                            }
+                        if active_tab.horizontal_scroll > 0 {
+                            active_tab.horizontal_scroll -= 1;
                         }
                     } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
-                        tabs[active_tab_index].textarea.scroll((-1, 0));
+                        // For textarea, scroll((lines, columns))
+                        tabs[active_tab_index].textarea.scroll((0, -1));
+                    }
+                } else if mouse.kind == MouseEventKind::ScrollRight {
+                    if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                        explorer_horizontal_scroll += 1;
+                    } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
+                        tabs[active_tab_index].horizontal_scroll += 1;
+                    } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                        tabs[active_tab_index].textarea.scroll((0, 1));
                     }
                 }
 
@@ -641,6 +700,12 @@ pub fn run_ide_loop(
                                     explorer_state.select(Some(selected + 1));
                                 }
                             }
+                        } else if key.code == KeyCode::Left {
+                            if explorer_horizontal_scroll > 0 {
+                                explorer_horizontal_scroll -= 1;
+                            }
+                        } else if key.code == KeyCode::Right {
+                            explorer_horizontal_scroll += 1;
                         } else if key.code == KeyCode::Enter {
                             trigger_explorer_action = true;
                         }
