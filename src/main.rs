@@ -1,3 +1,4 @@
+use std::panic;
 mod diff;
 mod tui;
 mod ide;
@@ -10,6 +11,11 @@ use std::path::{Path, PathBuf};
 
 /// The core CLI argument parser configuration using `clap`.
 /// Dictates all available terminal commands for duckpack.
+/// 
+/// # Educational Note:
+/// `clap` is the standard library for CLI parsing in Rust.
+/// By deriving `Parser`, we automatically generate help menus (`--help`)
+/// and strictly type our terminal arguments.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
@@ -105,6 +111,7 @@ fn is_remote(db: &str) -> bool {
 /// The main entry point for the DuckPack CLI.
 /// Parses the arguments and delegates to the appropriate command handler.
 fn main() -> Result<()> {
+    panic::set_hook(Box::new(|info| { let bt = std::backtrace::Backtrace::force_capture(); let _ = std::fs::write("panic.log", format!("Panic: {:?}\n\n{}", info, bt)); }));
     let cli = Cli::parse();
 
     let project_dir = match &cli.command {
@@ -373,10 +380,7 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-                    tui::TuiAction::ToggleShowIgnored => {
-                        // Handled natively in tui.rs loop
-                    }
-                    tui::TuiAction::ToggleTheme => {}
+
                     tui::TuiAction::Pull { obj_name, item_type } => {
                         let sql = match item_type {
                             diff::DiffItemType::DropTable => {
@@ -866,4 +870,17 @@ fn execute_views_with_retry(conn: &Connection, dir: &Path) -> Result<()> {
     }
 
     execute_views_sqls_with_retry(conn, pending_views)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_remote() {
+        assert_eq!(is_remote("md:my_db"), true);
+        assert_eq!(is_remote("motherduck:"), true);
+        assert_eq!(is_remote("local.db"), false);
+        assert_eq!(is_remote("/var/lib/duckdb/prod.db"), false);
+    }
 }
