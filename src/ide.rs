@@ -52,6 +52,10 @@ struct EditorTab<'a> {
     column_names: Vec<String>,
     horizontal_scroll: usize,
     results_state: ratatui::widgets::TableState,
+    base_query: Option<String>,
+    pagination_offset: usize,
+    pagination_limit: usize,
+    is_paginated: bool,
 }
 
 impl<'a> EditorTab<'a> {
@@ -67,6 +71,10 @@ impl<'a> EditorTab<'a> {
             column_names: Vec::new(),
             horizontal_scroll: 0,
             results_state: ratatui::widgets::TableState::default(),
+            base_query: None,
+            pagination_offset: 0,
+            pagination_limit: 500,
+            is_paginated: false,
         }
     }
 }
@@ -247,6 +255,7 @@ pub fn run_ide_loop(
     let mut current_explorer_rect = Rect::default();
     let mut current_tabs_rect = Rect::default();
     let mut current_results_rect = Rect::default();
+    let mut show_help = false;
 
     loop {
         terminal.draw(|f| {
@@ -333,7 +342,6 @@ pub fn run_ide_loop(
                 .block(Block::default().borders(Borders::ALL).title(" Open Tabs "))
                 .select(active_tab_index)
                 .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED));
-            
             f.render_widget(tabs_widget, right_chunks[0]);
             current_tabs_rect = right_chunks[0];
 
@@ -376,9 +384,18 @@ pub fn run_ide_loop(
                 Style::default()
             };
 
+            let title = if tabs[active_tab_index].is_paginated {
+                let offset = tabs[active_tab_index].pagination_offset;
+                let limit = tabs[active_tab_index].pagination_limit;
+                format!(" Results (Rows {} - {}) ", offset + 1, offset + limit)
+            } else {
+                " Results ".to_string()
+            };
+
             let results_block = Block::default()
                 .borders(Borders::ALL)
-                .title(" Results ")
+                .title(title)
+                .title_bottom(Line::from(" [?] Help ").alignment(Alignment::Right))
                 .border_style(results_border_style);
 
             let active_tab = &mut tabs[active_tab_index];
@@ -420,6 +437,39 @@ pub fn run_ide_loop(
             }
             current_results_rect = right_chunks[2];
 
+            if show_help {
+                let popup_area = ratatui::layout::Rect {
+                    x: f.area().width / 4,
+                    y: f.area().height / 4,
+                    width: f.area().width / 2,
+                    height: f.area().height / 2,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+                
+                let help_lines = vec![
+                    Line::from(vec![Span::styled(" [?]       ", Style::default().fg(Color::Cyan)), Span::raw("Toggle Help Menu")]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(" Ctrl+T    ", Style::default().fg(Color::Cyan)), Span::raw("New Tab")]),
+                    Line::from(vec![Span::styled(" Ctrl+W    ", Style::default().fg(Color::Cyan)), Span::raw("Close Tab")]),
+                    Line::from(vec![Span::styled(" Ctrl+N/P  ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Tab")]),
+                    Line::from(vec![Span::styled(" Ctrl+E/F5 ", Style::default().fg(Color::Cyan)), Span::raw("Execute Query (or selected text)")]),
+                    Line::from(vec![Span::styled(" Ctrl+S    ", Style::default().fg(Color::Cyan)), Span::raw("Save Query")]),
+                    Line::from(vec![Span::styled(" Ctrl+F    ", Style::default().fg(Color::Cyan)), Span::raw("Format Query")]),
+                    Line::from(vec![Span::styled(" Ctrl+Space", Style::default().fg(Color::Cyan)), Span::raw("Autocomplete")]),
+                    Line::from(vec![Span::styled(" n / p     ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Page (in Results pane)")]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(" Mouse     ", Style::default().fg(Color::Cyan)), Span::raw("Click tabs/buttons, scroll panes")]),
+                ];
+
+                let help_paragraph = Paragraph::new(help_lines)
+                        .block(Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Help Menu ")
+                        .border_style(Style::default().fg(Color::Cyan)))
+                        .alignment(Alignment::Left);
+                f.render_widget(help_paragraph, popup_area);
+            }
+
             // Status Bar
             let status = Paragraph::new(format!(" {}", status_msg))
                 .style(Style::default().fg(Color::Black).bg(Color::Cyan));
@@ -434,6 +484,7 @@ pub fn run_ide_loop(
         let mut new_tab = false;
         let mut close_tab = false;
         let mut trigger_explorer_action = false;
+        let mut trigger_pagination: Option<i32> = None;
         let ev = event::read()?;
 
         match ev {
@@ -454,6 +505,10 @@ pub fn run_ide_loop(
                         }
                         if mouse.column > current_editor_rect.left() + 61 && mouse.column <= current_editor_rect.left() + 85 {
                             format_query = true;
+                        }
+                    } else if mouse.row == current_results_rect.bottom().saturating_sub(1) {
+                        if mouse.column >= current_results_rect.right().saturating_sub(10) && mouse.column <= current_results_rect.right() {
+                            show_help = !show_help;
                         }
                     } else if mouse.row >= current_editor_rect.top() && mouse.row < current_editor_rect.bottom() {
                         if mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
@@ -586,6 +641,18 @@ pub fn run_ide_loop(
                 }
             }
             Event::Key(key) => {
+                if show_help {
+                    if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') || key.code == KeyCode::Char('?') {
+                        show_help = false;
+                    }
+                    continue; // Block other inputs while help is shown
+                }
+
+                if key.code == KeyCode::Char('?') {
+                    show_help = true;
+                    continue;
+                }
+
                 if key.code == KeyCode::F(5) || (key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL)) {
                     execute_query = true;
                 }
@@ -776,16 +843,32 @@ pub fn run_ide_loop(
                                 }
                             }
                         } else if key.code == KeyCode::PageDown {
-                            let len = active_tab.query_results.len();
-                            if len > 0 {
-                                let selected = active_tab.results_state.selected().unwrap_or(0);
-                                let new_sel = (selected + 10).min(len.saturating_sub(1));
-                                active_tab.results_state.select(Some(new_sel));
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                if active_tab.query_results.len() == active_tab.pagination_limit {
+                                    trigger_pagination = Some(1);
+                                }
+                            } else {
+                                let len = active_tab.query_results.len();
+                                if len > 0 {
+                                    let selected = active_tab.results_state.selected().unwrap_or(0);
+                                    let new_sel = (selected + 10).min(len.saturating_sub(1));
+                                    active_tab.results_state.select(Some(new_sel));
+                                }
                             }
+                        } else if key.code == KeyCode::Char('n') || key.code == KeyCode::Char('N') {
+                            if active_tab.query_results.len() == active_tab.pagination_limit {
+                                trigger_pagination = Some(1);
+                            }
+                        } else if key.code == KeyCode::Char('p') || key.code == KeyCode::Char('P') {
+                            trigger_pagination = Some(-1);
                         } else if key.code == KeyCode::PageUp {
-                            if let Some(selected) = active_tab.results_state.selected() {
-                                let new_sel = selected.saturating_sub(10);
-                                active_tab.results_state.select(Some(new_sel));
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                trigger_pagination = Some(-1);
+                            } else {
+                                if let Some(selected) = active_tab.results_state.selected() {
+                                    let new_sel = selected.saturating_sub(10);
+                                    active_tab.results_state.select(Some(new_sel));
+                                }
                             }
                         } else if key.code == KeyCode::Left {
                             active_tab.horizontal_scroll = active_tab.horizontal_scroll.saturating_sub(1);
@@ -884,31 +967,48 @@ pub fn run_ide_loop(
             }
         }
 
-        if execute_query {
-            let mut query = if let Some(((start_row, start_col), (end_row, end_col))) = tabs[active_tab_index].textarea.selection_range() {
-                let lines = tabs[active_tab_index].textarea.lines();
-                let mut selected_text = Vec::new();
-                for row in start_row..=end_row {
-                    if row >= lines.len() { continue; }
-                    let chars: Vec<char> = lines[row].chars().collect();
-                    let s = if row == start_row { start_col } else { 0 };
-                    let e = if row == end_row { end_col } else { chars.len() };
-                    let s = s.min(chars.len());
-                    let e = e.min(chars.len());
-                    if s <= e {
-                        selected_text.push(chars[s..e].iter().collect::<String>());
-                    }
-                }
-                selected_text.join("\n")
-            } else {
-                tabs[active_tab_index].textarea.lines().join("\n")
-            };
-            if query.is_empty() {
-                query = tabs[active_tab_index].textarea.lines().join("\n");
-            }
+        if execute_query || trigger_pagination.is_some() {
             let active_tab = &mut tabs[active_tab_index];
-            if query.trim().is_empty() {
-                status_msg = "Error: Query is empty".to_string();
+            
+            let query_to_execute = if let Some(dir) = trigger_pagination {
+                if let Some(bq) = &active_tab.base_query {
+                    let new_offset = (active_tab.pagination_offset as i64 + (dir as i64 * active_tab.pagination_limit as i64)).max(0) as usize;
+                    active_tab.pagination_offset = new_offset;
+                    bq.clone()
+                } else {
+                    String::new()
+                }
+            } else {
+                let mut query = if let Some(((start_row, start_col), (end_row, end_col))) = active_tab.textarea.selection_range() {
+                    let lines = active_tab.textarea.lines();
+                    let mut selected_text = Vec::new();
+                    for row in start_row..=end_row {
+                        if row >= lines.len() { continue; }
+                        let chars: Vec<char> = lines[row].chars().collect();
+                        let s = if row == start_row { start_col } else { 0 };
+                        let e = if row == end_row { end_col } else { chars.len() };
+                        let s = s.min(chars.len());
+                        let e = e.min(chars.len());
+                        if s <= e {
+                            selected_text.push(chars[s..e].iter().collect::<String>());
+                        }
+                    }
+                    selected_text.join("\n")
+                } else {
+                    active_tab.textarea.lines().join("\n")
+                };
+                if query.is_empty() {
+                    query = active_tab.textarea.lines().join("\n");
+                }
+                active_tab.pagination_offset = 0;
+                active_tab.base_query = Some(query.clone());
+                query
+            };
+
+            if query_to_execute.trim().is_empty() {
+                if trigger_pagination.is_none() {
+                    status_msg = "Error: Query is empty".to_string();
+                }
             } else {
                 active_tab.query_results.clear();
                 active_tab.column_names.clear();
@@ -918,7 +1018,39 @@ pub fn run_ide_loop(
                 active_tab.textarea.set_search_pattern("(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b").unwrap_or(());
                 active_tab.textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
-                match conn.prepare(&query) {
+                let mut clean_lower = query_to_execute.trim().to_lowercase();
+                loop {
+                    if clean_lower.starts_with("--") {
+                        if let Some(idx) = clean_lower.find('\n') {
+                            clean_lower = clean_lower[idx..].trim_start().to_string();
+                        } else {
+                            clean_lower = String::new();
+                        }
+                    } else if clean_lower.starts_with("/*") {
+                        if let Some(idx) = clean_lower.find("*/") {
+                            clean_lower = clean_lower[idx+2..].trim_start().to_string();
+                        } else {
+                            clean_lower = String::new();
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                
+                let is_paginatable = clean_lower.starts_with("select") || clean_lower.starts_with("with") || clean_lower.starts_with("values") || clean_lower.starts_with("from");
+                
+                let final_query = if is_paginatable {
+                    active_tab.is_paginated = true;
+                    let clean_query = query_to_execute.trim().strip_suffix(';').unwrap_or(query_to_execute.trim());
+                    format!("SELECT * FROM ({}) LIMIT {} OFFSET {}", clean_query, active_tab.pagination_limit, active_tab.pagination_offset)
+                } else {
+                    active_tab.is_paginated = false;
+                    query_to_execute.clone()
+                };
+
+                let _ = std::fs::write("debug_query.txt", format!("query: {}\nclean: {}\npag: {}\nfinal: {}", query_to_execute, clean_lower, is_paginatable, final_query));
+
+                match conn.prepare(&final_query) {
                     Ok(mut stmt) => {
                         let mut exec_rows = Vec::new();
                         let mut count = 0;
@@ -954,7 +1086,7 @@ pub fn run_ide_loop(
 
                                 let history_path = queries_dir.join(".history.sql");
                                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                                let history_entry = format!("-- Executed at {} (Took {:.2?})\n{};\n\n", timestamp, elapsed, query.trim());
+                                let history_entry = format!("-- Executed at {} (Took {:.2?})\n{};\n\n", timestamp, elapsed, query_to_execute.trim());
                                 use std::io::Write;
                                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(history_path) {
                                     let _ = f.write_all(history_entry.as_bytes());
