@@ -27,6 +27,7 @@ enum NodeType {
     Table,
     View,
     Query,
+    Macro,
     Column { data_type: String },
 }
 
@@ -103,6 +104,17 @@ pub fn run_ide_loop(
         }
     }
 
+    let mut macros: Vec<String> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false ORDER BY 1") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(name) = row.get::<_, String>(0) {
+                    macros.push(name);
+                }
+            }
+        }
+    }
+
     // Load autocomplete dictionary (tables + columns)
     let mut dictionary: Vec<String> = tables.clone();
     dictionary.extend(views.clone());
@@ -145,7 +157,7 @@ pub fn run_ide_loop(
     if !tables.is_empty() {
         explorer_items.push(ExplorerNode {
             name: "Tables".to_string(),
-            display: "📦 Tables".to_string(),
+            display: format!("📦 Tables ({})", tables.len()),
             level: 0,
             is_expandable: true,
             is_expanded: true,
@@ -166,7 +178,7 @@ pub fn run_ide_loop(
     if !views.is_empty() {
         explorer_items.push(ExplorerNode {
             name: "Views".to_string(),
-            display: "👁️ Views".to_string(),
+            display: format!("👁️ Views ({})", views.len()),
             level: 0,
             is_expandable: true,
             is_expanded: true,
@@ -184,10 +196,31 @@ pub fn run_ide_loop(
         }
     }
 
+    if !macros.is_empty() {
+        explorer_items.push(ExplorerNode {
+            name: "Macros".to_string(),
+            display: format!("🔧 Macros ({})", macros.len()),
+            level: 0,
+            is_expandable: true,
+            is_expanded: true,
+            node_type: NodeType::Group,
+        });
+        for m in &macros {
+            explorer_items.push(ExplorerNode {
+                name: m.clone(),
+                display: format!("  ├─ {}", m),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::Macro,
+            });
+        }
+    }
+
     if !queries.is_empty() {
         explorer_items.push(ExplorerNode {
             name: "Queries".to_string(),
-            display: "📄 Queries".to_string(),
+            display: format!("📄 Queries ({})", queries.len()),
             level: 0,
             is_expandable: true,
             is_expanded: true,
@@ -268,7 +301,7 @@ pub fn run_ide_loop(
             // Tabs Pane
             let tab_titles: Vec<Line> = tabs.iter().enumerate().map(|(i, tab)| {
                 let name = if let Some(ref path) = tab.active_file {
-                    path.file_name().unwrap().to_string_lossy().to_string()
+                    path.file_name().unwrap_or(std::ffi::OsStr::new("unknown")).to_string_lossy().to_string()
                 } else {
                     format!("New Query {}", i + 1)
                 };
@@ -291,7 +324,7 @@ pub fn run_ide_loop(
             // Editor Pane
             let active_tab = &mut tabs[active_tab_index];
             let editor_title = if let Some(ref path) = active_tab.active_file {
-                format!(" Editor [{}] ", path.file_name().unwrap().to_string_lossy())
+                format!(" Editor [{}] ", path.file_name().unwrap_or(std::ffi::OsStr::new("unknown")).to_string_lossy())
             } else {
                 " Editor [New Query] ".to_string()
             };
@@ -430,7 +463,7 @@ pub fn run_ide_loop(
                         let mut current_x = current_tabs_rect.left() + 1;
                         for (i, tab) in tabs.iter().enumerate() {
                             let tab_name = if let Some(ref path) = tab.active_file {
-                                path.file_name().unwrap().to_string_lossy().to_string()
+                                path.file_name().unwrap_or(std::ffi::OsStr::new("unknown")).to_string_lossy().to_string()
                             } else {
                                 format!("New Query {}", i + 1)
                             };
@@ -481,6 +514,15 @@ pub fn run_ide_loop(
                         }
                     } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
                         tabs[active_tab_index].textarea.scroll((-1, 0));
+                    }
+                }
+
+                // Forward mouse events to textarea if inside editor bounds
+                if mouse.row >= current_editor_rect.top() && mouse.row < current_editor_rect.bottom() - 1 {
+                    if mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                        if focus == FocusPane::Editor {
+                            tabs[active_tab_index].textarea.input(ev.clone());
+                        }
                     }
                 }
             }
@@ -729,7 +771,7 @@ pub fn run_ide_loop(
                     status_msg = format!("Saved {}", path.display());
                 }
             } else {
-                let name = format!("query_{}.sql", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+                let name = format!("query_{}.sql", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
                 let path = queries_dir.join(&name);
                 if let Err(e) = std::fs::write(&path, content) {
                     status_msg = format!("Error saving new file: {}", e);
@@ -753,7 +795,7 @@ pub fn run_ide_loop(
             if active_tab.query_results.is_empty() {
                 status_msg = "No results to export!".to_string();
             } else {
-                let name = format!("export_{}.csv", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+                let name = format!("export_{}.csv", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
                 let path = queries_dir.join(&name);
                 let mut csv_content = String::new();
                 csv_content.push_str(&active_tab.column_names.join(","));
@@ -959,6 +1001,17 @@ pub fn run_ide_loop(
                                             node_type: NodeType::View,
                                         });
                                     }
+                                } else if item_name == "Macros" {
+                                    for m in &macros {
+                                        new_nodes.push(ExplorerNode {
+                                            name: m.clone(),
+                                            display: format!("  ├─ {}", m),
+                                            level: 1,
+                                            is_expandable: false,
+                                            is_expanded: false,
+                                            node_type: NodeType::Macro,
+                                        });
+                                    }
                                 } else if item_name == "Queries" {
                                     for q in &queries {
                                         new_nodes.push(ExplorerNode {
@@ -1008,6 +1061,7 @@ pub fn run_ide_loop(
                             }
                         }
                         NodeType::Column { .. } => {}
+                        NodeType::Macro => {}
                     }
                 }
             }
@@ -1095,5 +1149,19 @@ fn format_duckdb_value(v: duckdb::types::Value) -> String {
             }
             s
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use duckdb::types::Value;
+
+    #[test]
+    fn test_format_duckdb_value() {
+        assert_eq!(format_duckdb_value(Value::Null), "NULL");
+        assert_eq!(format_duckdb_value(Value::Boolean(true)), "true");
+        assert_eq!(format_duckdb_value(Value::Int(42)), "42");
+        assert_eq!(format_duckdb_value(Value::Text("hello".to_string())), "hello");
     }
 }

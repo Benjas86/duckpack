@@ -22,8 +22,6 @@ pub enum TuiAction {
     Inspect { obj_name: String },
     CloseInspect,
     Pull { obj_name: String, item_type: DiffItemType },
-    ToggleShowIgnored,
-    ToggleTheme,
     Explore,
     CopyStatus,
 }
@@ -180,6 +178,12 @@ fn sort_diff_items(items: &mut Vec<DiffItem>) {
 
 /// The main execution loop for the `apply` command's Terminal UI.
 /// Handles rendering the list of changes, capturing keyboard events, and toggling selection states.
+/// The main UI rendering loop for the 'Apply' Diff engine.
+/// 
+/// # Educational Note:
+/// This function demonstrates a standard 'Immediate Mode GUI' pattern used by Ratatui.
+/// It runs in a continuous `loop`, where every iteration clears and redraws the entire
+/// screen based on the current state (`list_state`, `scroll_position`, etc).
 pub fn draw_and_handle_events(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     diff: &mut DiffResult,
@@ -296,7 +300,7 @@ pub fn draw_and_handle_events(
                     .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
                     .highlight_symbol(">> ");
 
-                f.render_stateful_widget(list, chunks[1], &mut list_state);
+                f.render_stateful_widget(list, chunks[2], &mut list_state);
 
                 // Render Details Pane (Side-by-Side)
                 if let Some(idx) = list_state.selected() {
@@ -310,7 +314,7 @@ pub fn draw_and_handle_events(
                     let details_chunks = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-                        .split(chunks[4]);
+                        .split(chunks[3]);
                         
                     let max_scroll = left_lines.len() as u16;
                     scroll_position = scroll_position.min(max_scroll);
@@ -329,7 +333,7 @@ pub fn draw_and_handle_events(
                     f.render_widget(right_pane, details_chunks[1]);
                 } else {
                     let p = Paragraph::new("Select an item to view details").block(Block::default().borders(Borders::ALL).title("Details"));
-                    f.render_widget(p, chunks[4]);
+                    f.render_widget(p, chunks[3]);
                 }
             }
 
