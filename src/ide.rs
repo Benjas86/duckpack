@@ -256,6 +256,10 @@ pub fn run_ide_loop(
     let mut current_tabs_rect = Rect::default();
     let mut current_results_rect = Rect::default();
     let mut show_help = false;
+    let mut show_schema_visualizer = false;
+    let mut schema_ascii_tree = String::new();
+    let mut schema_scroll = 0;
+    let mut max_schema_scroll = 0;
 
     loop {
         terminal.draw(|f| {
@@ -453,6 +457,7 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" Ctrl+W    ", Style::default().fg(Color::Cyan)), Span::raw("Close Tab")]),
                     Line::from(vec![Span::styled(" Ctrl+N/P  ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Tab")]),
                     Line::from(vec![Span::styled(" Ctrl+E/F5 ", Style::default().fg(Color::Cyan)), Span::raw("Execute Query (or selected text)")]),
+                    Line::from(vec![Span::styled(" Ctrl+V    ", Style::default().fg(Color::Cyan)), Span::raw("Visualize Schema")]),
                     Line::from(vec![Span::styled(" Ctrl+S    ", Style::default().fg(Color::Cyan)), Span::raw("Save Query")]),
                     Line::from(vec![Span::styled(" Ctrl+F    ", Style::default().fg(Color::Cyan)), Span::raw("Format Query")]),
                     Line::from(vec![Span::styled(" Ctrl+Space", Style::default().fg(Color::Cyan)), Span::raw("Autocomplete")]),
@@ -468,6 +473,26 @@ pub fn run_ide_loop(
                         .border_style(Style::default().fg(Color::Cyan)))
                         .alignment(Alignment::Left);
                 f.render_widget(help_paragraph, popup_area);
+            } else if show_schema_visualizer {
+                let popup_area = ratatui::layout::Rect {
+                    x: f.area().width / 8,
+                    y: f.area().height / 8,
+                    width: (f.area().width * 3) / 4,
+                    height: (f.area().height * 3) / 4,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+                
+                let lines: Vec<Line> = schema_ascii_tree.lines().map(|l| Line::from(l.to_string())).collect();
+                max_schema_scroll = lines.len().saturating_sub((popup_area.height as usize).saturating_sub(2)) as u16;
+
+                let tree_paragraph = Paragraph::new(lines)
+                        .block(Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" Schema Visualizer (Scroll: {}/{}) ", schema_scroll, max_schema_scroll))
+                        .border_style(Style::default().fg(Color::Cyan)))
+                        .alignment(Alignment::Left)
+                        .scroll((schema_scroll, 0));
+                f.render_widget(tree_paragraph, popup_area);
             }
 
             // Status Bar
@@ -641,15 +666,29 @@ pub fn run_ide_loop(
                 }
             }
             Event::Key(key) => {
-                if show_help {
+                if show_help || show_schema_visualizer {
                     if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') || key.code == KeyCode::Char('?') {
                         show_help = false;
+                        show_schema_visualizer = false;
+                    } else if show_schema_visualizer {
+                        if key.code == KeyCode::Down || key.code == KeyCode::Char('j') {
+                            schema_scroll = (schema_scroll + 1).min(max_schema_scroll);
+                        } else if key.code == KeyCode::Up || key.code == KeyCode::Char('k') {
+                            schema_scroll = schema_scroll.saturating_sub(1);
+                        }
                     }
-                    continue; // Block other inputs while help is shown
+                    continue; // Block other inputs while help or visualizer is shown
                 }
 
                 if key.code == KeyCode::Char('?') {
                     show_help = true;
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    show_schema_visualizer = true;
+                    // Generate schema visually here
+                    schema_ascii_tree = generate_schema_visualizer(&db_path).unwrap_or_else(|e| format!("Failed to generate schema visualizer: {}", e));
                     continue;
                 }
 
@@ -1347,6 +1386,82 @@ fn format_duckdb_value(v: duckdb::types::Value) -> String {
             s
         }
     }
+}
+
+/// Generates an ASCII tree of the schema and copies a Mermaid diagram to the clipboard.
+fn generate_schema_visualizer(db_str: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let conn = duckdb::Connection::open(db_str)?;
+    
+    // 1. Get Tables & Columns
+    let mut stmt = conn.prepare("SELECT table_name, column_name, data_type FROM duckdb_columns ORDER BY table_name, column_index;")?;
+    let mut rows = stmt.query([])?;
+    
+    let mut tables: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
+    while let Some(row) = rows.next()? {
+        let table_name: String = row.get(0)?;
+        let col_name: String = row.get(1)?;
+        let data_type: String = row.get(2)?;
+        tables.entry(table_name).or_insert_with(Vec::new).push((col_name, data_type));
+    }
+    
+    // 2. Get Foreign Keys
+    let mut stmt_fk = conn.prepare("SELECT table_name, constraint_column_names[1], referenced_table, referenced_column_names[1] FROM duckdb_constraints WHERE constraint_type = 'FOREIGN KEY';")?;
+    let mut rows_fk = stmt_fk.query([])?;
+    
+    let mut fks: Vec<(String, String, String, String)> = Vec::new();
+    while let Some(row) = rows_fk.next()? {
+        let table_name: String = row.get(0)?;
+        let col_name: String = row.get(1)?;
+        let ref_table: String = row.get(2)?;
+        let ref_col: String = row.get(3)?;
+        fks.push((table_name, col_name, ref_table, ref_col));
+    }
+    
+    // 3. Generate Mermaid
+    let mut mermaid = String::from("erDiagram\n");
+    for (table, cols) in &tables {
+        mermaid.push_str(&format!("    {} {{\n", table));
+        for (col, dtype) in cols {
+            mermaid.push_str(&format!("        {} {}\n", dtype.replace(" ", "_"), col));
+        }
+        mermaid.push_str("    }\n");
+    }
+    for (table, _col, ref_table, _ref_col) in &fks {
+        mermaid.push_str(&format!("    {} }}|--|| {} : \"\"\n", table, ref_table));
+    }
+    
+    // Use arboard to copy
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(&mermaid);
+    }
+    
+    // 4. Generate ASCII Tree
+    let mut tree = String::from("Database Schema (Mermaid.js diagram copied to clipboard!)\n");
+    let mut sorted_tables: Vec<&String> = tables.keys().collect();
+    sorted_tables.sort();
+    
+    for (i, table) in sorted_tables.iter().enumerate() {
+        let is_last_table = i == sorted_tables.len() - 1;
+        let prefix = if is_last_table { "└──" } else { "├──" };
+        tree.push_str(&format!("{} {}\n", prefix, table));
+        
+        let cols = tables.get(*table).unwrap();
+        for (j, (col, dtype)) in cols.iter().enumerate() {
+            let is_last_col = j == cols.len() - 1;
+            let col_prefix = if is_last_table { "    " } else { "│   " };
+            let line_prefix = if is_last_col { "└──" } else { "├──" };
+            
+            // Check if col is a foreign key
+            let fk = fks.iter().find(|(t, c, _, _)| t == *table && c == col);
+            if let Some((_, _, ref_table, ref_col)) = fk {
+                tree.push_str(&format!("{}{} {} ({}) -> {}.{}\n", col_prefix, line_prefix, col, dtype, ref_table, ref_col));
+            } else {
+                tree.push_str(&format!("{}{} {} ({})\n", col_prefix, line_prefix, col, dtype));
+            }
+        }
+    }
+    
+    Ok(tree)
 }
 
 #[cfg(test)]

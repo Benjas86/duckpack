@@ -8,6 +8,18 @@ use clap::{Parser, Subcommand};
 use duckdb::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
+use serde::Deserialize;
+use std::collections::HashMap;
+
+#[derive(Deserialize, Debug)]
+struct DuckpackConfig {
+    env: Option<HashMap<String, EnvConfig>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct EnvConfig {
+    db: Option<String>,
+}
 
 /// The core CLI argument parser configuration using `clap`.
 /// Dictates all available terminal commands for duckpack.
@@ -112,7 +124,7 @@ fn is_remote(db: &str) -> bool {
 /// Parses the arguments and delegates to the appropriate command handler.
 fn main() -> Result<()> {
     panic::set_hook(Box::new(|info| { let bt = std::backtrace::Backtrace::force_capture(); let _ = std::fs::write("panic.log", format!("Panic: {:?}\n\n{}", info, bt)); }));
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     let project_dir = match &cli.command {
         Commands::Init { project_dir } => project_dir,
@@ -130,6 +142,32 @@ fn main() -> Result<()> {
         ".env".to_string()
     };
     dotenvy::from_path(project_dir.join(env_file)).ok();
+
+    // Check for duckpack.toml
+    let toml_path = project_dir.join("duckpack.toml");
+    if toml_path.exists() {
+        if let Ok(content) = fs::read_to_string(&toml_path) {
+            if let Ok(config) = toml::from_str::<DuckpackConfig>(&content) {
+                if let Some(cli_env) = &cli.env {
+                    if let Some(envs) = config.env {
+                        if let Some(env_config) = envs.get(cli_env) {
+                            if let Some(toml_db) = &env_config.db {
+                                // Override the db argument for applicable commands
+                                match &mut cli.command {
+                                    Commands::Apply { db, .. } |
+                                    Commands::Deploy { db, .. } |
+                                    Commands::Explore { db, .. } => {
+                                        *db = toml_db.clone();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     match &cli.command {
         Commands::Init { project_dir } => {
