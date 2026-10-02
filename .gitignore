@@ -5,3 +5,4 @@
 duck-project.toml
 *.png
 *.duckpack
+/demo_project/*

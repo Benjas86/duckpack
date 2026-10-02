@@ -76,11 +76,26 @@ CREATE TABLE users (
 );
 ```
 
-### 4. Review and Deploy
+### 4. Configure Environments (Optional)
+
+You can define dynamic configurations across environments using a `duckpack.toml` file in your project directory:
+```toml
+[env.staging]
+db = "staging.duckdb"
+
+[env.prod]
+db = "prod.duckdb"
+```
+
+### 5. Review and Deploy
 
 Apply your schema to a target DuckDB database. This will open the interactive TUI so you can review the proposed execution plan:
 ```bash
+# Using a direct connection string
 duckpack apply --project-dir my_project --db local.duckdb
+
+# Or using an environment configured in your duckpack.toml!
+duckpack apply --project-dir my_project --env prod
 ```
 
 ## 🧑‍💻 DuckPack IDE / Explorer Mode
@@ -94,14 +109,15 @@ Instead of switching to a different terminal window or dealing with DuckDB file 
 ### Features
 1. **Integrated Query Editor:** Write multi-line SQL queries directly in the application with a built-in text editor featuring **Syntax Highlighting** (bold cyan keywords) and **Intelligent Autocomplete**. Press `Ctrl+Space` to dynamically cycle through matches from your database schema (tables, views, and columns)!
 2. **Multi-Tab Editor System & Independent Results:** Manage multiple queries simultaneously! Each tab maintains its very own independent state for query results, scrolling, and column headers! Hit `Ctrl+T` to open a new tab, `Ctrl+W` to close it, and navigate between them using `Ctrl+N` / `Ctrl+P`.
-3. **Full Mouse Support:** The entire IDE is highly interactive. You can instantly switch context by clicking on the Tab headers directly. The action bar at the bottom also provides intuitive `[+ New]` and `[❌ Close]` buttons you can click with your mouse!
+3. **Full Mouse Support:** The entire IDE is highly interactive. You can instantly switch context by clicking on the Tab headers directly. The action bar at the bottom also provides intuitive `[+ New]` and `[❌ Close]` buttons you can click with your mouse! You can also use your mouse wheel to seamlessly scroll vertically and horizontally across the Explorer, Editor, and Results grid.
 4. **Instant Transitions:** Hitting `e` from the `apply` screen instantly transfers your locked DuckDB connection over to the IDE, allowing you to seamlessly begin querying your tables without restarting.
 5. **Interactive & Expandable Explorer:** The left-hand sidebar acts as your navigation hub. You can click on any Table or View (or press `Enter`) to expand it hierarchically and dynamically query DuckDB for all nested columns and their exact data types! Click on any saved `.sql` file to load it instantly into your active tab.
-6. **Execution & Isolate Queries:** Hit `Ctrl+E` to execute your query! The dynamic engine parses the typed DuckDB rows and presents your results instantly in a formatted grid. You can navigate large datasets freely using `Up`/`Down`/`PgUp`/`PgDn` and scroll horizontally using `Left`/`Right`. **To isolate a query:** Highlight text using **`Shift` + Arrow Keys** and press `Ctrl+E` to execute *only* the highlighted snippet!
+6. **Execution & Isolate Queries:** Hit `Ctrl+E` to execute your query! The dynamic engine parses the typed DuckDB rows and presents your results instantly in a formatted grid. You can navigate large datasets freely using your mouse wheel, or `Up`/`Down`/`PgUp`/`PgDn` and scroll horizontally using your mouse's horizontal scroll wheel or `Left`/`Right` arrow keys. **To isolate a query:** Highlight text using **`Shift` + Arrow Keys** and press `Ctrl+E` to execute *only* the highlighted snippet!
 7. **Real-time Syntax Error Detection:** If DuckDB throws a syntax parsing error during execution, the engine intercepts the stack trace, extracts the exact offending token, and injects a dynamic regex highlight patch—turning that specific broken word bright red and halting execution until it is fixed!
 8. **Auto-Formatting:** Hit `Ctrl+F` to instantly pass your raw query through the internal `sqlformat` parser and auto-indent your code beautifully.
 9. **Auto-Save:** Hit `Ctrl+S` to instantly save your active editor contents to a scratchpad `.sql` file in your `queries/` directory.
-
+10. **Result Pagination:** View datasets with millions of rows safely! The IDE intelligently paginates `SELECT`, `WITH`, `VALUES`, and `FROM` statements into manageable 500-row chunks. Use `n` (Next Page) and `p` (Previous Page) when focused on the Results pane to navigate through massive datasets instantly.
+11. **Schema Visualizer:** Hit `Ctrl+V` to open the integrated visualizer! This will dynamically scan your active DuckDB database, extract foreign key mappings, and print an elegant ASCII visual tree inside the IDE while silently generating and copying the complete `Mermaid.js` Entity-Relationship syntax directly to your clipboard!
 ## 📦 Building DuckPacks for CI/CD
 
 For remote deployments (like production servers running Quack/DuckDB), executing migrations over a live network connection is risky and slow. Instead, you can compile your project into an immutable `.duckpack`:
@@ -136,6 +152,34 @@ By installing this `duckpack` CLI on your remote server as a companion tool, you
    ```bash
    ssh user@production-server "duckpack apply --project-dir /tmp/release_v1.duckpack --db /var/lib/duckdb/prod.duckdb --auto-approve"
    ```
+
+**Wait! What if I don't want to manually install the CLI on my remote server?**
+No problem! Because `duckpack` is a standalone, statically linked binary, it can auto-bootstrap itself!
+
+Instead of running SSH manually, you can just run `deploy` from your local machine (or CI pipeline) with the `--auto-install` flag. The engine will:
+1. Compile your `.duckpack`
+2. SCP the `.duckpack` to your remote server
+3. **SCP its own `duckpack` executable binary** to your remote server
+4. Execute it remotely via SSH
+5. Clean up both temporary files
+
+```bash
+duckpack deploy --project-dir . --remote user@production-server --db /var/lib/duckdb/prod.duckdb --auto-install
+```
+
+### 3. Explore
+Launch the fully featured built-in IDE to query and explore your DuckDB database safely.
+
+```bash
+duckpack explore --project-dir . --db local.duckdb
+```
+
+**Remote Exploration via SSH**
+You can also launch the TUI directly on a remote server over SSH! If you pass the `--remote` flag, `duckpack` will securely launch the IDE on your server and beam the interface back to your local terminal over an interactive SSH session. 
+
+```bash
+duckpack explore --remote user@production-server --db /var/lib/duckdb/prod.duckdb --auto-install
+```
 
 *(Note: The `--auto-approve` flag ensures the CLI bypasses the interactive TUI and runs entirely headless.)*
 

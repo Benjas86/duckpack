@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, BorderType, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
     Terminal,
 };
 use std::path::PathBuf;
@@ -27,6 +27,7 @@ enum NodeType {
     Table,
     View,
     Query,
+    Macro,
     Column { data_type: String },
 }
 
@@ -51,6 +52,10 @@ struct EditorTab<'a> {
     column_names: Vec<String>,
     horizontal_scroll: usize,
     results_state: ratatui::widgets::TableState,
+    base_query: Option<String>,
+    pagination_offset: usize,
+    pagination_limit: usize,
+    is_paginated: bool,
 }
 
 impl<'a> EditorTab<'a> {
@@ -66,6 +71,10 @@ impl<'a> EditorTab<'a> {
             column_names: Vec::new(),
             horizontal_scroll: 0,
             results_state: ratatui::widgets::TableState::default(),
+            base_query: None,
+            pagination_offset: 0,
+            pagination_limit: 500,
+            is_paginated: false,
         }
     }
 }
@@ -77,6 +86,7 @@ pub fn run_ide_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     conn: &Connection,
     project_dir: &PathBuf,
+    db_path: &str,
 ) -> Result<()> {
     let mut tabs: Vec<EditorTab> = vec![EditorTab::new()];
     let mut active_tab_index: usize = 0;
@@ -97,6 +107,17 @@ pub fn run_ide_loop(
                     } else if typ == "VIEW" {
                         views.push(display_name);
                     }
+                }
+            }
+        }
+    }
+
+    let mut macros: Vec<String> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false ORDER BY 1") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(name) = row.get::<_, String>(0) {
+                    macros.push(name);
                 }
             }
         }
@@ -140,11 +161,12 @@ pub fn run_ide_loop(
 
     let mut explorer_state = ListState::default();
     let mut explorer_items: Vec<ExplorerNode> = Vec::new();
+    let mut explorer_horizontal_scroll: usize = 0;
 
     if !tables.is_empty() {
         explorer_items.push(ExplorerNode {
             name: "Tables".to_string(),
-            display: "📦 Tables".to_string(),
+            display: format!("📦 Tables ({})", tables.len()),
             level: 0,
             is_expandable: true,
             is_expanded: true,
@@ -165,7 +187,7 @@ pub fn run_ide_loop(
     if !views.is_empty() {
         explorer_items.push(ExplorerNode {
             name: "Views".to_string(),
-            display: "👁️ Views".to_string(),
+            display: format!("👁️ Views ({})", views.len()),
             level: 0,
             is_expandable: true,
             is_expanded: true,
@@ -183,10 +205,31 @@ pub fn run_ide_loop(
         }
     }
 
+    if !macros.is_empty() {
+        explorer_items.push(ExplorerNode {
+            name: "Macros".to_string(),
+            display: format!("🔧 Macros ({})", macros.len()),
+            level: 0,
+            is_expandable: true,
+            is_expanded: true,
+            node_type: NodeType::Group,
+        });
+        for m in &macros {
+            explorer_items.push(ExplorerNode {
+                name: m.clone(),
+                display: format!("  ├─ {}", m),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::Macro,
+            });
+        }
+    }
+
     if !queries.is_empty() {
         explorer_items.push(ExplorerNode {
             name: "Queries".to_string(),
-            display: "📄 Queries".to_string(),
+            display: format!("📄 Queries ({})", queries.len()),
             level: 0,
             is_expandable: true,
             is_expanded: true,
@@ -212,18 +255,49 @@ pub fn run_ide_loop(
     let mut current_explorer_rect = Rect::default();
     let mut current_tabs_rect = Rect::default();
     let mut current_results_rect = Rect::default();
+    let mut show_help = false;
+    let mut show_schema_visualizer = false;
+    let mut schema_ascii_tree = String::new();
+    let mut schema_scroll = 0;
+    let mut max_schema_scroll = 0;
 
     loop {
         terminal.draw(|f| {
+            let main_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+                .split(f.area());
+
+            let ssh_prefix = if std::env::var("SSH_CLIENT").is_ok() { "[SSH Remote] " } else { "" };
+            let top_header = Paragraph::new("")
+                .block(Block::default().borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title_top(Line::from(format!(" Target DB: {}{} ", ssh_prefix, db_path)).alignment(Alignment::Right).style(Style::default().fg(Color::Cyan)))
+                    .title_top(Line::from(format!(" DuckPack v{} ", env!("CARGO_PKG_VERSION"))).alignment(Alignment::Center).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+                );
+            f.render_widget(top_header, main_chunks[0]);
+
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
-                .split(f.area());
+                .split(main_chunks[1]);
 
             let right_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Percentage(45), Constraint::Length(2)].as_ref())
                 .split(chunks[1]);
+
+            let max_item_width = explorer_items.iter().map(|item| {
+                let indent = item.level * 2;
+                let expand_indicator = if item.is_expandable { 2 } else { 0 };
+                indent + expand_indicator + item.display.chars().count()
+            }).max().unwrap_or(0);
+            
+            let explorer_inner_width = chunks[0].width.saturating_sub(2) as usize;
+            let max_scroll = max_item_width.saturating_sub(explorer_inner_width);
+            if explorer_horizontal_scroll > max_scroll {
+                explorer_horizontal_scroll = max_scroll;
+            }
 
             // Explorer Pane
             let mut list_items = Vec::new();
@@ -234,7 +308,10 @@ pub fn run_ide_loop(
                 } else {
                     ""
                 };
-                let display_text = format!("{}{}{}", indent, expand_indicator, item.display);
+                let display_text = format!("{}{}{}", indent, expand_indicator, item.display)
+                    .chars()
+                    .skip(explorer_horizontal_scroll)
+                    .collect::<String>();
                 list_items.push(ListItem::new(display_text));
             }
 
@@ -253,7 +330,7 @@ pub fn run_ide_loop(
             // Tabs Pane
             let tab_titles: Vec<Line> = tabs.iter().enumerate().map(|(i, tab)| {
                 let name = if let Some(ref path) = tab.active_file {
-                    path.file_name().unwrap().to_string_lossy().to_string()
+                    path.file_name().unwrap_or(std::ffi::OsStr::new("unknown")).to_string_lossy().to_string()
                 } else {
                     format!("New Query {}", i + 1)
                 };
@@ -269,14 +346,13 @@ pub fn run_ide_loop(
                 .block(Block::default().borders(Borders::ALL).title(" Open Tabs "))
                 .select(active_tab_index)
                 .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED));
-            
             f.render_widget(tabs_widget, right_chunks[0]);
             current_tabs_rect = right_chunks[0];
 
             // Editor Pane
             let active_tab = &mut tabs[active_tab_index];
             let editor_title = if let Some(ref path) = active_tab.active_file {
-                format!(" Editor [{}] ", path.file_name().unwrap().to_string_lossy())
+                format!(" Editor [{}] ", path.file_name().unwrap_or(std::ffi::OsStr::new("unknown")).to_string_lossy())
             } else {
                 " Editor [New Query] ".to_string()
             };
@@ -312,9 +388,18 @@ pub fn run_ide_loop(
                 Style::default()
             };
 
+            let title = if tabs[active_tab_index].is_paginated {
+                let offset = tabs[active_tab_index].pagination_offset;
+                let limit = tabs[active_tab_index].pagination_limit;
+                format!(" Results (Rows {} - {}) ", offset + 1, offset + limit)
+            } else {
+                " Results ".to_string()
+            };
+
             let results_block = Block::default()
                 .borders(Borders::ALL)
-                .title(" Results ")
+                .title(title)
+                .title_bottom(Line::from(" [?] Help ").alignment(Alignment::Right))
                 .border_style(results_border_style);
 
             let active_tab = &mut tabs[active_tab_index];
@@ -356,6 +441,60 @@ pub fn run_ide_loop(
             }
             current_results_rect = right_chunks[2];
 
+            if show_help {
+                let popup_area = ratatui::layout::Rect {
+                    x: f.area().width / 4,
+                    y: f.area().height / 4,
+                    width: f.area().width / 2,
+                    height: f.area().height / 2,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+                
+                let help_lines = vec![
+                    Line::from(vec![Span::styled(" [?]       ", Style::default().fg(Color::Cyan)), Span::raw("Toggle Help Menu")]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(" Ctrl+T    ", Style::default().fg(Color::Cyan)), Span::raw("New Tab")]),
+                    Line::from(vec![Span::styled(" Ctrl+W    ", Style::default().fg(Color::Cyan)), Span::raw("Close Tab")]),
+                    Line::from(vec![Span::styled(" Ctrl+N/P  ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Tab")]),
+                    Line::from(vec![Span::styled(" Ctrl+E/F5 ", Style::default().fg(Color::Cyan)), Span::raw("Execute Query (or selected text)")]),
+                    Line::from(vec![Span::styled(" Ctrl+V    ", Style::default().fg(Color::Cyan)), Span::raw("Visualize Schema")]),
+                    Line::from(vec![Span::styled(" Ctrl+S    ", Style::default().fg(Color::Cyan)), Span::raw("Save Query")]),
+                    Line::from(vec![Span::styled(" Ctrl+F    ", Style::default().fg(Color::Cyan)), Span::raw("Format Query")]),
+                    Line::from(vec![Span::styled(" Ctrl+Space", Style::default().fg(Color::Cyan)), Span::raw("Autocomplete")]),
+                    Line::from(vec![Span::styled(" n / p     ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Page (in Results pane)")]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(" Mouse     ", Style::default().fg(Color::Cyan)), Span::raw("Click tabs/buttons, scroll panes")]),
+                ];
+
+                let help_paragraph = Paragraph::new(help_lines)
+                        .block(Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Help Menu ")
+                        .border_style(Style::default().fg(Color::Cyan)))
+                        .alignment(Alignment::Left);
+                f.render_widget(help_paragraph, popup_area);
+            } else if show_schema_visualizer {
+                let popup_area = ratatui::layout::Rect {
+                    x: f.area().width / 8,
+                    y: f.area().height / 8,
+                    width: (f.area().width * 3) / 4,
+                    height: (f.area().height * 3) / 4,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+                
+                let lines: Vec<Line> = schema_ascii_tree.lines().map(|l| Line::from(l.to_string())).collect();
+                max_schema_scroll = lines.len().saturating_sub((popup_area.height as usize).saturating_sub(2)) as u16;
+
+                let tree_paragraph = Paragraph::new(lines)
+                        .block(Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" Schema Visualizer (Scroll: {}/{}) ", schema_scroll, max_schema_scroll))
+                        .border_style(Style::default().fg(Color::Cyan)))
+                        .alignment(Alignment::Left)
+                        .scroll((schema_scroll, 0));
+                f.render_widget(tree_paragraph, popup_area);
+            }
+
             // Status Bar
             let status = Paragraph::new(format!(" {}", status_msg))
                 .style(Style::default().fg(Color::Black).bg(Color::Cyan));
@@ -370,6 +509,7 @@ pub fn run_ide_loop(
         let mut new_tab = false;
         let mut close_tab = false;
         let mut trigger_explorer_action = false;
+        let mut trigger_pagination: Option<i32> = None;
         let ev = event::read()?;
 
         match ev {
@@ -390,6 +530,10 @@ pub fn run_ide_loop(
                         }
                         if mouse.column > current_editor_rect.left() + 61 && mouse.column <= current_editor_rect.left() + 85 {
                             format_query = true;
+                        }
+                    } else if mouse.row == current_results_rect.bottom().saturating_sub(1) {
+                        if mouse.column >= current_results_rect.right().saturating_sub(10) && mouse.column <= current_results_rect.right() {
+                            show_help = !show_help;
                         }
                     } else if mouse.row >= current_editor_rect.top() && mouse.row < current_editor_rect.bottom() {
                         if mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
@@ -415,7 +559,7 @@ pub fn run_ide_loop(
                         let mut current_x = current_tabs_rect.left() + 1;
                         for (i, tab) in tabs.iter().enumerate() {
                             let tab_name = if let Some(ref path) = tab.active_file {
-                                path.file_name().unwrap().to_string_lossy().to_string()
+                                path.file_name().unwrap_or(std::ffi::OsStr::new("unknown")).to_string_lossy().to_string()
                             } else {
                                 format!("New Query {}", i + 1)
                             };
@@ -430,46 +574,124 @@ pub fn run_ide_loop(
                         }
                     }
                 } else if mouse.kind == MouseEventKind::ScrollDown {
-                    if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
-                        if let Some(selected) = explorer_state.selected() {
-                            if selected < explorer_items.len().saturating_sub(1) {
-                                explorer_state.select(Some(selected + 1));
-                            }
-                        } else if !explorer_items.is_empty() {
-                            explorer_state.select(Some(0));
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                            explorer_horizontal_scroll += 1;
+                        } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
+                            tabs[active_tab_index].horizontal_scroll += 1;
+                        } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                            tabs[active_tab_index].textarea.scroll((0, 1));
                         }
-                    } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
-                        let active_tab = &mut tabs[active_tab_index];
-                        if let Some(selected) = active_tab.results_state.selected() {
-                            if selected < active_tab.query_results.len().saturating_sub(1) {
-                                active_tab.results_state.select(Some(selected + 1));
+                    } else {
+                        if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                            if let Some(selected) = explorer_state.selected() {
+                                if selected < explorer_items.len().saturating_sub(1) {
+                                    explorer_state.select(Some(selected + 1));
+                                }
+                            } else if !explorer_items.is_empty() {
+                                explorer_state.select(Some(0));
                             }
-                        } else if !active_tab.query_results.is_empty() {
-                            active_tab.results_state.select(Some(0));
+                        } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
+                            let active_tab = &mut tabs[active_tab_index];
+                            if let Some(selected) = active_tab.results_state.selected() {
+                                if selected < active_tab.query_results.len().saturating_sub(1) {
+                                    active_tab.results_state.select(Some(selected + 1));
+                                }
+                            } else if !active_tab.query_results.is_empty() {
+                                active_tab.results_state.select(Some(0));
+                            }
+                        } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                            tabs[active_tab_index].textarea.scroll((1, 0));
                         }
-                    } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
-                        tabs[active_tab_index].textarea.scroll((1, 0));
                     }
                 } else if mouse.kind == MouseEventKind::ScrollUp {
-                    if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
-                        if let Some(selected) = explorer_state.selected() {
-                            if selected > 0 {
-                                explorer_state.select(Some(selected - 1));
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                            if explorer_horizontal_scroll > 0 { explorer_horizontal_scroll -= 1; }
+                        } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
+                            let active_tab = &mut tabs[active_tab_index];
+                            if active_tab.horizontal_scroll > 0 { active_tab.horizontal_scroll -= 1; }
+                        } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                            tabs[active_tab_index].textarea.scroll((0, -1));
+                        }
+                    } else {
+                        if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                            if let Some(selected) = explorer_state.selected() {
+                                if selected > 0 {
+                                    explorer_state.select(Some(selected - 1));
+                                }
                             }
+                        } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
+                            let active_tab = &mut tabs[active_tab_index];
+                            if let Some(selected) = active_tab.results_state.selected() {
+                                if selected > 0 {
+                                    active_tab.results_state.select(Some(selected - 1));
+                                }
+                            }
+                        } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                            tabs[active_tab_index].textarea.scroll((-1, 0));
+                        }
+                    }
+                } else if mouse.kind == MouseEventKind::ScrollLeft {
+                    if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                        if explorer_horizontal_scroll > 0 {
+                            explorer_horizontal_scroll -= 1;
                         }
                     } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
                         let active_tab = &mut tabs[active_tab_index];
-                        if let Some(selected) = active_tab.results_state.selected() {
-                            if selected > 0 {
-                                active_tab.results_state.select(Some(selected - 1));
-                            }
+                        if active_tab.horizontal_scroll > 0 {
+                            active_tab.horizontal_scroll -= 1;
                         }
                     } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
-                        tabs[active_tab_index].textarea.scroll((-1, 0));
+                        // For textarea, scroll((lines, columns))
+                        tabs[active_tab_index].textarea.scroll((0, -1));
+                    }
+                } else if mouse.kind == MouseEventKind::ScrollRight {
+                    if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
+                        explorer_horizontal_scroll += 1;
+                    } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
+                        tabs[active_tab_index].horizontal_scroll += 1;
+                    } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                        tabs[active_tab_index].textarea.scroll((0, 1));
+                    }
+                }
+
+                // Forward mouse events to textarea if inside editor bounds
+                if mouse.row >= current_editor_rect.top() && mouse.row < current_editor_rect.bottom() - 1 {
+                    if mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
+                        if focus == FocusPane::Editor {
+                            tabs[active_tab_index].textarea.input(ev.clone());
+                        }
                     }
                 }
             }
             Event::Key(key) => {
+                if show_help || show_schema_visualizer {
+                    if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') || key.code == KeyCode::Char('?') {
+                        show_help = false;
+                        show_schema_visualizer = false;
+                    } else if show_schema_visualizer {
+                        if key.code == KeyCode::Down || key.code == KeyCode::Char('j') {
+                            schema_scroll = (schema_scroll + 1).min(max_schema_scroll);
+                        } else if key.code == KeyCode::Up || key.code == KeyCode::Char('k') {
+                            schema_scroll = schema_scroll.saturating_sub(1);
+                        }
+                    }
+                    continue; // Block other inputs while help or visualizer is shown
+                }
+
+                if key.code == KeyCode::Char('?') {
+                    show_help = true;
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    show_schema_visualizer = true;
+                    // Generate schema visually here
+                    schema_ascii_tree = generate_schema_visualizer(&db_path).unwrap_or_else(|e| format!("Failed to generate schema visualizer: {}", e));
+                    continue;
+                }
+
                 if key.code == KeyCode::F(5) || (key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL)) {
                     execute_query = true;
                 }
@@ -584,6 +806,12 @@ pub fn run_ide_loop(
                                     explorer_state.select(Some(selected + 1));
                                 }
                             }
+                        } else if key.code == KeyCode::Left {
+                            if explorer_horizontal_scroll > 0 {
+                                explorer_horizontal_scroll -= 1;
+                            }
+                        } else if key.code == KeyCode::Right {
+                            explorer_horizontal_scroll += 1;
                         } else if key.code == KeyCode::Enter {
                             trigger_explorer_action = true;
                         }
@@ -654,16 +882,32 @@ pub fn run_ide_loop(
                                 }
                             }
                         } else if key.code == KeyCode::PageDown {
-                            let len = active_tab.query_results.len();
-                            if len > 0 {
-                                let selected = active_tab.results_state.selected().unwrap_or(0);
-                                let new_sel = (selected + 10).min(len.saturating_sub(1));
-                                active_tab.results_state.select(Some(new_sel));
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                if active_tab.query_results.len() == active_tab.pagination_limit {
+                                    trigger_pagination = Some(1);
+                                }
+                            } else {
+                                let len = active_tab.query_results.len();
+                                if len > 0 {
+                                    let selected = active_tab.results_state.selected().unwrap_or(0);
+                                    let new_sel = (selected + 10).min(len.saturating_sub(1));
+                                    active_tab.results_state.select(Some(new_sel));
+                                }
                             }
+                        } else if key.code == KeyCode::Char('n') || key.code == KeyCode::Char('N') {
+                            if active_tab.query_results.len() == active_tab.pagination_limit {
+                                trigger_pagination = Some(1);
+                            }
+                        } else if key.code == KeyCode::Char('p') || key.code == KeyCode::Char('P') {
+                            trigger_pagination = Some(-1);
                         } else if key.code == KeyCode::PageUp {
-                            if let Some(selected) = active_tab.results_state.selected() {
-                                let new_sel = selected.saturating_sub(10);
-                                active_tab.results_state.select(Some(new_sel));
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                trigger_pagination = Some(-1);
+                            } else {
+                                if let Some(selected) = active_tab.results_state.selected() {
+                                    let new_sel = selected.saturating_sub(10);
+                                    active_tab.results_state.select(Some(new_sel));
+                                }
                             }
                         } else if key.code == KeyCode::Left {
                             active_tab.horizontal_scroll = active_tab.horizontal_scroll.saturating_sub(1);
@@ -714,7 +958,7 @@ pub fn run_ide_loop(
                     status_msg = format!("Saved {}", path.display());
                 }
             } else {
-                let name = format!("query_{}.sql", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+                let name = format!("query_{}.sql", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
                 let path = queries_dir.join(&name);
                 if let Err(e) = std::fs::write(&path, content) {
                     status_msg = format!("Error saving new file: {}", e);
@@ -738,7 +982,7 @@ pub fn run_ide_loop(
             if active_tab.query_results.is_empty() {
                 status_msg = "No results to export!".to_string();
             } else {
-                let name = format!("export_{}.csv", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+                let name = format!("export_{}.csv", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
                 let path = queries_dir.join(&name);
                 let mut csv_content = String::new();
                 csv_content.push_str(&active_tab.column_names.join(","));
@@ -762,31 +1006,48 @@ pub fn run_ide_loop(
             }
         }
 
-        if execute_query {
-            let mut query = if let Some(((start_row, start_col), (end_row, end_col))) = tabs[active_tab_index].textarea.selection_range() {
-                let lines = tabs[active_tab_index].textarea.lines();
-                let mut selected_text = Vec::new();
-                for row in start_row..=end_row {
-                    if row >= lines.len() { continue; }
-                    let chars: Vec<char> = lines[row].chars().collect();
-                    let s = if row == start_row { start_col } else { 0 };
-                    let e = if row == end_row { end_col } else { chars.len() };
-                    let s = s.min(chars.len());
-                    let e = e.min(chars.len());
-                    if s <= e {
-                        selected_text.push(chars[s..e].iter().collect::<String>());
-                    }
-                }
-                selected_text.join("\n")
-            } else {
-                tabs[active_tab_index].textarea.lines().join("\n")
-            };
-            if query.is_empty() {
-                query = tabs[active_tab_index].textarea.lines().join("\n");
-            }
+        if execute_query || trigger_pagination.is_some() {
             let active_tab = &mut tabs[active_tab_index];
-            if query.trim().is_empty() {
-                status_msg = "Error: Query is empty".to_string();
+            
+            let query_to_execute = if let Some(dir) = trigger_pagination {
+                if let Some(bq) = &active_tab.base_query {
+                    let new_offset = (active_tab.pagination_offset as i64 + (dir as i64 * active_tab.pagination_limit as i64)).max(0) as usize;
+                    active_tab.pagination_offset = new_offset;
+                    bq.clone()
+                } else {
+                    String::new()
+                }
+            } else {
+                let mut query = if let Some(((start_row, start_col), (end_row, end_col))) = active_tab.textarea.selection_range() {
+                    let lines = active_tab.textarea.lines();
+                    let mut selected_text = Vec::new();
+                    for row in start_row..=end_row {
+                        if row >= lines.len() { continue; }
+                        let chars: Vec<char> = lines[row].chars().collect();
+                        let s = if row == start_row { start_col } else { 0 };
+                        let e = if row == end_row { end_col } else { chars.len() };
+                        let s = s.min(chars.len());
+                        let e = e.min(chars.len());
+                        if s <= e {
+                            selected_text.push(chars[s..e].iter().collect::<String>());
+                        }
+                    }
+                    selected_text.join("\n")
+                } else {
+                    active_tab.textarea.lines().join("\n")
+                };
+                if query.is_empty() {
+                    query = active_tab.textarea.lines().join("\n");
+                }
+                active_tab.pagination_offset = 0;
+                active_tab.base_query = Some(query.clone());
+                query
+            };
+
+            if query_to_execute.trim().is_empty() {
+                if trigger_pagination.is_none() {
+                    status_msg = "Error: Query is empty".to_string();
+                }
             } else {
                 active_tab.query_results.clear();
                 active_tab.column_names.clear();
@@ -796,7 +1057,39 @@ pub fn run_ide_loop(
                 active_tab.textarea.set_search_pattern("(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b").unwrap_or(());
                 active_tab.textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
-                match conn.prepare(&query) {
+                let mut clean_lower = query_to_execute.trim().to_lowercase();
+                loop {
+                    if clean_lower.starts_with("--") {
+                        if let Some(idx) = clean_lower.find('\n') {
+                            clean_lower = clean_lower[idx..].trim_start().to_string();
+                        } else {
+                            clean_lower = String::new();
+                        }
+                    } else if clean_lower.starts_with("/*") {
+                        if let Some(idx) = clean_lower.find("*/") {
+                            clean_lower = clean_lower[idx+2..].trim_start().to_string();
+                        } else {
+                            clean_lower = String::new();
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                
+                let is_paginatable = clean_lower.starts_with("select") || clean_lower.starts_with("with") || clean_lower.starts_with("values") || clean_lower.starts_with("from");
+                
+                let final_query = if is_paginatable {
+                    active_tab.is_paginated = true;
+                    let clean_query = query_to_execute.trim().strip_suffix(';').unwrap_or(query_to_execute.trim());
+                    format!("SELECT * FROM ({}) LIMIT {} OFFSET {}", clean_query, active_tab.pagination_limit, active_tab.pagination_offset)
+                } else {
+                    active_tab.is_paginated = false;
+                    query_to_execute.clone()
+                };
+
+                let _ = std::fs::write("debug_query.txt", format!("query: {}\nclean: {}\npag: {}\nfinal: {}", query_to_execute, clean_lower, is_paginatable, final_query));
+
+                match conn.prepare(&final_query) {
                     Ok(mut stmt) => {
                         let mut exec_rows = Vec::new();
                         let mut count = 0;
@@ -832,7 +1125,7 @@ pub fn run_ide_loop(
 
                                 let history_path = queries_dir.join(".history.sql");
                                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                                let history_entry = format!("-- Executed at {} (Took {:.2?})\n{};\n\n", timestamp, elapsed, query.trim());
+                                let history_entry = format!("-- Executed at {} (Took {:.2?})\n{};\n\n", timestamp, elapsed, query_to_execute.trim());
                                 use std::io::Write;
                                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(history_path) {
                                     let _ = f.write_all(history_entry.as_bytes());
@@ -944,6 +1237,17 @@ pub fn run_ide_loop(
                                             node_type: NodeType::View,
                                         });
                                     }
+                                } else if item_name == "Macros" {
+                                    for m in &macros {
+                                        new_nodes.push(ExplorerNode {
+                                            name: m.clone(),
+                                            display: format!("  ├─ {}", m),
+                                            level: 1,
+                                            is_expandable: false,
+                                            is_expanded: false,
+                                            node_type: NodeType::Macro,
+                                        });
+                                    }
                                 } else if item_name == "Queries" {
                                     for q in &queries {
                                         new_nodes.push(ExplorerNode {
@@ -993,6 +1297,7 @@ pub fn run_ide_loop(
                             }
                         }
                         NodeType::Column { .. } => {}
+                        NodeType::Macro => {}
                     }
                 }
             }
@@ -1080,5 +1385,95 @@ fn format_duckdb_value(v: duckdb::types::Value) -> String {
             }
             s
         }
+    }
+}
+
+/// Generates an ASCII tree of the schema and copies a Mermaid diagram to the clipboard.
+fn generate_schema_visualizer(db_str: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let conn = duckdb::Connection::open(db_str)?;
+    
+    // 1. Get Tables & Columns
+    let mut stmt = conn.prepare("SELECT table_name, column_name, data_type FROM duckdb_columns ORDER BY table_name, column_index;")?;
+    let mut rows = stmt.query([])?;
+    
+    let mut tables: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
+    while let Some(row) = rows.next()? {
+        let table_name: String = row.get(0)?;
+        let col_name: String = row.get(1)?;
+        let data_type: String = row.get(2)?;
+        tables.entry(table_name).or_insert_with(Vec::new).push((col_name, data_type));
+    }
+    
+    // 2. Get Foreign Keys
+    let mut stmt_fk = conn.prepare("SELECT table_name, constraint_column_names[1], referenced_table, referenced_column_names[1] FROM duckdb_constraints WHERE constraint_type = 'FOREIGN KEY';")?;
+    let mut rows_fk = stmt_fk.query([])?;
+    
+    let mut fks: Vec<(String, String, String, String)> = Vec::new();
+    while let Some(row) = rows_fk.next()? {
+        let table_name: String = row.get(0)?;
+        let col_name: String = row.get(1)?;
+        let ref_table: String = row.get(2)?;
+        let ref_col: String = row.get(3)?;
+        fks.push((table_name, col_name, ref_table, ref_col));
+    }
+    
+    // 3. Generate Mermaid
+    let mut mermaid = String::from("erDiagram\n");
+    for (table, cols) in &tables {
+        mermaid.push_str(&format!("    {} {{\n", table));
+        for (col, dtype) in cols {
+            mermaid.push_str(&format!("        {} {}\n", dtype.replace(" ", "_"), col));
+        }
+        mermaid.push_str("    }\n");
+    }
+    for (table, _col, ref_table, _ref_col) in &fks {
+        mermaid.push_str(&format!("    {} }}|--|| {} : \"\"\n", table, ref_table));
+    }
+    
+    // Use arboard to copy
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(&mermaid);
+    }
+    
+    // 4. Generate ASCII Tree
+    let mut tree = String::from("Database Schema (Mermaid.js diagram copied to clipboard!)\n");
+    let mut sorted_tables: Vec<&String> = tables.keys().collect();
+    sorted_tables.sort();
+    
+    for (i, table) in sorted_tables.iter().enumerate() {
+        let is_last_table = i == sorted_tables.len() - 1;
+        let prefix = if is_last_table { "└──" } else { "├──" };
+        tree.push_str(&format!("{} {}\n", prefix, table));
+        
+        let cols = tables.get(*table).unwrap();
+        for (j, (col, dtype)) in cols.iter().enumerate() {
+            let is_last_col = j == cols.len() - 1;
+            let col_prefix = if is_last_table { "    " } else { "│   " };
+            let line_prefix = if is_last_col { "└──" } else { "├──" };
+            
+            // Check if col is a foreign key
+            let fk = fks.iter().find(|(t, c, _, _)| t == *table && c == col);
+            if let Some((_, _, ref_table, ref_col)) = fk {
+                tree.push_str(&format!("{}{} {} ({}) -> {}.{}\n", col_prefix, line_prefix, col, dtype, ref_table, ref_col));
+            } else {
+                tree.push_str(&format!("{}{} {} ({})\n", col_prefix, line_prefix, col, dtype));
+            }
+        }
+    }
+    
+    Ok(tree)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use duckdb::types::Value;
+
+    #[test]
+    fn test_format_duckdb_value() {
+        assert_eq!(format_duckdb_value(Value::Null), "NULL");
+        assert_eq!(format_duckdb_value(Value::Boolean(true)), "true");
+        assert_eq!(format_duckdb_value(Value::Int(42)), "42");
+        assert_eq!(format_duckdb_value(Value::Text("hello".to_string())), "hello");
     }
 }
