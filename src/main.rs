@@ -1,3 +1,4 @@
+use std::panic;
 mod diff;
 mod tui;
 mod ide;
@@ -7,9 +8,26 @@ use clap::{Parser, Subcommand};
 use duckdb::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
+use serde::Deserialize;
+use std::collections::HashMap;
+
+#[derive(Deserialize, Debug)]
+struct DuckpackConfig {
+    env: Option<HashMap<String, EnvConfig>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct EnvConfig {
+    db: Option<String>,
+}
 
 /// The core CLI argument parser configuration using `clap`.
 /// Dictates all available terminal commands for duckpack.
+/// 
+/// # Educational Note:
+/// `clap` is the standard library for CLI parsing in Rust.
+/// By deriving `Parser`, we automatically generate help menus (`--help`)
+/// and strictly type our terminal arguments.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
@@ -81,6 +99,9 @@ enum Commands {
         /// The connection string or path to the target DuckDB database on the remote server
         #[arg(short, long, default_value = "local.duckdb")]
         db: String,
+        /// Automatically install the duckpack CLI binary on the remote server
+        #[arg(long)]
+        auto_install: bool,
     },
     /// Explore a live DuckDB database in the built-in IDE
     Explore {
@@ -91,6 +112,15 @@ enum Commands {
         /// The connection string or path to the target DuckDB database
         #[arg(short, long, default_value = "local.duckdb")]
         db: String,
+        /// The remote server SSH target (e.g. user@10.0.0.5)
+        #[arg(long)]
+        remote: Option<String>,
+        /// The SSH port to use for remote deployment
+        #[arg(short = 'P', long, default_value = "22")]
+        port: String,
+        /// Automatically install the duckpack CLI binary on the remote server
+        #[arg(long)]
+        auto_install: bool,
         /// Quack authentication token
         #[arg(long)]
         quack_token: Option<String>,
@@ -105,7 +135,8 @@ fn is_remote(db: &str) -> bool {
 /// The main entry point for the DuckPack CLI.
 /// Parses the arguments and delegates to the appropriate command handler.
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    panic::set_hook(Box::new(|info| { let bt = std::backtrace::Backtrace::force_capture(); let _ = std::fs::write("panic.log", format!("Panic: {:?}\n\n{}", info, bt)); }));
+    let mut cli = Cli::parse();
 
     let project_dir = match &cli.command {
         Commands::Init { project_dir } => project_dir,
@@ -123,6 +154,32 @@ fn main() -> Result<()> {
         ".env".to_string()
     };
     dotenvy::from_path(project_dir.join(env_file)).ok();
+
+    // Check for duckpack.toml
+    let toml_path = project_dir.join("duckpack.toml");
+    if toml_path.exists() {
+        if let Ok(content) = fs::read_to_string(&toml_path) {
+            if let Ok(config) = toml::from_str::<DuckpackConfig>(&content) {
+                if let Some(cli_env) = &cli.env {
+                    if let Some(envs) = config.env {
+                        if let Some(env_config) = envs.get(cli_env) {
+                            if let Some(toml_db) = &env_config.db {
+                                // Override the db argument for applicable commands
+                                match &mut cli.command {
+                                    Commands::Apply { db, .. } |
+                                    Commands::Deploy { db, .. } |
+                                    Commands::Explore { db, .. } => {
+                                        *db = toml_db.clone();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     match &cli.command {
         Commands::Init { project_dir } => {
@@ -257,7 +314,7 @@ fn main() -> Result<()> {
                 }
 
                 if let Some(term) = &mut terminal {
-                    match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data)? {
+                    match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data, &db)? {
                         tui::TuiAction::Quit => {
                             break;
                         }
@@ -329,7 +386,7 @@ fn main() -> Result<()> {
                     }
                     tui::TuiAction::Explore => {
                         if let Some(term) = &mut terminal {
-                            ide::run_ide_loop(term, &target_conn, &project_dir)?;
+                            ide::run_ide_loop(term, &target_conn, &project_dir, &db)?;
                             term.clear()?;
                         }
                         continue;
@@ -337,7 +394,7 @@ fn main() -> Result<()> {
                     tui::TuiAction::Apply => {
                         status_msg = "Applying changes...".to_string();
                         if let Some(term) = &mut terminal {
-                            let _ = tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, true, &inspect_data);
+                            let _ = tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, true, &inspect_data, &db);
                         }
 
                         let remote = is_remote(db);
@@ -373,10 +430,7 @@ fn main() -> Result<()> {
                             }
                         }
                     }
-                    tui::TuiAction::ToggleShowIgnored => {
-                        // Handled natively in tui.rs loop
-                    }
-                    tui::TuiAction::ToggleTheme => {}
+
                     tui::TuiAction::Pull { obj_name, item_type } => {
                         let sql = match item_type {
                             diff::DiffItemType::DropTable => {
@@ -446,7 +500,79 @@ fn main() -> Result<()> {
             }
             println!("Compilation complete! Artifact: {}", out);
         }
-        Commands::Explore { project_dir, db, quack_token } => {
+        Commands::Explore { project_dir, db, remote, port, auto_install, quack_token } => {
+            if let Some(r) = remote {
+                let mut remote_bin = "duckpack".to_string();
+                let mut remote_tmp_bin = None;
+                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                
+                if *auto_install {
+                    println!("Auto-installing DuckPack companion binary for exploration...");
+                    let current_exe = std::env::current_exe().with_context(|| "Failed to get current executable path")?;
+                    let tmp_bin = format!("/tmp/duckpack_bin_{}", ts);
+                    
+                    let scp_bin_status = std::process::Command::new("scp")
+                        .arg("-P")
+                        .arg(port.to_string())
+                        .arg(&current_exe)
+                        .arg(format!("{}:{}", r, tmp_bin))
+                        .status()?;
+                        
+                    if !scp_bin_status.success() {
+                        anyhow::bail!("Failed to SCP binary to remote server.");
+                    }
+                    
+                    let chmod_status = std::process::Command::new("ssh")
+                        .arg("-p")
+                        .arg(port.to_string())
+                        .arg(r)
+                        .arg(format!("chmod +x {}", tmp_bin))
+                        .status()?;
+                        
+                    if !chmod_status.success() {
+                        anyhow::bail!("Failed to make binary executable on remote server.");
+                    }
+                    
+                    remote_bin = tmp_bin.clone();
+                    remote_tmp_bin = Some(tmp_bin);
+                }
+
+                let remote_tmp_proj = format!("/tmp/duckpack_explore_{}", ts);
+                let _ = std::process::Command::new("ssh")
+                    .arg("-p")
+                    .arg(port.to_string())
+                    .arg(r)
+                    .arg(format!("mkdir -p {}/queries", remote_tmp_proj))
+                    .status();
+                
+                println!("Launching remote TUI over SSH...");
+                let ssh_status = std::process::Command::new("ssh")
+                    .arg("-t") // Force pseudo-terminal for TUI
+                    .arg("-p")
+                    .arg(port.to_string())
+                    .arg(r)
+                    .arg(format!("{} explore --project-dir {} --db {}", remote_bin, remote_tmp_proj, db))
+                    .status()?;
+
+                if !ssh_status.success() {
+                    println!("Remote exploration session ended with error.");
+                }
+
+                println!("Cleaning up remote artifacts...");
+                let mut cleanup_cmd = format!("rm -rf {}", remote_tmp_proj);
+                if let Some(tmp_bin) = remote_tmp_bin {
+                    cleanup_cmd.push_str(&format!(" {}", tmp_bin));
+                }
+                let _ = std::process::Command::new("ssh")
+                    .arg("-p")
+                    .arg(port.to_string())
+                    .arg(r)
+                    .arg(cleanup_cmd)
+                    .status();
+
+                return Ok(());
+            }
+
             let mut project_dir = project_dir.clone();
             if project_dir == std::path::PathBuf::from(".") && !db.starts_with("quack:") && !is_remote(&db) {
                 let db_path = std::path::PathBuf::from(&db);
@@ -500,7 +626,7 @@ fn main() -> Result<()> {
                 conn
             };
 
-            ide::run_ide_loop(&mut terminal, &target_conn, &project_dir)?;
+            ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db)?;
 
             ratatui::crossterm::terminal::disable_raw_mode()?;
             ratatui::crossterm::execute!(
@@ -509,13 +635,16 @@ fn main() -> Result<()> {
                 ratatui::crossterm::event::DisableMouseCapture
             )?;
         }
-        Commands::Deploy { project_dir, remote, db, port } => {
+        Commands::Deploy { project_dir, remote, db, port, auto_install } => {
             println!("Deploying {} to {} at {}", project_dir.display(), remote, db);
             
-            let tmp_pack = format!("/tmp/duckpack_deploy_{}.duckpack", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let tmp_pack = format!("/tmp/duckpack_deploy_{}.duckpack", ts);
             
             println!("1. Compiling local DuckPack artifact...");
             let out_conn = Connection::open(&tmp_pack).with_context(|| "Failed to create temp .duckpack file")?;
+            let schemas_dir = project_dir.join("schemas");
+            if schemas_dir.exists() { execute_directory(&out_conn, &schemas_dir)?; }
             let tables_dir = project_dir.join("tables");
             if tables_dir.exists() { execute_directory(&out_conn, &tables_dir)?; }
             let views_dir = project_dir.join("views");
@@ -524,7 +653,7 @@ fn main() -> Result<()> {
             if macros_dir.exists() { execute_directory(&out_conn, &macros_dir)?; }
             out_conn.close().map_err(|e| anyhow::anyhow!("Failed to close DuckPack: {:?}", e.1))?;
             
-            let remote_tmp_pack = format!("/tmp/deploy_{}.duckpack", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+            let remote_tmp_pack = format!("/tmp/deploy_{}.duckpack", ts);
             
             println!("2. Transferring artifact to remote server (scp)...");
             let scp_status = std::process::Command::new("scp")
@@ -538,12 +667,47 @@ fn main() -> Result<()> {
                 anyhow::bail!("Failed to SCP artifact to remote server.");
             }
             
+            let mut remote_bin = "duckpack".to_string();
+            let mut remote_tmp_bin = None;
+            
+            if *auto_install {
+                println!("2.5. Auto-installing DuckPack companion binary...");
+                let current_exe = std::env::current_exe().with_context(|| "Failed to get current executable path")?;
+                let tmp_bin = format!("/tmp/duckpack_bin_{}", ts);
+                
+                let scp_bin_status = std::process::Command::new("scp")
+                    .arg("-P")
+                    .arg(port.to_string())
+                    .arg(&current_exe)
+                    .arg(format!("{}:{}", remote, tmp_bin))
+                    .status()?;
+                    
+                if !scp_bin_status.success() {
+                    anyhow::bail!("Failed to SCP binary to remote server.");
+                }
+                
+                // Make the binary executable
+                let chmod_status = std::process::Command::new("ssh")
+                    .arg("-p")
+                    .arg(port.to_string())
+                    .arg(remote)
+                    .arg(format!("chmod +x {}", tmp_bin))
+                    .status()?;
+                    
+                if !chmod_status.success() {
+                    anyhow::bail!("Failed to make binary executable on remote server.");
+                }
+                
+                remote_bin = tmp_bin.clone();
+                remote_tmp_bin = Some(tmp_bin);
+            }
+            
             println!("3. Executing companion CLI via SSH...");
             let ssh_status = std::process::Command::new("ssh")
                 .arg("-p")
                 .arg(port.to_string())
                 .arg(remote)
-                .arg(format!("duckpack apply --project-dir {} --db {} --auto-approve", remote_tmp_pack, db))
+                .arg(format!("{} apply --project-dir {} --db {} --auto-approve", remote_bin, remote_tmp_pack, db))
                 .status()?;
                 
             if !ssh_status.success() {
@@ -554,11 +718,17 @@ fn main() -> Result<()> {
             
             println!("4. Cleaning up temporary artifacts...");
             let _ = std::fs::remove_file(&tmp_pack);
+            
+            let mut cleanup_cmd = format!("rm -f {}", remote_tmp_pack);
+            if let Some(tmp_bin) = remote_tmp_bin {
+                cleanup_cmd.push_str(&format!(" {}", tmp_bin));
+            }
+            
             let _ = std::process::Command::new("ssh")
                 .arg("-p")
                 .arg(port.to_string())
                 .arg(remote)
-                .arg(format!("rm {}", remote_tmp_pack))
+                .arg(cleanup_cmd)
                 .status();
         }
     }
@@ -592,12 +762,12 @@ fn apply_diff(conn: &Connection, diff: &diff::DiffResult, force_drop: bool, is_r
             }
         }
 
-        // 2. Main structure changes
+        let mut structure_to_apply = Vec::new();
         for item in &diff.items {
             if !item.selected { continue; }
             match item.item_type {
                 diff::DiffItemType::CreateTable | diff::DiffItemType::AlterTable | diff::DiffItemType::CreateMacro | diff::DiffItemType::RenameTable | diff::DiffItemType::RenameColumn => {
-                    conn.execute_batch(&item.sql)?;
+                    structure_to_apply.push(item.sql.clone());
                 }
                 diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro => {
                     if force_drop {
@@ -616,9 +786,14 @@ fn apply_diff(conn: &Connection, diff: &diff::DiffResult, force_drop: bool, is_r
             }
         }
 
+        if !structure_to_apply.is_empty() {
+            execute_sqls_with_retry(conn, structure_to_apply)?;
+        }
+
+
         // 3. Views
         if !views_to_apply.is_empty() {
-            execute_views_sqls_with_retry(conn, views_to_apply)?;
+            execute_sqls_with_retry(conn, views_to_apply)?;
         }
 
         // 4. Drops
@@ -780,6 +955,10 @@ duckpack explore --project-dir . --db local.duckdb
 /// Compiles all local `.sql` files into an in-memory DuckDB connection.
 /// This acts as the "Desired State" or "Shadow DB" used for validation and diff generation.
 fn build_shadow_db(project_dir: &PathBuf) -> Result<Connection> {
+    if project_dir.is_file() && project_dir.extension().unwrap_or_default() == "duckpack" {
+        return Connection::open(project_dir).with_context(|| "Failed to open .duckpack artifact");
+    }
+
     let conn = Connection::open_in_memory().with_context(|| "Failed to create Shadow DB")?;
     
     let schemas_dir = project_dir.join("schemas");
@@ -799,38 +978,35 @@ fn build_shadow_db(project_dir: &PathBuf) -> Result<Connection> {
 
     let views_dir = project_dir.join("views");
     if views_dir.exists() {
-        execute_views_with_retry(&conn, &views_dir)?;
+        execute_directory(&conn, &views_dir)?;
     }
 
     Ok(conn)
 }
 
-/// A helper utility to iterate over a directory of `.sql` files and execute them sequentially against a connection.
+/// A helper utility to iterate over a directory of `.sql` files and execute them against a connection.
+/// This uses a retry loop because tables/views often depend on each other (e.g. foreign keys or nested views).
+/// If one fails, it is pushed to the back of the queue. The loop terminates once all succeed, or if no progress is made.
 fn execute_directory(conn: &Connection, dir: &Path) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    let mut pending_sqls = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.path());
+    
+    for entry in entries {
         let path = entry.path();
         if path.is_file() && path.extension().unwrap_or_default() == "sql" {
-            let sql = diff::read_sql_with_env(&path)?;
-            conn.execute_batch(&sql).with_context(|| format!("Failed to execute {}", path.display()))?;
+            pending_sqls.push(diff::read_sql_with_env(&path)?);
         }
     }
-    Ok(())
-}
-
-/// A specialized execution engine for Views.
-/// Because views often depend on each other, this algorithm continuously loops over the list of views
-/// and attempts to create them. If one fails, it is pushed to the back of the queue.
-/// The loop terminates once all views succeed, or if it completes a full pass without making any progress (circular dependency).
-fn execute_views_sqls_with_retry(conn: &Connection, mut pending_views: Vec<String>) -> Result<()> {
+    
     let mut last_error: Option<anyhow::Error> = None;
     let mut progress_made = true;
 
-    while !pending_views.is_empty() && progress_made {
+    while !pending_sqls.is_empty() && progress_made {
         progress_made = false;
         let mut remaining = Vec::new();
 
-        for sql in pending_views {
+        for sql in pending_sqls {
             match conn.execute_batch(&sql) {
                 Ok(_) => {
                     progress_made = true;
@@ -841,29 +1017,62 @@ fn execute_views_sqls_with_retry(conn: &Connection, mut pending_views: Vec<Strin
                 }
             }
         }
-        pending_views = remaining;
+        pending_sqls = remaining;
     }
 
-    if !pending_views.is_empty() {
+    if !pending_sqls.is_empty() {
         if let Some(e) = last_error {
-            return Err(e).context("Failed to compile views due to unresolvable dependencies or syntax errors");
+            return Err(e).context(format!("Failed to compile SQL files in {} due to unresolvable dependencies or syntax errors", dir.display()));
         }
     }
 
     Ok(())
 }
 
-/// Reads `.sql` files from a views directory and delegates them to the `execute_views_sqls_with_retry` algorithm.
-fn execute_views_with_retry(conn: &Connection, dir: &Path) -> Result<()> {
-    let mut pending_views = Vec::new();
-    
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() && path.extension().unwrap_or_default() == "sql" {
-            pending_views.push(diff::read_sql_with_env(&path)?);
+/// A specialized execution engine for arbitrary SQLs.
+/// Because objects often depend on each other, this algorithm continuously loops over the list of statements
+/// and attempts to execute them. If one fails, it is pushed to the back of the queue.
+/// The loop terminates once all succeed, or if it completes a full pass without making any progress (circular dependency).
+fn execute_sqls_with_retry(conn: &Connection, mut pending_sqls: Vec<String>) -> Result<()> {
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut progress_made = true;
+
+    while !pending_sqls.is_empty() && progress_made {
+        progress_made = false;
+        let mut remaining = Vec::new();
+
+        for sql in pending_sqls {
+            match conn.execute_batch(&sql) {
+                Ok(_) => {
+                    progress_made = true;
+                }
+                Err(e) => {
+                    last_error = Some(anyhow::anyhow!("Failed: {}", e));
+                    remaining.push(sql);
+                }
+            }
+        }
+        pending_sqls = remaining;
+    }
+
+    if !pending_sqls.is_empty() {
+        if let Some(e) = last_error {
+            return Err(e).context("Failed to compile SQLs due to unresolvable dependencies or syntax errors");
         }
     }
 
-    execute_views_sqls_with_retry(conn, pending_views)
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_remote() {
+        assert_eq!(is_remote("md:my_db"), true);
+        assert_eq!(is_remote("motherduck:"), true);
+        assert_eq!(is_remote("local.db"), false);
+        assert_eq!(is_remote("/var/lib/duckdb/prod.db"), false);
+    }
 }

@@ -14,22 +14,47 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          # Linux x86_64 (glibc 2.35 - works on Debian 12 Bookworm, Ubuntu 22.04+, Debian 13+, Fedora 36+, RHEL 9+)
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact_name: duckpack
             asset_name: duckpack-linux-amd64
+            use_cross: false
+
+          # Linux x86_64 Musl (Fully static binary - works on Alpine, Debian, CentOS, and any Linux distro)
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact_name: duckpack
+            asset_name: duckpack-linux-amd64-static
+            use_cross: true
+
+          # Linux aarch64 (ARM64 dev containers, Docker on Apple Silicon, AWS Graviton)
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            artifact_name: duckpack
+            asset_name: duckpack-linux-arm64
+            use_cross: true
+
+          # macOS (Intel)
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: duckpack
             asset_name: duckpack-macos-amd64
+            use_cross: false
+
+          # macOS (Apple Silicon)
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: duckpack
             asset_name: duckpack-macos-arm64
+            use_cross: false
+
+          # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: duckpack.exe
             asset_name: duckpack-windows-amd64.exe
+            use_cross: false
 
     steps:
       - name: Checkout code
@@ -40,8 +65,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build Release Binary
+      - name: Install Cross
+        if: matrix.use_cross == true
+        uses: taiki-e/install-action@cross
+
+      - name: Build Release Binary (Native Cargo)
+        if: matrix.use_cross != true
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build Release Binary (Cross)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }}
+        env:
+          DUCKDB_DISABLE_JEMALLOC: "1"
 
       - name: Rename Artifact (Linux/macOS)
         run: mv target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}

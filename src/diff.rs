@@ -8,6 +8,8 @@ use std::sync::OnceLock;
 /// Reads a SQL file and dynamically interpolates any `${VARIABLE_NAME}` templates 
 /// with the system's current environment variables (loaded from .env).
 /// This is used for multi-tenant or multi-environment deployments.
+/// Reads a SQL file from disk and replaces any `${VAR}` templates with environment variables.
+/// Uses `OnceLock` to safely cache the compiled regex for performance.
 pub fn read_sql_with_env<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     let content = std::fs::read_to_string(path)?;
     
@@ -76,6 +78,12 @@ impl DiffResult {
 
 /// Extracts the entire table schema from a DuckDB connection.
 /// It queries `sqlite_master` for table definitions and `duckdb_columns()` for specific datatypes.
+/// Queries the DuckDB database to extract the structural schema of all tables.
+/// 
+/// # Educational Note:
+/// We query `duckdb_tables()` to get the raw `CREATE TABLE` SQL, 
+/// and `duckdb_columns()` to map column names to data types.
+/// Returns a HashMap mapping `schema.table` -> `TableSchema`.
 pub fn get_schema(conn: &Connection) -> Result<HashMap<String, TableSchema>> {
     let mut stmt = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, COALESCE(sql, '/* Remote table: ' || table_name || ' */') FROM duckdb_tables() WHERE internal = false")?;
     let mut tables: HashMap<String, TableSchema> = HashMap::new();
@@ -124,12 +132,14 @@ pub fn get_views(conn: &Connection) -> Result<HashMap<String, String>> {
 
 /// Extracts all macro (function) definitions from a DuckDB connection using `duckdb_functions()`.
 pub fn get_macros(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END, macro_definition || CAST(parameters AS VARCHAR) FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let mut stmt = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END, macro_definition, CAST(parameters AS VARCHAR) FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
     let mut macros = HashMap::new();
     for row in rows {
-        let (name, def) = row?;
-        macros.insert(name, def);
+        let (name, def, params) = row?;
+        let params_clean = params.trim_matches(|c| c == '[' || c == ']');
+        let sql = format!("CREATE MACRO {}({}) AS {};", name, params_clean, def);
+        macros.insert(name, sql);
     }
     Ok(macros)
 }
@@ -149,6 +159,12 @@ pub fn get_schemas(conn: &Connection) -> Result<std::collections::HashSet<String
 /// Compares the `shadow` database (desired state) against the `target` database (current state)
 /// and calculates the exact delta (adding tables, renaming columns, altering types, etc.).
 /// It uses Jaro-Winkler string similarity to heuristically detect renames instead of destructive drops.
+/// The core Diff Engine. Compares two database schemas (target vs shadow) 
+/// and computes the exact SQL statements required to migrate the target to match the shadow.
+///
+/// # Educational Note:
+/// This function uses Git-style similarity matching (Jaccard Index) to detect if a table or column
+/// was renamed, rather than simply dropped and recreated, allowing for non-destructive migrations!
 pub fn compute_diff(
     shadow_schemas: &std::collections::HashSet<String>,
     target_schemas: &std::collections::HashSet<String>,
@@ -158,7 +174,7 @@ pub fn compute_diff(
     target_views: &HashMap<String, String>,
     shadow_macros: &HashMap<String, String>,
     target_macros: &HashMap<String, String>,
-    project_dir: &std::path::PathBuf,
+    _project_dir: &std::path::PathBuf,
     ignore_list: &[String]
 ) -> DiffResult {
     let mut diff = DiffResult {
@@ -435,4 +451,39 @@ pub fn compute_diff(
     }
 
     diff
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn test_compute_diff_new_table() {
+        let shadow_schemas = HashSet::new();
+        let target_schemas = HashSet::new();
+        
+        let mut shadow = HashMap::new();
+        let target = HashMap::new();
+        
+        let mut columns = HashMap::new();
+        columns.insert("id".to_string(), "INTEGER".to_string());
+        
+        shadow.insert("users".to_string(), TableSchema {
+            create_sql: "CREATE TABLE users (id INTEGER);".to_string(),
+            columns,
+        });
+        
+        let diff = compute_diff(
+            &shadow_schemas, &target_schemas,
+            &shadow, &target,
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[]
+        );
+        
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::CreateTable);
+    }
 }
