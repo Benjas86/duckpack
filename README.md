@@ -215,27 +215,36 @@ When you run `init`, the following structure is created:
 - **[DuckDB](https://duckdb.org/)**
 - **[Ratatui](https://ratatui.rs/)** (For the interactive UI)
 
-## 🦆 Quack Integration & Limitations
+## 🦆 Quack Remote Database Support
 
-You can securely explore and apply your declarative schema directly to a remote Quack DuckDB instance! We have fully integrated native Quack database discovery. 
+`duckpack` includes first-class integration with remote DuckDB servers running the [Quack](https://duckdb.org/) extension over HTTP/HTTPS.
 
-You can connect seamlessly by supplying your Quack token via the `--quack-token` flag (or the `DUCKDB_QUACK_TOKEN` environment variable):
+### 🔍 Interactive Remote Exploration (`duckpack explore`)
+Explore any remote Quack server directly inside the interactive terminal IDE:
+- **Live Catalog Discovery:** Remote tables, views, and macros are dynamically discovered and listed in the Explorer tree.
+- **Nested Column Introspection:** Expanding any table or view fetches column names and DuckDB data types on demand.
+- **Live Remote Querying:** Execute arbitrary queries directly against the remote database from the built-in editor tabs.
+- **Context-Aware Autocomplete:** Remote tables and columns are automatically loaded into the query editor's autocomplete dictionary.
+
 ```bash
-duckpack apply --project-dir my_project --db quack:localhost:9494 --quack-token super_secret
+# Explore a remote Quack server with authentication
+duckpack explore --db quack:localhost:9494 --quack-token <token>
 ```
 
-### 🔒 Quack SSL / TLS Options
-By default, DuckDB's Quack extension enforces HTTPS/SSL for remote hosts and container IPs, and uses plain HTTP for `localhost` and `127.0.0.1`.
-If you are running a local development container (e.g., bound to `0.0.0.0:9494` or an internal Docker/network IP) without TLS, DuckDB may fail with `IO Error: SSL Connect error`.
+You can also pass your token via the `DUCKDB_QUACK_TOKEN` environment variable.
 
-`duckpack` automatically detects local `0.0.0.0` bindings and disables SSL. You can also explicitly disable SSL for any remote container or plain-HTTP endpoint using `--quack-disable-ssl` (or `--insecure`), or by setting `DUCKDB_QUACK_DISABLE_SSL=true`:
+### 🔒 SSL & Plain HTTP Options
+By default, DuckDB's Quack extension enforces HTTPS/SSL for remote hosts and container IPs, and uses plain HTTP for `localhost` and `127.0.0.1`.
+
+If you are running a local development container (e.g., bound to `0.0.0.0:9494` or an internal Docker network IP) without TLS:
+- `duckpack` **automatically detects `0.0.0.0` bindings** and disables SSL so local container workflows work out-of-the-box.
+- For other non-TLS endpoints, you can explicitly disable SSL using `--insecure` (or `--quack-disable-ssl`), or by setting `DUCKDB_QUACK_DISABLE_SSL=true`:
+
 ```bash
-duckpack explore --db quack:0.0.0.0:9494 --quack-token <token> --quack-disable-ssl
-# Or with the shorthand alias:
 duckpack explore --db quack:0.0.0.0:9494 --quack-token <token> --insecure
 ```
 
-### ⚠️ Known Quack Limitation: `ALTER TABLE`
-Quack is currently an experimental extension and **does not yet support `ALTER TABLE` statements**. Because `duckpack` relies on non-destructive `ALTER TABLE` commands to safely apply schema diffs (adding columns, renaming tables, etc.), schema modifications over a live Quack connection will fail with a `Not implemented` error.
-
-For production and remote deployments where schema modifications are required, we highly recommend bypassing Quack's execution engine entirely and using the **Native Remote Deploy** (`duckpack deploy`) command. This uses standard SSH to ship your schema and execute the migration locally on the remote server's disk, granting you 100% full DuckDB functionality.
+### 🚀 Remote Migrations: `apply` vs `deploy`
+- **Schema Discovery & Diffing (`duckpack apply`)**: You can inspect and diff schemas directly against a remote Quack instance.
+- **Upstream `ALTER TABLE` Note**: The experimental upstream DuckDB Quack extension does not yet support `ALTER TABLE` statements over its HTTP wire protocol. Live in-place alterations (such as adding or renaming columns) will return a `Not implemented` error from the remote engine.
+- **Recommended for Full Remote Deployments (`duckpack deploy`)**: For remote production deployments that require schema modifications, use `duckpack deploy`. This compiles an immutable `.duckpack` bundle and executes migrations locally on the remote server's disk over SSH with 100% full DuckDB engine support.
