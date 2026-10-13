@@ -378,7 +378,7 @@ pub fn run_ide_loop(
                     .title_bottom(Line::from(" ▶ Run (F5) ").alignment(Alignment::Right))
                     .border_style(editor_border_style)
             );
-            f.render_widget(active_tab.textarea.widget(), right_chunks[1]);
+            f.render_widget(&active_tab.textarea, right_chunks[1]);
             current_editor_rect = right_chunks[1];
 
             // Results Pane
@@ -388,53 +388,96 @@ pub fn run_ide_loop(
                 Style::default()
             };
 
-            let title = if tabs[active_tab_index].is_paginated {
-                let offset = tabs[active_tab_index].pagination_offset;
-                let limit = tabs[active_tab_index].pagination_limit;
-                format!(" Results (Rows {} - {}) ", offset + 1, offset + limit)
-            } else {
-                " Results ".to_string()
-            };
-
-            let results_block = Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .title_bottom(Line::from(" [?] Help ").alignment(Alignment::Right))
-                .border_style(results_border_style);
-
             let active_tab = &mut tabs[active_tab_index];
 
             if active_tab.query_results.is_empty() && active_tab.column_names.is_empty() {
+                let results_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Results ")
+                    .title_bottom(Line::from(" [?] Help ").alignment(Alignment::Right))
+                    .border_style(results_border_style);
                 f.render_widget(Paragraph::new("No results.").block(results_block), right_chunks[2]);
             } else {
-                let display_cols = active_tab.column_names.len().saturating_sub(active_tab.horizontal_scroll);
-                let display_names = if active_tab.horizontal_scroll < active_tab.column_names.len() {
-                    &active_tab.column_names[active_tab.horizontal_scroll..]
-                } else {
-                    &[]
-                };
-                
+                let total_cols = active_tab.column_names.len();
+                let total_rows = active_tab.query_results.len();
+
+                // Keep horizontal_scroll within bounds
+                if total_cols > 0 && active_tab.horizontal_scroll >= total_cols {
+                    active_tab.horizontal_scroll = total_cols.saturating_sub(1);
+                }
+
+                // Available width for columns inside the results pane (excluding border padding)
+                let avail_width = (right_chunks[2].width.saturating_sub(2) as usize).max(10);
+
+                // Dynamically fit columns starting from horizontal_scroll so Ratatui never squashes them to width 0
+                let mut visible_indices = Vec::new();
                 let mut widths = Vec::new();
-                for (i, name) in display_names.iter().enumerate() {
-                    let mut max_len = name.len();
-                    for row in &active_tab.query_results {
-                        if let Some(cell) = row.get(active_tab.horizontal_scroll + i) {
+                let mut used_width: usize = 0;
+
+                for col_idx in active_tab.horizontal_scroll..total_cols {
+                    let col_name = &active_tab.column_names[col_idx];
+                    let mut max_len = col_name.len();
+                    // Sample first 50 rows for snappy rendering performance
+                    for row in active_tab.query_results.iter().take(50) {
+                        if let Some(cell) = row.get(col_idx) {
                             max_len = max_len.max(cell.len());
                         }
                     }
-                    widths.push(Constraint::Length((max_len as u16 + 2).min(30)));
+                    let col_w = (max_len + 2).clamp(6, 30);
+
+                    // Always show at least 1 column, then pack as many as fit in available width
+                    if visible_indices.is_empty() || used_width + col_w <= avail_width {
+                        used_width += col_w;
+                        widths.push(Constraint::Length(col_w as u16));
+                        visible_indices.push(col_idx);
+                    } else {
+                        break;
+                    }
                 }
 
-                let header = Row::new(display_names.iter().map(|c| c.as_str())).style(Style::default().add_modifier(Modifier::BOLD));
+                let (start_col, end_col) = if visible_indices.is_empty() {
+                    (0, 0)
+                } else {
+                    (visible_indices[0] + 1, visible_indices.last().unwrap() + 1)
+                };
+
+                let row_info = if active_tab.is_paginated {
+                    let offset = active_tab.pagination_offset;
+                    format!("Rows {} - {}", offset + 1, offset + total_rows)
+                } else {
+                    format!("{} rows", total_rows)
+                };
+
+                let col_info = if total_cols > 0 {
+                    format!(" [Cols {}-{} of {}]", start_col, end_col, total_cols)
+                } else {
+                    String::new()
+                };
+
+                let title = format!(" Results ({}{}) ", row_info, col_info);
+
+                let nav_hint = if total_cols > visible_indices.len() {
+                    " ◄/► Scroll Cols (Shift+◄/► fast, Home/End) | [?] Help "
+                } else {
+                    " [?] Help "
+                };
+
+                let results_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .title_bottom(Line::from(nav_hint).alignment(Alignment::Right))
+                    .border_style(results_border_style);
+
+                let header = Row::new(visible_indices.iter().map(|&i| active_tab.column_names[i].as_str()))
+                    .style(Style::default().add_modifier(Modifier::BOLD));
+
                 let rows: Vec<Row> = active_tab.query_results.iter().map(|r| {
-                    let display_cells = if active_tab.horizontal_scroll < r.len() {
-                        &r[active_tab.horizontal_scroll..]
-                    } else {
-                        &[]
-                    };
-                    Row::new(display_cells.iter().map(|c| c.as_str()))
+                    let display_cells: Vec<&str> = visible_indices.iter()
+                        .map(|&i| r.get(i).map(|s| s.as_str()).unwrap_or(""))
+                        .collect();
+                    Row::new(display_cells)
                 }).collect();
-                
+
                 let table = Table::new(rows, widths).header(header).block(results_block)
                     .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
                 f.render_stateful_widget(table, right_chunks[2], &mut active_tab.results_state);
@@ -462,6 +505,8 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" Ctrl+F    ", Style::default().fg(Color::Cyan)), Span::raw("Format Query")]),
                     Line::from(vec![Span::styled(" Ctrl+Space", Style::default().fg(Color::Cyan)), Span::raw("Autocomplete")]),
                     Line::from(vec![Span::styled(" n / p     ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Page (in Results pane)")]),
+                    Line::from(vec![Span::styled(" ◄ / ►     ", Style::default().fg(Color::Cyan)), Span::raw("Scroll Columns (Shift+◄/► fast)")]),
+                    Line::from(vec![Span::styled(" Home/End  ", Style::default().fg(Color::Cyan)), Span::raw("First/Last Column (in Results pane)")]),
                     Line::from(""),
                     Line::from(vec![Span::styled(" Mouse     ", Style::default().fg(Color::Cyan)), Span::raw("Click tabs/buttons, scroll panes")]),
                 ];
@@ -578,7 +623,10 @@ pub fn run_ide_loop(
                         if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
                             explorer_horizontal_scroll += 1;
                         } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
-                            tabs[active_tab_index].horizontal_scroll += 1;
+                            let max_col = tabs[active_tab_index].column_names.len().saturating_sub(1);
+                            if tabs[active_tab_index].horizontal_scroll < max_col {
+                                tabs[active_tab_index].horizontal_scroll += 1;
+                            }
                         } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
                             tabs[active_tab_index].textarea.scroll((0, 1));
                         }
@@ -650,7 +698,10 @@ pub fn run_ide_loop(
                     if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
                         explorer_horizontal_scroll += 1;
                     } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
-                        tabs[active_tab_index].horizontal_scroll += 1;
+                        let max_col = tabs[active_tab_index].column_names.len().saturating_sub(1);
+                        if tabs[active_tab_index].horizontal_scroll < max_col {
+                            tabs[active_tab_index].horizontal_scroll += 1;
+                        }
                     } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
                         tabs[active_tab_index].textarea.scroll((0, 1));
                     }
@@ -910,11 +961,22 @@ pub fn run_ide_loop(
                                 }
                             }
                         } else if key.code == KeyCode::Left {
-                            active_tab.horizontal_scroll = active_tab.horizontal_scroll.saturating_sub(1);
+                            if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                                active_tab.horizontal_scroll = active_tab.horizontal_scroll.saturating_sub(5);
+                            } else {
+                                active_tab.horizontal_scroll = active_tab.horizontal_scroll.saturating_sub(1);
+                            }
                         } else if key.code == KeyCode::Right {
-                            if active_tab.horizontal_scroll < active_tab.column_names.len().saturating_sub(1) {
+                            let max_col = active_tab.column_names.len().saturating_sub(1);
+                            if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                                active_tab.horizontal_scroll = (active_tab.horizontal_scroll + 5).min(max_col);
+                            } else if active_tab.horizontal_scroll < max_col {
                                 active_tab.horizontal_scroll += 1;
                             }
+                        } else if key.code == KeyCode::Home {
+                            active_tab.horizontal_scroll = 0;
+                        } else if key.code == KeyCode::End {
+                            active_tab.horizontal_scroll = active_tab.column_names.len().saturating_sub(1);
                         }
                     }
                 }
@@ -1475,5 +1537,30 @@ mod tests {
         assert_eq!(format_duckdb_value(Value::Boolean(true)), "true");
         assert_eq!(format_duckdb_value(Value::Int(42)), "42");
         assert_eq!(format_duckdb_value(Value::Text("hello".to_string())), "hello");
+    }
+
+    #[test]
+    fn test_wide_table_column_windowing() {
+        let cols: Vec<String> = (0..217).map(|i| format!("col_{}", i)).collect();
+        let rows: Vec<Vec<String>> = vec![
+            (0..217).map(|i| format!("val_{}", i)).collect(),
+        ];
+
+        let avail_width: usize = 80;
+        let mut visible = Vec::new();
+        let mut used = 0;
+        for i in 0..cols.len() {
+            let col_w = (cols[i].len().max(rows[0][i].len()) + 2).clamp(6, 30);
+            if visible.is_empty() || used + col_w <= avail_width {
+                used += col_w;
+                visible.push(i);
+            } else {
+                break;
+            }
+        }
+        assert!(!visible.is_empty());
+        assert!(visible.len() < cols.len());
+        assert_eq!(visible[0], 0);
+        assert!(used <= avail_width);
     }
 }

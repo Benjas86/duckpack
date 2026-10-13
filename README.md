@@ -224,6 +224,17 @@ You can connect seamlessly by supplying your Quack token via the `--quack-token`
 duckpack apply --project-dir my_project --db quack:localhost:9494 --quack-token super_secret
 ```
 
+### 🔒 Quack SSL / TLS Options
+By default, DuckDB's Quack extension enforces HTTPS/SSL for remote hosts and container IPs, and uses plain HTTP for `localhost` and `127.0.0.1`.
+If you are running a local development container (e.g., bound to `0.0.0.0:9494` or an internal Docker/network IP) without TLS, DuckDB may fail with `IO Error: SSL Connect error`.
+
+`duckpack` automatically detects local `0.0.0.0` bindings and disables SSL. You can also explicitly disable SSL for any remote container or plain-HTTP endpoint using `--quack-disable-ssl` (or `--insecure`), or by setting `DUCKDB_QUACK_DISABLE_SSL=true`:
+```bash
+duckpack explore --db quack:0.0.0.0:9494 --quack-token <token> --quack-disable-ssl
+# Or with the shorthand alias:
+duckpack explore --db quack:0.0.0.0:9494 --quack-token <token> --insecure
+```
+
 ### ⚠️ Known Quack Limitation: `ALTER TABLE`
 Quack is currently an experimental extension and **does not yet support `ALTER TABLE` statements**. Because `duckpack` relies on non-destructive `ALTER TABLE` commands to safely apply schema diffs (adding columns, renaming tables, etc.), schema modifications over a live Quack connection will fail with a `Not implemented` error.
 

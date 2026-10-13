@@ -75,6 +75,9 @@ enum Commands {
         /// Quack authentication token
         #[arg(long)]
         quack_token: Option<String>,
+        /// Disable SSL/TLS verification for Quack connection (plain HTTP)
+        #[arg(long, visible_alias = "insecure", alias = "quack-insecure")]
+        quack_disable_ssl: bool,
     },
     /// Compile the DB project into a standalone .duckpack artifact
     Compile {
@@ -124,12 +127,92 @@ enum Commands {
         /// Quack authentication token
         #[arg(long)]
         quack_token: Option<String>,
+        /// Disable SSL/TLS verification for Quack connection (plain HTTP)
+        #[arg(long, visible_alias = "insecure", alias = "quack-insecure")]
+        quack_disable_ssl: bool,
     },
 }
 
 /// Determines if the provided database string refers to a remote motherduck instance.
 fn is_remote(db: &str) -> bool {
     db.starts_with("md:") || db.starts_with("motherduck:")
+}
+
+/// Determines if the provided quack connection URI targets the 0.0.0.0 local unspecified address.
+fn is_quack_zero_host(db: &str) -> bool {
+    let stripped = db.strip_prefix("quack://").or_else(|| db.strip_prefix("quack:")).unwrap_or(db);
+    stripped.starts_with("0.0.0.0") || stripped.starts_with("[::]")
+}
+
+/// Determines if SSL should be disabled for a Quack connection.
+/// Returns true if explicitly flagged, if DUCKDB_QUACK_DISABLE_SSL is set, or if connecting to 0.0.0.0.
+fn should_disable_quack_ssl(db: &str, flag_disable_ssl: bool) -> bool {
+    flag_disable_ssl
+        || std::env::var("DUCKDB_QUACK_DISABLE_SSL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+            .unwrap_or(false)
+        || is_quack_zero_host(db)
+}
+
+/// Builds the SQL ATTACH statement for a Quack database.
+fn build_quack_attach_sql(db: &str, disable_ssl: bool) -> String {
+    let safe_db = db.replace("'", "''");
+    if disable_ssl {
+        format!("ATTACH '{}' AS target_db (DISABLE_SSL true);", safe_db)
+    } else {
+        format!("ATTACH '{}' AS target_db;", safe_db)
+    }
+}
+
+/// Connects to the target DuckDB database (local, motherduck remote, or quack remote).
+fn connect_target_db(
+    db: &str,
+    quack_token: Option<&str>,
+    quack_disable_ssl: bool,
+) -> Result<Connection> {
+    if db.starts_with("quack:") {
+        let conn = Connection::open_in_memory()
+            .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
+        conn.execute_batch("INSTALL quack; LOAD quack;")
+            .with_context(|| "Failed to install/load quack extension")?;
+
+        let token = quack_token
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("DUCKDB_QUACK_TOKEN").ok());
+
+        if let Some(token) = token {
+            let safe_token = token.replace("'", "''");
+            conn.execute(&format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token), [])
+                .with_context(|| "Failed to set quack auth secret")?;
+        }
+
+        let disable_ssl = should_disable_quack_ssl(db, quack_disable_ssl);
+        let attach_sql = build_quack_attach_sql(db, disable_ssl);
+
+        conn.execute(&attach_sql, [])
+            .with_context(|| "Failed to attach remote database")?;
+        conn.execute("USE target_db;", [])
+            .with_context(|| "Failed to switch to target database")?;
+        Ok(conn)
+    } else if is_remote(db) {
+        let conn = Connection::open_in_memory()
+            .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
+        let safe_db = db.replace("'", "''");
+        conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
+            .with_context(|| "Failed to attach remote database")?;
+        conn.execute("USE target_db;", [])
+            .with_context(|| "Failed to switch to target database")?;
+        Ok(conn)
+    } else {
+        let conn = Connection::open_in_memory()
+            .with_context(|| "Failed to open in-memory DB for local ATTACH")?;
+        let safe_db = db.replace("'", "''");
+        conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
+            .with_context(|| "Failed to attach local database")?;
+        conn.execute("USE target_db;", [])
+            .with_context(|| "Failed to switch to target database")?;
+        Ok(conn)
+    }
 }
 
 /// The main entry point for the DuckPack CLI.
@@ -192,7 +275,7 @@ fn main() -> Result<()> {
             let _ = build_shadow_db(project_dir)?;
             println!("Build successful! All SQL syntax is valid.");
         }
-        Commands::Apply { project_dir, db, force_drop, auto_approve, out, quack_token } => {
+        Commands::Apply { project_dir, db, force_drop, auto_approve, out, quack_token, quack_disable_ssl } => {
             if !project_dir.exists() {
                 eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
                 return Ok(());
@@ -215,37 +298,7 @@ fn main() -> Result<()> {
             loop {
                 let shadow_conn = build_shadow_db(project_dir)?;
                 
-                let target_conn = if db.starts_with("quack:") {
-                    let conn = Connection::open_in_memory().with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
-                    conn.execute_batch("INSTALL quack; LOAD quack;")
-                        .with_context(|| "Failed to install/load quack extension")?;
-                    if let Some(token) = quack_token.clone().or_else(|| std::env::var("DUCKDB_QUACK_TOKEN").ok()) {
-                        conn.execute(&format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", token), [])
-                            .with_context(|| "Failed to set quack auth secret")?;
-                    }
-                    let safe_db = db.replace("'", "''");
-                    conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-                        .with_context(|| "Failed to attach remote database")?;
-                    conn.execute("USE target_db;", [])
-                        .with_context(|| "Failed to switch to target database")?;
-                    conn
-                } else if is_remote(&db) {
-                    let conn = Connection::open_in_memory().with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
-                    let safe_db = db.replace("'", "''");
-                    conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-                        .with_context(|| "Failed to attach remote database")?;
-                    conn.execute("USE target_db;", [])
-                        .with_context(|| "Failed to switch to target database")?;
-                    conn
-                } else {
-                    let conn = Connection::open_in_memory().with_context(|| "Failed to open in-memory DB for local ATTACH")?;
-                    let safe_db = db.replace("'", "''");
-                    conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-                        .with_context(|| "Failed to attach local database")?;
-                    conn.execute("USE target_db;", [])
-                        .with_context(|| "Failed to switch to target database")?;
-                    conn
-                };
+                let target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
                 
                 let shadow_schemas = diff::get_schemas(&shadow_conn)?;
                 let target_schemas = diff::get_schemas(&target_conn)?;
@@ -500,7 +553,7 @@ fn main() -> Result<()> {
             }
             println!("Compilation complete! Artifact: {}", out);
         }
-        Commands::Explore { project_dir, db, remote, port, auto_install, quack_token } => {
+        Commands::Explore { project_dir, db, remote, port, auto_install, quack_token, quack_disable_ssl } => {
             if let Some(r) = remote {
                 let mut remote_bin = "duckpack".to_string();
                 let mut remote_tmp_bin = None;
@@ -546,12 +599,19 @@ fn main() -> Result<()> {
                     .status();
                 
                 println!("Launching remote TUI over SSH...");
+                let mut remote_cmd = format!("{} explore --project-dir {} --db {}", remote_bin, remote_tmp_proj, db);
+                if let Some(token) = quack_token {
+                    remote_cmd.push_str(&format!(" --quack-token {}", token));
+                }
+                if *quack_disable_ssl {
+                    remote_cmd.push_str(" --quack-disable-ssl");
+                }
                 let ssh_status = std::process::Command::new("ssh")
                     .arg("-t") // Force pseudo-terminal for TUI
                     .arg("-p")
                     .arg(port.to_string())
                     .arg(r)
-                    .arg(format!("{} explore --project-dir {} --db {}", remote_bin, remote_tmp_proj, db))
+                    .arg(remote_cmd)
                     .status()?;
 
                 if !ssh_status.success() {
@@ -594,37 +654,7 @@ fn main() -> Result<()> {
             let backend = ratatui::backend::CrosstermBackend::new(stdout);
             let mut terminal = ratatui::Terminal::new(backend)?;
 
-            let target_conn = if db.starts_with("quack:") {
-                let conn = Connection::open_in_memory().with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
-                conn.execute_batch("INSTALL quack; LOAD quack;")
-                    .with_context(|| "Failed to install/load quack extension")?;
-                if let Some(token) = quack_token.clone().or_else(|| std::env::var("DUCKDB_QUACK_TOKEN").ok()) {
-                    conn.execute(&format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", token), [])
-                        .with_context(|| "Failed to set quack auth secret")?;
-                }
-                let safe_db = db.replace("'", "''");
-                conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-                    .with_context(|| "Failed to attach remote database")?;
-                conn.execute("USE target_db;", [])
-                    .with_context(|| "Failed to switch to target database")?;
-                conn
-            } else if is_remote(&db) {
-                let conn = Connection::open_in_memory().with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
-                let safe_db = db.replace("'", "''");
-                conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-                    .with_context(|| "Failed to attach remote database")?;
-                conn.execute("USE target_db;", [])
-                    .with_context(|| "Failed to switch to target database")?;
-                conn
-            } else {
-                let conn = Connection::open_in_memory().with_context(|| "Failed to open in-memory DB for local ATTACH")?;
-                let safe_db = db.replace("'", "''");
-                conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-                    .with_context(|| "Failed to attach local database")?;
-                conn.execute("USE target_db;", [])
-                    .with_context(|| "Failed to switch to target database")?;
-                conn
-            };
+            let target_conn = connect_target_db(&db, quack_token.as_deref(), *quack_disable_ssl)?;
 
             ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db)?;
 
@@ -1074,5 +1104,76 @@ mod tests {
         assert_eq!(is_remote("motherduck:"), true);
         assert_eq!(is_remote("local.db"), false);
         assert_eq!(is_remote("/var/lib/duckdb/prod.db"), false);
+    }
+
+    #[test]
+    fn test_is_quack_zero_host() {
+        assert!(is_quack_zero_host("quack:0.0.0.0:9494"));
+        assert!(is_quack_zero_host("quack://0.0.0.0:9494"));
+        assert!(is_quack_zero_host("quack:[::]:9494"));
+        assert!(!is_quack_zero_host("quack:localhost:9494"));
+        assert!(!is_quack_zero_host("quack:127.0.0.1:9494"));
+        assert!(!is_quack_zero_host("quack:remote.example.com"));
+    }
+
+    #[test]
+    fn test_build_quack_attach_sql() {
+        assert_eq!(
+            build_quack_attach_sql("quack:0.0.0.0:9494", true),
+            "ATTACH 'quack:0.0.0.0:9494' AS target_db (DISABLE_SSL true);"
+        );
+        assert_eq!(
+            build_quack_attach_sql("quack:remote.example.com", false),
+            "ATTACH 'quack:remote.example.com' AS target_db;"
+        );
+    }
+
+    #[test]
+    fn test_should_disable_quack_ssl() {
+        // Zero host auto-disables SSL
+        assert!(should_disable_quack_ssl("quack:0.0.0.0:9494", false));
+        // Flag explicitly disables SSL
+        assert!(should_disable_quack_ssl("quack:remote.example.com", true));
+        // Non-zero host without flag or env keeps SSL
+        assert!(!should_disable_quack_ssl("quack:remote.example.com", false));
+    }
+
+    #[test]
+    fn test_cli_quack_disable_ssl_flags() {
+        let cli = Cli::try_parse_from(&[
+            "duckpack",
+            "explore",
+            "--db",
+            "quack:0.0.0.0:9494",
+            "--quack-disable-ssl",
+        ]).unwrap();
+        match cli.command {
+            Commands::Explore { quack_disable_ssl, .. } => assert!(quack_disable_ssl),
+            _ => panic!("Expected Explore command"),
+        }
+
+        let cli_insecure = Cli::try_parse_from(&[
+            "duckpack",
+            "explore",
+            "--db",
+            "quack:0.0.0.0:9494",
+            "--insecure",
+        ]).unwrap();
+        match cli_insecure.command {
+            Commands::Explore { quack_disable_ssl, .. } => assert!(quack_disable_ssl),
+            _ => panic!("Expected Explore command"),
+        }
+
+        let cli_apply = Cli::try_parse_from(&[
+            "duckpack",
+            "apply",
+            "--db",
+            "quack:0.0.0.0:9494",
+            "--quack-disable-ssl",
+        ]).unwrap();
+        match cli_apply.command {
+            Commands::Apply { quack_disable_ssl, .. } => assert!(quack_disable_ssl),
+            _ => panic!("Expected Apply command"),
+        }
     }
 }
