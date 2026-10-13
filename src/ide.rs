@@ -5,11 +5,11 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, BorderType, List, ListItem, ListState, Paragraph, Row, Table, Tabs},
     Terminal,
 };
 use std::path::PathBuf;
-use tui_textarea::{Input, Key, TextArea};
+use tui_textarea::TextArea;
 
 /// Manages the currently focused UI pane inside the IDE.
 /// Determines which component receives keyboard inputs.
@@ -94,18 +94,69 @@ pub fn run_ide_loop(
     let mut focus = FocusPane::Editor;
     let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
 
+    let is_quack = db_path.starts_with("quack:");
+
     // Load tables/views
     let mut tables: Vec<String> = Vec::new();
     let mut views: Vec<String> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_type, table_schema, table_name") {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let (Ok(schema), Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
-                    let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
-                    if typ == "BASE TABLE" {
-                        tables.push(display_name);
-                    } else if typ == "VIEW" {
-                        views.push(display_name);
+
+    if is_quack {
+        // For Quack remote connections, client-side information_schema doesn't discover remote tables
+        // (duckdb-quack issue #175). Query through the remote instance via target_db.query(...)
+        let quack_sql = "SELECT table_schema, table_name, table_type FROM target_db.query('SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN (''information_schema'', ''pg_catalog'') ORDER BY table_type, table_schema, table_name')";
+        if let Ok(mut stmt) = conn.prepare(quack_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                        let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
+                        if typ == "BASE TABLE" {
+                            if !tables.contains(&display_name) { tables.push(display_name); }
+                        } else if typ == "VIEW" {
+                            if !views.contains(&display_name) { views.push(display_name); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback for quack if information_schema was empty on the remote: check duckdb_tables() & duckdb_views()
+        if tables.is_empty() && views.is_empty() {
+            let quack_tbl_sql = "SELECT schema_name, table_name FROM target_db.query('SELECT schema_name, table_name FROM duckdb_tables() WHERE internal = false')";
+            if let Ok(mut stmt) = conn.prepare(quack_tbl_sql) {
+                if let Ok(mut rows) = stmt.query([]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                            let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
+                            if !tables.contains(&display_name) { tables.push(display_name); }
+                        }
+                    }
+                }
+            }
+            let quack_view_sql = "SELECT schema_name, view_name FROM target_db.query('SELECT schema_name, view_name FROM duckdb_views() WHERE internal = false')";
+            if let Ok(mut stmt) = conn.prepare(quack_view_sql) {
+                if let Ok(mut rows) = stmt.query([]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                            let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
+                            if !views.contains(&display_name) { views.push(display_name); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if tables.is_empty() && views.is_empty() {
+        if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_type, table_schema, table_name") {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                        let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
+                        if typ == "BASE TABLE" {
+                            tables.push(display_name);
+                        } else if typ == "VIEW" {
+                            views.push(display_name);
+                        }
                     }
                 }
             }
@@ -113,11 +164,25 @@ pub fn run_ide_loop(
     }
 
     let mut macros: Vec<String> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false ORDER BY 1") {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(name) = row.get::<_, String>(0) {
-                    macros.push(name);
+    if is_quack {
+        let quack_macro_sql = "SELECT function_name FROM target_db.query('SELECT CASE WHEN schema_name = ''main'' THEN function_name ELSE schema_name || ''.'' || function_name END AS function_name FROM duckdb_functions() WHERE function_type = ''macro'' AND internal = false ORDER BY 1')";
+        if let Ok(mut stmt) = conn.prepare(quack_macro_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(name) = row.get::<_, String>(0) {
+                        if !macros.contains(&name) { macros.push(name); }
+                    }
+                }
+            }
+        }
+    }
+    if macros.is_empty() {
+        if let Ok(mut stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false ORDER BY 1") {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(name) = row.get::<_, String>(0) {
+                        macros.push(name);
+                    }
                 }
             }
         }
@@ -126,6 +191,20 @@ pub fn run_ide_loop(
     // Load autocomplete dictionary (tables + columns)
     let mut dictionary: Vec<String> = tables.clone();
     dictionary.extend(views.clone());
+    if is_quack {
+        let quack_col_sql = "SELECT column_name FROM target_db.query('SELECT column_name FROM information_schema.columns WHERE table_schema NOT IN (''information_schema'', ''pg_catalog'')')";
+        if let Ok(mut stmt) = conn.prepare(quack_col_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(col) = row.get::<_, String>(0) {
+                        if !dictionary.contains(&col) {
+                            dictionary.push(col);
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Ok(mut stmt) = conn.prepare("SELECT column_name FROM information_schema.columns WHERE table_schema NOT IN ('information_schema', 'pg_catalog')") {
         if let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
@@ -1237,7 +1316,7 @@ pub fn run_ide_loop(
                         NodeType::Table | NodeType::View => {
                             if item_expanded {
                                 explorer_items[selected].is_expanded = false;
-                                let mut j = selected + 1;
+                                let j = selected + 1;
                                 while j < explorer_items.len() && explorer_items[j].level > item_level {
                                     explorer_items.remove(j);
                                 }
@@ -1245,21 +1324,39 @@ pub fn run_ide_loop(
                                 explorer_items[selected].is_expanded = true;
                                 let mut new_nodes = Vec::new();
                                 let safe_name = item_name.replace("'", "''");
-                                if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info('{}')", safe_name)) {
-                                    if let Ok(mut rows) = stmt.query([]) {
-                                        while let Ok(Some(row)) = rows.next() {
-                                            if let Ok(col_name) = row.get::<_, String>(1) {
-                                                let data_type: String = row.get(2).unwrap_or_else(|_| "UNKNOWN".to_string());
-                                                new_nodes.push(ExplorerNode {
-                                                    name: col_name.clone(),
-                                                    display: format!("    └─ {} ({})", col_name, data_type),
-                                                    level: item_level + 1,
-                                                    is_expandable: false,
-                                                    is_expanded: false,
-                                                    node_type: NodeType::Column { data_type },
-                                                });
+
+                                let pragma_queries = if is_quack {
+                                    vec![
+                                        format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_name}'')')"),
+                                        format!("PRAGMA table_info('{}')", safe_name),
+                                    ]
+                                } else {
+                                    vec![
+                                        format!("PRAGMA table_info('{}')", safe_name),
+                                        format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_name}'')')"),
+                                    ]
+                                };
+
+                                for query in &pragma_queries {
+                                    if let Ok(mut stmt) = conn.prepare(query) {
+                                        if let Ok(mut rows) = stmt.query([]) {
+                                            while let Ok(Some(row)) = rows.next() {
+                                                if let Ok(col_name) = row.get::<_, String>(1) {
+                                                    let data_type: String = row.get(2).unwrap_or_else(|_| "UNKNOWN".to_string());
+                                                    new_nodes.push(ExplorerNode {
+                                                        name: col_name.clone(),
+                                                        display: format!("    └─ {} ({})", col_name, data_type),
+                                                        level: item_level + 1,
+                                                        is_expandable: false,
+                                                        is_expanded: false,
+                                                        node_type: NodeType::Column { data_type },
+                                                    });
+                                                }
                                             }
                                         }
+                                    }
+                                    if !new_nodes.is_empty() {
+                                        break;
                                     }
                                 }
                                 for (offset, node) in new_nodes.into_iter().enumerate() {
@@ -1270,7 +1367,7 @@ pub fn run_ide_loop(
                         NodeType::Group => {
                             if item_expanded {
                                 explorer_items[selected].is_expanded = false;
-                                let mut j = selected + 1;
+                                let j = selected + 1;
                                 while j < explorer_items.len() && explorer_items[j].level > item_level {
                                     explorer_items.remove(j);
                                 }
