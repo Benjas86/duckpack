@@ -8,7 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, BorderType, List, ListItem, ListState, Paragraph, Row, Table, Tabs},
     Terminal,
 };
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use tui_textarea::TextArea;
 
 /// Manages the currently focused UI pane inside the IDE.
@@ -79,30 +80,100 @@ impl<'a> EditorTab<'a> {
     }
 }
 
-/// The main execution loop for the IDE/Explorer feature.
-/// Handles rendering the UI layout, capturing keyboard/mouse events, managing tabs,
-/// and securely executing raw DuckDB queries from the active text buffer.
-pub fn run_ide_loop(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+/// Formats an integer count with comma separators and singular/plural suffixes (e.g. "1 row", "10,000 rows").
+pub fn format_row_count(count: i64) -> String {
+    if count == 1 {
+        "1 row".to_string()
+    } else {
+        let s = count.to_string();
+        let mut result = String::new();
+        let len = s.len();
+        for (idx, ch) in s.chars().enumerate() {
+            if idx > 0 && (len - idx) % 3 == 0 {
+                result.push(',');
+            }
+            result.push(ch);
+        }
+        format!("{} rows", result)
+    }
+}
+
+/// Loads estimated/cached row counts for all non-internal tables.
+fn load_table_counts(conn: &Connection, is_quack: bool) -> HashMap<String, i64> {
+    let mut counts = HashMap::new();
+    let query = if is_quack {
+        "SELECT schema_name, table_name, estimated_size FROM target_db.query('SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false')"
+    } else {
+        "SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false"
+    };
+
+    if let Ok(mut stmt) = conn.prepare(query) {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(schema), Ok(name), Ok(est)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, i64>(2)) {
+                    let full_name = if schema == "main" { name } else { format!("{}.{}", schema, name) };
+                    counts.insert(full_name, est);
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Loads column names and types for a given table or view.
+fn load_table_columns(conn: &Connection, table_name: &str, is_quack: bool) -> Vec<(String, String)> {
+    let mut cols = Vec::new();
+    let safe_name = table_name.replace("'", "''");
+
+    let pragma_queries = if is_quack {
+        vec![
+            format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_name}'')')"),
+            format!("PRAGMA table_info('{}')", safe_name),
+        ]
+    } else {
+        vec![
+            format!("PRAGMA table_info('{}')", safe_name),
+            format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_name}'')')"),
+        ]
+    };
+
+    for query in &pragma_queries {
+        if let Ok(mut stmt) = conn.prepare(query) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(col_name) = row.get::<_, String>(1) {
+                        let data_type: String = row.get(2).unwrap_or_else(|_| "UNKNOWN".to_string());
+                        cols.push((col_name, data_type));
+                    }
+                }
+            }
+        }
+        if !cols.is_empty() {
+            break;
+        }
+    }
+    cols
+}
+
+/// Metadata holding all discoverable entities in the database and project.
+struct ExplorerMetadata {
+    tables: Vec<String>,
+    table_counts: HashMap<String, i64>,
+    views: Vec<String>,
+    macros: Vec<String>,
+    queries: Vec<String>,
+    dictionary: Vec<String>,
+}
+
+fn load_explorer_metadata(
     conn: &Connection,
-    project_dir: &PathBuf,
-    db_path: &str,
-) -> Result<()> {
-    let mut tabs: Vec<EditorTab> = vec![EditorTab::new()];
-    let mut active_tab_index: usize = 0;
-
-    let mut focus = FocusPane::Editor;
-    let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
-
-    let is_quack = db_path.starts_with("quack:");
-
-    // Load tables/views
+    project_dir: &Path,
+    is_quack: bool,
+) -> ExplorerMetadata {
     let mut tables: Vec<String> = Vec::new();
     let mut views: Vec<String> = Vec::new();
 
     if is_quack {
-        // For Quack remote connections, client-side information_schema doesn't discover remote tables
-        // (duckdb-quack issue #175). Query through the remote instance via target_db.query(...)
         let quack_sql = "SELECT table_schema, table_name, table_type FROM target_db.query('SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN (''information_schema'', ''pg_catalog'') ORDER BY table_type, table_schema, table_name')";
         if let Ok(mut stmt) = conn.prepare(quack_sql) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -119,7 +190,6 @@ pub fn run_ide_loop(
             }
         }
 
-        // Fallback for quack if information_schema was empty on the remote: check duckdb_tables() & duckdb_views()
         if tables.is_empty() && views.is_empty() {
             let quack_tbl_sql = "SELECT schema_name, table_name FROM target_db.query('SELECT schema_name, table_name FROM duckdb_tables() WHERE internal = false')";
             if let Ok(mut stmt) = conn.prepare(quack_tbl_sql) {
@@ -163,6 +233,8 @@ pub fn run_ide_loop(
         }
     }
 
+    let table_counts = load_table_counts(conn, is_quack);
+
     let mut macros: Vec<String> = Vec::new();
     if is_quack {
         let quack_macro_sql = "SELECT function_name FROM target_db.query('SELECT CASE WHEN schema_name = ''main'' THEN function_name ELSE schema_name || ''.'' || function_name END AS function_name FROM duckdb_functions() WHERE function_type = ''macro'' AND internal = false ORDER BY 1')";
@@ -188,7 +260,6 @@ pub fn run_ide_loop(
         }
     }
 
-    // Load autocomplete dictionary (tables + columns)
     let mut dictionary: Vec<String> = tables.clone();
     dictionary.extend(views.clone());
     if is_quack {
@@ -216,11 +287,7 @@ pub fn run_ide_loop(
             }
         }
     }
-    let mut autocomplete_matches: Vec<String> = Vec::new();
-    let mut autocomplete_index = 0;
-    let mut autocomplete_original_word = String::new();
 
-    // Load queries
     let mut queries: Vec<String> = Vec::new();
     let queries_dir = project_dir.join("queries");
     if queries_dir.exists() {
@@ -238,93 +305,187 @@ pub fn run_ide_loop(
     }
     queries.sort();
 
-    let mut explorer_state = ListState::default();
-    let mut explorer_items: Vec<ExplorerNode> = Vec::new();
-    let mut explorer_horizontal_scroll: usize = 0;
+    ExplorerMetadata {
+        tables,
+        table_counts,
+        views,
+        macros,
+        queries,
+        dictionary,
+    }
+}
 
-    if !tables.is_empty() {
-        explorer_items.push(ExplorerNode {
+fn rebuild_explorer_nodes(
+    meta: &ExplorerMetadata,
+    expanded_groups: &HashSet<String>,
+    expanded_tables: &HashSet<String>,
+    conn: &Connection,
+    is_quack: bool,
+) -> Vec<ExplorerNode> {
+    let mut items = Vec::new();
+
+    if !meta.tables.is_empty() {
+        let is_expanded = expanded_groups.contains("Tables");
+        items.push(ExplorerNode {
             name: "Tables".to_string(),
-            display: format!("📦 Tables ({})", tables.len()),
+            display: format!("📦 Tables ({})", meta.tables.len()),
             level: 0,
             is_expandable: true,
-            is_expanded: true,
+            is_expanded,
             node_type: NodeType::Group,
         });
-        for t in &tables {
-            explorer_items.push(ExplorerNode {
-                name: t.clone(),
-                display: format!("  ├─ {}", t),
-                level: 1,
-                is_expandable: true,
-                is_expanded: false,
-                node_type: NodeType::Table,
-            });
+        if is_expanded {
+            for t in &meta.tables {
+                let is_tbl_expanded = expanded_tables.contains(t);
+                let count_str = meta.table_counts.get(t).map(|&c| format!(" ({})", format_row_count(c))).unwrap_or_default();
+                items.push(ExplorerNode {
+                    name: t.clone(),
+                    display: format!("  ├─ {}{}", t, count_str),
+                    level: 1,
+                    is_expandable: true,
+                    is_expanded: is_tbl_expanded,
+                    node_type: NodeType::Table,
+                });
+                if is_tbl_expanded {
+                    let cols = load_table_columns(conn, t, is_quack);
+                    for (col_name, data_type) in cols {
+                        items.push(ExplorerNode {
+                            name: col_name.clone(),
+                            display: format!("    └─ {} ({})", col_name, data_type),
+                            level: 2,
+                            is_expandable: false,
+                            is_expanded: false,
+                            node_type: NodeType::Column { data_type },
+                        });
+                    }
+                }
+            }
         }
     }
 
-    if !views.is_empty() {
-        explorer_items.push(ExplorerNode {
+    if !meta.views.is_empty() {
+        let is_expanded = expanded_groups.contains("Views");
+        items.push(ExplorerNode {
             name: "Views".to_string(),
-            display: format!("👁️ Views ({})", views.len()),
+            display: format!("👁️ Views ({})", meta.views.len()),
             level: 0,
             is_expandable: true,
-            is_expanded: true,
+            is_expanded,
             node_type: NodeType::Group,
         });
-        for v in &views {
-            explorer_items.push(ExplorerNode {
-                name: v.clone(),
-                display: format!("  ├─ {}", v),
-                level: 1,
-                is_expandable: true,
-                is_expanded: false,
-                node_type: NodeType::View,
-            });
+        if is_expanded {
+            for v in &meta.views {
+                let is_view_expanded = expanded_tables.contains(v);
+                items.push(ExplorerNode {
+                    name: v.clone(),
+                    display: format!("  ├─ {}", v),
+                    level: 1,
+                    is_expandable: true,
+                    is_expanded: is_view_expanded,
+                    node_type: NodeType::View,
+                });
+                if is_view_expanded {
+                    let cols = load_table_columns(conn, v, is_quack);
+                    for (col_name, data_type) in cols {
+                        items.push(ExplorerNode {
+                            name: col_name.clone(),
+                            display: format!("    └─ {} ({})", col_name, data_type),
+                            level: 2,
+                            is_expandable: false,
+                            is_expanded: false,
+                            node_type: NodeType::Column { data_type },
+                        });
+                    }
+                }
+            }
         }
     }
 
-    if !macros.is_empty() {
-        explorer_items.push(ExplorerNode {
+    if !meta.macros.is_empty() {
+        let is_expanded = expanded_groups.contains("Macros");
+        items.push(ExplorerNode {
             name: "Macros".to_string(),
-            display: format!("🔧 Macros ({})", macros.len()),
+            display: format!("🔧 Macros ({})", meta.macros.len()),
             level: 0,
             is_expandable: true,
-            is_expanded: true,
+            is_expanded,
             node_type: NodeType::Group,
         });
-        for m in &macros {
-            explorer_items.push(ExplorerNode {
-                name: m.clone(),
-                display: format!("  ├─ {}", m),
-                level: 1,
-                is_expandable: false,
-                is_expanded: false,
-                node_type: NodeType::Macro,
-            });
+        if is_expanded {
+            for m in &meta.macros {
+                items.push(ExplorerNode {
+                    name: m.clone(),
+                    display: format!("  ├─ {}", m),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::Macro,
+                });
+            }
         }
     }
 
-    if !queries.is_empty() {
-        explorer_items.push(ExplorerNode {
+    if !meta.queries.is_empty() {
+        let is_expanded = expanded_groups.contains("Queries");
+        items.push(ExplorerNode {
             name: "Queries".to_string(),
-            display: format!("📄 Queries ({})", queries.len()),
+            display: format!("📄 Queries ({})", meta.queries.len()),
             level: 0,
             is_expandable: true,
-            is_expanded: true,
+            is_expanded,
             node_type: NodeType::Group,
         });
-        for q in &queries {
-            explorer_items.push(ExplorerNode {
-                name: q.clone(),
-                display: format!("  ├─ {}", q),
-                level: 1,
-                is_expandable: false,
-                is_expanded: false,
-                node_type: NodeType::Query,
-            });
+        if is_expanded {
+            for q in &meta.queries {
+                items.push(ExplorerNode {
+                    name: q.clone(),
+                    display: format!("  ├─ {}", q),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::Query,
+                });
+            }
         }
     }
+
+    items
+}
+
+/// The main execution loop for the IDE/Explorer feature.
+/// Handles rendering the UI layout, capturing keyboard/mouse events, managing tabs,
+/// and securely executing raw DuckDB queries from the active text buffer.
+pub fn run_ide_loop(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    conn: &Connection,
+    project_dir: &PathBuf,
+    db_path: &str,
+) -> Result<()> {
+    let mut tabs: Vec<EditorTab> = vec![EditorTab::new()];
+    let mut active_tab_index: usize = 0;
+
+    let mut focus = FocusPane::Editor;
+    let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
+
+    let is_quack = db_path.starts_with("quack:");
+
+    let mut meta = load_explorer_metadata(conn, project_dir, is_quack);
+    let mut expanded_groups: HashSet<String> = vec!["Tables", "Views", "Macros", "Queries"]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut expanded_tables: HashSet<String> = HashSet::new();
+
+    let mut dictionary = meta.dictionary.clone();
+    let mut autocomplete_matches: Vec<String> = Vec::new();
+    let mut autocomplete_index = 0;
+    let mut autocomplete_original_word = String::new();
+
+    let queries_dir = project_dir.join("queries");
+
+    let mut explorer_state = ListState::default();
+    let mut explorer_horizontal_scroll: usize = 0;
+    let mut explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
 
     if !explorer_items.is_empty() {
         explorer_state.select(Some(0));
@@ -400,8 +561,14 @@ pub fn run_ide_loop(
                 Style::default()
             };
 
+            let explorer_title = if focus == FocusPane::Explorer {
+                " Explorer [R: Refresh] "
+            } else {
+                " Explorer "
+            };
+
             let explorer_list = List::new(list_items)
-                .block(Block::default().borders(Borders::ALL).title(" Explorer ").border_style(explorer_border_style))
+                .block(Block::default().borders(Borders::ALL).title(explorer_title).border_style(explorer_border_style))
                 .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
             f.render_stateful_widget(explorer_list, chunks[0], &mut explorer_state);
             current_explorer_rect = chunks[0];
@@ -584,6 +751,7 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" Ctrl+F    ", Style::default().fg(Color::Cyan)), Span::raw("Format Query")]),
                     Line::from(vec![Span::styled(" Ctrl+Space", Style::default().fg(Color::Cyan)), Span::raw("Autocomplete")]),
                     Line::from(vec![Span::styled(" n / p     ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Page (in Results pane)")]),
+                    Line::from(vec![Span::styled(" r / R     ", Style::default().fg(Color::Cyan)), Span::raw("Refresh Explorer (when in Explorer pane)")]),
                     Line::from(vec![Span::styled(" ◄ / ►     ", Style::default().fg(Color::Cyan)), Span::raw("Scroll Columns (Shift+◄/► fast)")]),
                     Line::from(vec![Span::styled(" Home/End  ", Style::default().fg(Color::Cyan)), Span::raw("First/Last Column (in Results pane)")]),
                     Line::from(""),
@@ -633,6 +801,7 @@ pub fn run_ide_loop(
         let mut new_tab = false;
         let mut close_tab = false;
         let mut trigger_explorer_action = false;
+        let mut trigger_explorer_refresh = false;
         let mut trigger_pagination: Option<i32> = None;
         let ev = event::read()?;
 
@@ -944,6 +1113,8 @@ pub fn run_ide_loop(
                             explorer_horizontal_scroll += 1;
                         } else if key.code == KeyCode::Enter {
                             trigger_explorer_action = true;
+                        } else if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
+                            trigger_explorer_refresh = true;
                         }
                     }
                     FocusPane::Editor => {
@@ -1304,6 +1475,20 @@ pub fn run_ide_loop(
             }
         }
 
+        if trigger_explorer_refresh {
+            let prev_selected = explorer_state.selected();
+            meta = load_explorer_metadata(conn, project_dir, is_quack);
+            dictionary = meta.dictionary.clone();
+            autocomplete_matches.clear();
+            explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+            if let Some(sel) = prev_selected {
+                explorer_state.select(Some(sel.min(explorer_items.len().saturating_sub(1))));
+            } else if !explorer_items.is_empty() {
+                explorer_state.select(Some(0));
+            }
+            status_msg = "Explorer refreshed.".to_string();
+        }
+
         if trigger_explorer_action {
             if let Some(selected) = explorer_state.selected() {
                 if selected < explorer_items.len() {
@@ -1316,48 +1501,25 @@ pub fn run_ide_loop(
                         NodeType::Table | NodeType::View => {
                             if item_expanded {
                                 explorer_items[selected].is_expanded = false;
+                                expanded_tables.remove(&item_name);
                                 let j = selected + 1;
                                 while j < explorer_items.len() && explorer_items[j].level > item_level {
                                     explorer_items.remove(j);
                                 }
                             } else {
                                 explorer_items[selected].is_expanded = true;
+                                expanded_tables.insert(item_name.clone());
+                                let cols = load_table_columns(conn, &item_name, is_quack);
                                 let mut new_nodes = Vec::new();
-                                let safe_name = item_name.replace("'", "''");
-
-                                let pragma_queries = if is_quack {
-                                    vec![
-                                        format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_name}'')')"),
-                                        format!("PRAGMA table_info('{}')", safe_name),
-                                    ]
-                                } else {
-                                    vec![
-                                        format!("PRAGMA table_info('{}')", safe_name),
-                                        format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_name}'')')"),
-                                    ]
-                                };
-
-                                for query in &pragma_queries {
-                                    if let Ok(mut stmt) = conn.prepare(query) {
-                                        if let Ok(mut rows) = stmt.query([]) {
-                                            while let Ok(Some(row)) = rows.next() {
-                                                if let Ok(col_name) = row.get::<_, String>(1) {
-                                                    let data_type: String = row.get(2).unwrap_or_else(|_| "UNKNOWN".to_string());
-                                                    new_nodes.push(ExplorerNode {
-                                                        name: col_name.clone(),
-                                                        display: format!("    └─ {} ({})", col_name, data_type),
-                                                        level: item_level + 1,
-                                                        is_expandable: false,
-                                                        is_expanded: false,
-                                                        node_type: NodeType::Column { data_type },
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if !new_nodes.is_empty() {
-                                        break;
-                                    }
+                                for (col_name, data_type) in cols {
+                                    new_nodes.push(ExplorerNode {
+                                        name: col_name.clone(),
+                                        display: format!("    └─ {} ({})", col_name, data_type),
+                                        level: item_level + 1,
+                                        is_expandable: false,
+                                        is_expanded: false,
+                                        node_type: NodeType::Column { data_type },
+                                    });
                                 }
                                 for (offset, node) in new_nodes.into_iter().enumerate() {
                                     explorer_items.insert(selected + 1 + offset, node);
@@ -1367,18 +1529,21 @@ pub fn run_ide_loop(
                         NodeType::Group => {
                             if item_expanded {
                                 explorer_items[selected].is_expanded = false;
+                                expanded_groups.remove(&item_name);
                                 let j = selected + 1;
                                 while j < explorer_items.len() && explorer_items[j].level > item_level {
                                     explorer_items.remove(j);
                                 }
                             } else {
                                 explorer_items[selected].is_expanded = true;
+                                expanded_groups.insert(item_name.clone());
                                 let mut new_nodes = Vec::new();
                                 if item_name == "Tables" {
-                                    for t in &tables {
+                                    for t in &meta.tables {
+                                        let count_str = meta.table_counts.get(t).map(|&c| format!(" ({})", format_row_count(c))).unwrap_or_default();
                                         new_nodes.push(ExplorerNode {
                                             name: t.clone(),
-                                            display: format!("  ├─ {}", t),
+                                            display: format!("  ├─ {}{}", t, count_str),
                                             level: 1,
                                             is_expandable: true,
                                             is_expanded: false,
@@ -1386,7 +1551,7 @@ pub fn run_ide_loop(
                                         });
                                     }
                                 } else if item_name == "Views" {
-                                    for v in &views {
+                                    for v in &meta.views {
                                         new_nodes.push(ExplorerNode {
                                             name: v.clone(),
                                             display: format!("  ├─ {}", v),
@@ -1397,7 +1562,7 @@ pub fn run_ide_loop(
                                         });
                                     }
                                 } else if item_name == "Macros" {
-                                    for m in &macros {
+                                    for m in &meta.macros {
                                         new_nodes.push(ExplorerNode {
                                             name: m.clone(),
                                             display: format!("  ├─ {}", m),
@@ -1408,7 +1573,7 @@ pub fn run_ide_loop(
                                         });
                                     }
                                 } else if item_name == "Queries" {
-                                    for q in &queries {
+                                    for q in &meta.queries {
                                         new_nodes.push(ExplorerNode {
                                             name: q.clone(),
                                             display: format!("  ├─ {}", q),
@@ -1659,5 +1824,15 @@ mod tests {
         assert!(visible.len() < cols.len());
         assert_eq!(visible[0], 0);
         assert!(used <= avail_width);
+    }
+
+    #[test]
+    fn test_format_row_count() {
+        assert_eq!(format_row_count(0), "0 rows");
+        assert_eq!(format_row_count(1), "1 row");
+        assert_eq!(format_row_count(42), "42 rows");
+        assert_eq!(format_row_count(1000), "1,000 rows");
+        assert_eq!(format_row_count(10000), "10,000 rows");
+        assert_eq!(format_row_count(1234567), "1,234,567 rows");
     }
 }
