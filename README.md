@@ -117,7 +117,7 @@ Instead of switching to a different terminal window or dealing with DuckDB file 
 8. **Auto-Formatting:** Hit `Ctrl+F` to instantly pass your raw query through the internal `sqlformat` parser and auto-indent your code beautifully.
 9. **Auto-Save:** Hit `Ctrl+S` to instantly save your active editor contents to a scratchpad `.sql` file in your `queries/` directory.
 10. **Result Pagination:** View datasets with millions of rows safely! The IDE intelligently paginates `SELECT`, `WITH`, `VALUES`, and `FROM` statements into manageable 500-row chunks. Use `n` (Next Page) and `p` (Previous Page) when focused on the Results pane to navigate through massive datasets instantly.
-11. **Schema Visualizer:** Hit `Ctrl+V` to open the integrated visualizer! This will dynamically scan your active DuckDB database, extract foreign key mappings, and print an elegant ASCII visual tree inside the IDE while silently generating and copying the complete `Mermaid.js` Entity-Relationship syntax directly to your clipboard!
+11. **Schema Visualizer:** Hit `Ctrl+G` to open the integrated visualizer! This will dynamically scan your active DuckDB database, extract foreign key mappings, and print an elegant ASCII visual tree inside the IDE while silently generating and copying the complete `Mermaid.js` Entity-Relationship syntax directly to your clipboard!
 ## 📦 Building DuckPacks for CI/CD
 
 For remote deployments (like production servers running Quack/DuckDB), executing migrations over a live network connection is risky and slow. Instead, you can compile your project into an immutable `.duckpack`:
