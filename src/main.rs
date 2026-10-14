@@ -146,7 +146,7 @@ fn is_quack_zero_host(db: &str) -> bool {
 
 /// Determines if SSL should be disabled for a Quack connection.
 /// Returns true if explicitly flagged, if DUCKDB_QUACK_DISABLE_SSL is set, or if connecting to 0.0.0.0.
-fn should_disable_quack_ssl(db: &str, flag_disable_ssl: bool) -> bool {
+pub(crate) fn should_disable_quack_ssl(db: &str, flag_disable_ssl: bool) -> bool {
     flag_disable_ssl
         || std::env::var("DUCKDB_QUACK_DISABLE_SSL")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
@@ -155,7 +155,7 @@ fn should_disable_quack_ssl(db: &str, flag_disable_ssl: bool) -> bool {
 }
 
 /// Builds the SQL ATTACH statement for a Quack database.
-fn build_quack_attach_sql(db: &str, disable_ssl: bool) -> String {
+pub(crate) fn build_quack_attach_sql(db: &str, disable_ssl: bool) -> String {
     let safe_db = db.replace("'", "''");
     if disable_ssl {
         format!("ATTACH '{}' AS target_db (DISABLE_SSL true);", safe_db)
