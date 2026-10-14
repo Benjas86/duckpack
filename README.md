@@ -118,7 +118,17 @@ Instead of switching to a different terminal window or dealing with DuckDB file 
 9. **Auto-Save:** Hit `Ctrl+S` to instantly save your active editor contents to a scratchpad `.sql` file in your `queries/` directory.
 10. **Result Pagination:** View datasets with millions of rows safely! The IDE intelligently paginates `SELECT`, `WITH`, `VALUES`, and `FROM` statements into manageable 500-row chunks. Use `n` (Next Page) and `p` (Previous Page) when focused on the Results pane to navigate through massive datasets instantly.
 11. **Schema Visualizer:** Hit `Ctrl+G` to open the integrated visualizer! This will dynamically scan your active DuckDB database, extract foreign key mappings, and print an elegant ASCII visual tree inside the IDE while silently generating and copying the complete `Mermaid.js` Entity-Relationship syntax directly to your clipboard!
-12. **Remote Quack Execution & Cloud Storage (`-- @remote`):** When attached to a remote Quack or MotherDuck database, DuckDB evaluates `CREATE SECRET` and session settings on the local client by default. Prepending `-- @remote` at the top of any query instructs DuckPack to automatically forward the statement directly to the remote server engine via `FROM query(...)`. DuckPack also automatically probes and displays both Local and Remote DuckDB versions in the top header and provides real-time diagnostic hints if remote S3 credentials are missing!
+12. **Remote Quack Execution & Cloud Storage (`-- @remote`):** When attached to a remote Quack or MotherDuck database, DuckPack sets `USE target_db;` automatically so that **99% of your normal SQL executes directly on the remote server** without any special syntax. However, in DuckDB's engine architecture, session-scoped entities like **Secrets** and **Settings** are kept in local client memory by default. Prepending `-- @remote` at the top of your query instructs DuckPack to automatically forward the statement directly to the remote server engine via `FROM query(...)`. DuckPack also automatically probes and displays both Local and Remote DuckDB versions in the top header and provides real-time diagnostic hints if remote S3 credentials are missing!
+
+    | Statement Type | Needs `-- @remote`? | Execution Target | Behavior |
+    | :--- | :---: | :--- | :--- |
+    | `CREATE TABLE` / `CREATE VIEW` | **No** | Remote Database | Standard SQL; persists directly on remote Quack DB. |
+    | `SELECT * FROM table / view` | **No** | Remote Database | Standard SQL; queries remote data directly. |
+    | `INSERT` / `UPDATE` / `DELETE` | **No** | Remote Database | Standard SQL; mutates remote data directly. |
+    | **`CREATE SECRET (TYPE S3 ...)`** | **YES** | Remote Server Instance | Pushes S3/GCS/Azure credentials directly to the remote Quack daemon. |
+    | **`SHOW TABLES` / `DESCRIBE`** | **YES** | Remote Server Instance | Quack protocol limitation (multiple streaming scans across the wire); use `-- @remote` to execute server-side cleanly. |
+    | **`SET variable = ...`** | **YES** | Remote Server Instance | Applies configuration variables directly to the remote server session. |
+    | **`INSTALL / LOAD extension`** | **YES** | Remote Server Instance | Installs or loads extensions directly on the remote Quack engine. |
 ## 📦 Building DuckPacks for CI/CD
 
 For remote deployments (like production servers running Quack/DuckDB), executing migrations over a live network connection is risky and slow. Instead, you can compile your project into an immutable `.duckpack`:
