@@ -5,11 +5,12 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, BorderType, List, ListItem, ListState, Paragraph, Row, Table, Tabs},
     Terminal,
 };
-use std::path::PathBuf;
-use tui_textarea::{Input, Key, TextArea};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use tui_textarea::TextArea;
 
 /// Manages the currently focused UI pane inside the IDE.
 /// Determines which component receives keyboard inputs.
@@ -79,53 +80,202 @@ impl<'a> EditorTab<'a> {
     }
 }
 
-/// The main execution loop for the IDE/Explorer feature.
-/// Handles rendering the UI layout, capturing keyboard/mouse events, managing tabs,
-/// and securely executing raw DuckDB queries from the active text buffer.
-pub fn run_ide_loop(
-    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-    conn: &Connection,
-    project_dir: &PathBuf,
-    db_path: &str,
-) -> Result<()> {
-    let mut tabs: Vec<EditorTab> = vec![EditorTab::new()];
-    let mut active_tab_index: usize = 0;
+/// Formats an integer count with comma separators and singular/plural suffixes (e.g. "1 row", "10,000 rows").
+pub fn format_row_count(count: i64) -> String {
+    if count == 1 {
+        "1 row".to_string()
+    } else {
+        let s = count.to_string();
+        let mut result = String::new();
+        let len = s.len();
+        for (idx, ch) in s.chars().enumerate() {
+            if idx > 0 && (len - idx) % 3 == 0 {
+                result.push(',');
+            }
+            result.push(ch);
+        }
+        format!("{} rows", result)
+    }
+}
 
-    let mut focus = FocusPane::Editor;
-    let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
+/// Loads estimated/cached row counts for all non-internal tables.
+fn load_table_counts(conn: &Connection, is_quack: bool) -> HashMap<String, i64> {
+    let mut counts = HashMap::new();
+    let query = if is_quack {
+        "SELECT schema_name, table_name, estimated_size FROM target_db.query('SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false')"
+    } else {
+        "SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false"
+    };
 
-    // Load tables/views
-    let mut tables: Vec<String> = Vec::new();
-    let mut views: Vec<String> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_type, table_schema, table_name") {
+    if let Ok(mut stmt) = conn.prepare(query) {
         if let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
-                if let (Ok(schema), Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
-                    let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
-                    if typ == "BASE TABLE" {
-                        tables.push(display_name);
-                    } else if typ == "VIEW" {
-                        views.push(display_name);
+                if let (Ok(schema), Ok(name), Ok(est)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, i64>(2)) {
+                    let full_name = if schema == "main" { name } else { format!("{}.{}", schema, name) };
+                    counts.insert(full_name, est);
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Loads column names and types for a given table or view.
+fn load_table_columns(conn: &Connection, table_name: &str, is_quack: bool) -> Vec<(String, String)> {
+    let mut cols = Vec::new();
+    let safe_name = table_name.replace("'", "''");
+
+    let pragma_queries = if is_quack {
+        vec![
+            format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_name}'')')"),
+            format!("PRAGMA table_info('{}')", safe_name),
+        ]
+    } else {
+        vec![
+            format!("PRAGMA table_info('{}')", safe_name),
+            format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_name}'')')"),
+        ]
+    };
+
+    for query in &pragma_queries {
+        if let Ok(mut stmt) = conn.prepare(query) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(col_name) = row.get::<_, String>(1) {
+                        let data_type: String = row.get(2).unwrap_or_else(|_| "UNKNOWN".to_string());
+                        cols.push((col_name, data_type));
+                    }
+                }
+            }
+        }
+        if !cols.is_empty() {
+            break;
+        }
+    }
+    cols
+}
+
+/// Metadata holding all discoverable entities in the database and project.
+struct ExplorerMetadata {
+    tables: Vec<String>,
+    table_counts: HashMap<String, i64>,
+    views: Vec<String>,
+    macros: Vec<String>,
+    queries: Vec<String>,
+    dictionary: Vec<String>,
+}
+
+fn load_explorer_metadata(
+    conn: &Connection,
+    project_dir: &Path,
+    is_quack: bool,
+) -> ExplorerMetadata {
+    let mut tables: Vec<String> = Vec::new();
+    let mut views: Vec<String> = Vec::new();
+
+    if is_quack {
+        let quack_sql = "SELECT table_schema, table_name, table_type FROM target_db.query('SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN (''information_schema'', ''pg_catalog'') ORDER BY table_type, table_schema, table_name')";
+        if let Ok(mut stmt) = conn.prepare(quack_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                        let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
+                        if typ == "BASE TABLE" {
+                            if !tables.contains(&display_name) { tables.push(display_name); }
+                        } else if typ == "VIEW" {
+                            if !views.contains(&display_name) { views.push(display_name); }
+                        }
+                    }
+                }
+            }
+        }
+
+        if tables.is_empty() && views.is_empty() {
+            let quack_tbl_sql = "SELECT schema_name, table_name FROM target_db.query('SELECT schema_name, table_name FROM duckdb_tables() WHERE internal = false')";
+            if let Ok(mut stmt) = conn.prepare(quack_tbl_sql) {
+                if let Ok(mut rows) = stmt.query([]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                            let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
+                            if !tables.contains(&display_name) { tables.push(display_name); }
+                        }
+                    }
+                }
+            }
+            let quack_view_sql = "SELECT schema_name, view_name FROM target_db.query('SELECT schema_name, view_name FROM duckdb_views() WHERE internal = false')";
+            if let Ok(mut stmt) = conn.prepare(quack_view_sql) {
+                if let Ok(mut rows) = stmt.query([]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                            let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
+                            if !views.contains(&display_name) { views.push(display_name); }
+                        }
                     }
                 }
             }
         }
     }
 
-    let mut macros: Vec<String> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false ORDER BY 1") {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(name) = row.get::<_, String>(0) {
-                    macros.push(name);
+    if tables.is_empty() && views.is_empty() {
+        if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_type, table_schema, table_name") {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                        let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
+                        if typ == "BASE TABLE" {
+                            tables.push(display_name);
+                        } else if typ == "VIEW" {
+                            views.push(display_name);
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Load autocomplete dictionary (tables + columns)
+    let table_counts = load_table_counts(conn, is_quack);
+
+    let mut macros: Vec<String> = Vec::new();
+    if is_quack {
+        let quack_macro_sql = "SELECT function_name FROM target_db.query('SELECT CASE WHEN schema_name = ''main'' THEN function_name ELSE schema_name || ''.'' || function_name END AS function_name FROM duckdb_functions() WHERE function_type = ''macro'' AND internal = false ORDER BY 1')";
+        if let Ok(mut stmt) = conn.prepare(quack_macro_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(name) = row.get::<_, String>(0) {
+                        if !macros.contains(&name) { macros.push(name); }
+                    }
+                }
+            }
+        }
+    }
+    if macros.is_empty() {
+        if let Ok(mut stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false ORDER BY 1") {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(name) = row.get::<_, String>(0) {
+                        macros.push(name);
+                    }
+                }
+            }
+        }
+    }
+
     let mut dictionary: Vec<String> = tables.clone();
     dictionary.extend(views.clone());
+    if is_quack {
+        let quack_col_sql = "SELECT column_name FROM target_db.query('SELECT column_name FROM information_schema.columns WHERE table_schema NOT IN (''information_schema'', ''pg_catalog'')')";
+        if let Ok(mut stmt) = conn.prepare(quack_col_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(col) = row.get::<_, String>(0) {
+                        if !dictionary.contains(&col) {
+                            dictionary.push(col);
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Ok(mut stmt) = conn.prepare("SELECT column_name FROM information_schema.columns WHERE table_schema NOT IN ('information_schema', 'pg_catalog')") {
         if let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
@@ -137,11 +287,7 @@ pub fn run_ide_loop(
             }
         }
     }
-    let mut autocomplete_matches: Vec<String> = Vec::new();
-    let mut autocomplete_index = 0;
-    let mut autocomplete_original_word = String::new();
 
-    // Load queries
     let mut queries: Vec<String> = Vec::new();
     let queries_dir = project_dir.join("queries");
     if queries_dir.exists() {
@@ -159,93 +305,187 @@ pub fn run_ide_loop(
     }
     queries.sort();
 
-    let mut explorer_state = ListState::default();
-    let mut explorer_items: Vec<ExplorerNode> = Vec::new();
-    let mut explorer_horizontal_scroll: usize = 0;
+    ExplorerMetadata {
+        tables,
+        table_counts,
+        views,
+        macros,
+        queries,
+        dictionary,
+    }
+}
 
-    if !tables.is_empty() {
-        explorer_items.push(ExplorerNode {
+fn rebuild_explorer_nodes(
+    meta: &ExplorerMetadata,
+    expanded_groups: &HashSet<String>,
+    expanded_tables: &HashSet<String>,
+    conn: &Connection,
+    is_quack: bool,
+) -> Vec<ExplorerNode> {
+    let mut items = Vec::new();
+
+    if !meta.tables.is_empty() {
+        let is_expanded = expanded_groups.contains("Tables");
+        items.push(ExplorerNode {
             name: "Tables".to_string(),
-            display: format!("📦 Tables ({})", tables.len()),
+            display: format!("📦 Tables ({})", meta.tables.len()),
             level: 0,
             is_expandable: true,
-            is_expanded: true,
+            is_expanded,
             node_type: NodeType::Group,
         });
-        for t in &tables {
-            explorer_items.push(ExplorerNode {
-                name: t.clone(),
-                display: format!("  ├─ {}", t),
-                level: 1,
-                is_expandable: true,
-                is_expanded: false,
-                node_type: NodeType::Table,
-            });
+        if is_expanded {
+            for t in &meta.tables {
+                let is_tbl_expanded = expanded_tables.contains(t);
+                let count_str = meta.table_counts.get(t).map(|&c| format!(" ({})", format_row_count(c))).unwrap_or_default();
+                items.push(ExplorerNode {
+                    name: t.clone(),
+                    display: format!("  ├─ {}{}", t, count_str),
+                    level: 1,
+                    is_expandable: true,
+                    is_expanded: is_tbl_expanded,
+                    node_type: NodeType::Table,
+                });
+                if is_tbl_expanded {
+                    let cols = load_table_columns(conn, t, is_quack);
+                    for (col_name, data_type) in cols {
+                        items.push(ExplorerNode {
+                            name: col_name.clone(),
+                            display: format!("    └─ {} ({})", col_name, data_type),
+                            level: 2,
+                            is_expandable: false,
+                            is_expanded: false,
+                            node_type: NodeType::Column { data_type },
+                        });
+                    }
+                }
+            }
         }
     }
 
-    if !views.is_empty() {
-        explorer_items.push(ExplorerNode {
+    if !meta.views.is_empty() {
+        let is_expanded = expanded_groups.contains("Views");
+        items.push(ExplorerNode {
             name: "Views".to_string(),
-            display: format!("👁️ Views ({})", views.len()),
+            display: format!("👁️ Views ({})", meta.views.len()),
             level: 0,
             is_expandable: true,
-            is_expanded: true,
+            is_expanded,
             node_type: NodeType::Group,
         });
-        for v in &views {
-            explorer_items.push(ExplorerNode {
-                name: v.clone(),
-                display: format!("  ├─ {}", v),
-                level: 1,
-                is_expandable: true,
-                is_expanded: false,
-                node_type: NodeType::View,
-            });
+        if is_expanded {
+            for v in &meta.views {
+                let is_view_expanded = expanded_tables.contains(v);
+                items.push(ExplorerNode {
+                    name: v.clone(),
+                    display: format!("  ├─ {}", v),
+                    level: 1,
+                    is_expandable: true,
+                    is_expanded: is_view_expanded,
+                    node_type: NodeType::View,
+                });
+                if is_view_expanded {
+                    let cols = load_table_columns(conn, v, is_quack);
+                    for (col_name, data_type) in cols {
+                        items.push(ExplorerNode {
+                            name: col_name.clone(),
+                            display: format!("    └─ {} ({})", col_name, data_type),
+                            level: 2,
+                            is_expandable: false,
+                            is_expanded: false,
+                            node_type: NodeType::Column { data_type },
+                        });
+                    }
+                }
+            }
         }
     }
 
-    if !macros.is_empty() {
-        explorer_items.push(ExplorerNode {
+    if !meta.macros.is_empty() {
+        let is_expanded = expanded_groups.contains("Macros");
+        items.push(ExplorerNode {
             name: "Macros".to_string(),
-            display: format!("🔧 Macros ({})", macros.len()),
+            display: format!("🔧 Macros ({})", meta.macros.len()),
             level: 0,
             is_expandable: true,
-            is_expanded: true,
+            is_expanded,
             node_type: NodeType::Group,
         });
-        for m in &macros {
-            explorer_items.push(ExplorerNode {
-                name: m.clone(),
-                display: format!("  ├─ {}", m),
-                level: 1,
-                is_expandable: false,
-                is_expanded: false,
-                node_type: NodeType::Macro,
-            });
+        if is_expanded {
+            for m in &meta.macros {
+                items.push(ExplorerNode {
+                    name: m.clone(),
+                    display: format!("  ├─ {}", m),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::Macro,
+                });
+            }
         }
     }
 
-    if !queries.is_empty() {
-        explorer_items.push(ExplorerNode {
+    if !meta.queries.is_empty() {
+        let is_expanded = expanded_groups.contains("Queries");
+        items.push(ExplorerNode {
             name: "Queries".to_string(),
-            display: format!("📄 Queries ({})", queries.len()),
+            display: format!("📄 Queries ({})", meta.queries.len()),
             level: 0,
             is_expandable: true,
-            is_expanded: true,
+            is_expanded,
             node_type: NodeType::Group,
         });
-        for q in &queries {
-            explorer_items.push(ExplorerNode {
-                name: q.clone(),
-                display: format!("  ├─ {}", q),
-                level: 1,
-                is_expandable: false,
-                is_expanded: false,
-                node_type: NodeType::Query,
-            });
+        if is_expanded {
+            for q in &meta.queries {
+                items.push(ExplorerNode {
+                    name: q.clone(),
+                    display: format!("  ├─ {}", q),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::Query,
+                });
+            }
         }
     }
+
+    items
+}
+
+/// The main execution loop for the IDE/Explorer feature.
+/// Handles rendering the UI layout, capturing keyboard/mouse events, managing tabs,
+/// and securely executing raw DuckDB queries from the active text buffer.
+pub fn run_ide_loop(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    conn: &Connection,
+    project_dir: &PathBuf,
+    db_path: &str,
+) -> Result<()> {
+    let mut tabs: Vec<EditorTab> = vec![EditorTab::new()];
+    let mut active_tab_index: usize = 0;
+
+    let mut focus = FocusPane::Editor;
+    let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
+
+    let is_quack = db_path.starts_with("quack:");
+
+    let mut meta = load_explorer_metadata(conn, project_dir, is_quack);
+    let mut expanded_groups: HashSet<String> = vec!["Tables", "Views", "Macros", "Queries"]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut expanded_tables: HashSet<String> = HashSet::new();
+
+    let mut dictionary = meta.dictionary.clone();
+    let mut autocomplete_matches: Vec<String> = Vec::new();
+    let mut autocomplete_index = 0;
+    let mut autocomplete_original_word = String::new();
+
+    let queries_dir = project_dir.join("queries");
+
+    let mut explorer_state = ListState::default();
+    let mut explorer_horizontal_scroll: usize = 0;
+    let mut explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
 
     if !explorer_items.is_empty() {
         explorer_state.select(Some(0));
@@ -321,8 +561,14 @@ pub fn run_ide_loop(
                 Style::default()
             };
 
+            let explorer_title = if focus == FocusPane::Explorer {
+                " Explorer [R: Refresh] "
+            } else {
+                " Explorer "
+            };
+
             let explorer_list = List::new(list_items)
-                .block(Block::default().borders(Borders::ALL).title(" Explorer ").border_style(explorer_border_style))
+                .block(Block::default().borders(Borders::ALL).title(explorer_title).border_style(explorer_border_style))
                 .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
             f.render_stateful_widget(explorer_list, chunks[0], &mut explorer_state);
             current_explorer_rect = chunks[0];
@@ -378,7 +624,7 @@ pub fn run_ide_loop(
                     .title_bottom(Line::from(" ▶ Run (F5) ").alignment(Alignment::Right))
                     .border_style(editor_border_style)
             );
-            f.render_widget(active_tab.textarea.widget(), right_chunks[1]);
+            f.render_widget(&active_tab.textarea, right_chunks[1]);
             current_editor_rect = right_chunks[1];
 
             // Results Pane
@@ -388,53 +634,96 @@ pub fn run_ide_loop(
                 Style::default()
             };
 
-            let title = if tabs[active_tab_index].is_paginated {
-                let offset = tabs[active_tab_index].pagination_offset;
-                let limit = tabs[active_tab_index].pagination_limit;
-                format!(" Results (Rows {} - {}) ", offset + 1, offset + limit)
-            } else {
-                " Results ".to_string()
-            };
-
-            let results_block = Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .title_bottom(Line::from(" [?] Help ").alignment(Alignment::Right))
-                .border_style(results_border_style);
-
             let active_tab = &mut tabs[active_tab_index];
 
             if active_tab.query_results.is_empty() && active_tab.column_names.is_empty() {
+                let results_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Results ")
+                    .title_bottom(Line::from(" [?] Help ").alignment(Alignment::Right))
+                    .border_style(results_border_style);
                 f.render_widget(Paragraph::new("No results.").block(results_block), right_chunks[2]);
             } else {
-                let display_cols = active_tab.column_names.len().saturating_sub(active_tab.horizontal_scroll);
-                let display_names = if active_tab.horizontal_scroll < active_tab.column_names.len() {
-                    &active_tab.column_names[active_tab.horizontal_scroll..]
-                } else {
-                    &[]
-                };
-                
+                let total_cols = active_tab.column_names.len();
+                let total_rows = active_tab.query_results.len();
+
+                // Keep horizontal_scroll within bounds
+                if total_cols > 0 && active_tab.horizontal_scroll >= total_cols {
+                    active_tab.horizontal_scroll = total_cols.saturating_sub(1);
+                }
+
+                // Available width for columns inside the results pane (excluding border padding)
+                let avail_width = (right_chunks[2].width.saturating_sub(2) as usize).max(10);
+
+                // Dynamically fit columns starting from horizontal_scroll so Ratatui never squashes them to width 0
+                let mut visible_indices = Vec::new();
                 let mut widths = Vec::new();
-                for (i, name) in display_names.iter().enumerate() {
-                    let mut max_len = name.len();
-                    for row in &active_tab.query_results {
-                        if let Some(cell) = row.get(active_tab.horizontal_scroll + i) {
+                let mut used_width: usize = 0;
+
+                for col_idx in active_tab.horizontal_scroll..total_cols {
+                    let col_name = &active_tab.column_names[col_idx];
+                    let mut max_len = col_name.len();
+                    // Sample first 50 rows for snappy rendering performance
+                    for row in active_tab.query_results.iter().take(50) {
+                        if let Some(cell) = row.get(col_idx) {
                             max_len = max_len.max(cell.len());
                         }
                     }
-                    widths.push(Constraint::Length((max_len as u16 + 2).min(30)));
+                    let col_w = (max_len + 2).clamp(6, 30);
+
+                    // Always show at least 1 column, then pack as many as fit in available width
+                    if visible_indices.is_empty() || used_width + col_w <= avail_width {
+                        used_width += col_w;
+                        widths.push(Constraint::Length(col_w as u16));
+                        visible_indices.push(col_idx);
+                    } else {
+                        break;
+                    }
                 }
 
-                let header = Row::new(display_names.iter().map(|c| c.as_str())).style(Style::default().add_modifier(Modifier::BOLD));
+                let (start_col, end_col) = if visible_indices.is_empty() {
+                    (0, 0)
+                } else {
+                    (visible_indices[0] + 1, visible_indices.last().unwrap() + 1)
+                };
+
+                let row_info = if active_tab.is_paginated {
+                    let offset = active_tab.pagination_offset;
+                    format!("Rows {} - {}", offset + 1, offset + total_rows)
+                } else {
+                    format!("{} rows", total_rows)
+                };
+
+                let col_info = if total_cols > 0 {
+                    format!(" [Cols {}-{} of {}]", start_col, end_col, total_cols)
+                } else {
+                    String::new()
+                };
+
+                let title = format!(" Results ({}{}) ", row_info, col_info);
+
+                let nav_hint = if total_cols > visible_indices.len() {
+                    " ◄/► Scroll Cols (Shift+◄/► fast, Home/End) | [?] Help "
+                } else {
+                    " [?] Help "
+                };
+
+                let results_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .title_bottom(Line::from(nav_hint).alignment(Alignment::Right))
+                    .border_style(results_border_style);
+
+                let header = Row::new(visible_indices.iter().map(|&i| active_tab.column_names[i].as_str()))
+                    .style(Style::default().add_modifier(Modifier::BOLD));
+
                 let rows: Vec<Row> = active_tab.query_results.iter().map(|r| {
-                    let display_cells = if active_tab.horizontal_scroll < r.len() {
-                        &r[active_tab.horizontal_scroll..]
-                    } else {
-                        &[]
-                    };
-                    Row::new(display_cells.iter().map(|c| c.as_str()))
+                    let display_cells: Vec<&str> = visible_indices.iter()
+                        .map(|&i| r.get(i).map(|s| s.as_str()).unwrap_or(""))
+                        .collect();
+                    Row::new(display_cells)
                 }).collect();
-                
+
                 let table = Table::new(rows, widths).header(header).block(results_block)
                     .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
                 f.render_stateful_widget(table, right_chunks[2], &mut active_tab.results_state);
@@ -462,6 +751,9 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" Ctrl+F    ", Style::default().fg(Color::Cyan)), Span::raw("Format Query")]),
                     Line::from(vec![Span::styled(" Ctrl+Space", Style::default().fg(Color::Cyan)), Span::raw("Autocomplete")]),
                     Line::from(vec![Span::styled(" n / p     ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Page (in Results pane)")]),
+                    Line::from(vec![Span::styled(" r / R     ", Style::default().fg(Color::Cyan)), Span::raw("Refresh Explorer (when in Explorer pane)")]),
+                    Line::from(vec![Span::styled(" ◄ / ►     ", Style::default().fg(Color::Cyan)), Span::raw("Scroll Columns (Shift+◄/► fast)")]),
+                    Line::from(vec![Span::styled(" Home/End  ", Style::default().fg(Color::Cyan)), Span::raw("First/Last Column (in Results pane)")]),
                     Line::from(""),
                     Line::from(vec![Span::styled(" Mouse     ", Style::default().fg(Color::Cyan)), Span::raw("Click tabs/buttons, scroll panes")]),
                 ];
@@ -509,6 +801,7 @@ pub fn run_ide_loop(
         let mut new_tab = false;
         let mut close_tab = false;
         let mut trigger_explorer_action = false;
+        let mut trigger_explorer_refresh = false;
         let mut trigger_pagination: Option<i32> = None;
         let ev = event::read()?;
 
@@ -578,7 +871,10 @@ pub fn run_ide_loop(
                         if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
                             explorer_horizontal_scroll += 1;
                         } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
-                            tabs[active_tab_index].horizontal_scroll += 1;
+                            let max_col = tabs[active_tab_index].column_names.len().saturating_sub(1);
+                            if tabs[active_tab_index].horizontal_scroll < max_col {
+                                tabs[active_tab_index].horizontal_scroll += 1;
+                            }
                         } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
                             tabs[active_tab_index].textarea.scroll((0, 1));
                         }
@@ -650,7 +946,10 @@ pub fn run_ide_loop(
                     if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
                         explorer_horizontal_scroll += 1;
                     } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
-                        tabs[active_tab_index].horizontal_scroll += 1;
+                        let max_col = tabs[active_tab_index].column_names.len().saturating_sub(1);
+                        if tabs[active_tab_index].horizontal_scroll < max_col {
+                            tabs[active_tab_index].horizontal_scroll += 1;
+                        }
                     } else if mouse.row >= current_editor_rect.top() && mouse.row <= current_editor_rect.bottom() && mouse.column >= current_editor_rect.left() && mouse.column <= current_editor_rect.right() {
                         tabs[active_tab_index].textarea.scroll((0, 1));
                     }
@@ -814,6 +1113,8 @@ pub fn run_ide_loop(
                             explorer_horizontal_scroll += 1;
                         } else if key.code == KeyCode::Enter {
                             trigger_explorer_action = true;
+                        } else if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
+                            trigger_explorer_refresh = true;
                         }
                     }
                     FocusPane::Editor => {
@@ -910,11 +1211,22 @@ pub fn run_ide_loop(
                                 }
                             }
                         } else if key.code == KeyCode::Left {
-                            active_tab.horizontal_scroll = active_tab.horizontal_scroll.saturating_sub(1);
+                            if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                                active_tab.horizontal_scroll = active_tab.horizontal_scroll.saturating_sub(5);
+                            } else {
+                                active_tab.horizontal_scroll = active_tab.horizontal_scroll.saturating_sub(1);
+                            }
                         } else if key.code == KeyCode::Right {
-                            if active_tab.horizontal_scroll < active_tab.column_names.len().saturating_sub(1) {
+                            let max_col = active_tab.column_names.len().saturating_sub(1);
+                            if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::CONTROL) {
+                                active_tab.horizontal_scroll = (active_tab.horizontal_scroll + 5).min(max_col);
+                            } else if active_tab.horizontal_scroll < max_col {
                                 active_tab.horizontal_scroll += 1;
                             }
+                        } else if key.code == KeyCode::Home {
+                            active_tab.horizontal_scroll = 0;
+                        } else if key.code == KeyCode::End {
+                            active_tab.horizontal_scroll = active_tab.column_names.len().saturating_sub(1);
                         }
                     }
                 }
@@ -1163,6 +1475,20 @@ pub fn run_ide_loop(
             }
         }
 
+        if trigger_explorer_refresh {
+            let prev_selected = explorer_state.selected();
+            meta = load_explorer_metadata(conn, project_dir, is_quack);
+            dictionary = meta.dictionary.clone();
+            autocomplete_matches.clear();
+            explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+            if let Some(sel) = prev_selected {
+                explorer_state.select(Some(sel.min(explorer_items.len().saturating_sub(1))));
+            } else if !explorer_items.is_empty() {
+                explorer_state.select(Some(0));
+            }
+            status_msg = "Explorer refreshed.".to_string();
+        }
+
         if trigger_explorer_action {
             if let Some(selected) = explorer_state.selected() {
                 if selected < explorer_items.len() {
@@ -1175,30 +1501,25 @@ pub fn run_ide_loop(
                         NodeType::Table | NodeType::View => {
                             if item_expanded {
                                 explorer_items[selected].is_expanded = false;
-                                let mut j = selected + 1;
+                                expanded_tables.remove(&item_name);
+                                let j = selected + 1;
                                 while j < explorer_items.len() && explorer_items[j].level > item_level {
                                     explorer_items.remove(j);
                                 }
                             } else {
                                 explorer_items[selected].is_expanded = true;
+                                expanded_tables.insert(item_name.clone());
+                                let cols = load_table_columns(conn, &item_name, is_quack);
                                 let mut new_nodes = Vec::new();
-                                let safe_name = item_name.replace("'", "''");
-                                if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info('{}')", safe_name)) {
-                                    if let Ok(mut rows) = stmt.query([]) {
-                                        while let Ok(Some(row)) = rows.next() {
-                                            if let Ok(col_name) = row.get::<_, String>(1) {
-                                                let data_type: String = row.get(2).unwrap_or_else(|_| "UNKNOWN".to_string());
-                                                new_nodes.push(ExplorerNode {
-                                                    name: col_name.clone(),
-                                                    display: format!("    └─ {} ({})", col_name, data_type),
-                                                    level: item_level + 1,
-                                                    is_expandable: false,
-                                                    is_expanded: false,
-                                                    node_type: NodeType::Column { data_type },
-                                                });
-                                            }
-                                        }
-                                    }
+                                for (col_name, data_type) in cols {
+                                    new_nodes.push(ExplorerNode {
+                                        name: col_name.clone(),
+                                        display: format!("    └─ {} ({})", col_name, data_type),
+                                        level: item_level + 1,
+                                        is_expandable: false,
+                                        is_expanded: false,
+                                        node_type: NodeType::Column { data_type },
+                                    });
                                 }
                                 for (offset, node) in new_nodes.into_iter().enumerate() {
                                     explorer_items.insert(selected + 1 + offset, node);
@@ -1208,18 +1529,21 @@ pub fn run_ide_loop(
                         NodeType::Group => {
                             if item_expanded {
                                 explorer_items[selected].is_expanded = false;
-                                let mut j = selected + 1;
+                                expanded_groups.remove(&item_name);
+                                let j = selected + 1;
                                 while j < explorer_items.len() && explorer_items[j].level > item_level {
                                     explorer_items.remove(j);
                                 }
                             } else {
                                 explorer_items[selected].is_expanded = true;
+                                expanded_groups.insert(item_name.clone());
                                 let mut new_nodes = Vec::new();
                                 if item_name == "Tables" {
-                                    for t in &tables {
+                                    for t in &meta.tables {
+                                        let count_str = meta.table_counts.get(t).map(|&c| format!(" ({})", format_row_count(c))).unwrap_or_default();
                                         new_nodes.push(ExplorerNode {
                                             name: t.clone(),
-                                            display: format!("  ├─ {}", t),
+                                            display: format!("  ├─ {}{}", t, count_str),
                                             level: 1,
                                             is_expandable: true,
                                             is_expanded: false,
@@ -1227,7 +1551,7 @@ pub fn run_ide_loop(
                                         });
                                     }
                                 } else if item_name == "Views" {
-                                    for v in &views {
+                                    for v in &meta.views {
                                         new_nodes.push(ExplorerNode {
                                             name: v.clone(),
                                             display: format!("  ├─ {}", v),
@@ -1238,7 +1562,7 @@ pub fn run_ide_loop(
                                         });
                                     }
                                 } else if item_name == "Macros" {
-                                    for m in &macros {
+                                    for m in &meta.macros {
                                         new_nodes.push(ExplorerNode {
                                             name: m.clone(),
                                             display: format!("  ├─ {}", m),
@@ -1249,7 +1573,7 @@ pub fn run_ide_loop(
                                         });
                                     }
                                 } else if item_name == "Queries" {
-                                    for q in &queries {
+                                    for q in &meta.queries {
                                         new_nodes.push(ExplorerNode {
                                             name: q.clone(),
                                             display: format!("  ├─ {}", q),
@@ -1475,5 +1799,40 @@ mod tests {
         assert_eq!(format_duckdb_value(Value::Boolean(true)), "true");
         assert_eq!(format_duckdb_value(Value::Int(42)), "42");
         assert_eq!(format_duckdb_value(Value::Text("hello".to_string())), "hello");
+    }
+
+    #[test]
+    fn test_wide_table_column_windowing() {
+        let cols: Vec<String> = (0..217).map(|i| format!("col_{}", i)).collect();
+        let rows: Vec<Vec<String>> = vec![
+            (0..217).map(|i| format!("val_{}", i)).collect(),
+        ];
+
+        let avail_width: usize = 80;
+        let mut visible = Vec::new();
+        let mut used = 0;
+        for i in 0..cols.len() {
+            let col_w = (cols[i].len().max(rows[0][i].len()) + 2).clamp(6, 30);
+            if visible.is_empty() || used + col_w <= avail_width {
+                used += col_w;
+                visible.push(i);
+            } else {
+                break;
+            }
+        }
+        assert!(!visible.is_empty());
+        assert!(visible.len() < cols.len());
+        assert_eq!(visible[0], 0);
+        assert!(used <= avail_width);
+    }
+
+    #[test]
+    fn test_format_row_count() {
+        assert_eq!(format_row_count(0), "0 rows");
+        assert_eq!(format_row_count(1), "1 row");
+        assert_eq!(format_row_count(42), "42 rows");
+        assert_eq!(format_row_count(1000), "1,000 rows");
+        assert_eq!(format_row_count(10000), "10,000 rows");
+        assert_eq!(format_row_count(1234567), "1,234,567 rows");
     }
 }
