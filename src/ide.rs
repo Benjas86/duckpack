@@ -500,6 +500,7 @@ pub fn run_ide_loop(
     let mut schema_ascii_tree = String::new();
     let mut schema_scroll = 0;
     let mut max_schema_scroll = 0;
+    let mut os_clipboard: Option<arboard::Clipboard> = arboard::Clipboard::new().ok();
 
     loop {
         terminal.draw(|f| {
@@ -987,8 +988,11 @@ pub fn run_ide_loop(
 
                 if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     show_schema_visualizer = true;
+                    if os_clipboard.is_none() {
+                        os_clipboard = arboard::Clipboard::new().ok();
+                    }
                     // Generate schema visually here
-                    schema_ascii_tree = generate_schema_visualizer(&db_path).unwrap_or_else(|e| format!("Failed to generate schema visualizer: {}", e));
+                    schema_ascii_tree = generate_schema_visualizer(&db_path, os_clipboard.as_mut()).unwrap_or_else(|e| format!("Failed to generate schema visualizer: {}", e));
                     continue;
                 }
 
@@ -1070,23 +1074,47 @@ pub fn run_ide_loop(
                 // Copy to OS Clipboard
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) && focus == FocusPane::Editor {
                     let active_tab = &mut tabs[active_tab_index];
-                    active_tab.textarea.copy();
-                    let yanked = active_tab.textarea.yank_text();
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        let _ = cb.set_text(yanked);
-                        status_msg = "Copied to clipboard".to_string();
+                    let text_to_copy = if active_tab.textarea.selection_range().is_some() {
+                        active_tab.textarea.copy();
+                        active_tab.textarea.yank_text().to_string()
+                    } else {
+                        // If no selection, copy the current line
+                        let cursor = active_tab.textarea.cursor();
+                        if cursor.0 < active_tab.textarea.lines().len() {
+                            format!("{}\n", active_tab.textarea.lines()[cursor.0])
+                        } else {
+                            active_tab.textarea.copy();
+                            active_tab.textarea.yank_text().to_string()
+                        }
+                    };
+                    if !text_to_copy.is_empty() {
+                        if os_clipboard.is_none() {
+                            os_clipboard = arboard::Clipboard::new().ok();
+                        }
+                        if let Some(cb) = &mut os_clipboard {
+                            if cb.set_text(text_to_copy).is_ok() {
+                                status_msg = "Copied to clipboard".to_string();
+                            }
+                        }
                     }
                     continue;
                 }
 
                 // Paste from OS Clipboard
                 if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) && focus == FocusPane::Editor {
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                    if os_clipboard.is_none() {
+                        os_clipboard = arboard::Clipboard::new().ok();
+                    }
+                    let mut text_opt = None;
+                    if let Some(cb) = &mut os_clipboard {
                         if let Ok(text) = cb.get_text() {
-                            let active_tab = &mut tabs[active_tab_index];
-                            active_tab.textarea.insert_str(&text);
-                            status_msg = "Pasted from clipboard".to_string();
+                            text_opt = Some(text);
                         }
+                    }
+                    if let Some(text) = text_opt {
+                        let active_tab = &mut tabs[active_tab_index];
+                        active_tab.textarea.insert_str(&text);
+                        status_msg = "Pasted from clipboard".to_string();
                     }
                     continue;
                 }
@@ -1714,7 +1742,7 @@ fn format_duckdb_value(v: duckdb::types::Value) -> String {
 }
 
 /// Generates an ASCII tree of the schema and copies a Mermaid diagram to the clipboard.
-fn generate_schema_visualizer(db_str: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn generate_schema_visualizer(db_str: &str, mut os_clipboard: Option<&mut arboard::Clipboard>) -> Result<String, Box<dyn std::error::Error>> {
     let conn = duckdb::Connection::open(db_str)?;
     
     // 1. Get Tables & Columns
@@ -1755,9 +1783,9 @@ fn generate_schema_visualizer(db_str: &str) -> Result<String, Box<dyn std::error
         mermaid.push_str(&format!("    {} }}|--|| {} : \"\"\n", table, ref_table));
     }
     
-    // Use arboard to copy
-    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-        let _ = clipboard.set_text(&mermaid);
+    // Use persistent clipboard to copy
+    if let Some(cb) = os_clipboard.as_deref_mut() {
+        let _ = cb.set_text(&mermaid);
     }
     
     // 4. Generate ASCII Tree
