@@ -100,6 +100,20 @@ pub fn get_schema(conn: &Connection) -> Result<HashMap<String, TableSchema>> {
         });
     }
 
+    if tables.is_empty() {
+        if let Ok(mut q_stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, COALESCE(sql, '/* Remote table: ' || table_name || ' */') FROM target_db.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false')") {
+            if let Ok(rows) = q_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                for row in rows.flatten() {
+                    let (table_name, sql) = row;
+                    tables.insert(table_name, TableSchema {
+                        create_sql: sql,
+                        columns: HashMap::new(),
+                    });
+                }
+            }
+        }
+    }
+
     let mut col_stmt = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type FROM duckdb_columns() WHERE internal = false")?;
     let col_rows = col_stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
@@ -109,6 +123,20 @@ pub fn get_schema(conn: &Connection) -> Result<HashMap<String, TableSchema>> {
         let (table_name, column_name, data_type) = row?;
         if let Some(table) = tables.get_mut(&table_name) {
             table.columns.insert(column_name, data_type);
+        }
+    }
+
+    let any_col_empty = tables.values().any(|t| t.columns.is_empty());
+    if any_col_empty {
+        if let Ok(mut q_col_stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type FROM target_db.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false')") {
+            if let Ok(q_col_rows) = q_col_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))) {
+                for row in q_col_rows.flatten() {
+                    let (table_name, column_name, data_type) = row;
+                    if let Some(table) = tables.get_mut(&table_name) {
+                        table.columns.insert(column_name, data_type);
+                    }
+                }
+            }
         }
     }
     
@@ -126,6 +154,16 @@ pub fn get_views(conn: &Connection) -> Result<HashMap<String, String>> {
     for row in rows {
         let (name, sql) = row?;
         views.insert(name, sql);
+    }
+    if views.is_empty() {
+        if let Ok(mut q_stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, COALESCE(sql, '/* Remote view: ' || view_name || ' */') FROM target_db.query('SELECT schema_name, view_name, sql FROM duckdb_views() WHERE internal = false')") {
+            if let Ok(rows) = q_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                for row in rows.flatten() {
+                    let (name, sql) = row;
+                    views.insert(name, sql);
+                }
+            }
+        }
     }
     Ok(views)
 }
@@ -151,6 +189,15 @@ pub fn get_schemas(conn: &Connection) -> Result<std::collections::HashSet<String
     let mut schemas = std::collections::HashSet::new();
     for row in rows {
         schemas.insert(row?);
+    }
+    if schemas.is_empty() {
+        if let Ok(mut q_stmt) = conn.prepare("SELECT schema_name FROM target_db.query('SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN (''information_schema'', ''pg_catalog'', ''main'')')") {
+            if let Ok(rows) = q_stmt.query_map([], |row| Ok(row.get::<_, String>(0)?)) {
+                for row in rows.flatten() {
+                    schemas.insert(row);
+                }
+            }
+        }
     }
     Ok(schemas)
 }
