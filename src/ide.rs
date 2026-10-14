@@ -452,6 +452,102 @@ fn rebuild_explorer_nodes(
     items
 }
 
+/// Checks if a query snippet begins with or contains the `-- @remote` directive.
+pub fn is_remote_directive_query(query: &str) -> bool {
+    query.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.eq_ignore_ascii_case("-- @remote")
+            || trimmed.eq_ignore_ascii_case("--@remote")
+            || trimmed.to_lowercase().starts_with("-- @remote ")
+            || trimmed.to_lowercase().starts_with("--@remote ")
+            || trimmed.eq_ignore_ascii_case("-- [remote]")
+    })
+}
+
+/// Strips the `-- @remote` directive and wraps the query for remote execution on target_db.
+pub fn wrap_remote_query(query: &str) -> (String, bool) {
+    let stripped_lines: Vec<&str> = query
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.eq_ignore_ascii_case("-- @remote")
+                || trimmed.eq_ignore_ascii_case("--@remote")
+                || trimmed.to_lowercase().starts_with("-- @remote ")
+                || trimmed.to_lowercase().starts_with("--@remote ")
+                || trimmed.eq_ignore_ascii_case("-- [remote]"))
+        })
+        .collect();
+    let stripped = stripped_lines.join("\n");
+    let trimmed = stripped.trim();
+    let clean_stripped = trimmed.strip_suffix(';').unwrap_or(trimmed);
+    let lower = clean_stripped.to_lowercase();
+    let is_select = lower.starts_with("select")
+        || lower.starts_with("with")
+        || lower.starts_with("values")
+        || lower.starts_with("from");
+
+    let escaped = clean_stripped.replace("'", "''");
+    let wrapped = if is_select {
+        format!("SELECT * FROM query('{}')", escaped)
+    } else {
+        format!("FROM query('{}');", escaped)
+    };
+    (wrapped, is_select)
+}
+
+/// Checks if an unadorned statement executed on a remote connection appears to be a secret or session setting.
+pub fn is_unadorned_secret_or_setting(query: &str) -> bool {
+    let lower = query.trim().to_lowercase();
+    let mut clean_lower = lower.as_str();
+    loop {
+        if clean_lower.starts_with("--") {
+            if let Some(idx) = clean_lower.find('\n') {
+                clean_lower = clean_lower[idx..].trim_start();
+            } else {
+                clean_lower = "";
+            }
+        } else if clean_lower.starts_with("/*") {
+            if let Some(idx) = clean_lower.find("*/") {
+                clean_lower = clean_lower[idx+2..].trim_start();
+            } else {
+                clean_lower = "";
+            }
+        } else {
+            break;
+        }
+    }
+    (clean_lower.starts_with("create secret")
+        || clean_lower.starts_with("create persistent secret")
+        || clean_lower.starts_with("create temporary secret")
+        || clean_lower.starts_with("drop secret")
+        || clean_lower.starts_with("set s3_")
+        || clean_lower.starts_with("set aws_")
+        || clean_lower.starts_with("install ")
+        || clean_lower.starts_with("load "))
+        && !clean_lower.contains("query(")
+        && !clean_lower.contains("in motherduck")
+}
+
+/// Generates a diagnostic hint if an error message on a remote database indicates cloud storage or credential issues.
+pub fn diagnose_remote_credential_error(err_str: &str, is_remote: bool) -> &'static str {
+    if !is_remote {
+        return "";
+    }
+    let lower = err_str.to_lowercase();
+    if lower.contains("s3")
+        || lower.contains("403")
+        || lower.contains("access denied")
+        || lower.contains("no credentials")
+        || lower.contains("credential")
+        || lower.contains("missing secret")
+        || lower.contains("forbidden")
+    {
+        " [Hint: Missing S3 secret on remote Quack? Add '-- @remote' above your CREATE SECRET]"
+    } else {
+        ""
+    }
+}
+
 /// The main execution loop for the IDE/Explorer feature.
 /// Handles rendering the UI layout, capturing keyboard/mouse events, managing tabs,
 /// and securely executing raw DuckDB queries from the active text buffer.
@@ -468,6 +564,18 @@ pub fn run_ide_loop(
     let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
 
     let is_quack = db_path.starts_with("quack:");
+    let is_remote_db = is_quack || db_path.starts_with("md:") || db_path.starts_with("motherduck:");
+
+    let local_duckdb_version: String = conn
+        .query_row("SELECT version();", [], |r| r.get(0))
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let remote_duckdb_version: Option<String> = if is_remote_db {
+        conn.query_row("SELECT * FROM query('target_db', 'SELECT version()');", [], |r| r.get(0))
+            .ok()
+    } else {
+        None
+    };
 
     let mut meta = load_explorer_metadata(conn, project_dir, is_quack);
     let mut expanded_groups: HashSet<String> = vec!["Tables", "Views", "Macros", "Queries"]
@@ -510,10 +618,15 @@ pub fn run_ide_loop(
                 .split(f.area());
 
             let ssh_prefix = if std::env::var("SSH_CLIENT").is_ok() { "[SSH Remote] " } else { "" };
+            let version_badge = if let Some(ref r_ver) = remote_duckdb_version {
+                format!(" (Remote: {} | Local: {})", r_ver, local_duckdb_version)
+            } else {
+                format!(" ({})", local_duckdb_version)
+            };
             let top_header = Paragraph::new("")
                 .block(Block::default().borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .title_top(Line::from(format!(" Target DB: {}{} ", ssh_prefix, db_path)).alignment(Alignment::Right).style(Style::default().fg(Color::Cyan)))
+                    .title_top(Line::from(format!(" Target DB: {}{}{} ", ssh_prefix, db_path, version_badge)).alignment(Alignment::Right).style(Style::default().fg(Color::Cyan)))
                     .title_top(Line::from(format!(" DuckPack v{} ", env!("CARGO_PKG_VERSION"))).alignment(Alignment::Center).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
                 );
             f.render_widget(top_header, main_chunks[0]);
@@ -733,10 +846,10 @@ pub fn run_ide_loop(
 
             if show_help {
                 let popup_area = ratatui::layout::Rect {
-                    x: f.area().width / 4,
-                    y: f.area().height / 4,
-                    width: f.area().width / 2,
-                    height: f.area().height / 2,
+                    x: f.area().width / 6,
+                    y: f.area().height / 6,
+                    width: f.area().width * 2 / 3,
+                    height: (f.area().height * 2 / 3).max(18),
                 };
                 f.render_widget(ratatui::widgets::Clear, popup_area);
                 
@@ -756,6 +869,8 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" r / R     ", Style::default().fg(Color::Cyan)), Span::raw("Refresh Explorer (when in Explorer pane)")]),
                     Line::from(vec![Span::styled(" ◄ / ►     ", Style::default().fg(Color::Cyan)), Span::raw("Scroll Columns (Shift+◄/► fast)")]),
                     Line::from(vec![Span::styled(" Home/End  ", Style::default().fg(Color::Cyan)), Span::raw("First/Last Column (in Results pane)")]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(" -- @remote", Style::default().fg(Color::Yellow)), Span::raw("Add at top of query to execute on remote Quack server (e.g. CREATE SECRET)")]),
                     Line::from(""),
                     Line::from(vec![Span::styled(" Mouse     ", Style::default().fg(Color::Cyan)), Span::raw("Click tabs/buttons, scroll panes")]),
                 ];
@@ -1398,37 +1513,42 @@ pub fn run_ide_loop(
                 active_tab.textarea.set_search_pattern("(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b").unwrap_or(());
                 active_tab.textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
-                let mut clean_lower = query_to_execute.trim().to_lowercase();
-                loop {
-                    if clean_lower.starts_with("--") {
-                        if let Some(idx) = clean_lower.find('\n') {
-                            clean_lower = clean_lower[idx..].trim_start().to_string();
+                let is_explicit_remote = is_remote_directive_query(&query_to_execute);
+                let (exec_query, is_paginatable) = if is_explicit_remote {
+                    wrap_remote_query(&query_to_execute)
+                } else {
+                    let mut clean_lower = query_to_execute.trim().to_lowercase();
+                    loop {
+                        if clean_lower.starts_with("--") {
+                            if let Some(idx) = clean_lower.find('\n') {
+                                clean_lower = clean_lower[idx..].trim_start().to_string();
+                            } else {
+                                clean_lower = String::new();
+                            }
+                        } else if clean_lower.starts_with("/*") {
+                            if let Some(idx) = clean_lower.find("*/") {
+                                clean_lower = clean_lower[idx+2..].trim_start().to_string();
+                            } else {
+                                clean_lower = String::new();
+                            }
                         } else {
-                            clean_lower = String::new();
+                            break;
                         }
-                    } else if clean_lower.starts_with("/*") {
-                        if let Some(idx) = clean_lower.find("*/") {
-                            clean_lower = clean_lower[idx+2..].trim_start().to_string();
-                        } else {
-                            clean_lower = String::new();
-                        }
-                    } else {
-                        break;
                     }
-                }
-                
-                let is_paginatable = clean_lower.starts_with("select") || clean_lower.starts_with("with") || clean_lower.starts_with("values") || clean_lower.starts_with("from");
+                    let is_pag = clean_lower.starts_with("select") || clean_lower.starts_with("with") || clean_lower.starts_with("values") || clean_lower.starts_with("from");
+                    (query_to_execute.clone(), is_pag)
+                };
                 
                 let final_query = if is_paginatable {
                     active_tab.is_paginated = true;
-                    let clean_query = query_to_execute.trim().strip_suffix(';').unwrap_or(query_to_execute.trim());
+                    let clean_query = exec_query.trim().strip_suffix(';').unwrap_or(exec_query.trim());
                     format!("SELECT * FROM ({}) LIMIT {} OFFSET {}", clean_query, active_tab.pagination_limit, active_tab.pagination_offset)
                 } else {
                     active_tab.is_paginated = false;
-                    query_to_execute.clone()
+                    exec_query.clone()
                 };
 
-                let _ = std::fs::write("debug_query.txt", format!("query: {}\nclean: {}\npag: {}\nfinal: {}", query_to_execute, clean_lower, is_paginatable, final_query));
+                let _ = std::fs::write("debug_query.txt", format!("query: {}\nremote: {}\npag: {}\nfinal: {}", query_to_execute, is_explicit_remote, is_paginatable, final_query));
 
                 match conn.prepare(&final_query) {
                     Ok(mut stmt) => {
@@ -1462,7 +1582,17 @@ pub fn run_ide_loop(
                                 active_tab.results_state.select(Some(0));
                                 active_tab.horizontal_scroll = 0;
                                 let elapsed = start_time.elapsed();
-                                status_msg = format!("Query executed successfully. Returned {} rows in {:.2?}.", count, elapsed);
+                                if is_explicit_remote {
+                                    if count > 0 {
+                                        status_msg = format!("Remote statement executed on target_db. Returned {} rows in {:.2?}.", count, elapsed);
+                                    } else {
+                                        status_msg = format!("Remote statement executed successfully on target_db in {:.2?}.", elapsed);
+                                    }
+                                } else if is_remote_db && is_unadorned_secret_or_setting(&query_to_execute) {
+                                    status_msg = "⚠️ Applied LOCALLY on DuckPack! Use '-- @remote' at top of query to apply to remote Quack.".to_string();
+                                } else {
+                                    status_msg = format!("Query executed successfully. Returned {} rows in {:.2?}.", count, elapsed);
+                                }
 
                                 let history_path = queries_dir.join(".history.sql");
                                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -1483,7 +1613,8 @@ pub fn run_ide_loop(
                                         }
                                     }
                                 }
-                                status_msg = format!("Execution Error: {}", e);
+                                let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
+                                status_msg = format!("Execution Error: {}{}", e, diag);
                             }
                         }
                     }
@@ -1498,7 +1629,8 @@ pub fn run_ide_loop(
                                 }
                             }
                         }
-                        status_msg = format!("Prepare Error: {}", e);
+                        let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
+                        status_msg = format!("Prepare Error: {}{}", e, diag);
                     }
                 }
             }
@@ -1863,5 +1995,46 @@ mod tests {
         assert_eq!(format_row_count(1000), "1,000 rows");
         assert_eq!(format_row_count(10000), "10,000 rows");
         assert_eq!(format_row_count(1234567), "1,234,567 rows");
+    }
+
+    #[test]
+    fn test_remote_directive_query() {
+        assert!(is_remote_directive_query("-- @remote\nCREATE SECRET my_s3..."));
+        assert!(is_remote_directive_query("--@remote\nSELECT 1;"));
+        assert!(is_remote_directive_query("-- @remote (s3)\nSELECT 1;"));
+        assert!(is_remote_directive_query("/* comment */\n-- @remote\nSET s3_region='us-east-1';"));
+        assert!(!is_remote_directive_query("SELECT 1;"));
+        assert!(!is_remote_directive_query("-- regular comment\nCREATE SECRET foo;"));
+    }
+
+    #[test]
+    fn test_wrap_remote_query() {
+        let (ddl, is_select) = wrap_remote_query("-- @remote\nCREATE SECRET my_s3 (TYPE S3, KEY_ID 'foo', SECRET 'bar');");
+        assert!(!is_select);
+        assert_eq!(ddl, "FROM query('CREATE SECRET my_s3 (TYPE S3, KEY_ID ''foo'', SECRET ''bar'')');");
+
+        let (query, is_select) = wrap_remote_query("-- @remote\nSELECT * FROM 's3://bucket/test.parquet';");
+        assert!(is_select);
+        assert_eq!(query, "SELECT * FROM query('SELECT * FROM ''s3://bucket/test.parquet''')");
+    }
+
+    #[test]
+    fn test_is_unadorned_secret_or_setting() {
+        assert!(is_unadorned_secret_or_setting("CREATE SECRET s3 (TYPE S3);"));
+        assert!(is_unadorned_secret_or_setting("CREATE PERSISTENT SECRET s3 (TYPE S3);"));
+        assert!(is_unadorned_secret_or_setting("DROP SECRET s3;"));
+        assert!(is_unadorned_secret_or_setting("SET s3_region = 'us-east-1';"));
+        assert!(is_unadorned_secret_or_setting("-- comment\nCREATE SECRET s3;"));
+        assert!(!is_unadorned_secret_or_setting("SELECT * FROM query('target_db', 'CREATE SECRET s3');"));
+        assert!(!is_unadorned_secret_or_setting("CREATE TABLE foo AS SELECT 1;"));
+        assert!(!is_unadorned_secret_or_setting("SELECT * FROM s3_table;"));
+    }
+
+    #[test]
+    fn test_diagnose_remote_credential_error() {
+        assert!(diagnose_remote_credential_error("IO Error: HTTP 403 (Access Denied)", true).contains("Missing S3 secret"));
+        assert!(diagnose_remote_credential_error("No credentials found for S3", true).contains("Missing S3 secret"));
+        assert_eq!(diagnose_remote_credential_error("syntax error at or near 'SELECT'", true), "");
+        assert_eq!(diagnose_remote_credential_error("IO Error: HTTP 403", false), "");
     }
 }
