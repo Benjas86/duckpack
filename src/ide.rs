@@ -1,11 +1,12 @@
 use anyhow::Result;
+use base64::Engine;
 use duckdb::Connection;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton},
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, List, ListItem, ListState, Paragraph, Row, Table, Tabs},
+    widgets::{Block, Borders, BorderType, List, ListItem, ListState, Padding, Paragraph, Row, Table, Tabs, Wrap},
     Terminal,
 };
 use std::collections::{HashMap, HashSet};
@@ -452,6 +453,261 @@ fn rebuild_explorer_nodes(
     items
 }
 
+/// Checks if a query snippet begins with or contains the `-- @remote` directive.
+pub fn is_remote_directive_query(query: &str) -> bool {
+    query.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.eq_ignore_ascii_case("-- @remote")
+            || trimmed.eq_ignore_ascii_case("--@remote")
+            || trimmed.to_lowercase().starts_with("-- @remote ")
+            || trimmed.to_lowercase().starts_with("--@remote ")
+            || trimmed.eq_ignore_ascii_case("-- [remote]")
+    })
+}
+
+/// Strips the `-- @remote` directive and wraps the query for remote execution on target_db.
+pub fn wrap_remote_query(query: &str) -> (String, bool) {
+    let stripped_lines: Vec<&str> = query
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.eq_ignore_ascii_case("-- @remote")
+                || trimmed.eq_ignore_ascii_case("--@remote")
+                || trimmed.to_lowercase().starts_with("-- @remote ")
+                || trimmed.to_lowercase().starts_with("--@remote ")
+                || trimmed.eq_ignore_ascii_case("-- [remote]"))
+        })
+        .collect();
+    let stripped = stripped_lines.join("\n");
+    let trimmed = stripped.trim();
+    let clean_stripped = trimmed.strip_suffix(';').unwrap_or(trimmed);
+    let lower = clean_stripped.to_lowercase();
+    let is_select = lower.starts_with("select")
+        || lower.starts_with("with")
+        || lower.starts_with("values")
+        || lower.starts_with("from");
+
+    let escaped = clean_stripped.replace("'", "''");
+    let wrapped = if is_select {
+        format!("SELECT * FROM query('{}')", escaped)
+    } else {
+        format!("FROM query('{}');", escaped)
+    };
+    (wrapped, is_select)
+}
+
+/// Checks if an unadorned statement executed on a remote connection appears to be a secret or session setting.
+pub fn is_unadorned_secret_or_setting(query: &str) -> bool {
+    let lower = query.trim().to_lowercase();
+    let mut clean_lower = lower.as_str();
+    loop {
+        if clean_lower.starts_with("--") {
+            if let Some(idx) = clean_lower.find('\n') {
+                clean_lower = clean_lower[idx..].trim_start();
+            } else {
+                clean_lower = "";
+            }
+        } else if clean_lower.starts_with("/*") {
+            if let Some(idx) = clean_lower.find("*/") {
+                clean_lower = clean_lower[idx+2..].trim_start();
+            } else {
+                clean_lower = "";
+            }
+        } else {
+            break;
+        }
+    }
+    (clean_lower.starts_with("create secret")
+        || clean_lower.starts_with("create persistent secret")
+        || clean_lower.starts_with("create temporary secret")
+        || clean_lower.starts_with("drop secret")
+        || clean_lower.starts_with("set s3_")
+        || clean_lower.starts_with("set aws_")
+        || clean_lower.starts_with("install ")
+        || clean_lower.starts_with("load "))
+        && !clean_lower.contains("query(")
+        && !clean_lower.contains("in motherduck")
+}
+
+/// Generates a diagnostic hint if an error message on a remote database indicates cloud storage, credential, or Quack streaming scan limitations.
+pub fn diagnose_remote_credential_error(err_str: &str, is_remote: bool) -> &'static str {
+    if !is_remote {
+        return "";
+    }
+    let lower = err_str.to_lowercase();
+    if lower.contains("multiple streaming scans") || lower.contains("streaming scans + ctas") {
+        " [Hint: Quack protocol limitation. Add '-- @remote' above query to execute server-side!]"
+    } else if lower.contains("s3")
+        || lower.contains("403")
+        || lower.contains("access denied")
+        || lower.contains("no credentials")
+        || lower.contains("credential")
+        || lower.contains("missing secret")
+        || lower.contains("forbidden")
+    {
+        " [Hint: Missing S3 secret on remote Quack? Add '-- @remote' above your CREATE SECRET]"
+    } else {
+        ""
+    }
+}
+
+/// Dynamically calculates the required vertical height of the status bar pane
+/// based on the length and line wraps of the status message.
+pub fn calculate_status_height(status_msg: &str, content_width: usize, total_height: u16) -> u16 {
+    let status_inner_width = content_width.saturating_sub(4).max(20);
+    let status_line_count: usize = status_msg
+        .split('\n')
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars == 0 {
+                1
+            } else {
+                (chars + status_inner_width - 1) / status_inner_width
+            }
+        })
+        .sum();
+    let max_status_height = (total_height / 3).clamp(3, 8);
+    ((status_line_count as u16) + 2).clamp(3, max_status_height)
+}
+
+/// Sets the clipboard text across multiple channels for maximum compatibility:
+/// 1. `wl-copy` on Wayland sessions
+/// 2. `xclip` on X11 sessions
+/// 3. `arboard` (Wayland data-control & X11)
+/// 4. OSC 52 ANSI escape sequence for terminal clipboard sync
+pub fn set_clipboard_text(text: &str, os_clipboard: &mut Option<arboard::Clipboard>) -> bool {
+    let mut success = false;
+
+    // 1. Wayland CLI (wl-copy)
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        let res = if text.len() < 65536 {
+            std::process::Command::new("wl-copy").arg("--").arg(text).status()
+        } else {
+            std::process::Command::new("wl-copy")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(text.as_bytes());
+                        drop(stdin);
+                    }
+                    child.wait()
+                })
+        };
+        if let Ok(status) = res {
+            if status.success() {
+                success = true;
+            }
+        }
+    }
+
+    // 2. X11 CLI (xclip) if not Wayland or as secondary
+    if !success && std::env::var_os("DISPLAY").is_some() {
+        if let Ok(mut child) = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if let Ok(status) = child.wait() {
+                if status.success() {
+                    success = true;
+                }
+            }
+        }
+    }
+
+    // 3. Native arboard
+    if os_clipboard.is_none() {
+        *os_clipboard = arboard::Clipboard::new().ok();
+    }
+    if let Some(cb) = os_clipboard {
+        if cb.set_text(text).is_ok() {
+            success = true;
+        }
+    }
+
+    // 4. Terminal OSC 52 sequence (universal across SSH, Wayland, X11, macOS, etc.)
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    use std::io::Write;
+    let _ = write!(std::io::stdout(), "\x1b]52;c;{}\x07", encoded);
+    let _ = std::io::stdout().flush();
+
+    success || true
+}
+
+/// Reads clipboard text from system clipboard, checking wl-paste, arboard, and xclip.
+pub fn get_clipboard_text(os_clipboard: &mut Option<arboard::Clipboard>) -> Option<String> {
+    // 1. Try Wayland CLI (wl-paste) first if Wayland session
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if let Ok(output) = std::process::Command::new("wl-paste")
+            .args(["--no-newline"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(text) = String::from_utf8(output.stdout) {
+                    if !text.is_empty() {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Try native arboard
+    if os_clipboard.is_none() {
+        *os_clipboard = arboard::Clipboard::new().ok();
+    }
+    if let Some(cb) = os_clipboard {
+        if let Ok(text) = cb.get_text() {
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    // 3. Try X11 CLI (xclip)
+    if let Ok(output) = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard", "-o"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Refreshes the attached remote database catalog so that the client's internal planner and
+/// explorer immediately see any new tables, views, or schema changes created on the server.
+pub fn refresh_attached_catalog(conn: &Connection, db_path: &str) {
+    if db_path.starts_with("quack:") {
+        let disable_ssl = crate::should_disable_quack_ssl(db_path, false);
+        let attach_sql = crate::build_quack_attach_sql(db_path, disable_ssl);
+        let _ = conn.execute("USE memory;", []);
+        let _ = conn.execute("DETACH target_db;", []);
+        let _ = conn.execute(&attach_sql, []);
+        let _ = conn.execute("USE target_db;", []);
+    } else if db_path.starts_with("md:") || db_path.starts_with("motherduck:") {
+        let _ = conn.execute("REFRESH DATABASES;", []);
+    } else {
+        let safe_db = db_path.replace("'", "''");
+        let _ = conn.execute("USE memory;", []);
+        let _ = conn.execute("DETACH target_db;", []);
+        let _ = conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), []);
+        let _ = conn.execute("USE target_db;", []);
+    }
+}
+
 /// The main execution loop for the IDE/Explorer feature.
 /// Handles rendering the UI layout, capturing keyboard/mouse events, managing tabs,
 /// and securely executing raw DuckDB queries from the active text buffer.
@@ -468,6 +724,18 @@ pub fn run_ide_loop(
     let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
 
     let is_quack = db_path.starts_with("quack:");
+    let is_remote_db = is_quack || db_path.starts_with("md:") || db_path.starts_with("motherduck:");
+
+    let local_duckdb_version: String = conn
+        .query_row("SELECT version();", [], |r| r.get(0))
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let remote_duckdb_version: Option<String> = if is_remote_db {
+        conn.query_row("SELECT * FROM query('target_db', 'SELECT version()');", [], |r| r.get(0))
+            .ok()
+    } else {
+        None
+    };
 
     let mut meta = load_explorer_metadata(conn, project_dir, is_quack);
     let mut expanded_groups: HashSet<String> = vec!["Tables", "Views", "Macros", "Queries"]
@@ -495,11 +763,13 @@ pub fn run_ide_loop(
     let mut current_explorer_rect = Rect::default();
     let mut current_tabs_rect = Rect::default();
     let mut current_results_rect = Rect::default();
+    let mut current_status_rect = Rect::default();
     let mut show_help = false;
     let mut show_schema_visualizer = false;
     let mut schema_ascii_tree = String::new();
     let mut schema_scroll = 0;
     let mut max_schema_scroll = 0;
+    let mut os_clipboard: Option<arboard::Clipboard> = arboard::Clipboard::new().ok();
 
     loop {
         terminal.draw(|f| {
@@ -509,10 +779,15 @@ pub fn run_ide_loop(
                 .split(f.area());
 
             let ssh_prefix = if std::env::var("SSH_CLIENT").is_ok() { "[SSH Remote] " } else { "" };
+            let version_badge = if let Some(ref r_ver) = remote_duckdb_version {
+                format!(" (Remote: {} | Local: {})", r_ver, local_duckdb_version)
+            } else {
+                format!(" ({})", local_duckdb_version)
+            };
             let top_header = Paragraph::new("")
                 .block(Block::default().borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .title_top(Line::from(format!(" Target DB: {}{} ", ssh_prefix, db_path)).alignment(Alignment::Right).style(Style::default().fg(Color::Cyan)))
+                    .title_top(Line::from(format!(" Target DB: {}{}{} ", ssh_prefix, db_path, version_badge)).alignment(Alignment::Right).style(Style::default().fg(Color::Cyan)))
                     .title_top(Line::from(format!(" DuckPack v{} ", env!("CARGO_PKG_VERSION"))).alignment(Alignment::Center).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
                 );
             f.render_widget(top_header, main_chunks[0]);
@@ -522,9 +797,12 @@ pub fn run_ide_loop(
                 .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
                 .split(main_chunks[1]);
 
+            let is_error_status = status_msg.contains("Error") || status_msg.contains("⚠️") || status_msg.contains("Failed");
+            let status_height = calculate_status_height(&status_msg, chunks[1].width as usize, chunks[1].height);
+
             let right_chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Percentage(45), Constraint::Length(2)].as_ref())
+                .constraints([Constraint::Length(3), Constraint::Min(8), Constraint::Percentage(45), Constraint::Length(status_height)].as_ref())
                 .split(chunks[1]);
 
             let max_item_width = explorer_items.iter().map(|item| {
@@ -732,10 +1010,10 @@ pub fn run_ide_loop(
 
             if show_help {
                 let popup_area = ratatui::layout::Rect {
-                    x: f.area().width / 4,
-                    y: f.area().height / 4,
-                    width: f.area().width / 2,
-                    height: f.area().height / 2,
+                    x: f.area().width / 6,
+                    y: f.area().height / 6,
+                    width: f.area().width * 2 / 3,
+                    height: (f.area().height * 2 / 3).max(18),
                 };
                 f.render_widget(ratatui::widgets::Clear, popup_area);
                 
@@ -746,7 +1024,8 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" Ctrl+W    ", Style::default().fg(Color::Cyan)), Span::raw("Close Tab")]),
                     Line::from(vec![Span::styled(" Ctrl+N/P  ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Tab")]),
                     Line::from(vec![Span::styled(" Ctrl+E/F5 ", Style::default().fg(Color::Cyan)), Span::raw("Execute Query (or selected text)")]),
-                    Line::from(vec![Span::styled(" Ctrl+V    ", Style::default().fg(Color::Cyan)), Span::raw("Visualize Schema")]),
+                    Line::from(vec![Span::styled(" Ctrl+G    ", Style::default().fg(Color::Cyan)), Span::raw("Visualize Schema (Graph)")]),
+                    Line::from(vec![Span::styled(" Ctrl+C/V  ", Style::default().fg(Color::Cyan)), Span::raw("Copy / Paste")]),
                     Line::from(vec![Span::styled(" Ctrl+S    ", Style::default().fg(Color::Cyan)), Span::raw("Save Query")]),
                     Line::from(vec![Span::styled(" Ctrl+F    ", Style::default().fg(Color::Cyan)), Span::raw("Format Query")]),
                     Line::from(vec![Span::styled(" Ctrl+Space", Style::default().fg(Color::Cyan)), Span::raw("Autocomplete")]),
@@ -754,6 +1033,8 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" r / R     ", Style::default().fg(Color::Cyan)), Span::raw("Refresh Explorer (when in Explorer pane)")]),
                     Line::from(vec![Span::styled(" ◄ / ►     ", Style::default().fg(Color::Cyan)), Span::raw("Scroll Columns (Shift+◄/► fast)")]),
                     Line::from(vec![Span::styled(" Home/End  ", Style::default().fg(Color::Cyan)), Span::raw("First/Last Column (in Results pane)")]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(" -- @remote", Style::default().fg(Color::Yellow)), Span::raw("Add at top of query to execute on remote Quack server (e.g. CREATE SECRET)")]),
                     Line::from(""),
                     Line::from(vec![Span::styled(" Mouse     ", Style::default().fg(Color::Cyan)), Span::raw("Click tabs/buttons, scroll panes")]),
                 ];
@@ -788,9 +1069,39 @@ pub fn run_ide_loop(
             }
 
             // Status Bar
-            let status = Paragraph::new(format!(" {}", status_msg))
-                .style(Style::default().fg(Color::Black).bg(Color::Cyan));
+            let status_title = if status_msg.starts_with("📋 [Copied] ") {
+                " Status [Copied to clipboard! 📋] "
+            } else if is_error_status {
+                " Status / Error [Click box to copy 📋] "
+            } else {
+                " Status [Click box to copy 📋] "
+            };
+
+            let status_block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .padding(Padding::horizontal(1))
+                .border_style(if is_error_status {
+                    Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                })
+                .title(Line::from(status_title).style(if is_error_status {
+                    Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                }));
+
+            let status = Paragraph::new(status_msg.as_str())
+                .block(status_block)
+                .style(if is_error_status {
+                    Style::default().fg(Color::LightRed)
+                } else {
+                    Style::default().fg(Color::White)
+                })
+                .wrap(Wrap { trim: false });
             f.render_widget(status, right_chunks[3]);
+            current_status_rect = right_chunks[3];
 
         })?;
 
@@ -808,7 +1119,22 @@ pub fn run_ide_loop(
         match ev {
             Event::Mouse(mouse) => {
                 if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                    if mouse.row == current_editor_rect.bottom().saturating_sub(1) {
+                    if mouse.row >= current_status_rect.top() && mouse.row < current_status_rect.bottom()
+                        && mouse.column >= current_status_rect.left() && mouse.column < current_status_rect.right()
+                    {
+                        let clean_text = if let Some(stripped) = status_msg.strip_prefix("📋 [Copied] ") {
+                            stripped.to_string()
+                        } else {
+                            status_msg.clone()
+                        };
+                        if !clean_text.is_empty() {
+                            if set_clipboard_text(&clean_text, &mut os_clipboard) {
+                                if !status_msg.starts_with("📋 [Copied] ") {
+                                    status_msg = format!("📋 [Copied] {}", status_msg);
+                                }
+                            }
+                        }
+                    } else if mouse.row == current_editor_rect.bottom().saturating_sub(1) {
                         if mouse.column >= current_editor_rect.right().saturating_sub(15) && mouse.column <= current_editor_rect.right() {
                             execute_query = true;
                         }
@@ -984,10 +1310,10 @@ pub fn run_ide_loop(
                     continue;
                 }
 
-                if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     show_schema_visualizer = true;
-                    // Generate schema visually here
-                    schema_ascii_tree = generate_schema_visualizer(&db_path).unwrap_or_else(|e| format!("Failed to generate schema visualizer: {}", e));
+                    schema_scroll = 0;
+                    schema_ascii_tree = generate_schema_visualizer(&db_path, &mut os_clipboard).unwrap_or_else(|e| format!("Failed to generate schema visualizer: {}", e));
                     continue;
                 }
 
@@ -1069,23 +1395,33 @@ pub fn run_ide_loop(
                 // Copy to OS Clipboard
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) && focus == FocusPane::Editor {
                     let active_tab = &mut tabs[active_tab_index];
-                    active_tab.textarea.copy();
-                    let yanked = active_tab.textarea.yank_text();
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        let _ = cb.set_text(yanked);
-                        status_msg = "Copied to clipboard".to_string();
+                    let text_to_copy = if active_tab.textarea.selection_range().is_some() {
+                        active_tab.textarea.copy();
+                        active_tab.textarea.yank_text().to_string()
+                    } else {
+                        // If no selection, copy the current line
+                        let cursor = active_tab.textarea.cursor();
+                        if cursor.0 < active_tab.textarea.lines().len() {
+                            format!("{}\n", active_tab.textarea.lines()[cursor.0])
+                        } else {
+                            active_tab.textarea.copy();
+                            active_tab.textarea.yank_text().to_string()
+                        }
+                    };
+                    if !text_to_copy.is_empty() {
+                        if set_clipboard_text(&text_to_copy, &mut os_clipboard) {
+                            status_msg = "Copied to clipboard".to_string();
+                        }
                     }
                     continue;
                 }
 
                 // Paste from OS Clipboard
                 if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) && focus == FocusPane::Editor {
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        if let Ok(text) = cb.get_text() {
-                            let active_tab = &mut tabs[active_tab_index];
-                            active_tab.textarea.insert_str(&text);
-                            status_msg = "Pasted from clipboard".to_string();
-                        }
+                    if let Some(text) = get_clipboard_text(&mut os_clipboard) {
+                        let active_tab = &mut tabs[active_tab_index];
+                        active_tab.textarea.insert_str(&text);
+                        status_msg = "Pasted from clipboard".to_string();
                     }
                     continue;
                 }
@@ -1369,37 +1705,42 @@ pub fn run_ide_loop(
                 active_tab.textarea.set_search_pattern("(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b").unwrap_or(());
                 active_tab.textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
-                let mut clean_lower = query_to_execute.trim().to_lowercase();
-                loop {
-                    if clean_lower.starts_with("--") {
-                        if let Some(idx) = clean_lower.find('\n') {
-                            clean_lower = clean_lower[idx..].trim_start().to_string();
+                let is_explicit_remote = is_remote_directive_query(&query_to_execute);
+                let (exec_query, is_paginatable) = if is_explicit_remote {
+                    wrap_remote_query(&query_to_execute)
+                } else {
+                    let mut clean_lower = query_to_execute.trim().to_lowercase();
+                    loop {
+                        if clean_lower.starts_with("--") {
+                            if let Some(idx) = clean_lower.find('\n') {
+                                clean_lower = clean_lower[idx..].trim_start().to_string();
+                            } else {
+                                clean_lower = String::new();
+                            }
+                        } else if clean_lower.starts_with("/*") {
+                            if let Some(idx) = clean_lower.find("*/") {
+                                clean_lower = clean_lower[idx+2..].trim_start().to_string();
+                            } else {
+                                clean_lower = String::new();
+                            }
                         } else {
-                            clean_lower = String::new();
+                            break;
                         }
-                    } else if clean_lower.starts_with("/*") {
-                        if let Some(idx) = clean_lower.find("*/") {
-                            clean_lower = clean_lower[idx+2..].trim_start().to_string();
-                        } else {
-                            clean_lower = String::new();
-                        }
-                    } else {
-                        break;
                     }
-                }
-                
-                let is_paginatable = clean_lower.starts_with("select") || clean_lower.starts_with("with") || clean_lower.starts_with("values") || clean_lower.starts_with("from");
+                    let is_pag = clean_lower.starts_with("select") || clean_lower.starts_with("with") || clean_lower.starts_with("values") || clean_lower.starts_with("from");
+                    (query_to_execute.clone(), is_pag)
+                };
                 
                 let final_query = if is_paginatable {
                     active_tab.is_paginated = true;
-                    let clean_query = query_to_execute.trim().strip_suffix(';').unwrap_or(query_to_execute.trim());
+                    let clean_query = exec_query.trim().strip_suffix(';').unwrap_or(exec_query.trim());
                     format!("SELECT * FROM ({}) LIMIT {} OFFSET {}", clean_query, active_tab.pagination_limit, active_tab.pagination_offset)
                 } else {
                     active_tab.is_paginated = false;
-                    query_to_execute.clone()
+                    exec_query.clone()
                 };
 
-                let _ = std::fs::write("debug_query.txt", format!("query: {}\nclean: {}\npag: {}\nfinal: {}", query_to_execute, clean_lower, is_paginatable, final_query));
+                let _ = std::fs::write("debug_query.txt", format!("query: {}\nremote: {}\npag: {}\nfinal: {}", query_to_execute, is_explicit_remote, is_paginatable, final_query));
 
                 match conn.prepare(&final_query) {
                     Ok(mut stmt) => {
@@ -1433,7 +1774,23 @@ pub fn run_ide_loop(
                                 active_tab.results_state.select(Some(0));
                                 active_tab.horizontal_scroll = 0;
                                 let elapsed = start_time.elapsed();
-                                status_msg = format!("Query executed successfully. Returned {} rows in {:.2?}.", count, elapsed);
+                                if is_explicit_remote {
+                                    let lower = query_to_execute.to_lowercase();
+                                    let is_ddl = lower.contains("create ") || lower.contains("drop ") || lower.contains("alter ");
+                                    if is_ddl {
+                                        refresh_attached_catalog(conn, db_path);
+                                        trigger_explorer_refresh = true;
+                                    }
+                                    if count > 0 {
+                                        status_msg = format!("Remote statement executed successfully. Returned {} rows in {:.2?}.", count, elapsed);
+                                    } else {
+                                        status_msg = format!("Remote statement executed successfully in {:.2?}.", elapsed);
+                                    }
+                                } else if is_remote_db && is_unadorned_secret_or_setting(&query_to_execute) {
+                                    status_msg = "⚠️ Applied LOCALLY on DuckPack! Use '-- @remote' at top of query to apply to remote Quack.".to_string();
+                                } else {
+                                    status_msg = format!("Query executed successfully. Returned {} rows in {:.2?}.", count, elapsed);
+                                }
 
                                 let history_path = queries_dir.join(".history.sql");
                                 let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -1454,7 +1811,8 @@ pub fn run_ide_loop(
                                         }
                                     }
                                 }
-                                status_msg = format!("Execution Error: {}", e);
+                                let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
+                                status_msg = format!("Execution Error: {}{}", e, diag);
                             }
                         }
                     }
@@ -1469,13 +1827,15 @@ pub fn run_ide_loop(
                                 }
                             }
                         }
-                        status_msg = format!("Prepare Error: {}", e);
+                        let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
+                        status_msg = format!("Prepare Error: {}{}", e, diag);
                     }
                 }
             }
         }
 
         if trigger_explorer_refresh {
+            refresh_attached_catalog(conn, db_path);
             let prev_selected = explorer_state.selected();
             meta = load_explorer_metadata(conn, project_dir, is_quack);
             dictionary = meta.dictionary.clone();
@@ -1713,7 +2073,7 @@ fn format_duckdb_value(v: duckdb::types::Value) -> String {
 }
 
 /// Generates an ASCII tree of the schema and copies a Mermaid diagram to the clipboard.
-fn generate_schema_visualizer(db_str: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn generate_schema_visualizer(db_str: &str, os_clipboard: &mut Option<arboard::Clipboard>) -> Result<String, Box<dyn std::error::Error>> {
     let conn = duckdb::Connection::open(db_str)?;
     
     // 1. Get Tables & Columns
@@ -1754,10 +2114,8 @@ fn generate_schema_visualizer(db_str: &str) -> Result<String, Box<dyn std::error
         mermaid.push_str(&format!("    {} }}|--|| {} : \"\"\n", table, ref_table));
     }
     
-    // Use arboard to copy
-    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-        let _ = clipboard.set_text(&mermaid);
-    }
+    // Copy Mermaid diagram using multi-channel clipboard helper
+    set_clipboard_text(&mermaid, os_clipboard);
     
     // 4. Generate ASCII Tree
     let mut tree = String::from("Database Schema (Mermaid.js diagram copied to clipboard!)\n");
@@ -1834,5 +2192,88 @@ mod tests {
         assert_eq!(format_row_count(1000), "1,000 rows");
         assert_eq!(format_row_count(10000), "10,000 rows");
         assert_eq!(format_row_count(1234567), "1,234,567 rows");
+    }
+
+    #[test]
+    fn test_remote_directive_query() {
+        assert!(is_remote_directive_query("-- @remote\nCREATE SECRET my_s3..."));
+        assert!(is_remote_directive_query("--@remote\nSELECT 1;"));
+        assert!(is_remote_directive_query("-- @remote (s3)\nSELECT 1;"));
+        assert!(is_remote_directive_query("/* comment */\n-- @remote\nSET s3_region='us-east-1';"));
+        assert!(!is_remote_directive_query("SELECT 1;"));
+        assert!(!is_remote_directive_query("-- regular comment\nCREATE SECRET foo;"));
+    }
+
+    #[test]
+    fn test_wrap_remote_query() {
+        let (ddl, is_select) = wrap_remote_query("-- @remote\nCREATE SECRET my_s3 (TYPE S3, KEY_ID 'foo', SECRET 'bar');");
+        assert!(!is_select);
+        assert_eq!(ddl, "FROM query('CREATE SECRET my_s3 (TYPE S3, KEY_ID ''foo'', SECRET ''bar'')');");
+
+        let (query, is_select) = wrap_remote_query("-- @remote\nSELECT * FROM 's3://bucket/test.parquet';");
+        assert!(is_select);
+        assert_eq!(query, "SELECT * FROM query('SELECT * FROM ''s3://bucket/test.parquet''')");
+    }
+
+    #[test]
+    fn test_is_unadorned_secret_or_setting() {
+        assert!(is_unadorned_secret_or_setting("CREATE SECRET s3 (TYPE S3);"));
+        assert!(is_unadorned_secret_or_setting("CREATE PERSISTENT SECRET s3 (TYPE S3);"));
+        assert!(is_unadorned_secret_or_setting("DROP SECRET s3;"));
+        assert!(is_unadorned_secret_or_setting("SET s3_region = 'us-east-1';"));
+        assert!(is_unadorned_secret_or_setting("-- comment\nCREATE SECRET s3;"));
+        assert!(!is_unadorned_secret_or_setting("SELECT * FROM query('target_db', 'CREATE SECRET s3');"));
+        assert!(!is_unadorned_secret_or_setting("CREATE TABLE foo AS SELECT 1;"));
+        assert!(!is_unadorned_secret_or_setting("SELECT * FROM s3_table;"));
+    }
+
+    #[test]
+    fn test_diagnose_remote_credential_error() {
+        assert!(diagnose_remote_credential_error("IO Error: HTTP 403 (Access Denied)", true).contains("Missing S3 secret"));
+        assert!(diagnose_remote_credential_error("No credentials found for S3", true).contains("Missing S3 secret"));
+        assert!(diagnose_remote_credential_error("Not implemented Error: multiple streaming scans or streaming scans + CTAS", true).contains("Quack protocol limitation"));
+        assert_eq!(diagnose_remote_credential_error("syntax error at or near 'SELECT'", true), "");
+        assert_eq!(diagnose_remote_credential_error("IO Error: HTTP 403", false), "");
+    }
+
+    #[test]
+    fn test_duckdb_detach() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute("ATTACH ':memory:' AS target_db;", []).unwrap();
+        conn.execute("USE target_db;", []).unwrap();
+        // Switch to memory first, then detach
+        conn.execute("USE memory;", []).unwrap();
+        conn.execute("DETACH target_db;", []).unwrap();
+        conn.execute("ATTACH ':memory:' AS target_db;", []).unwrap();
+        conn.execute("USE target_db;", []).unwrap();
+    }
+
+    #[test]
+    fn test_calculate_status_height() {
+        // Single line short status
+        assert_eq!(calculate_status_height("Ready.", 80, 30), 3);
+
+        // Long status that wraps to 2 lines
+        let long_msg = "A".repeat(100);
+        assert_eq!(calculate_status_height(&long_msg, 80, 30), 4);
+
+        // Multi-line status with newlines
+        let multi_line = "Error: Line 1\nLine 2\nLine 3";
+        assert_eq!(calculate_status_height(multi_line, 80, 30), 5);
+
+        // Respects maximum limit clamped to total_height / 3 or 8
+        let huge_msg = "Error:\n".repeat(20);
+        assert_eq!(calculate_status_height(&huge_msg, 80, 30), 8);
+    }
+
+    #[test]
+    fn test_clipboard_roundtrip() {
+        let mut cb: Option<arboard::Clipboard> = None;
+        let test_str = "duckpack_test_clipboard_12345";
+        assert!(set_clipboard_text(test_str, &mut cb));
+        let retrieved = get_clipboard_text(&mut cb);
+        if let Some(ref text) = retrieved {
+            assert_eq!(text, test_str);
+        }
     }
 }
