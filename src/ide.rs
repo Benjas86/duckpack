@@ -691,8 +691,8 @@ pub fn get_clipboard_text(os_clipboard: &mut Option<arboard::Clipboard>) -> Opti
 /// explorer immediately see any new tables, views, or schema changes created on the server.
 pub fn refresh_attached_catalog(conn: &Connection, db_path: &str) {
     if db_path.starts_with("quack:") {
-        let disable_ssl = crate::should_disable_quack_ssl(db_path, false);
-        let attach_sql = crate::build_quack_attach_sql(db_path, disable_ssl);
+        let disable_ssl = crate::engine::should_disable_quack_ssl(db_path, false);
+        let attach_sql = crate::engine::build_quack_attach_sql(db_path, disable_ssl);
         let _ = conn.execute("USE memory;", []);
         let _ = conn.execute("DETACH target_db;", []);
         let _ = conn.execute(&attach_sql, []);
@@ -2032,15 +2032,15 @@ fn format_duckdb_value(v: duckdb::types::Value) -> String {
                 TimeUnit::Microsecond => (val % 1_000_000) * 1000,
                 TimeUnit::Nanosecond => val % 1_000_000_000,
             };
-            if let Some(dt) = chrono::NaiveDateTime::from_timestamp_opt(timestamp_secs, timestamp_nanos as u32) {
-                dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+            if let Some(dt) = chrono::DateTime::from_timestamp(timestamp_secs, timestamp_nanos as u32) {
+                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
             } else {
                 format!("{:?}", Value::Timestamp(unit, val))
             }
         }
         Value::Date32(days) => {
-            if let Some(dt) = chrono::NaiveDateTime::from_timestamp_opt((days as i64) * 86400, 0) {
-                dt.date().format("%Y-%m-%d").to_string()
+            if let Some(dt) = chrono::DateTime::from_timestamp((days as i64) * 86400, 0) {
+                dt.naive_utc().date().format("%Y-%m-%d").to_string()
             } else {
                 format!("{:?}", Value::Date32(days))
             }
