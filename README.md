@@ -30,16 +30,20 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
 - [📋 CLI Command Reference](#-cli-command-reference)
 - [🧑‍💻 DuckPack Terminal IDE](#-duckpack-terminal-ide)
   - [Keyboard Shortcuts Cheat Sheet](#keyboard-shortcuts-cheat-sheet)
+  - [Catalog-Aware Multi-Database Exploration & Cross-DB Joins](#catalog-aware-multi-database-exploration--cross-db-joins)
+  - [Live Database Attachment & Detach (`Ctrl+A` / `d`)](#live-database-attachment--detach-ctrla--d)
   - [Multi-Tab Query System & Isolated Results](#multi-tab-query-system--isolated-results)
   - [Interactive Schema Visualizer & Mermaid.js ERD](#interactive-schema-visualizer--mermaidjs-erd)
   - [Dynamic Status Bar & Error Interception](#dynamic-status-bar--error-interception)
 - [🐍 Python Integration](#-python-integration)
   - [1. Interactive In-Memory Debugging (`explore`)](#1-interactive-in-memory-debugging)
+  - [Jupyter Notebook & VS Code Pop-Out Terminal Support](#jupyter-notebook--vs-code-pop-out-terminal-support)
   - [2. Automated Testing with Pytest (`apply`)](#2-automated-testing-with-pytest)
   - [3. Pipeline Schema Drift Detection (`diff`)](#3-pipeline-schema-drift-detection)
   - [4. Python API Reference](#4-python-api-reference)
   - [CLI Python Management](#cli-python-management)
 - [🦆 Quack Remote Server Integration](#-quack-remote-server-integration)
+  - [Exploring Remote Quack Servers from CLI](#exploring-remote-quack-servers-from-cli)
   - [The `-- @remote` Query Directive](#the---remote-query-directive)
   - [SSL & Non-TLS Options](#ssl--non-tls-options)
 - [📁 Declarative Project Structure](#-declarative-project-structure)
@@ -57,10 +61,12 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
 - **Declarative Schemas:** Define your schemas, tables, views, and macros as raw `.sql` files. No migration timestamps or versions to manage.
 - **Git-Style Smart Renames:** Uses Jaro-Winkler similarity matching (>80%) to detect renamed tables or columns, issuing non-destructive `ALTER TABLE RENAME` statements instead of dropping and recreating data.
 - **Built-in Interactive Terminal IDE:** Explore live databases, write queries with syntax highlighting and autocompletion (`Ctrl+Space`), and manage independent query tabs.
-- **Python Integration:** Import `duckpack` into Python pipelines, pytest fixtures, or debug sessions (`duckpack.explore(con)`, `duckpack.apply(con)`, `duckpack.diff(con)`).
+- **Catalog-Aware Multi-Database Exploration:** Inspect multiple attached catalogs (local DuckDB, in-memory `memory` scratchpad, attached SQLite/Postgres/MySQL/MSSQL, and remote Quack `target_db` instances) in a unified hierarchical tree with catalog-qualified query generation and cross-database joins.
+- **Live Catalog Attach & Detach (`Ctrl+A` / `d`):** Dynamically attach third-party databases, DuckDB files, or remote Quack instances directly inside the IDE without restarting.
+- **Python Integration with Jupyter / VS Code Support:** Import `duckpack` into Python pipelines, pytest fixtures, or Jupyter notebooks (`duckpack.explore(con)`). Automatically spawns a connected native terminal window in non-interactive notebook environments.
 - **In-Memory & Remote Attach:** Connect to local files, `:memory:` instances, MotherDuck (`md:...`), or remote DuckDB instances over the [Quack](https://duckdb.org/) protocol.
 - **Remote Query Directive (`-- @remote`):** Forward session-scoped statements (e.g. S3 secrets, settings, and catalog scans) directly to remote engines with automated diagnostic hints.
-- **ASCII & Mermaid.js Schema Visualizer:** Press `Ctrl+G` to view table relationships and automatically copy formatted Mermaid.js Entity-Relationship diagrams to your system clipboard.
+- **ASCII & Mermaid.js Schema Visualizer:** Press `Ctrl+G` (or `F2`) to view table relationships and automatically copy formatted Mermaid.js Entity-Relationship diagrams to your system clipboard.
 - **Environment Variable Templating:** Write `${ENV}_orders_${REGION}` directly in SQL; DuckPack dynamically interpolates values from `.env` files.
 - **Immutable Snapshots (`.duckpack`):** Compile your entire project into a single, portable snapshot artifact for deterministic zero-dependency deployments.
 
@@ -159,23 +165,31 @@ Launch it directly:
 ```bash
 duckpack explore --db local.duckdb
 ```
+Or explore a remote Quack server:
+```bash
+duckpack explore --db quack:0.0.0.0:9494 --quack-token <TOKEN>
+```
 Or transition instantly from `duckpack apply` by pressing **`e`**.
 
 ```
-┌ Explorer [r: Refresh] ───────┬─ [Tab 1: users.sql] ── [+ New] ── [❌ Close] ───────────────┐
-│ ▼ Tables                     │ SELECT id, name, email                                     │
-│   ├─ customers (1,450 rows)  │ FROM users                                                 │
-│   │  ├─ customer_id (BIGINT) │ WHERE created_at >= '2026-01-01';                          │
-│   │  └─ email (VARCHAR)      │                                                            │
-│   └─ orders (8,920 rows)     │                                                            │
-│ ▼ Views                      │                                                            │
-│   └─ active_users            │                                                            │
-├──────────────────────────────┴────────────────────────────────────────────────────────────┤
-│ Query Results [Page 1/3] (Showing 500 rows)                                               │
-│ id │ name             │ email                                                             │
-│ 1  │ Alice Smith      │ alice@example.com                                                 │
-│ 2  │ Bob Jones        │ bob@example.com                                                   │
-└───────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Explorer [R: Refresh | Ctrl+A: Attach | q: Query] ──┬─ [Tab 1: cross_join.sql] ── [+ New] ── [❌ Close] ────┐
+│ ▼ 📁 target_db [Active] (quack)                     │ SELECT                                                │
+│   ▼ 📦 Tables (2)                                   │   ro.order_id,                                        │
+│     ├─ customers (1,450 rows)                       │   ro.amount,                                          │
+│     │  ├─ customer_id (BIGINT)                      │   lu.user_email                                       │
+│     │  └─ email (VARCHAR)                           │ FROM target_db.orders ro                              │
+│     └─ orders (8,920 rows)                          │ JOIN memory.local_users lu                            │
+│   ▼ 👁️ Views (1)                                    │   ON ro.customer_id = lu.id                           │
+│     └─ active_orders                                │ LIMIT 100;                                            │
+│ ▼ 📁 memory (duckdb)                                │                                                       │
+│   ▼ 📦 Tables (1)                                   │                                                       │
+│     └─ local_users (50 rows)                        │                                                       │
+├─────────────────────────────────────────────────────┴───────────────────────────────────────────────────────┤
+│ Query Results [Page 1/1] (Showing 50 rows)                                                                  │
+│ order_id │ amount  │ user_email                                                                             │
+│ 1001     │ 149.99  │ alice@example.com                                                                      │
+│ 1002     │ 89.50   │ bob@example.com                                                                        │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Keyboard Shortcuts Cheat Sheet
@@ -185,25 +199,55 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | **Global / Navigation** | `Tab` | Cycle focus between **Explorer**, **Editor**, and **Results** panes |
 | | `?` | Toggle the Help Modal |
 | | `Ctrl+C` / `Esc` | Cancel operation / exit modal / quit IDE |
-| **Editor** | `Ctrl+E` | **Execute query** in active tab |
+| **Editor** | `Ctrl+E` / `F5` | **Execute query** in active tab (or execute highlighted selection) |
 | | `Shift + Arrows` | Highlight text to isolate and execute *only* the selection on `Ctrl+E` |
-| | `Ctrl+Space` | Trigger **Intelligent Autocomplete** (tables, views, columns) |
+| | `Ctrl+Space` | Trigger **Intelligent Autocomplete** (catalog-aware tables, views, columns) |
 | | `Ctrl+F` | **Auto-format** SQL statement using SQL parser |
 | | `Ctrl+S` | **Save** active query to `queries/<tab_name>.sql` |
-| | `Ctrl+Y` / `Ctrl+C` | **Copy** selected text (or current line) to system clipboard |
-| | `Ctrl+G` | Open **Schema Visualizer** (ASCII tree + copies Mermaid.js ERD to clipboard) |
+| | `Ctrl+Y` / `Ctrl+C` | **Copy** selected text (or active cell/line) to system clipboard |
+| | `Ctrl+V` | **Paste** from OS system clipboard into editor |
+| | `Ctrl+G` / `F2` | Open **Schema Visualizer** (ASCII tree + copies Mermaid.js ERD to clipboard) |
 | **Tabs** | `Ctrl+T` | Open a new blank query tab |
 | | `Ctrl+W` | Close the active query tab |
 | | `Ctrl+N` / `Ctrl+P` | Switch to the **Next** / **Previous** tab |
-| **Explorer** | `Up` / `Down` | Navigate through nodes |
-| | `Enter` / Click | Expand or collapse table column tree / open SQL file in tab |
+| **Explorer** | `Up` / `Down` | Navigate through databases, table groups, tables, and columns |
+| | `Enter` / `Space` | Expand or collapse database/group/table column tree / open SQL file |
+| | `q` / `s` | **Query table/view** (generates catalog-qualified SQL into editor) |
+| | `Ctrl+A` | **Attach Database** dialog (DuckDB, SQLite, Postgres, MySQL, MSSQL, Quack) |
+| | `d` | **Detach Database** from current session |
 | | `r` / `R` | **Refresh catalog** from live/remote database (preserves open state) |
-| **Results Grid** | `Arrows` | Scroll vertically and horizontally through rows and columns |
+| **Results Grid** | `Arrows` | Scroll vertically through rows and horizontally through columns |
+| | `Shift + ◄ / ►` | Fast horizontal scroll across wide result tables |
+| | `Home` / `End` | Jump directly to the **First** / **Last** column |
 | | `PgUp` / `PgDn` | Fast scroll vertically |
 | | `n` / `p` | Navigate to **Next** / **Previous** page (500-row pagination chunks) |
-| | `Ctrl+O` | Export query results to a CSV file in `queries/` |
+| | `Ctrl+O` | Export active query results to a CSV file in `queries/` |
 | **Mouse Support** | Mouse Wheel | Seamless vertical & horizontal scrolling in any focused pane |
 | | Click Tabs | Click on tab headers to switch or click `[+ New]` / `[❌ Close]` buttons |
+
+### Catalog-Aware Multi-Database Exploration & Cross-DB Joins
+
+DuckPack dynamically detects your active catalogs:
+- **Single-Database Mode:** When working with an isolated database file, DuckPack renders a streamlined flat view (`📦 Tables` and `👁️ Views`).
+- **Multi-Database Mode:** When multiple databases are attached—such as when connecting to a remote Quack server, attaching an external database via `Ctrl+A`, or attaching in Python—DuckPack organizes the sidebar into an explicit catalog hierarchy:
+  - `📁 <database_name> [Active] (<type>)`
+  - The `[Active]` badge highlights the database currently selected as `current_database()`.
+  - Pressing `q` or double-clicking any table/view automatically produces the catalog-qualified SQL (e.g. `SELECT * FROM target_db.orders LIMIT 500;` or `SELECT * FROM memory.local_users LIMIT 500;`).
+  - **Cross-Database Joins:** Because DuckDB supports federated queries, you can join remote Quack tables, local scratchpad tables in `memory`, and attached databases directly in the editor:
+    ```sql
+    SELECT *
+    FROM target_db.remote_orders ro
+    JOIN memory.local_users lu ON ro.customer_id = lu.id;
+    ```
+
+### Live Database Attachment & Detach (`Ctrl+A` / `d`)
+
+Press **`Ctrl+A`** from anywhere in the IDE to open the interactive **Attach Database** modal dialog:
+- Attach local DuckDB files (`.duckdb`, `.db`, `.ddb`).
+- Attach SQLite databases (`TYPE SQLITE`).
+- Connect to remote PostgreSQL, MySQL, or Microsoft SQL Server instances.
+- Attach remote DuckDB instances over Quack (`TYPE QUACK`).
+- Select attached databases in the Explorer and press **`d`** to safely detach them from the live session.
 
 ---
 
@@ -234,6 +278,34 @@ duckpack.explore(con)
 
 # When you quit the TUI (Esc / q), Python resumes execution seamlessly!
 print("Resuming pipeline execution...")
+```
+
+### Jupyter Notebook & VS Code Pop-Out Terminal Support
+
+Running terminal applications inside Jupyter notebooks (such as in VS Code Interactive, JupyterLab, or Jupyter Notebooks) usually fails with `os error 6: No such device or address` because notebooks lack an interactive TTY.
+
+DuckPack solves this seamlessly:
+- When you call `duckpack.explore(con)` inside a notebook cell, DuckPack automatically spins up an ephemeral local Quack bridge on a free local port, attaches to your live in-memory connection `con`, and **spawns a native graphical terminal emulator window** (Ghostty, Foot, Kitty, WezTerm, Alacritty, GNOME Terminal, Konsole, Windows Terminal `wt.exe`, macOS Terminal.app / iTerm2).
+- You get the **full interactive TUI IDE experience** directly connected to your live in-memory notebook tables!
+- When you exit the IDE window (`Esc` / `q`), the temporary bridge shuts down and notebook execution continues.
+- In headless environments (CI / Docker without display), DuckPack falls back gracefully to printing a formatted schema overview directly into the notebook output cell.
+
+```python
+import duckdb
+import duckpack
+
+con = duckdb.connect()
+con.execute(
+    "CREATE TABLE metrics AS SELECT range AS id, random() AS val FROM"
+    " range(500);"
+)
+
+# Automatically pops open an external connected terminal window:
+duckpack.explore(con)
+
+# Optional controls:
+# duckpack.explore(con, open_window=False)  # Force in-cell formatted overview (headless mode)
+# duckpack.explore(con, wait=False)         # Run terminal asynchronously in background
 ```
 
 ---
@@ -299,8 +371,8 @@ import duckpack
 
 #### Functions
 
-- **`duckpack.explore(target, project_dir=".") -> None`**
-  Launches the interactive TUI IDE against a live connection (`duckdb.DuckDBPyConnection`) or database URI (`str`).
+- **`duckpack.explore(target, project_dir=".", quack_token=None, insecure=False, open_window=True, wait=True) -> None`**
+  Launches the interactive TUI IDE against a live connection (`duckdb.DuckDBPyConnection`) or database URI (`str`). In non-TTY environments (Jupyter/VS Code), automatically launches a connected terminal window.
 
 - **`duckpack.apply(target, project_dir=".", auto_approve=True, force_drop=False, interactive=False) -> ApplyResult`**
   Computes schema diffs and applies declarative migrations. Returns an `ApplyResult`.
@@ -348,6 +420,41 @@ DuckPack includes first-class integration with remote DuckDB instances running t
 duckpack explore --db quack:localhost:9494 --quack-token <token>
 ```
 *(You can also set `DUCKDB_QUACK_TOKEN=<token>` in your environment).*
+
+### Exploring Remote Quack Servers from CLI
+
+When you connect DuckPack to a remote Quack server from the CLI:
+
+```bash
+duckpack explore --db quack:0.0.0.0:9494 --quack-token <token>
+```
+
+DuckPack establishes a dual-catalog session:
+1. **`target_db [Active] (quack)`**: The primary remote Quack database hosting remote tables, views, and persistent data.
+2. **`memory (duckdb)`**: A fast, local client-side in-memory scratchpad database.
+
+#### Dual Root Hierarchical Explorer
+The Explorer pane automatically switches to multi-database mode, grouping assets under their respective root database folders:
+- Navigate down to any table in `target_db` or `memory` and press **`q`** or **`s`** (or press Enter) to generate catalog-qualified queries directly into your active query editor tab:
+  ```sql
+  -- Generated by pressing 'q' on a target_db table:
+  SELECT * FROM target_db.remote_table LIMIT 500;
+
+  -- Generated by pressing 'q' on a memory table:
+  SELECT * FROM memory.local_scratchpad LIMIT 500;
+  ```
+
+#### Cross-Database Joins Across Remote and Local
+Because DuckDB evaluates queries client-side across all attached catalogs, you can write federated joins combining remote Quack datasets with local client tables in a single query:
+```sql
+SELECT 
+    rt.order_id,
+    rt.amount,
+    mem.customer_category
+FROM target_db.orders rt
+JOIN memory.customer_categories mem ON rt.customer_id = mem.customer_id;
+```
+Standard `SELECT` queries, aggregations, cross-database joins, and DML run natively across the connection without requiring any special annotations.
 
 ### The `-- @remote` Query Directive
 
