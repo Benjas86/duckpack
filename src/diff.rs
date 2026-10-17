@@ -72,7 +72,7 @@ pub struct DiffResult {
 
 impl DiffResult {
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        !self.items.iter().any(|i| !i.ignored)
     }
 }
 
@@ -334,28 +334,30 @@ pub fn compute_diff(
 
             if !safe_sqls.is_empty() {
                 let has_rename = safe_sqls.iter().any(|s| s.contains("RENAME COLUMN"));
+                let ignored = is_ignored(table_name);
                 diff.items.push(DiffItem {
                     item_type: if has_rename { DiffItemType::RenameColumn } else { DiffItemType::AlterTable },
                     obj_name: table_name.clone(),
                     sql: safe_sqls.join("\n"),
                     old_def: Some(target_table.create_sql.clone()),
                     new_def: Some(shadow_table.create_sql.clone()),
-                    selected: true,
+                    selected: !ignored,
                     locked: false,
-                    ignored: is_ignored(table_name),
+                    ignored,
                 });
             }
 
             if !destructive_sqls.is_empty() {
+                let ignored = is_ignored(table_name);
                 diff.items.push(DiffItem {
                     item_type: DiffItemType::DropColumn,
                     obj_name: table_name.clone(),
                     sql: destructive_sqls.join("\n"),
                     old_def: Some(target_table.create_sql.clone()),
                     new_def: Some(shadow_table.create_sql.clone()),
-                    selected: true,
+                    selected: !ignored,
                     locked: false,
-                    ignored: is_ignored(table_name),
+                    ignored,
                 });
             }
         } else {
@@ -380,15 +382,16 @@ pub fn compute_diff(
                 matched_created_tables.insert(created.clone());
                 let shadow_table = shadow.get(created).unwrap();
                 let target_table = target.get(dropped).unwrap();
+                let ignored = is_ignored(dropped) || is_ignored(created);
                 diff.items.push(DiffItem {
                     item_type: DiffItemType::RenameTable,
                     obj_name: format!("{} -> {}", dropped, created),
                     sql: format!("ALTER TABLE {} RENAME TO {};", dropped, created),
                     old_def: Some(target_table.create_sql.clone()),
                     new_def: Some(shadow_table.create_sql.clone()),
-                    selected: true,
+                    selected: !ignored,
                     locked: false,
-                    ignored: is_ignored(dropped) || is_ignored(created),
+                    ignored,
                 });
                 break;
             }
@@ -398,30 +401,32 @@ pub fn compute_diff(
     for created in &created_tables {
         if !matched_created_tables.contains(created) {
             let shadow_table = shadow.get(created).unwrap();
+            let ignored = is_ignored(created);
             diff.items.push(DiffItem {
                 item_type: DiffItemType::CreateTable,
                 obj_name: created.clone(),
                 sql: shadow_table.create_sql.clone(),
                 old_def: Some(String::new()),
                 new_def: Some(shadow_table.create_sql.clone()),
-                selected: true,
+                selected: !ignored,
                 locked: false,
-                ignored: is_ignored(created),
+                ignored,
             });
         }
     }
 
     for dropped in &dropped_tables {
         if !matched_dropped_tables.contains(dropped) {
+            let ignored = is_ignored(dropped);
             diff.items.push(DiffItem {
                 item_type: DiffItemType::DropTable,
                 obj_name: dropped.clone(),
                 sql: format!("DROP TABLE {}", dropped),
                 old_def: Some(target.get(dropped).unwrap().create_sql.clone()),
                 new_def: Some(String::new()),
-                selected: true,
+                selected: !ignored,
                 locked: false,
-                ignored: is_ignored(dropped),
+                ignored,
             });
         }
     }
@@ -433,6 +438,7 @@ pub fn compute_diff(
         if target_def.is_none() || target_def != Some(shadow_def) {
             let view_re = Regex::new(r"(?i)^(\s*CREATE\s+)VIEW\b").unwrap();
             let safe_sql = view_re.replace(shadow_def, "${1}OR REPLACE VIEW").to_string();
+            let ignored = is_ignored(name);
             
             diff.items.push(DiffItem {
                 item_type: DiffItemType::CreateView,
@@ -440,24 +446,25 @@ pub fn compute_diff(
                 sql: safe_sql,
                 old_def: target_def.cloned(),
                 new_def: Some(shadow_def.clone()),
-                selected: true,
+                selected: !ignored,
                 locked: false,
-                ignored: is_ignored(name),
+                ignored,
             });
         }
     }
     
     for name in target_views.keys() {
         if !shadow_views.contains_key(name) {
+            let ignored = is_ignored(name);
             diff.items.push(DiffItem {
                 item_type: DiffItemType::DropView,
                 obj_name: name.clone(),
                 sql: format!("DROP VIEW {}", name),
                 old_def: Some(target_views.get(name).unwrap().clone()),
                 new_def: Some(String::new()),
-                selected: true,
+                selected: !ignored,
                 locked: false,
-                ignored: is_ignored(name),
+                ignored,
             });
         }
     }
@@ -468,6 +475,7 @@ pub fn compute_diff(
         if target_def.is_none() || target_def != Some(shadow_def) {
             let macro_re = Regex::new(r"(?i)^(\s*CREATE\s+)MACRO\b").unwrap();
             let safe_sql = macro_re.replace(shadow_def, "${1}OR REPLACE MACRO").to_string();
+            let ignored = is_ignored(name);
 
             diff.items.push(DiffItem {
                 item_type: DiffItemType::CreateMacro,
@@ -475,24 +483,25 @@ pub fn compute_diff(
                 sql: safe_sql,
                 old_def: target_def.cloned(),
                 new_def: Some(shadow_def.clone()),
-                selected: true,
+                selected: !ignored,
                 locked: false,
-                ignored: is_ignored(name),
+                ignored,
             });
         }
     }
     
     for name in target_macros.keys() {
         if !shadow_macros.contains_key(name) {
+            let ignored = is_ignored(name);
             diff.items.push(DiffItem {
                 item_type: DiffItemType::DropMacro,
                 obj_name: name.clone(),
                 sql: format!("DROP MACRO {}", name),
                 old_def: Some(target_macros.get(name).unwrap().clone()),
                 new_def: Some(String::new()),
-                selected: true,
+                selected: !ignored,
                 locked: false,
-                ignored: is_ignored(name),
+                ignored,
             });
         }
     }

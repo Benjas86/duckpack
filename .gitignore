@@ -3,6 +3,7 @@
 *.duckdb
 /*/README.md
 duck-project.toml
+duckpack.toml
 *.png
 *.duckpack
 /demo_project/*

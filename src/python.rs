@@ -236,15 +236,7 @@ pub fn diff(_py: Python<'_>, target: &Bound<'_, PyAny>, project_dir: &str) -> Py
         introspect_py_catalog(&mut executor)?
     };
 
-    let mut ignore_list = Vec::new();
-    if let Ok(ignore_content) = std::fs::read_to_string(p_dir.join(".duckdbignore")) {
-        for line in ignore_content.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                ignore_list.push(trimmed.to_string());
-            }
-        }
-    }
+    let ignore_list = engine::load_ignore_rules(&p_dir);
 
     let diff_result = schema_diff::compute_diff(
         &shadow_schemas,
@@ -259,11 +251,17 @@ pub fn diff(_py: Python<'_>, target: &Bound<'_, PyAny>, project_dir: &str) -> Py
         &ignore_list,
     );
 
-    let items: Vec<String> = diff_result.items.iter().map(|item| format!("{:?}: {}", item.item_type, item.obj_name)).collect();
+    let unignored_items: Vec<_> = diff_result
+        .items
+        .into_iter()
+        .filter(|i| !i.ignored)
+        .collect();
+    let change_count = unignored_items.len();
+    let items = unignored_items.iter().map(|item| format!("{:?}: {}", item.item_type, item.obj_name)).collect();
 
     Ok(DiffSummary {
-        has_changes: !diff_result.is_empty(),
-        change_count: diff_result.items.len(),
+        has_changes: change_count > 0,
+        change_count,
         items,
     })
 }
@@ -283,6 +281,8 @@ pub fn apply(
     if !p_dir.exists() {
         return Err(SchemaError::new_err(format!("Project directory {} does not exist", p_dir.display())));
     }
+
+    let ignore_list = engine::load_ignore_rules(&p_dir);
 
     if let Ok(db_str) = target.extract::<String>() {
         let conn = engine::connect_target_db(&db_str, None, false)
@@ -310,17 +310,23 @@ pub fn apply(
             &shadow_macros,
             &target_macros,
             &p_dir,
-            &[],
+            &ignore_list,
         );
 
         let remote = engine::is_remote(&db_str);
         engine::apply_diff(&conn, &diff_result, force_drop, remote, &p_dir)
             .map_err(|e| ExecutionError::new_err(format!("Apply error: {}", e)))?;
 
-        let applied_items = diff_result.items.iter().map(|i| i.obj_name.clone()).collect();
+        let applied_items: Vec<String> = diff_result
+            .items
+            .iter()
+            .filter(|i| i.selected && !i.ignored)
+            .map(|i| i.obj_name.clone())
+            .collect();
+        let applied_count = applied_items.len();
         Ok(ApplyResult {
             success: true,
-            applied_count: diff_result.items.len(),
+            applied_count,
             items: applied_items,
         })
     } else {
@@ -346,11 +352,11 @@ pub fn apply(
             &shadow_macros,
             &target_macros,
             &p_dir,
-            &[],
+            &ignore_list,
         );
 
         for item in &diff_result.items {
-            if !item.selected { continue; }
+            if !item.selected || item.ignored { continue; }
             let is_drop = matches!(
                 item.item_type,
                 schema_diff::DiffItemType::DropTable
@@ -368,10 +374,16 @@ pub fn apply(
             }
         }
 
-        let applied_items = diff_result.items.iter().map(|i| i.obj_name.clone()).collect();
+        let applied_items: Vec<String> = diff_result
+            .items
+            .iter()
+            .filter(|i| i.selected && !i.ignored)
+            .map(|i| i.obj_name.clone())
+            .collect();
+        let applied_count = applied_items.len();
         Ok(ApplyResult {
             success: true,
-            applied_count: diff_result.items.len(),
+            applied_count,
             items: applied_items,
         })
     }
