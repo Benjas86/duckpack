@@ -566,6 +566,47 @@ fn introspect_py_catalog(
         }
     }
 
+    // Check for attached quack databases
+    if let Ok((_, db_rows)) = executor.query_rows("SELECT database_name, type FROM duckdb_databases() WHERE internal = false") {
+        for db in db_rows {
+            if db.len() >= 2 && db[1].eq_ignore_ascii_case("quack") {
+                let db_name = &db[0];
+                let safe_name = db_name.replace("'", "''");
+                let tbl_sql = format!(
+                    "SELECT '{}.' || (CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END), COALESCE(sql, '') FROM {}.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false')",
+                    safe_name, safe_name
+                );
+                if let Ok((_, q_tbls)) = executor.query_rows(&tbl_sql) {
+                    for row in q_tbls {
+                        if row.len() >= 2 {
+                            table_map.insert(
+                                row[0].clone(),
+                                schema_diff::TableSchema {
+                                    create_sql: row[1].clone(),
+                                    columns: HashMap::new(),
+                                },
+                            );
+                        }
+                    }
+                }
+
+                let col_sql = format!(
+                    "SELECT '{}.' || (CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END), column_name, data_type FROM {}.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false')",
+                    safe_name, safe_name
+                );
+                if let Ok((_, q_cols)) = executor.query_rows(&col_sql) {
+                    for row in q_cols {
+                        if row.len() >= 3 {
+                            if let Some(t) = table_map.get_mut(&row[0]) {
+                                t.columns.insert(row[1].clone(), row[2].clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 4. Views
     let (_, view_rows) = executor
         .query_rows("SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, COALESCE(sql, '') FROM duckdb_views() WHERE internal = false")
@@ -659,9 +700,10 @@ pub fn explore(
             })
             .unwrap_or_else(|| ":memory:".to_string());
 
-        let conn = if !db_name.is_empty() && db_name != ":memory:" {
-            engine::connect_target_db(&db_name, None, false)
-                .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_name, e)))?
+        let (conn, active_db_target) = if !db_name.is_empty() && db_name != ":memory:" {
+            let c = engine::connect_target_db(&db_name, None, false)
+                .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_name, e)))?;
+            (c, db_name)
         } else {
             // For in-memory connection, start quack_serve on an available port
             let port = find_available_port();
@@ -678,12 +720,16 @@ pub fn explore(
             }
 
             let server_uri = format!("quack:localhost:{}", port);
-            engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
-                .map_err(|e| ExecutionError::new_err(format!("Failed to attach to Python in-memory DuckDB: {}", e)))?
+            let c = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
+                .map_err(|e| ExecutionError::new_err(format!("Failed to attach to Python in-memory DuckDB: {}", e)))?;
+            (c, server_uri)
         };
 
-        crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, ":memory:")
-            .map_err(|e| ExecutionError::new_err(format!("IDE error: {}", e)))?;
+        let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &active_db_target);
+        if active_db_target.starts_with("quack:") {
+            let _ = target.call_method1("execute", (format!("CALL quack_stop('{}');", active_db_target),));
+        }
+        ide_res.map_err(|e| ExecutionError::new_err(format!("IDE error: {}", e)))?;
 
         Ok(())
     }
