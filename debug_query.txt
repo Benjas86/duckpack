@@ -1,4 +1,0 @@
-query: from test_tbl
-clean: from test_tbl
-pag: true
-final: SELECT * FROM (from test_tbl) LIMIT 500 OFFSET 0
