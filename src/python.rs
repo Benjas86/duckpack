@@ -336,8 +336,14 @@ pub fn compile(project_dir: &str, out: &str) -> PyResult<()> {
 
 /// Compute differences between project declarative definitions and the target database.
 #[pyfunction]
-#[pyo3(signature = (target, project_dir = "."))]
-pub fn diff(_py: Python<'_>, target: &Bound<'_, PyAny>, project_dir: &str) -> PyResult<DiffSummary> {
+#[pyo3(signature = (target, project_dir = ".", quack_token = None, insecure = false))]
+pub fn diff(
+    _py: Python<'_>,
+    target: &Bound<'_, PyAny>,
+    project_dir: &str,
+    quack_token: Option<&str>,
+    insecure: bool,
+) -> PyResult<DiffSummary> {
     let p_dir = PathBuf::from(project_dir);
     let shadow_conn = engine::build_shadow_db(&p_dir)
         .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
@@ -353,7 +359,7 @@ pub fn diff(_py: Python<'_>, target: &Bound<'_, PyAny>, project_dir: &str) -> Py
 
     // Determine target connection
     let (target_schemas, target_schema, target_views, target_macros) = if let Ok(db_str) = target.extract::<String>() {
-        let conn = engine::connect_target_db(&db_str, None, false)
+        let conn = engine::connect_target_db(&db_str, quack_token, insecure)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
         (
             schema_diff::get_schemas(&conn).map_err(|e| ExecutionError::new_err(e.to_string()))?,
@@ -399,14 +405,16 @@ pub fn diff(_py: Python<'_>, target: &Bound<'_, PyAny>, project_dir: &str) -> Py
 
 /// Apply declarative schema migrations to the target database.
 #[pyfunction]
-#[pyo3(signature = (target, project_dir = ".", _auto_approve = true, force_drop = false, _interactive = false))]
+#[pyo3(signature = (target, project_dir = ".", auto_approve = true, force_drop = false, interactive = false, quack_token = None, insecure = false))]
 pub fn apply(
     _py: Python<'_>,
     target: &Bound<'_, PyAny>,
     project_dir: &str,
-    _auto_approve: bool,
+    auto_approve: bool,
     force_drop: bool,
-    _interactive: bool,
+    interactive: bool,
+    quack_token: Option<&str>,
+    insecure: bool,
 ) -> PyResult<ApplyResult> {
     let p_dir = PathBuf::from(project_dir);
     if !p_dir.exists() {
@@ -416,7 +424,7 @@ pub fn apply(
     let ignore_list = engine::load_ignore_rules(&p_dir);
 
     if let Ok(db_str) = target.extract::<String>() {
-        let conn = engine::connect_target_db(&db_str, None, false)
+        let conn = engine::connect_target_db(&db_str, quack_token, insecure)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
 
         let shadow_conn = engine::build_shadow_db(&p_dir)
@@ -443,6 +451,46 @@ pub fn apply(
             &p_dir,
             &ignore_list,
         );
+
+        if !auto_approve || interactive {
+            let pending_items: Vec<_> = diff_result
+                .items
+                .iter()
+                .filter(|i| i.selected && !i.ignored)
+                .collect();
+            if pending_items.is_empty() {
+                return Ok(ApplyResult {
+                    success: true,
+                    applied_count: 0,
+                    items: vec![],
+                });
+            }
+
+            if is_interactive_terminal() {
+                println!("🦆 DuckPack: Found {} change(s) to apply:", pending_items.len());
+                for item in &pending_items {
+                    println!("  • {:?}: {}", item.item_type, item.obj_name);
+                }
+                use std::io::Write;
+                print!("Apply changes? [y/N]: ");
+                std::io::stdout().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).ok();
+                if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
+                    println!("Migration cancelled by user.");
+                    return Ok(ApplyResult {
+                        success: false,
+                        applied_count: 0,
+                        items: vec![],
+                    });
+                }
+            } else if !auto_approve {
+                return Err(ExecutionError::new_err(
+                    "Cannot apply schema changes: auto_approve is False in a non-interactive environment. \
+                     Pass auto_approve=True to approve and apply migrations automatically.",
+                ));
+            }
+        }
 
         let remote = engine::is_remote(&db_str);
         engine::apply_diff(&conn, &diff_result, force_drop, remote, &p_dir)
@@ -485,6 +533,46 @@ pub fn apply(
             &p_dir,
             &ignore_list,
         );
+
+        if !auto_approve || interactive {
+            let pending_items: Vec<_> = diff_result
+                .items
+                .iter()
+                .filter(|i| i.selected && !i.ignored)
+                .collect();
+            if pending_items.is_empty() {
+                return Ok(ApplyResult {
+                    success: true,
+                    applied_count: 0,
+                    items: vec![],
+                });
+            }
+
+            if is_interactive_terminal() {
+                println!("🦆 DuckPack: Found {} change(s) to apply:", pending_items.len());
+                for item in &pending_items {
+                    println!("  • {:?}: {}", item.item_type, item.obj_name);
+                }
+                use std::io::Write;
+                print!("Apply changes? [y/N]: ");
+                std::io::stdout().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).ok();
+                if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
+                    println!("Migration cancelled by user.");
+                    return Ok(ApplyResult {
+                        success: false,
+                        applied_count: 0,
+                        items: vec![],
+                    });
+                }
+            } else if !auto_approve {
+                return Err(ExecutionError::new_err(
+                    "Cannot apply schema changes: auto_approve is False in a non-interactive environment. \
+                     Pass auto_approve=True to approve and apply migrations automatically.",
+                ));
+            }
+        }
 
         for item in &diff_result.items {
             if !item.selected || item.ignored { continue; }

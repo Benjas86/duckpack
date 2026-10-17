@@ -30,6 +30,8 @@ def compile(project_dir: str, out: str) -> None:
 def diff(
     target: Union[duckdb.DuckDBPyConnection, str],
     project_dir: str = ".",
+    quack_token: Optional[str] = None,
+    insecure: bool = False,
 ) -> DiffSummary:
     """Compute differences between project declarative definitions and the target database."""
     ...
@@ -40,6 +42,8 @@ def apply(
     auto_approve: bool = True,
     force_drop: bool = False,
     interactive: bool = False,
+    quack_token: Optional[str] = None,
+    insecure: bool = False,
 ) -> ApplyResult:
     """Apply declarative schema migrations to the target database."""
     ...
