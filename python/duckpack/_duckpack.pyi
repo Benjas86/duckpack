@@ -47,6 +47,16 @@ def apply(
 def explore(
     target: Union[duckdb.DuckDBPyConnection, str],
     project_dir: str = ".",
+    quack_token: Optional[str] = None,
+    insecure: bool = False,
+    open_window: bool = True,
+    wait: bool = True,
 ) -> None:
-    """Launch the interactive DuckPack IDE terminal UI against a target database."""
+    """Launch the interactive DuckPack IDE terminal UI against a target database or live connection.
+
+    - In an interactive terminal shell (TTY), runs full-screen directly in-process.
+    - In non-interactive environments (e.g. Jupyter Notebooks or VS Code Interactive):
+      • When open_window=True (default), automatically launches a connected terminal window.
+      • When open_window=False or in headless environments, prints a formatted schema overview.
+    """
     ...
