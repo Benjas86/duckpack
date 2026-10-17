@@ -1048,9 +1048,9 @@ pub fn wrap_remote_query(query: &str) -> (String, bool) {
 
     let escaped = clean_stripped.replace("'", "''");
     let wrapped = if is_select {
-        format!("SELECT * FROM query('{}')", escaped)
+        format!("SELECT * FROM target_db.query('{}')", escaped)
     } else {
-        format!("FROM query('{}');", escaped)
+        format!("FROM target_db.query('{}');", escaped)
     };
     (wrapped, is_select)
 }
@@ -1289,9 +1289,11 @@ pub fn run_ide_loop(
         .query_row("SELECT version();", [], |r| r.get(0))
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let remote_duckdb_version: Option<String> = if is_remote_db {
-        conn.query_row("SELECT * FROM query('target_db', 'SELECT version()');", [], |r| r.get(0))
+    let remote_duckdb_version: Option<String> = if is_quack {
+        conn.query_row("SELECT * FROM target_db.query('SELECT version()');", [], |r| r.get(0))
             .ok()
+    } else if is_remote_db {
+        conn.query_row("SELECT version();", [], |r| r.get(0)).ok()
     } else {
         None
     };
@@ -2632,67 +2634,85 @@ pub fn run_ide_loop(
                     }
                     Err(e) => {
                         let mut executed_remote_fallback = false;
-                        if is_quack && !is_explicit_remote {
+                        let local_err_str = e.to_string();
+                        let is_syntax_error = local_err_str.contains("syntax error at or near");
+                        if is_quack && !is_explicit_remote && !is_syntax_error {
                             let clean_query = query_to_execute.trim().strip_suffix(';').unwrap_or(query_to_execute.trim());
                             let remote_sql = if is_paginatable {
-                                format!("SELECT * FROM query('{}') LIMIT {} OFFSET {}", clean_query.replace("'", "''"), active_tab.pagination_limit, active_tab.pagination_offset)
+                                format!("SELECT * FROM target_db.query('{}') LIMIT {} OFFSET {}", clean_query.replace("'", "''"), active_tab.pagination_limit, active_tab.pagination_offset)
                             } else {
-                                format!("FROM query('{}');", clean_query.replace("'", "''"))
+                                format!("FROM target_db.query('{}');", clean_query.replace("'", "''"))
                             };
-                            if let Ok(mut remote_stmt) = conn.prepare(&remote_sql) {
-                                let start_time = std::time::Instant::now();
-                                if let Ok(mut rows) = remote_stmt.query([]) {
-                                    let mut cols = Vec::new();
-                                    if let Some(stmt_ref) = rows.as_ref() {
-                                        for col in stmt_ref.column_names() {
-                                            cols.push(col.to_string());
-                                        }
-                                    }
-                                    active_tab.column_names = cols;
-                                    let mut exec_rows = Vec::new();
-                                    let mut count = 0;
-                                    while let Ok(Some(row)) = rows.next() {
-                                        count += 1;
-                                        let mut str_row = Vec::new();
-                                        for i in 0..active_tab.column_names.len() {
-                                            let val: String = match row.get(i) {
-                                                Ok(v) => format_duckdb_value(v),
-                                                Err(_) => "NULL".to_string(),
-                                            };
-                                            str_row.push(val);
-                                        }
-                                        exec_rows.push(str_row);
-                                    }
-                                    active_tab.query_results = exec_rows;
-                                    active_tab.results_state.select(Some(0));
-                                    active_tab.horizontal_scroll = 0;
-                                    let elapsed = start_time.elapsed();
+                            match conn.prepare(&remote_sql) {
+                                Ok(mut remote_stmt) => {
+                                    let start_time = std::time::Instant::now();
+                                    match remote_stmt.query([]) {
+                                        Ok(mut rows) => {
+                                            let mut cols = Vec::new();
+                                            if let Some(stmt_ref) = rows.as_ref() {
+                                                for col in stmt_ref.column_names() {
+                                                    cols.push(col.to_string());
+                                                }
+                                            }
+                                            active_tab.column_names = cols;
+                                            let mut exec_rows = Vec::new();
+                                            let mut count = 0;
+                                            while let Ok(Some(row)) = rows.next() {
+                                                count += 1;
+                                                let mut str_row = Vec::new();
+                                                for i in 0..active_tab.column_names.len() {
+                                                    let val: String = match row.get(i) {
+                                                        Ok(v) => format_duckdb_value(v),
+                                                        Err(_) => "NULL".to_string(),
+                                                    };
+                                                    str_row.push(val);
+                                                }
+                                                exec_rows.push(str_row);
+                                            }
+                                            active_tab.query_results = exec_rows;
+                                            active_tab.results_state.select(Some(0));
+                                            active_tab.horizontal_scroll = 0;
+                                            let elapsed = start_time.elapsed();
 
-                                    let lower = query_to_execute.to_lowercase();
-                                    let is_catalog_mutation = lower.contains("attach ")
-                                        || lower.contains("detach ")
-                                        || lower.contains("create ")
-                                        || lower.contains("drop ")
-                                        || lower.contains("alter ")
-                                        || lower.contains("use ");
-                                    if is_catalog_mutation {
-                                        refresh_attached_catalog(conn, db_path);
-                                        trigger_explorer_refresh = true;
+                                            let lower = query_to_execute.to_lowercase();
+                                            let is_catalog_mutation = lower.contains("attach ")
+                                                || lower.contains("detach ")
+                                                || lower.contains("create ")
+                                                || lower.contains("drop ")
+                                                || lower.contains("alter ")
+                                                || lower.contains("use ");
+                                            if is_catalog_mutation {
+                                                refresh_attached_catalog(conn, db_path);
+                                                trigger_explorer_refresh = true;
+                                            }
+                                            if count > 0 {
+                                                status_msg = format!("Remote statement executed successfully. Returned {} rows in {:.2?}.", count, elapsed);
+                                            } else {
+                                                status_msg = format!("Remote statement executed successfully in {:.2?}.", elapsed);
+                                            }
+                                            executed_remote_fallback = true;
+
+                                            let history_path = queries_dir.join(".history.sql");
+                                            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                                            let history_entry = format!("-- Executed at {} (Took {:.2?})\n{};\n\n", timestamp, elapsed, query_to_execute.trim());
+                                            use std::io::Write;
+                                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(history_path) {
+                                                let _ = f.write_all(history_entry.as_bytes());
+                                            }
+                                        }
+                                        Err(query_err) => {
+                                            let err_str = query_err.to_string();
+                                            let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
+                                            status_msg = format!("Execution Error: {}{}", query_err, diag);
+                                            executed_remote_fallback = true;
+                                        }
                                     }
-                                    if count > 0 {
-                                        status_msg = format!("Remote statement executed successfully. Returned {} rows in {:.2?}.", count, elapsed);
-                                    } else {
-                                        status_msg = format!("Remote statement executed successfully in {:.2?}.", elapsed);
-                                    }
+                                }
+                                Err(prep_err) => {
+                                    let err_str = prep_err.to_string();
+                                    let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
+                                    status_msg = format!("Prepare Error: {}{}", prep_err, diag);
                                     executed_remote_fallback = true;
-
-                                    let history_path = queries_dir.join(".history.sql");
-                                    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                                    let history_entry = format!("-- Executed at {} (Took {:.2?})\n{};\n\n", timestamp, elapsed, query_to_execute.trim());
-                                    use std::io::Write;
-                                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(history_path) {
-                                        let _ = f.write_all(history_entry.as_bytes());
-                                    }
                                 }
                             }
                         }
@@ -3114,11 +3134,11 @@ mod tests {
     fn test_wrap_remote_query() {
         let (ddl, is_select) = wrap_remote_query("-- @remote\nCREATE SECRET my_s3 (TYPE S3, KEY_ID 'foo', SECRET 'bar');");
         assert!(!is_select);
-        assert_eq!(ddl, "FROM query('CREATE SECRET my_s3 (TYPE S3, KEY_ID ''foo'', SECRET ''bar'')');");
+        assert_eq!(ddl, "FROM target_db.query('CREATE SECRET my_s3 (TYPE S3, KEY_ID ''foo'', SECRET ''bar'')');");
 
         let (query, is_select) = wrap_remote_query("-- @remote\nSELECT * FROM 's3://bucket/test.parquet';");
         assert!(is_select);
-        assert_eq!(query, "SELECT * FROM query('SELECT * FROM ''s3://bucket/test.parquet''')");
+        assert_eq!(query, "SELECT * FROM target_db.query('SELECT * FROM ''s3://bucket/test.parquet''')");
     }
 
     #[test]
@@ -3128,7 +3148,7 @@ mod tests {
         assert!(is_unadorned_secret_or_setting("DROP SECRET s3;"));
         assert!(is_unadorned_secret_or_setting("SET s3_region = 'us-east-1';"));
         assert!(is_unadorned_secret_or_setting("-- comment\nCREATE SECRET s3;"));
-        assert!(!is_unadorned_secret_or_setting("SELECT * FROM query('target_db', 'CREATE SECRET s3');"));
+        assert!(!is_unadorned_secret_or_setting("SELECT * FROM target_db.query('CREATE SECRET s3');"));
         assert!(!is_unadorned_secret_or_setting("CREATE TABLE foo AS SELECT 1;"));
         assert!(!is_unadorned_secret_or_setting("SELECT * FROM s3_table;"));
     }
