@@ -14,3 +14,5 @@ __pycache__/
 *.whl
 .pytest_cache/
 debug_query.txt
+/medium
+*.jpg
