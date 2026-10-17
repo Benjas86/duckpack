@@ -2,36 +2,100 @@
   <img src="duckpack_logo.png" width="400" alt="DuckPack Logo" />
 </p>
 
+<p align="center">
+  <strong>Declarative Schema Management, Interactive Terminal IDE, and In-Memory Inspection for DuckDB</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Benjas86/duckpack/releases"><img src="https://img.shields.io/github/v/release/Benjas86/duckpack?color=brightgreen&label=release" alt="GitHub Release"></a>
+  <a href="https://pypi.org/project/duckpack/"><img src="https://img.shields.io/pypi/v/duckpack?color=blue&label=pypi" alt="PyPI Version"></a>
+  <a href="https://pypi.org/project/duckpack/"><img src="https://img.shields.io/pypi/pyversions/duckpack" alt="Python Versions"></a>
+  <a href="https://crates.io/crates/duckpack"><img src="https://img.shields.io/crates/v/duckpack?color=orange&label=crates.io" alt="Crates.io"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
+
 ---
 
-DuckPack is a Rust-based CLI and Interactive TUI that completely changes how you manage DuckDB schemas. Instead of writing imperative `UP/DOWN` migration scripts, you simply write your desired database state as raw SQL files, and this engine automatically computes the diff and applies the necessary changes non-destructively.
+DuckPack transforms how you develop with and manage DuckDB. Instead of maintaining fragile imperative `UP` and `DOWN` migration files, you define your desired database state as plain SQL files. DuckPack automatically computes the structural delta, detects renames heuristically, and applies non-destructive updates.
 
-## NOTE ##
-I've spent time as an education journey into Rust vibe coding this application. I have personal reasons to want to use this application and had never tried to 'vibe code' anything before.
+DuckPack includes a **rich terminal IDE** for live database exploration and first-class **Python bindings** to query and migrate in-memory databases directly inside your Python pipelines and test suites.
 
-I know this may contain 'sub optimal' or 'vibe code' solutions and code that could be written more elegantly. I've also not fully tested everything yet so expect bugs, I'm fine with this! If you find this useful, want to tinker etc, please do. 
+## 📌 Table of Contents
 
-Thanks, Ben.
+- [✨ Features](#-features)
+- [🚀 Quick Start & Installation](#-quick-start--installation)
+  - [Standalone Binary (Linux / macOS / Windows)](#1-standalone-binary)
+  - [Python Package (pip / uv)](#2-python-package-pip--uv)
+  - [Cargo (Rust Developers)](#3-cargo-rust-developers)
+- [📋 CLI Command Reference](#-cli-command-reference)
+- [🧑‍💻 DuckPack Terminal IDE](#-duckpack-terminal-ide)
+  - [Keyboard Shortcuts Cheat Sheet](#keyboard-shortcuts-cheat-sheet)
+  - [Multi-Tab Query System & Isolated Results](#multi-tab-query-system--isolated-results)
+  - [Interactive Schema Visualizer & Mermaid.js ERD](#interactive-schema-visualizer--mermaidjs-erd)
+  - [Dynamic Status Bar & Error Interception](#dynamic-status-bar--error-interception)
+- [🐍 Python Integration](#-python-integration)
+  - [1. Interactive In-Memory Debugging (`explore`)](#1-interactive-in-memory-debugging)
+  - [2. Automated Testing with Pytest (`apply`)](#2-automated-testing-with-pytest)
+  - [3. Pipeline Schema Drift Detection (`diff`)](#3-pipeline-schema-drift-detection)
+  - [4. Python API Reference](#4-python-api-reference)
+  - [CLI Python Management](#cli-python-management)
+- [🦆 Quack Remote Server Integration](#-quack-remote-server-integration)
+  - [The `-- @remote` Query Directive](#the---remote-query-directive)
+  - [SSL & Non-TLS Options](#ssl--non-tls-options)
+- [📁 Declarative Project Structure](#-declarative-project-structure)
+  - [Directory Layout](#directory-layout)
+  - [Configuration (`duckpack.toml`)](#configuration-duckpacktoml)
+  - [Environment Variables (`.env`)](#environment-variables-env)
+  - [Ignoring Tables (`.duckdbignore`)](#ignoring-tables-duckdbignore)
+- [📦 DuckPacks (`.duckpack`) for CI/CD](#-duckpacks-duckpack-for-cicd)
+- [NOTE](#note)
+
+---
 
 ## ✨ Features
 
-- **Declarative Schema**: Define your tables, views, and macros as raw `.sql` files. No migration versions to track.
-- **Git-Style Smart Renames**: The engine uses heuristic similarity matching. If you rename a table or column, it automatically detects the similarity (>80%) and issues a non-destructive `ALTER TABLE RENAME` instead of dropping and recreating your data.
-- **Environment Variables**: Dynamically inject an unlimited number of variables (e.g. `CREATE TABLE ${ENV}_users_${REGION}`) directly into your SQL using `.env` files. The engine automatically parses them via regex and injects them seamlessly!
-- **Views and Macros**: Define views and macros using standard `CREATE VIEW` statements, and the engine automatically forces `OR REPLACE` under the hood to ensure seamless non-destructive updates.
-- **Interactive TUI**: Review proposed schema changes (`[NEW TABLE]`, `[DROP VIEW]`, `[RENAME TABLE]`) in a gorgeous, side-by-side interactive terminal UI before deploying.
-- **Built-in IDE & Explorer**: Seamlessly explore your live DuckDB database, write queries, and save your scratchpad files directly within a powerful integrated terminal IDE.
-- **DuckPacks (`.duckpack`)**: Compile your entire project into a single, immutable DuckDB snapshot artifact containing fully resolved environment variables and encapsulated pre/post deployment scripts. Deploy it instantly to production without the raw SQL files.
+- **Declarative Schemas:** Define your schemas, tables, views, and macros as raw `.sql` files. No migration timestamps or versions to manage.
+- **Git-Style Smart Renames:** Uses Jaro-Winkler similarity matching (>80%) to detect renamed tables or columns, issuing non-destructive `ALTER TABLE RENAME` statements instead of dropping and recreating data.
+- **Built-in Interactive Terminal IDE:** Explore live databases, write queries with syntax highlighting and autocompletion (`Ctrl+Space`), and manage independent query tabs.
+- **Python Integration:** Import `duckpack` into Python pipelines, pytest fixtures, or debug sessions (`duckpack.explore(con)`, `duckpack.apply(con)`, `duckpack.diff(con)`).
+- **In-Memory & Remote Attach:** Connect to local files, `:memory:` instances, MotherDuck (`md:...`), or remote DuckDB instances over the [Quack](https://duckdb.org/) protocol.
+- **Remote Query Directive (`-- @remote`):** Forward session-scoped statements (e.g. S3 secrets, settings, and catalog scans) directly to remote engines with automated diagnostic hints.
+- **ASCII & Mermaid.js Schema Visualizer:** Press `Ctrl+G` to view table relationships and automatically copy formatted Mermaid.js Entity-Relationship diagrams to your system clipboard.
+- **Environment Variable Templating:** Write `${ENV}_orders_${REGION}` directly in SQL; DuckPack dynamically interpolates values from `.env` files.
+- **Immutable Snapshots (`.duckpack`):** Compile your entire project into a single, portable snapshot artifact for deterministic zero-dependency deployments.
 
-## 🚀 Quick Start
+---
 
-### 1. Installation
+## 🚀 Quick Start & Installation
 
-Download the latest pre-compiled binary for your operating system directly from the [GitHub Releases](https://github.com/Benjas86/duckpack/releases/latest) page, or use the quick-install script below:
+### 1. Standalone Binary
 
-**Linux:**
+Download pre-compiled binaries from the [GitHub Releases](https://github.com/Benjas86/duckpack/releases/latest) page, or install via terminal:
+
+**Linux (x86_64 / AMD64):**
 ```bash
 curl -L https://github.com/Benjas86/duckpack/releases/latest/download/duckpack-linux-amd64 -o duckpack
+chmod +x duckpack
+sudo mv duckpack /usr/local/bin/
+```
+
+**Linux (ARM64 / aarch64):**
+```bash
+curl -L https://github.com/Benjas86/duckpack/releases/latest/download/duckpack-linux-arm64 -o duckpack
+chmod +x duckpack
+sudo mv duckpack /usr/local/bin/
+```
+
+**Linux (Musl Static — Alpine, Docker, minimal distros):**
+```bash
+curl -L https://github.com/Benjas86/duckpack/releases/latest/download/duckpack-linux-amd64-static -o duckpack
+chmod +x duckpack
+sudo mv duckpack /usr/local/bin/
+```
+
+**macOS (Apple Silicon M1/M2/M3/M4):**
+```bash
+curl -L https://github.com/Benjas86/duckpack/releases/latest/download/duckpack-macos-arm64 -o duckpack
 chmod +x duckpack
 sudo mv duckpack /usr/local/bin/
 ```
@@ -43,292 +107,388 @@ chmod +x duckpack
 sudo mv duckpack /usr/local/bin/
 ```
 
-**macOS (Apple Silicon / M1+):**
-```bash
-curl -L https://github.com/Benjas86/duckpack/releases/latest/download/duckpack-macos-arm64 -o duckpack
-chmod +x duckpack
-sudo mv duckpack /usr/local/bin/
-```
-
 **Windows:**
-Download `duckpack-windows-amd64.exe` from the Releases page and add it to your system PATH.
+Download `duckpack-windows-amd64.exe` from [GitHub Releases](https://github.com/Benjas86/duckpack/releases/latest) and add it to your system `PATH`.
 
-*No Rust installation is required!*
+---
 
-**Python (pip / uv):**
-Install the Python extension and CLI simultaneously:
+### 2. Python Package (`pip` / `uv`)
+
+Installing DuckPack via Python installs **both** the Python package (`import duckpack`) and the standalone CLI binary (`duckpack` command in your virtualenv `bin/`):
+
 ```bash
+# Using pip
 pip install duckpack
-# or
+
+# Using uv
 uv add duckpack
 ```
-*(Provides both `import duckpack` in Python and the `duckpack` CLI binary in your shell!)*
 
-### 2. Initialize a Project
+*Requires Python ≥ 3.10. Pre-compiled wheels are available for Linux, macOS, and Windows.*
 
-Initialize a new declarative project directory:
-```bash
-duckpack init --project-dir my_project
-```
-This automatically scaffolds the necessary directories (`tables/`, `views/`, `macros/`, `scripts/`) and configuration files.
+---
 
-### 3. Define Your Schema
-
-Write your desired state into standard `.sql` files:
-
-**`my_project/tables/users.sql`**
-```sql
-CREATE TABLE users (
-    id INT PRIMARY KEY,
-    name VARCHAR,
-    created_at TIMESTAMP
-);
-```
-
-### 4. Configure Environments (Optional)
-
-You can define dynamic configurations across environments using a `duckpack.toml` file in your project directory:
-```toml
-[env.staging]
-db = "staging.duckdb"
-
-[env.prod]
-db = "prod.duckdb"
-```
-
-### 5. Review and Deploy
-
-Apply your schema to a target DuckDB database. This will open the interactive TUI so you can review the proposed execution plan:
-```bash
-# Using a direct connection string
-duckpack apply --project-dir my_project --db local.duckdb
-
-# Or using an environment configured in your duckpack.toml!
-duckpack apply --project-dir my_project --env prod
-```
-
-## 🧑‍💻 DuckPack IDE / Explorer Mode
-
-DuckPack ships with a fully integrated terminal IDE! After deploying your schema, you often want to explore the live database to verify that the changes applied correctly.
-
-Instead of switching to a different terminal window or dealing with DuckDB file locks, you can jump straight into the IDE in two ways:
-1. **Standalone:** Run `duckpack explore -p my_project -d local.duckdb` to open the IDE directly.
-2. **Seamless Transition:** After running `duckpack apply`, simply press `e` (Explore) from the TUI!
-
-### Features
-1. **Integrated Query Editor:** Write multi-line SQL queries directly in the application with a built-in text editor featuring **Syntax Highlighting** (bold cyan keywords) and **Intelligent Autocomplete**. Press `Ctrl+Space` to dynamically cycle through matches from your database schema (tables, views, and columns)!
-2. **Multi-Tab Editor System & Independent Results:** Manage multiple queries simultaneously! Each tab maintains its very own independent state for query results, scrolling, and column headers! Hit `Ctrl+T` to open a new tab, `Ctrl+W` to close it, and navigate between them using `Ctrl+N` / `Ctrl+P`.
-3. **Full Mouse Support:** The entire IDE is highly interactive. You can instantly switch context by clicking on the Tab headers directly. The action bar at the bottom also provides intuitive `[+ New]` and `[❌ Close]` buttons you can click with your mouse! You can also use your mouse wheel to seamlessly scroll vertically and horizontally across the Explorer, Editor, and Results grid.
-4. **Instant Transitions:** Hitting `e` from the `apply` screen instantly transfers your locked DuckDB connection over to the IDE, allowing you to seamlessly begin querying your tables without restarting.
-5. **Interactive & Expandable Explorer:** The left-hand sidebar acts as your navigation hub. You can click on any Table or View (or press `Enter`) to expand it hierarchically and dynamically query DuckDB for all nested columns and their exact data types! Click on any saved `.sql` file to load it instantly into your active tab.
-6. **Execution & Isolate Queries:** Hit `Ctrl+E` to execute your query! The dynamic engine parses the typed DuckDB rows and presents your results instantly in a formatted grid. You can navigate large datasets freely using your mouse wheel, or `Up`/`Down`/`PgUp`/`PgDn` and scroll horizontally using your mouse's horizontal scroll wheel or `Left`/`Right` arrow keys. **To isolate a query:** Highlight text using **`Shift` + Arrow Keys** and press `Ctrl+E` to execute *only* the highlighted snippet!
-7. **Real-time Syntax Error Detection:** If DuckDB throws a syntax parsing error during execution, the engine intercepts the stack trace, extracts the exact offending token, and injects a dynamic regex highlight patch—turning that specific broken word bright red and halting execution until it is fixed!
-8. **Auto-Formatting:** Hit `Ctrl+F` to instantly pass your raw query through the internal `sqlformat` parser and auto-indent your code beautifully.
-9. **Auto-Save:** Hit `Ctrl+S` to instantly save your active editor contents to a scratchpad `.sql` file in your `queries/` directory.
-10. **Result Pagination:** View datasets with millions of rows safely! The IDE intelligently paginates `SELECT`, `WITH`, `VALUES`, and `FROM` statements into manageable 500-row chunks. Use `n` (Next Page) and `p` (Previous Page) when focused on the Results pane to navigate through massive datasets instantly.
-11. **Schema Visualizer:** Hit `Ctrl+G` to open the integrated visualizer! This will dynamically scan your active DuckDB database, extract foreign key mappings, and print an elegant ASCII visual tree inside the IDE while silently generating and copying the complete `Mermaid.js` Entity-Relationship syntax directly to your clipboard!
-12. **Remote Quack Execution & Cloud Storage (`-- @remote`):** When attached to a remote Quack or MotherDuck database, DuckPack sets `USE target_db;` automatically so that **99% of your normal SQL executes directly on the remote server** without any special syntax. However, in DuckDB's engine architecture, session-scoped entities like **Secrets** and **Settings** are kept in local client memory by default. Prepending `-- @remote` at the top of your query instructs DuckPack to automatically forward the statement directly to the remote server engine via `FROM query(...)`. DuckPack also automatically probes and displays both Local and Remote DuckDB versions in the top header and provides real-time diagnostic hints if remote S3 credentials are missing!
-
-    | Statement Type | Needs `-- @remote`? | Execution Target | Behavior |
-    | :--- | :---: | :--- | :--- |
-    | `CREATE TABLE` / `CREATE VIEW` | **No** | Remote Database | Standard SQL; persists directly on remote Quack DB. |
-    | `SELECT * FROM table / view` | **No** | Remote Database | Standard SQL; queries remote data directly. |
-    | `INSERT` / `UPDATE` / `DELETE` | **No** | Remote Database | Standard SQL; mutates remote data directly. |
-    | **`CREATE SECRET (TYPE S3 ...)`** | **YES** | Remote Server Instance | Pushes S3/GCS/Azure credentials directly to the remote Quack daemon. |
-    | **`SHOW TABLES` / `DESCRIBE`** | **YES** | Remote Server Instance | Quack protocol limitation (multiple streaming scans across the wire); use `-- @remote` to execute server-side cleanly. |
-    | **`SET variable = ...`** | **YES** | Remote Server Instance | Applies configuration variables directly to the remote server session. |
-    | **`INSTALL / LOAD extension`** | **YES** | Remote Server Instance | Installs or loads extensions directly on the remote Quack engine. |
-## 📦 Building DuckPacks for CI/CD
-
-For remote deployments (like production servers running Quack/DuckDB), executing migrations over a live network connection is risky and slow. Instead, you can compile your project into an immutable `.duckpack`:
+### 3. Cargo (Rust Developers)
 
 ```bash
-duckpack compile --project-dir my_project --out release_v1.duckpack
+cargo install duckpack
 ```
 
-This resolves all environment variables and encapsulates your schema. 
+---
 
-### How DuckPacks Work (And Why They Are Non-Destructive)
+## 📋 CLI Command Reference
 
-You might be wondering: *"If I compile my entire project into an artifact and apply it to production, won't it just destructively replace my live database?"*
+| Command | Description | Key Arguments / Flags | Default |
+| :--- | :--- | :--- | :--- |
+| `duckpack init` | Scaffold a new declarative database project | `-p, --project-dir <DIR>` | `.` |
+| `duckpack build` | Validate SQL syntax against an in-memory Shadow DB | `-p, --project-dir <DIR>` | `.` |
+| `duckpack apply` | Compute diff and apply migrations to target database | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--auto-approve`<br>`--force-drop`<br>`--out <FILE>`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`false`<br>`false`<br>`None`<br>`None`<br>`false` |
+| `duckpack explore` | Open the interactive terminal IDE / query editor | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--remote <SSH_TARGET>`<br>`-P, --port <PORT>`<br>`--auto-install`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`22`<br>`false`<br>`None`<br>`false` |
+| `duckpack compile` | Package project into an immutable `.duckpack` snapshot | `-p, --project-dir <DIR>`<br>`-o, --out <FILE>` | `.`<br>*(Required)* |
+| `duckpack deploy` | Deploy compiled project to a remote server over SSH | `-p, --project-dir <DIR>`<br>`-r, --remote <HOST>`<br>`-d, --db <URI>`<br>`-P, --port <PORT>`<br>`--auto-install` | `.`<br>*(Required)*<br>`local.duckdb`<br>`22`<br>`false` |
+| `duckpack python status` | Check if Python bindings are installed in active environment | — | — |
+| `duckpack python install` | Install/upgrade `duckpack` Python package via pip | `--upgrade` | `false` |
 
-**No!** A `.duckpack` is actually an offline, empty DuckDB database file containing your fully resolved `CREATE` statements. It perfectly represents your **Desired State**. 
+---
 
-When you run `apply` against your production server using a DuckPack, the engine:
-1. Opens the `.duckpack` (Desired State).
-2. Opens your live `prod.duckdb` (Current State).
-3. **Calculates the Diff:** It dynamically compares the schemas of the two databases in-memory.
-4. It then applies *only* the delta non-destructively. If you added a column, it issues an `ALTER TABLE ADD COLUMN`. If you renamed a table, the Git-style similarity engine issues an `ALTER TABLE RENAME TO`. Your live data is never wiped out.
+## 🧑‍💻 DuckPack Terminal IDE
 
-### The "Companion Install" Deployment Pattern
+DuckPack includes a fully integrated terminal IDE built with Ratatui and Crossterm.
 
-Because DuckDB is an embedded database without a traditional client-server protocol, the safest way to deploy changes is to run them locally on the server's disk.
-
-By installing this `duckpack` CLI on your remote server as a companion tool, your CI/CD pipeline becomes incredibly powerful:
-
-1. **GitHub Actions** compiles your offline SQL files into a `release_v1.duckpack`.
-2. The pipeline securely transfers the `.duckpack` to your remote server via SCP/SSH.
-3. The pipeline executes the companion CLI remotely via SSH to deploy the artifact:
-   ```bash
-   ssh user@production-server "duckpack apply --project-dir /tmp/release_v1.duckpack --db /var/lib/duckdb/prod.duckdb --auto-approve"
-   ```
-
-**Wait! What if I don't want to manually install the CLI on my remote server?**
-No problem! Because `duckpack` is a standalone, statically linked binary, it can auto-bootstrap itself!
-
-Instead of running SSH manually, you can just run `deploy` from your local machine (or CI pipeline) with the `--auto-install` flag. The engine will:
-1. Compile your `.duckpack`
-2. SCP the `.duckpack` to your remote server
-3. **SCP its own `duckpack` executable binary** to your remote server
-4. Execute it remotely via SSH
-5. Clean up both temporary files
-
+Launch it directly:
 ```bash
-duckpack deploy --project-dir . --remote user@production-server --db /var/lib/duckdb/prod.duckdb --auto-install
+duckpack explore --db local.duckdb
+```
+Or transition instantly from `duckpack apply` by pressing **`e`**.
+
+```
+┌ Explorer [r: Refresh] ───────┬─ [Tab 1: users.sql] ── [+ New] ── [❌ Close] ───────────────┐
+│ ▼ Tables                     │ SELECT id, name, email                                     │
+│   ├─ customers (1,450 rows)  │ FROM users                                                 │
+│   │  ├─ customer_id (BIGINT) │ WHERE created_at >= '2026-01-01';                          │
+│   │  └─ email (VARCHAR)      │                                                            │
+│   └─ orders (8,920 rows)     │                                                            │
+│ ▼ Views                      │                                                            │
+│   └─ active_users            │                                                            │
+├──────────────────────────────┴────────────────────────────────────────────────────────────┤
+│ Query Results [Page 1/3] (Showing 500 rows)                                               │
+│ id │ name             │ email                                                             │
+│ 1  │ Alice Smith      │ alice@example.com                                                 │
+│ 2  │ Bob Jones        │ bob@example.com                                                   │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3. Explore
-Launch the fully featured built-in IDE to query and explore your DuckDB database safely.
+### Keyboard Shortcuts Cheat Sheet
 
-```bash
-duckpack explore --project-dir . --db local.duckdb
-```
+| Scope | Shortcut | Action |
+| :--- | :--- | :--- |
+| **Global / Navigation** | `Tab` | Cycle focus between **Explorer**, **Editor**, and **Results** panes |
+| | `?` | Toggle the Help Modal |
+| | `Ctrl+C` / `Esc` | Cancel operation / exit modal / quit IDE |
+| **Editor** | `Ctrl+E` | **Execute query** in active tab |
+| | `Shift + Arrows` | Highlight text to isolate and execute *only* the selection on `Ctrl+E` |
+| | `Ctrl+Space` | Trigger **Intelligent Autocomplete** (tables, views, columns) |
+| | `Ctrl+F` | **Auto-format** SQL statement using SQL parser |
+| | `Ctrl+S` | **Save** active query to `queries/<tab_name>.sql` |
+| | `Ctrl+Y` / `Ctrl+C` | **Copy** selected text (or current line) to system clipboard |
+| | `Ctrl+G` | Open **Schema Visualizer** (ASCII tree + copies Mermaid.js ERD to clipboard) |
+| **Tabs** | `Ctrl+T` | Open a new blank query tab |
+| | `Ctrl+W` | Close the active query tab |
+| | `Ctrl+N` / `Ctrl+P` | Switch to the **Next** / **Previous** tab |
+| **Explorer** | `Up` / `Down` | Navigate through nodes |
+| | `Enter` / Click | Expand or collapse table column tree / open SQL file in tab |
+| | `r` / `R` | **Refresh catalog** from live/remote database (preserves open state) |
+| **Results Grid** | `Arrows` | Scroll vertically and horizontally through rows and columns |
+| | `PgUp` / `PgDn` | Fast scroll vertically |
+| | `n` / `p` | Navigate to **Next** / **Previous** page (500-row pagination chunks) |
+| | `Ctrl+O` | Export query results to a CSV file in `queries/` |
+| **Mouse Support** | Mouse Wheel | Seamless vertical & horizontal scrolling in any focused pane |
+| | Click Tabs | Click on tab headers to switch or click `[+ New]` / `[❌ Close]` buttons |
 
-**Remote Exploration via SSH**
-You can also launch the TUI directly on a remote server over SSH! If you pass the `--remote` flag, `duckpack` will securely launch the IDE on your server and beam the interface back to your local terminal over an interactive SSH session. 
-
-```bash
-duckpack explore --remote user@production-server --db /var/lib/duckdb/prod.duckdb --auto-install
-```
-
-*(Note: The `--auto-approve` flag ensures the CLI bypasses the interactive TUI and runs entirely headless.)*
-
-This architecture completely eliminates network latency during deployment, prevents file-locking issues, and gives you a fully automated, Git-backed declarative pipeline for your embedded database!
-
-## 🚀 Native Remote Deploy (No CI/CD Needed!)
-
-If you want to deploy directly to a local server or VM without setting up GitHub Actions or a CI/CD pipeline, you can use the native `deploy` command!
-
-```bash
-duckpack deploy --project-dir my_project --remote user@10.0.0.5 -P 2222 --db /var/lib/duckdb/prod.duckdb
-```
-
-This command automatically handles the entire "Companion Install" pipeline for you:
-1. It locally compiles your project into a temporary DuckPack.
-2. It uses your system's built-in `scp` to securely transfer the DuckPack to the remote server.
-3. It uses your system's built-in `ssh` to execute the remote companion CLI and apply the changes headless.
-4. It safely cleans up the temporary files from both machines!
-
-## 📂 Folder Structure
-When you run `init`, the following structure is created:
-- `tables/`: Place your `CREATE TABLE` definitions here.
-- `views/`: Place your `CREATE VIEW` definitions here (engine auto-forces `OR REPLACE`).
-- `macros/`: Place your `CREATE MACRO` definitions here.
-- `queries/`: Save your ad-hoc `.sql` queries and scratchpad files here. These are ignored during deployment and are exclusively available within the IDE.
-- `scripts/pre-deploy/`: Raw SQL scripts that run *before* any schema diffs are applied.
-- `scripts/post-deploy/`: Raw SQL scripts that run *after* schema diffs are applied.
-- `.env`: Define environment variables for `${VAR}` interpolation in your SQL.
-- `.duckdbignore`: Specify tables or views to ignore during diffing (wildcards supported).
-
-## 🛠️ Built With
-- **[Rust](https://www.rust-lang.org/)**
-- **[DuckDB](https://duckdb.org/)**
-- **[Ratatui](https://ratatui.rs/)** (For the interactive UI)
-
-## 🦆 Quack Remote Database Support
-
-`duckpack` includes first-class integration with remote DuckDB servers running the [Quack](https://duckdb.org/) extension over HTTP/HTTPS.
-
-### 🔍 Interactive Remote Exploration (`duckpack explore`)
-Explore any remote Quack server directly inside the interactive terminal IDE:
-- **Live Catalog Discovery:** Remote tables, views, and macros are dynamically discovered and listed in the Explorer tree.
-- **Nested Column Introspection:** Expanding any table or view fetches column names and DuckDB data types on demand.
-- **Live Remote Querying:** Execute arbitrary queries directly against the remote database from the built-in editor tabs.
-- **Context-Aware Autocomplete:** Remote tables and columns are automatically loaded into the query editor's autocomplete dictionary.
-
-```bash
-# Explore a remote Quack server with authentication
-duckpack explore --db quack:localhost:9494 --quack-token <token>
-```
-
-You can also pass your token via the `DUCKDB_QUACK_TOKEN` environment variable.
-
-### 🔒 SSL & Plain HTTP Options
-By default, DuckDB's Quack extension enforces HTTPS/SSL for remote hosts and container IPs, and uses plain HTTP for `localhost` and `127.0.0.1`.
-
-If you are running a local development container (e.g., bound to `0.0.0.0:9494` or an internal Docker network IP) without TLS:
-- `duckpack` **automatically detects `0.0.0.0` bindings** and disables SSL so local container workflows work out-of-the-box.
-- For other non-TLS endpoints, you can explicitly disable SSL using `--insecure` (or `--quack-disable-ssl`), or by setting `DUCKDB_QUACK_DISABLE_SSL=true`:
-
-```bash
-duckpack explore --db quack:0.0.0.0:9494 --quack-token <token> --insecure
-```
-
-### 🚀 Remote Migrations: `apply` vs `deploy`
-- **Schema Discovery & Diffing (`duckpack apply`)**: You can inspect and diff schemas directly against a remote Quack instance.
-- **Upstream `ALTER TABLE` Note**: The experimental upstream DuckDB Quack extension does not yet support `ALTER TABLE` statements over its HTTP wire protocol. Live in-place alterations (such as adding or renaming columns) will return a `Not implemented` error from the remote engine.
-- **Recommended for Full Remote Deployments (`duckpack deploy`)**: For remote production deployments that require schema modifications, use `duckpack deploy`. This compiles an immutable `.duckpack` bundle and executes migrations locally on the remote server's disk over SSH with 100% full DuckDB engine support.
+---
 
 ## 🐍 Python Integration
 
-DuckPack provides first-class Python bindings! You can programmatically inspect in-memory databases, run declarative migrations in test fixtures, and launch the interactive terminal IDE directly from your Python pipeline or debug session.
+DuckPack provides native Python bindings compiled via **PyO3**. It allows data engineers and developers to programmatically inspect in-memory DuckDB connections, run declarative migrations in test fixtures, and detect schema drift without leaving Python.
 
-### 1. Interactive In-Memory Exploration
-Drop into the full DuckPack terminal IDE during pipeline development or at a `breakpoint()`:
+### 1. Interactive In-Memory Debugging
+
+Drop into the full DuckPack terminal IDE during pipeline execution or inside a `breakpoint()` / `pdb` session:
 
 ```python
 import duckdb
 import duckpack
 
-con = duckdb.connect()  # in-memory database
-con.execute("CREATE TABLE users AS SELECT 1 AS id, 'Alice' AS name;")
+# In-memory DuckDB database
+con = duckdb.connect()
 
-# Launches the interactive DuckPack TUI directly in your active terminal:
+# Populate data in memory
+con.execute("CREATE TABLE users AS SELECT 1 AS id, 'Alice' AS name;")
+con.execute(
+    "CREATE TABLE telemetry AS SELECT range AS id, random() AS metric FROM"
+    " range(1000);"
+)
+
+# Launches the interactive DuckPack IDE directly in your current terminal:
 duckpack.explore(con)
 
-# When you exit the TUI (Esc / q), Python execution resumes seamlessly!
-print("Pipeline continuing...")
+# When you quit the TUI (Esc / q), Python resumes execution seamlessly!
+print("Resuming pipeline execution...")
 ```
 
-### 2. Programmatic Migrations (Great for Pytest & Pipelines)
-Apply your declarative schema SQL files directly to in-memory or on-disk databases:
+---
+
+### 2. Automated Testing with Pytest
+
+Maintain a single declarative SQL project and automatically apply it to fresh in-memory test databases:
 
 ```python
 import duckdb
 import duckpack
 import pytest
 
+
 @pytest.fixture
 def db():
-    con = duckdb.connect()
-    # Apply your declarative project into the test database:
-    result = duckpack.apply(con, project_dir="./schema", auto_approve=True)
-    assert result.success
-    return con
+  # Spin up an isolated in-memory test database
+  con = duckdb.connect()
+
+  # Apply all schemas, tables, views, and macros from your declarative project:
+  result = duckpack.apply(con, project_dir="./duckdb_project", auto_approve=True)
+  assert result.success
+
+  yield con
+  con.close()
+
+
+def test_user_creation(db):
+  db.execute("INSERT INTO users (id, name) VALUES (42, 'Bob');")
+  count = db.execute("SELECT count(*) FROM users;").fetchone()[0]
+  assert count == 1
 ```
 
-### 3. Schema Drift Detection
-Check if a target database is in sync with your declarative `.sql` definitions:
+---
+
+### 3. Pipeline Schema Drift Detection
+
+Check if an analytical database matches your version-controlled SQL definitions before running ETL/ELT pipelines:
 
 ```python
 import duckdb
 import duckpack
 
-con = duckdb.connect("prod.duckdb")
-diff = duckpack.diff(con, project_dir="./schema")
+con = duckdb.connect("production.duckdb")
+
+# Detect schema drift
+diff = duckpack.diff(con, project_dir="./duckdb_project")
 
 if diff.has_changes:
-    print(f"Warning: {diff.change_count} schema drift items detected: {diff.items}")
+  print(f"Schema drift detected ({diff.change_count} changes):")
+  for change in diff.items:
+    print(f" - {change}")
+  raise RuntimeError("Database schema does not match codebase!")
 ```
 
-### 4. CLI Python Management
-Manage the Python environment directly from the standalone DuckPack CLI:
+---
+
+### 4. Python API Reference
+
+```python
+import duckpack
+```
+
+#### Functions
+
+- **`duckpack.explore(target, project_dir=".") -> None`**
+  Launches the interactive TUI IDE against a live connection (`duckdb.DuckDBPyConnection`) or database URI (`str`).
+
+- **`duckpack.apply(target, project_dir=".", auto_approve=True, force_drop=False, interactive=False) -> ApplyResult`**
+  Computes schema diffs and applies declarative migrations. Returns an `ApplyResult`.
+
+- **`duckpack.diff(target, project_dir=".") -> DiffSummary`**
+  Compares declarative project state against target database. Returns a `DiffSummary`.
+
+- **`duckpack.compile(project_dir, out) -> None`**
+  Compiles project SQL definitions into an immutable `.duckpack` snapshot file.
+
+- **`duckpack.build(project_dir=".") -> None`**
+  Validates SQL syntax and dependencies against an in-memory Shadow DB.
+
+- **`duckpack.init(project_dir=".") -> None`**
+  Scaffolds a new declarative database project directory.
+
+#### Objects & Exceptions
+
+- **`ApplyResult`**: Has attributes `.success: bool`, `.applied_count: int`, and `.items: list[str]`.
+- **`DiffSummary`**: Has attributes `.has_changes: bool`, `.change_count: int`, and `.items: list[str]`.
+- **Exceptions**: `duckpack.Error` (base), `duckpack.SchemaError`, `duckpack.ExecutionError`.
+
+---
+
+### CLI Python Management
+
+Check and install the Python bindings directly from the standalone DuckPack CLI:
 
 ```bash
-# Check if DuckPack is available in active Python environment
+# Verify Python extension status in active environment
 duckpack python status
 
-# Install or upgrade DuckPack into active Python environment
+# Install or upgrade duckpack in active environment via pip
 duckpack python install --upgrade
 ```
 
+---
+
+## 🦆 Quack Remote Server Integration
+
+DuckPack includes first-class integration with remote DuckDB instances running the [Quack](https://duckdb.org/) extension over HTTP/HTTPS.
+
+```bash
+# Explore a remote Quack server with authentication token
+duckpack explore --db quack:localhost:9494 --quack-token <token>
+```
+*(You can also set `DUCKDB_QUACK_TOKEN=<token>` in your environment).*
+
+### The `-- @remote` Query Directive
+
+In DuckDB's engine architecture, session-scoped entities like **Secrets** and **Settings** are kept in local client memory by default. Prepending `-- @remote` at the top of your query instructs DuckPack to automatically forward the statement directly to the remote server engine via `FROM query(...)`:
+
+```sql
+-- @remote
+CREATE SECRET (
+    TYPE S3,
+    KEY_ID 'AKIAIOSFODNN7EXAMPLE',
+    SECRET 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    REGION 'us-east-1'
+);
+```
+
+| Statement Type | Needs `-- @remote`? | Execution Target | Behavior |
+| :--- | :---: | :--- | :--- |
+| `CREATE TABLE` / `CREATE VIEW` | **No** | Remote Database | Standard SQL; persists directly on remote Quack DB. |
+| `SELECT * FROM table / view` | **No** | Remote Database | Standard SQL; queries remote data directly. |
+| `INSERT` / `UPDATE` / `DELETE` | **No** | Remote Database | Standard SQL; mutates remote data directly. |
+| **`CREATE SECRET (TYPE S3 ...)`** | **YES** | Remote Server Instance | Pushes S3/GCS/Azure credentials directly to the remote daemon. |
+| **`SHOW TABLES` / `DESCRIBE`** | **YES** | Remote Server Instance | Executes server-side cleanly to introspect remote catalog. |
+| **`SET variable = ...`** | **YES** | Remote Server Instance | Applies configuration variables directly to remote server session. |
+| **`INSTALL / LOAD extension`** | **YES** | Remote Server Instance | Installs or loads extensions directly on remote Quack engine. |
+
+### SSL & Non-TLS Options
+
+DuckDB's Quack extension enforces HTTPS/SSL for remote hosts and uses plain HTTP for `localhost` and `127.0.0.1`.
+
+If you are running a local development container (e.g. bound to `0.0.0.0:9494` or a Docker network IP) without TLS:
+- `duckpack` **automatically detects `0.0.0.0` bindings** and disables SSL out-of-the-box.
+- For other non-TLS endpoints, explicitly disable SSL using `--insecure` (or `--quack-disable-ssl`), or set `DUCKDB_QUACK_DISABLE_SSL=true`:
+  ```bash
+  duckpack explore --db quack:10.0.0.5:9494 --quack-token <token> --insecure
+  ```
+
+---
+
+## 📁 Declarative Project Structure
+
+### Directory Layout
+
+Running `duckpack init --project-dir my_project` generates the standard declarative project scaffold:
+
+```
+my_project/
+├── schemas/               # CREATE SCHEMA statements
+├── tables/                # CREATE TABLE statements (one table per .sql file)
+├── views/                 # CREATE VIEW statements (engine auto-forces OR REPLACE)
+├── macros/                # CREATE MACRO statements
+├── queries/               # Scratchpad queries, exports, and query history
+├── seeds/                 # Static CSVs or data seed files
+├── scripts/
+│   ├── pre-deploy/        # Raw SQL executed BEFORE migrations are applied
+│   └── post-deploy/       # Raw SQL executed AFTER migrations are applied
+├── duckpack.toml          # Multi-environment targets configuration
+├── .env                   # Environment variables for ${VAR} template substitution
+└── .duckdbignore          # Ignore patterns for tables/views
+```
+
+### Configuration (`duckpack.toml`)
+
+Define multiple environments to avoid hardcoding database paths:
+
+```toml
+[project]
+name = "analytics_warehouse"
+version = "0.2.0"
+
+[target]
+default_db = "dev.duckdb"
+
+[env.dev]
+db = "dev.duckdb"
+
+[env.staging]
+db = "staging.duckdb"
+
+[env.prod]
+db = "md:prod_db" # Points directly to MotherDuck!
+```
+
+Deploy or explore against any profile:
+```bash
+duckpack apply --env staging
+duckpack explore --env prod
+```
+
+### Environment Variables (`.env`)
+
+Write dynamic templates directly in your SQL files:
+```sql
+CREATE TABLE ${ENV}_customers_${REGION} (
+    id INT PRIMARY KEY,
+    name VARCHAR
+);
+```
+DuckPack loads `.env` (or `.env.<profile>` when using `--env <profile>`) and interpolates variables via regex before compiling.
+
+### Ignoring Tables (`.duckdbignore`)
+
+Specify glob patterns for tables or views that DuckPack should ignore during schema diffs:
+```
+# Ignore ephemeral tables and temp backups
+temp_*
+*_backup
+scratch.*
+```
+
+---
+
+## 📦 DuckPacks (`.duckpack`) for CI/CD
+
+For production pipelines and remote servers, applying migrations over a live network connection can be slow or risky. Compile your project into an immutable, offline snapshot artifact:
+
+```bash
+duckpack compile --project-dir my_project --out release_v1.duckpack
+```
+
+### How DuckPacks Work (Non-Destructively)
+
+A `.duckpack` file is a pre-compiled DuckDB database containing your desired state with all environment variables resolved.
+
+When you run `apply` using a DuckPack:
+1. Opens `release_v1.duckpack` (Desired State).
+2. Opens your live `prod.duckdb` (Current State).
+3. **Calculates the Diff:** Compares the two databases in memory.
+4. **Applies Non-Destructively:** Issues `ALTER TABLE`, `CREATE TABLE`, and `CREATE OR REPLACE VIEW` statements against the live database without dropping existing data.
+
+Deploy to a remote server over SSH in a single step:
+```bash
+duckpack deploy --project-dir my_project --remote user@prod-server.internal --db /var/lib/duckdb/prod.duckdb --auto-install
+```
+
+---
+
+## NOTE
+
+I've spent time as an educational journey into Rust vibe coding this application. I have personal reasons to want to use this application and had never tried to 'vibe code' anything before.
+
+I know this may contain 'sub-optimal' or 'vibe code' solutions and code that could be written more elegantly. I've also not fully tested everything yet so expect bugs, I'm fine with this! If you find this useful, want to tinker etc, please do.
+
+Thanks,  
+**Ben**

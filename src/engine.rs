@@ -201,7 +201,7 @@ pub fn apply_diff(conn: &Connection, diff: &diff::DiffResult, force_drop: bool, 
 
         // 1. Create schemas first
         for item in &diff.items {
-            if !item.selected { continue; }
+            if !item.selected || item.ignored { continue; }
             if item.item_type == diff::DiffItemType::CreateSchema {
                 conn.execute_batch(&item.sql)?;
             }
@@ -209,7 +209,7 @@ pub fn apply_diff(conn: &Connection, diff: &diff::DiffResult, force_drop: bool, 
 
         let mut structure_to_apply = Vec::new();
         for item in &diff.items {
-            if !item.selected { continue; }
+            if !item.selected || item.ignored { continue; }
             match item.item_type {
                 diff::DiffItemType::CreateTable | diff::DiffItemType::AlterTable | diff::DiffItemType::CreateMacro | diff::DiffItemType::RenameTable | diff::DiffItemType::RenameColumn => {
                     structure_to_apply.push(item.sql.clone());
@@ -267,7 +267,7 @@ pub fn apply_diff(conn: &Connection, diff: &diff::DiffResult, force_drop: bool, 
 }
 
 /// Scaffolds a new declarative database project by generating the standard directory structure,
-/// configuration files (`duck-project.toml`), environment templates, and documentation.
+/// configuration files (`duckpack.toml`), environment templates, and documentation.
 pub fn init_project(project_dir: &Path) -> Result<()> {
     let dirs = ["schemas", "tables", "views", "macros", "queries", "seeds", "scripts/pre-deploy", "scripts/post-deploy"];
     for dir in dirs.iter() {
@@ -278,7 +278,7 @@ pub fn init_project(project_dir: &Path) -> Result<()> {
         }
     }
 
-    let config_path = project_dir.join("duck-project.toml");
+    let config_path = project_dir.join("duckpack.toml");
     if !config_path.exists() {
         let default_config = r#"[project]
 name = "my_duckdb_project"
@@ -288,7 +288,7 @@ description = "A declarative DuckDB database project"
 [target]
 default_db = "local.duckdb"
 "#;
-        fs::write(&config_path, default_config).with_context(|| "Failed to write duck-project.toml")?;
+        fs::write(&config_path, default_config).with_context(|| "Failed to write duckpack.toml")?;
         println!("Created config file: {}", config_path.display());
     }
 
@@ -307,7 +307,7 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
 - `queries/`: Save your ad-hoc `.sql` queries and scratchpad files here.
 - `seeds/`: Contains static CSVs or seed scripts.
 - `scripts/`: Contains `pre-deploy` and `post-deploy` scripts.
-- `duck-project.toml`: Project configuration and targets.
+- `duckpack.toml`: Project configuration and targets.
 - `.env`: Environment variables for template interpolation. Write `${VAR_NAME}` in your SQL, and the engine will dynamically replace it!
 - `.duckdbignore`: Specifies tables or views to ignore during diffing (wildcards supported).
 "#;
@@ -456,4 +456,29 @@ pub fn execute_sqls_with_retry(conn: &Connection, mut pending_sqls: Vec<String>)
     }
 
     Ok(())
+}
+
+/// Loads ignore patterns from `.duckdbignore` (or legacy `.duckignore`).
+/// Lines beginning with '#' and empty lines are skipped.
+pub fn load_ignore_rules(project_dir: &Path) -> Vec<String> {
+    let ignore_path = if project_dir.join(".duckdbignore").exists() {
+        Some(project_dir.join(".duckdbignore"))
+    } else if project_dir.join(".duckignore").exists() {
+        Some(project_dir.join(".duckignore"))
+    } else {
+        None
+    };
+
+    let mut rules = Vec::new();
+    if let Some(path) = ignore_path {
+        if let Ok(content) = fs::read_to_string(path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    rules.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    rules
 }

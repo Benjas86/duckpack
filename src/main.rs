@@ -247,16 +247,7 @@ fn main() -> Result<()> {
                 let target_views = diff::get_views(&target_conn)?;
                 let shadow_macros = diff::get_macros(&shadow_conn)?;
                 let target_macros = diff::get_macros(&target_conn)?;
-
-                let mut ignore_list = Vec::new();
-                if let Ok(ignore_content) = std::fs::read_to_string(project_dir.join(".duckdbignore")) {
-                    for line in ignore_content.lines() {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                            ignore_list.push(trimmed.to_string());
-                        }
-                    }
-                }
+                let ignore_list = load_ignore_rules(project_dir);
 
                 let mut diff_result = diff::compute_diff(
                     &shadow_schemas,

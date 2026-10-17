@@ -22,7 +22,7 @@ def test_init_and_build(tmp_path):
     assert os.path.exists(os.path.join(proj_dir, "schemas"))
     assert os.path.exists(os.path.join(proj_dir, "views"))
     assert os.path.exists(os.path.join(proj_dir, "macros"))
-    assert os.path.exists(os.path.join(proj_dir, "duck-project.toml"))
+    assert os.path.exists(os.path.join(proj_dir, "duckpack.toml"))
 
     # Validate build on newly initialized project
     duckpack.build(proj_dir)
@@ -101,3 +101,30 @@ def test_compile_artifact(tmp_path):
     art_con = duckdb.connect(artifact_path)
     tables = [t[0] for t in art_con.execute("SHOW TABLES;").fetchall()]
     assert "products" in tables
+
+def test_duckdbignore_rules(tmp_path):
+    proj_dir = str(tmp_path / "ignore_proj")
+    duckpack.init(proj_dir)
+
+    with open(os.path.join(proj_dir, "tables", "active.sql"), "w") as f:
+        f.write("CREATE TABLE active (id INT PRIMARY KEY);")
+
+    with open(os.path.join(proj_dir, "tables", "temp_staging.sql"), "w") as f:
+        f.write("CREATE TABLE temp_staging (val VARCHAR);")
+
+    # Write ignore pattern
+    with open(os.path.join(proj_dir, ".duckdbignore"), "w") as f:
+        f.write("temp_*\n")
+
+    con = duckdb.connect()
+    # Diff should ignore temp_staging
+    d = duckpack.diff(con, proj_dir)
+    assert any("active" in item for item in d.items)
+    assert not any("temp_staging" in item for item in d.items)
+
+    # Apply should only create active
+    duckpack.apply(con, proj_dir)
+    tables = [t[0] for t in con.execute("SHOW TABLES;").fetchall()]
+    assert "active" in tables
+    assert "temp_staging" not in tables
+
