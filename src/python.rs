@@ -701,9 +701,32 @@ pub fn explore(
             .unwrap_or_else(|| ":memory:".to_string());
 
         let (conn, active_db_target) = if !db_name.is_empty() && db_name != ":memory:" {
-            let c = engine::connect_target_db(&db_name, None, false)
-                .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_name, e)))?;
-            (c, db_name)
+            match engine::connect_target_db(&db_name, None, false) {
+                Ok(c) => (c, db_name),
+                Err(e) => {
+                    // Fall back to serving via Python's active connection using the Quack bridge
+                    eprintln!("💡 Notice: Direct connection to target database file '{}' failed: {}.", db_name, e);
+                    eprintln!("   Seamlessly falling back to live Python Quack bridge...");
+
+                    let port = find_available_port();
+                    let start_server_sql = format!(
+                        "INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:{}', token := 'duckpack_py');",
+                        port
+                    );
+                    if let Err(serve_err) = target.call_method1("execute", (start_server_sql,)) {
+                        return Err(ExecutionError::new_err(format!(
+                            "Direct attach to '{}' failed ({}) and unable to start local quack bridge: {}. \
+                            Tip: Ensure the 'quack' extension can be loaded in your Python DuckDB environment.",
+                            db_name, e, serve_err
+                        )));
+                    }
+
+                    let server_uri = format!("quack:localhost:{}", port);
+                    let c = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
+                        .map_err(|attach_err| ExecutionError::new_err(format!("Failed to attach to Python Quack bridge: {}", attach_err)))?;
+                    (c, server_uri)
+                }
+            }
         } else {
             // For in-memory connection, start quack_serve on an available port
             let port = find_available_port();

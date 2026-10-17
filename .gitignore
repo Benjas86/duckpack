@@ -16,3 +16,4 @@ __pycache__/
 debug_query.txt
 /medium
 *.jpg
+/decisions/
