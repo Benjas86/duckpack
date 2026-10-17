@@ -25,12 +25,109 @@ enum FocusPane {
 /// Categorizes the type of entity currently being rendered in the Explorer tree.
 #[derive(Clone, Debug, PartialEq)]
 enum NodeType {
+    Database { db_type: String, is_active: bool, path: Option<String> },
     Group,
-    Table,
-    View,
+    Table { database: Option<String>, schema: Option<String> },
+    View { database: Option<String>, schema: Option<String> },
     Query,
     Macro,
     Column { data_type: String },
+}
+
+/// Represents an individual table across any attached DuckDB database/catalog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableEntry {
+    pub database: String,
+    pub schema: String,
+    pub name: String,
+    pub row_count: Option<i64>,
+}
+
+impl TableEntry {
+    pub fn display_name(&self) -> String {
+        if self.schema == "main" {
+            self.name.clone()
+        } else {
+            format!("{}.{}", self.schema, self.name)
+        }
+    }
+
+    pub fn qualified_name(&self) -> String {
+        format!("{}.{}.{}", self.database, self.schema, self.name)
+    }
+}
+
+/// Represents an individual view across any attached DuckDB database/catalog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ViewEntry {
+    pub database: String,
+    pub schema: String,
+    pub name: String,
+}
+
+impl ViewEntry {
+    pub fn display_name(&self) -> String {
+        if self.schema == "main" {
+            self.name.clone()
+        } else {
+            format!("{}.{}", self.schema, self.name)
+        }
+    }
+
+    pub fn qualified_name(&self) -> String {
+        format!("{}.{}.{}", self.database, self.schema, self.name)
+    }
+}
+
+/// Metadata holding info on an attached database catalog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatabaseInfo {
+    pub name: String,
+    pub db_type: String,
+    pub path: Option<String>,
+    pub is_active: bool,
+    pub readonly: bool,
+    pub tables: Vec<TableEntry>,
+    pub views: Vec<ViewEntry>,
+}
+
+/// State for the Attach Database modal dialog (Ctrl+A).
+#[derive(Clone, Debug)]
+struct AttachModalState {
+    is_open: bool,
+    path: String,
+    alias: String,
+    alias_is_custom: bool,
+    db_type: String,
+    read_only: bool,
+    active_field: usize, // 0: path, 1: alias, 2: type, 3: readonly, 4: submit, 5: cancel
+    error_msg: Option<String>,
+}
+
+impl AttachModalState {
+    fn new() -> Self {
+        Self {
+            is_open: false,
+            path: String::new(),
+            alias: String::new(),
+            alias_is_custom: false,
+            db_type: String::new(),
+            read_only: false,
+            active_field: 0,
+            error_msg: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.is_open = true;
+        self.path.clear();
+        self.alias.clear();
+        self.alias_is_custom = false;
+        self.db_type.clear();
+        self.read_only = false;
+        self.active_field = 0;
+        self.error_msg = None;
+    }
 }
 
 /// Represents a single renderable node in the Explorer sidebar.
@@ -99,47 +196,74 @@ pub fn format_row_count(count: i64) -> String {
     }
 }
 
-/// Loads estimated/cached row counts for all non-internal tables.
-fn load_table_counts(conn: &Connection, is_quack: bool) -> HashMap<String, i64> {
-    let mut counts = HashMap::new();
-    let query = if is_quack {
-        "SELECT schema_name, table_name, estimated_size FROM target_db.query('SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false')"
-    } else {
-        "SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false"
-    };
+/// Loads column names and types for a specific database, schema, and table/view.
+pub fn load_table_columns_for(
+    db: &str,
+    schema: &str,
+    table: &str,
+    conn: &Connection,
+    is_quack: bool,
+) -> Vec<(String, String)> {
+    let mut cols = Vec::new();
 
-    if let Ok(mut stmt) = conn.prepare(query) {
+    // 1. Check duckdb_columns()
+    let col_query = format!(
+        "SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = '{}' AND schema_name = '{}' AND table_name = '{}' ORDER BY column_index",
+        db.replace("'", "''"),
+        schema.replace("'", "''"),
+        table.replace("'", "''")
+    );
+    if let Ok(mut stmt) = conn.prepare(&col_query) {
         if let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
-                if let (Ok(schema), Ok(name), Ok(est)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, i64>(2)) {
-                    let full_name = if schema == "main" { name } else { format!("{}.{}", schema, name) };
-                    counts.insert(full_name, est);
+                if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                    cols.push((name, typ));
                 }
             }
         }
     }
-    counts
-}
 
-/// Loads column names and types for a given table or view.
-fn load_table_columns(conn: &Connection, table_name: &str, is_quack: bool) -> Vec<(String, String)> {
-    let mut cols = Vec::new();
-    let safe_name = table_name.replace("'", "''");
+    if cols.is_empty() {
+        // 2. Try PRAGMA table_info('db.table') or PRAGMA table_info('db.schema.table')
+        let qualified = if schema == "main" {
+            format!("{}.{}", db, table)
+        } else {
+            format!("{}.{}.{}", db, schema, table)
+        };
+        let safe_qualified = qualified.replace("'", "''");
+        let pragma_queries = if is_quack {
+            vec![
+                format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_qualified}'')')"),
+                format!("PRAGMA table_info('{}')", safe_qualified),
+            ]
+        } else {
+            vec![
+                format!("PRAGMA table_info('{}')", safe_qualified),
+                format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_qualified}'')')"),
+            ]
+        };
 
-    let pragma_queries = if is_quack {
-        vec![
-            format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_name}'')')"),
-            format!("PRAGMA table_info('{}')", safe_name),
-        ]
-    } else {
-        vec![
-            format!("PRAGMA table_info('{}')", safe_name),
-            format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_name}'')')"),
-        ]
-    };
+        for query in &pragma_queries {
+            if let Ok(mut stmt) = conn.prepare(query) {
+                if let Ok(mut rows) = stmt.query([]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        if let Ok(col_name) = row.get::<_, String>(1) {
+                            let data_type: String = row.get(2).unwrap_or_else(|_| "UNKNOWN".to_string());
+                            cols.push((col_name, data_type));
+                        }
+                    }
+                }
+            }
+            if !cols.is_empty() {
+                break;
+            }
+        }
+    }
 
-    for query in &pragma_queries {
-        if let Ok(mut stmt) = conn.prepare(query) {
+    if cols.is_empty() {
+        // 3. Fallback to simple table name
+        let simple_name = table.replace("'", "''");
+        if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info('{}')", simple_name)) {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let Ok(col_name) = row.get::<_, String>(1) {
@@ -149,21 +273,21 @@ fn load_table_columns(conn: &Connection, table_name: &str, is_quack: bool) -> Ve
                 }
             }
         }
-        if !cols.is_empty() {
-            break;
-        }
     }
+
     cols
 }
 
 /// Metadata holding all discoverable entities in the database and project.
-struct ExplorerMetadata {
-    tables: Vec<String>,
-    table_counts: HashMap<String, i64>,
-    views: Vec<String>,
-    macros: Vec<String>,
-    queries: Vec<String>,
-    dictionary: Vec<String>,
+pub struct ExplorerMetadata {
+    pub databases: Vec<DatabaseInfo>,
+    pub active_database: String,
+    pub tables: Vec<String>,
+    pub table_counts: HashMap<String, i64>,
+    pub views: Vec<String>,
+    pub macros: Vec<String>,
+    pub queries: Vec<String>,
+    pub dictionary: Vec<String>,
 }
 
 fn load_explorer_metadata(
@@ -171,70 +295,181 @@ fn load_explorer_metadata(
     project_dir: &Path,
     is_quack: bool,
 ) -> ExplorerMetadata {
+    let active_database: String = conn
+        .query_row("SELECT current_database();", [], |r| r.get(0))
+        .unwrap_or_else(|_| "memory".to_string());
+
+    let mut raw_dbs: Vec<(String, String, Option<String>, bool)> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT database_name, type, path, readonly FROM duckdb_databases() WHERE internal = false") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                    let path: Option<String> = row.get(2).ok();
+                    let readonly: bool = row.get(3).unwrap_or(false);
+                    raw_dbs.push((name, typ, path, readonly));
+                }
+            }
+        }
+    }
+    if raw_dbs.is_empty() {
+        raw_dbs.push((active_database.clone(), "duckdb".to_string(), None, false));
+    }
+
+    let mut all_tables: Vec<TableEntry> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT database_name, schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(db), Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                    let est: Option<i64> = row.get(3).ok();
+                    all_tables.push(TableEntry {
+                        database: db,
+                        schema,
+                        name: table,
+                        row_count: est,
+                    });
+                }
+            }
+        }
+    }
+
+    // Quack remote tables fallback
+    if is_quack && !all_tables.iter().any(|t| t.database == "target_db") {
+        let quack_tbl_sql = "SELECT schema_name, table_name, estimated_size FROM target_db.query('SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false')";
+        if let Ok(mut stmt) = conn.prepare(quack_tbl_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        let est: Option<i64> = row.get(2).ok();
+                        all_tables.push(TableEntry {
+                            database: "target_db".to_string(),
+                            schema,
+                            name,
+                            row_count: est,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Information schema fallback if tables still empty
+    if all_tables.is_empty() {
+        if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('information_schema', 'pg_catalog')") {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        all_tables.push(TableEntry {
+                            database: active_database.clone(),
+                            schema,
+                            name,
+                            row_count: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut all_views: Vec<ViewEntry> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT database_name, schema_name, view_name FROM duckdb_views() WHERE internal = false") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(db), Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                    all_views.push(ViewEntry {
+                        database: db,
+                        schema,
+                        name,
+                    });
+                }
+            }
+        }
+    }
+
+    // Quack remote views fallback
+    if is_quack && !all_views.iter().any(|v| v.database == "target_db") {
+        let quack_view_sql = "SELECT schema_name, view_name FROM target_db.query('SELECT schema_name, view_name FROM duckdb_views() WHERE internal = false')";
+        if let Ok(mut stmt) = conn.prepare(quack_view_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        all_views.push(ViewEntry {
+                            database: "target_db".to_string(),
+                            schema,
+                            name,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Information schema fallback if views still empty
+    if all_views.is_empty() {
+        if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'VIEW' AND table_schema NOT IN ('information_schema', 'pg_catalog')") {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        all_views.push(ViewEntry {
+                            database: active_database.clone(),
+                            schema,
+                            name,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut databases: Vec<DatabaseInfo> = Vec::new();
+    for (name, db_type, path, readonly) in raw_dbs {
+        let db_tables: Vec<TableEntry> = all_tables.iter().filter(|t| t.database == name).cloned().collect();
+        let db_views: Vec<ViewEntry> = all_views.iter().filter(|v| v.database == name).cloned().collect();
+
+        // If 'memory' is empty and not the active database, skip it (scratch pad created by open_in_memory)
+        if name == "memory" && active_database != "memory" && db_tables.is_empty() && db_views.is_empty() {
+            continue;
+        }
+
+        let is_active = name == active_database;
+        databases.push(DatabaseInfo {
+            name,
+            db_type,
+            path,
+            is_active,
+            readonly,
+            tables: db_tables,
+            views: db_views,
+        });
+    }
+
+    // Sort: active database first, then alphabetical
+    databases.sort_by(|a, b| {
+        if a.is_active && !b.is_active {
+            std::cmp::Ordering::Less
+        } else if !a.is_active && b.is_active {
+            std::cmp::Ordering::Greater
+        } else {
+            a.name.cmp(&b.name)
+        }
+    });
+
+    // Populate flat lists for single-db mode (or active db)
     let mut tables: Vec<String> = Vec::new();
+    let mut table_counts: HashMap<String, i64> = HashMap::new();
     let mut views: Vec<String> = Vec::new();
 
-    if is_quack {
-        let quack_sql = "SELECT table_schema, table_name, table_type FROM target_db.query('SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN (''information_schema'', ''pg_catalog'') ORDER BY table_type, table_schema, table_name')";
-        if let Ok(mut stmt) = conn.prepare(quack_sql) {
-            if let Ok(mut rows) = stmt.query([]) {
-                while let Ok(Some(row)) = rows.next() {
-                    if let (Ok(schema), Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
-                        let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
-                        if typ == "BASE TABLE" {
-                            if !tables.contains(&display_name) { tables.push(display_name); }
-                        } else if typ == "VIEW" {
-                            if !views.contains(&display_name) { views.push(display_name); }
-                        }
-                    }
-                }
+    if let Some(active_info) = databases.iter().find(|d| d.is_active).or_else(|| databases.first()) {
+        for t in &active_info.tables {
+            let disp = t.display_name();
+            tables.push(disp.clone());
+            if let Some(c) = t.row_count {
+                table_counts.insert(disp, c);
             }
         }
-
-        if tables.is_empty() && views.is_empty() {
-            let quack_tbl_sql = "SELECT schema_name, table_name FROM target_db.query('SELECT schema_name, table_name FROM duckdb_tables() WHERE internal = false')";
-            if let Ok(mut stmt) = conn.prepare(quack_tbl_sql) {
-                if let Ok(mut rows) = stmt.query([]) {
-                    while let Ok(Some(row)) = rows.next() {
-                        if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
-                            let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
-                            if !tables.contains(&display_name) { tables.push(display_name); }
-                        }
-                    }
-                }
-            }
-            let quack_view_sql = "SELECT schema_name, view_name FROM target_db.query('SELECT schema_name, view_name FROM duckdb_views() WHERE internal = false')";
-            if let Ok(mut stmt) = conn.prepare(quack_view_sql) {
-                if let Ok(mut rows) = stmt.query([]) {
-                    while let Ok(Some(row)) = rows.next() {
-                        if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
-                            let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
-                            if !views.contains(&display_name) { views.push(display_name); }
-                        }
-                    }
-                }
-            }
+        for v in &active_info.views {
+            views.push(v.display_name());
         }
     }
-
-    if tables.is_empty() && views.is_empty() {
-        if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_type, table_schema, table_name") {
-            if let Ok(mut rows) = stmt.query([]) {
-                while let Ok(Some(row)) = rows.next() {
-                    if let (Ok(schema), Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
-                        let display_name = if schema == "main" { name.clone() } else { format!("{}.{}", schema, name) };
-                        if typ == "BASE TABLE" {
-                            tables.push(display_name);
-                        } else if typ == "VIEW" {
-                            views.push(display_name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let table_counts = load_table_counts(conn, is_quack);
 
     let mut macros: Vec<String> = Vec::new();
     if is_quack {
@@ -261,8 +496,37 @@ fn load_explorer_metadata(
         }
     }
 
-    let mut dictionary: Vec<String> = tables.clone();
-    dictionary.extend(views.clone());
+    let mut dictionary: Vec<String> = Vec::new();
+    for db in &databases {
+        dictionary.push(db.name.clone());
+        for t in &db.tables {
+            dictionary.push(t.name.clone());
+            dictionary.push(t.display_name());
+            dictionary.push(format!("{}.{}", db.name, t.name));
+            dictionary.push(t.qualified_name());
+        }
+        for v in &db.views {
+            dictionary.push(v.name.clone());
+            dictionary.push(v.display_name());
+            dictionary.push(format!("{}.{}", db.name, v.name));
+            dictionary.push(v.qualified_name());
+        }
+    }
+
+    // Column names for autocomplete
+    if let Ok(mut stmt) = conn.prepare("SELECT database_name, schema_name, table_name, column_name FROM duckdb_columns() WHERE internal = false") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(db), Ok(schema), Ok(table), Ok(col)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, String>(3)) {
+                    dictionary.push(col.clone());
+                    dictionary.push(format!("{}.{}", table, col));
+                    dictionary.push(format!("{}.{}.{}", db, table, col));
+                    dictionary.push(format!("{}.{}.{}.{}", db, schema, table, col));
+                }
+            }
+        }
+    }
+
     if is_quack {
         let quack_col_sql = "SELECT column_name FROM target_db.query('SELECT column_name FROM information_schema.columns WHERE table_schema NOT IN (''information_schema'', ''pg_catalog'')')";
         if let Ok(mut stmt) = conn.prepare(quack_col_sql) {
@@ -277,17 +541,10 @@ fn load_explorer_metadata(
             }
         }
     }
-    if let Ok(mut stmt) = conn.prepare("SELECT column_name FROM information_schema.columns WHERE table_schema NOT IN ('information_schema', 'pg_catalog')") {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(col) = row.get::<_, String>(0) {
-                    if !dictionary.contains(&col) {
-                        dictionary.push(col);
-                    }
-                }
-            }
-        }
-    }
+
+    dictionary.extend(macros.clone());
+    dictionary.sort();
+    dictionary.dedup();
 
     let mut queries: Vec<String> = Vec::new();
     let queries_dir = project_dir.join("queries");
@@ -307,6 +564,8 @@ fn load_explorer_metadata(
     queries.sort();
 
     ExplorerMetadata {
+        databases,
+        active_database,
         tables,
         table_counts,
         views,
@@ -325,77 +584,206 @@ fn rebuild_explorer_nodes(
 ) -> Vec<ExplorerNode> {
     let mut items = Vec::new();
 
-    if !meta.tables.is_empty() {
-        let is_expanded = expanded_groups.contains("Tables");
-        items.push(ExplorerNode {
-            name: "Tables".to_string(),
-            display: format!("📦 Tables ({})", meta.tables.len()),
-            level: 0,
-            is_expandable: true,
-            is_expanded,
-            node_type: NodeType::Group,
-        });
-        if is_expanded {
-            for t in &meta.tables {
-                let is_tbl_expanded = expanded_tables.contains(t);
-                let count_str = meta.table_counts.get(t).map(|&c| format!(" ({})", format_row_count(c))).unwrap_or_default();
-                items.push(ExplorerNode {
-                    name: t.clone(),
-                    display: format!("  ├─ {}{}", t, count_str),
-                    level: 1,
-                    is_expandable: true,
-                    is_expanded: is_tbl_expanded,
-                    node_type: NodeType::Table,
-                });
-                if is_tbl_expanded {
-                    let cols = load_table_columns(conn, t, is_quack);
-                    for (col_name, data_type) in cols {
-                        items.push(ExplorerNode {
-                            name: col_name.clone(),
-                            display: format!("    └─ {} ({})", col_name, data_type),
-                            level: 2,
-                            is_expandable: false,
-                            is_expanded: false,
-                            node_type: NodeType::Column { data_type },
-                        });
+    if meta.databases.len() > 1 {
+        // Multi-database mode: render database root nodes
+        for db in &meta.databases {
+            let db_key = format!("db:{}", db.name);
+            let is_db_expanded = expanded_groups.contains(&db_key);
+            let icon = match db.db_type.to_lowercase().as_str() {
+                "sqlite" => "🗃️",
+                "postgres" | "postgresql" | "mysql" | "mssql" => "🔌",
+                _ => "📁",
+            };
+            let active_tag = if db.is_active { " [Active]" } else { "" };
+            let ro_tag = if db.readonly { " [RO]" } else { "" };
+            let type_tag = format!(" ({})", db.db_type);
+
+            items.push(ExplorerNode {
+                name: db_key.clone(),
+                display: format!("{} {}{}{}{}", icon, db.name, active_tag, type_tag, ro_tag),
+                level: 0,
+                is_expandable: true,
+                is_expanded: is_db_expanded,
+                node_type: NodeType::Database {
+                    db_type: db.db_type.clone(),
+                    is_active: db.is_active,
+                    path: db.path.clone(),
+                },
+            });
+
+            if is_db_expanded {
+                if !db.tables.is_empty() {
+                    let tbl_group_key = format!("{}:Tables", db.name);
+                    let is_tbl_group_expanded = expanded_groups.contains(&tbl_group_key);
+                    items.push(ExplorerNode {
+                        name: tbl_group_key.clone(),
+                        display: format!("  📦 Tables ({})", db.tables.len()),
+                        level: 1,
+                        is_expandable: true,
+                        is_expanded: is_tbl_group_expanded,
+                        node_type: NodeType::Group,
+                    });
+
+                    if is_tbl_group_expanded {
+                        for t in &db.tables {
+                            let table_key = t.qualified_name();
+                            let is_tbl_expanded = expanded_tables.contains(&table_key) || expanded_tables.contains(&t.display_name());
+                            let count_str = t.row_count.map(|c| format!(" ({})", format_row_count(c))).unwrap_or_default();
+                            items.push(ExplorerNode {
+                                name: t.name.clone(),
+                                display: format!("    ├─ {}{}", t.display_name(), count_str),
+                                level: 2,
+                                is_expandable: true,
+                                is_expanded: is_tbl_expanded,
+                                node_type: NodeType::Table {
+                                    database: Some(db.name.clone()),
+                                    schema: Some(t.schema.clone()),
+                                },
+                            });
+
+                            if is_tbl_expanded {
+                                let cols = load_table_columns_for(&db.name, &t.schema, &t.name, conn, is_quack);
+                                for (col_name, data_type) in cols {
+                                    items.push(ExplorerNode {
+                                        name: col_name.clone(),
+                                        display: format!("      └─ {} ({})", col_name, data_type),
+                                        level: 3,
+                                        is_expandable: false,
+                                        is_expanded: false,
+                                        node_type: NodeType::Column { data_type },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !db.views.is_empty() {
+                    let view_group_key = format!("{}:Views", db.name);
+                    let is_view_group_expanded = expanded_groups.contains(&view_group_key);
+                    items.push(ExplorerNode {
+                        name: view_group_key.clone(),
+                        display: format!("  👁️ Views ({})", db.views.len()),
+                        level: 1,
+                        is_expandable: true,
+                        is_expanded: is_view_group_expanded,
+                        node_type: NodeType::Group,
+                    });
+
+                    if is_view_group_expanded {
+                        for v in &db.views {
+                            let view_key = v.qualified_name();
+                            let is_view_expanded = expanded_tables.contains(&view_key) || expanded_tables.contains(&v.display_name());
+                            items.push(ExplorerNode {
+                                name: v.name.clone(),
+                                display: format!("    ├─ {}", v.display_name()),
+                                level: 2,
+                                is_expandable: true,
+                                is_expanded: is_view_expanded,
+                                node_type: NodeType::View {
+                                    database: Some(db.name.clone()),
+                                    schema: Some(v.schema.clone()),
+                                },
+                            });
+
+                            if is_view_expanded {
+                                let cols = load_table_columns_for(&db.name, &v.schema, &v.name, conn, is_quack);
+                                for (col_name, data_type) in cols {
+                                    items.push(ExplorerNode {
+                                        name: col_name.clone(),
+                                        display: format!("      └─ {} ({})", col_name, data_type),
+                                        level: 3,
+                                        is_expandable: false,
+                                        is_expanded: false,
+                                        node_type: NodeType::Column { data_type },
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-    }
+    } else {
+        // Single database mode (classic flat layout)
+        if !meta.tables.is_empty() {
+            let is_expanded = expanded_groups.contains("Tables");
+            items.push(ExplorerNode {
+                name: "Tables".to_string(),
+                display: format!("📦 Tables ({})", meta.tables.len()),
+                level: 0,
+                is_expandable: true,
+                is_expanded,
+                node_type: NodeType::Group,
+            });
+            if is_expanded {
+                for t in &meta.tables {
+                    let is_tbl_expanded = expanded_tables.contains(t);
+                    let count_str = meta.table_counts.get(t).map(|&c| format!(" ({})", format_row_count(c))).unwrap_or_default();
+                    items.push(ExplorerNode {
+                        name: t.clone(),
+                        display: format!("  ├─ {}{}", t, count_str),
+                        level: 1,
+                        is_expandable: true,
+                        is_expanded: is_tbl_expanded,
+                        node_type: NodeType::Table {
+                            database: Some(meta.active_database.clone()),
+                            schema: Some("main".to_string()),
+                        },
+                    });
+                    if is_tbl_expanded {
+                        let cols = load_table_columns_for(&meta.active_database, "main", t, conn, is_quack);
+                        for (col_name, data_type) in cols {
+                            items.push(ExplorerNode {
+                                name: col_name.clone(),
+                                display: format!("    └─ {} ({})", col_name, data_type),
+                                level: 2,
+                                is_expandable: false,
+                                is_expanded: false,
+                                node_type: NodeType::Column { data_type },
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
-    if !meta.views.is_empty() {
-        let is_expanded = expanded_groups.contains("Views");
-        items.push(ExplorerNode {
-            name: "Views".to_string(),
-            display: format!("👁️ Views ({})", meta.views.len()),
-            level: 0,
-            is_expandable: true,
-            is_expanded,
-            node_type: NodeType::Group,
-        });
-        if is_expanded {
-            for v in &meta.views {
-                let is_view_expanded = expanded_tables.contains(v);
-                items.push(ExplorerNode {
-                    name: v.clone(),
-                    display: format!("  ├─ {}", v),
-                    level: 1,
-                    is_expandable: true,
-                    is_expanded: is_view_expanded,
-                    node_type: NodeType::View,
-                });
-                if is_view_expanded {
-                    let cols = load_table_columns(conn, v, is_quack);
-                    for (col_name, data_type) in cols {
-                        items.push(ExplorerNode {
-                            name: col_name.clone(),
-                            display: format!("    └─ {} ({})", col_name, data_type),
-                            level: 2,
-                            is_expandable: false,
-                            is_expanded: false,
-                            node_type: NodeType::Column { data_type },
-                        });
+        if !meta.views.is_empty() {
+            let is_expanded = expanded_groups.contains("Views");
+            items.push(ExplorerNode {
+                name: "Views".to_string(),
+                display: format!("👁️ Views ({})", meta.views.len()),
+                level: 0,
+                is_expandable: true,
+                is_expanded,
+                node_type: NodeType::Group,
+            });
+            if is_expanded {
+                for v in &meta.views {
+                    let is_view_expanded = expanded_tables.contains(v);
+                    items.push(ExplorerNode {
+                        name: v.clone(),
+                        display: format!("  ├─ {}", v),
+                        level: 1,
+                        is_expandable: true,
+                        is_expanded: is_view_expanded,
+                        node_type: NodeType::View {
+                            database: Some(meta.active_database.clone()),
+                            schema: Some("main".to_string()),
+                        },
+                    });
+                    if is_view_expanded {
+                        let cols = load_table_columns_for(&meta.active_database, "main", v, conn, is_quack);
+                        for (col_name, data_type) in cols {
+                            items.push(ExplorerNode {
+                                name: col_name.clone(),
+                                display: format!("    └─ {} ({})", col_name, data_type),
+                                level: 2,
+                                is_expandable: false,
+                                is_expanded: false,
+                                node_type: NodeType::Column { data_type },
+                            });
+                        }
                     }
                 }
             }
@@ -738,11 +1126,21 @@ pub fn run_ide_loop(
     };
 
     let mut meta = load_explorer_metadata(conn, project_dir, is_quack);
-    let mut expanded_groups: HashSet<String> = vec!["Tables", "Views", "Macros", "Queries"]
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut expanded_groups: HashSet<String> = if meta.databases.len() > 1 {
+        let mut set = HashSet::new();
+        set.insert(format!("db:{}", meta.active_database));
+        set.insert(format!("{}:Tables", meta.active_database));
+        set.insert("Macros".to_string());
+        set.insert("Queries".to_string());
+        set
+    } else {
+        vec!["Tables", "Views", "Macros", "Queries"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
+    };
     let mut expanded_tables: HashSet<String> = HashSet::new();
+    let mut attach_modal = AttachModalState::new();
 
     let mut dictionary = meta.dictionary.clone();
     let mut autocomplete_matches: Vec<String> = Vec::new();
@@ -840,9 +1238,9 @@ pub fn run_ide_loop(
             };
 
             let explorer_title = if focus == FocusPane::Explorer {
-                " Explorer [R: Refresh] "
+                " Explorer [R: Refresh | Ctrl+A: Attach | q: Query] "
             } else {
-                " Explorer "
+                " Explorer [Ctrl+A: Attach] "
             };
 
             let explorer_list = List::new(list_items)
@@ -1025,12 +1423,15 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" Ctrl+N/P  ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Tab")]),
                     Line::from(vec![Span::styled(" Ctrl+E/F5 ", Style::default().fg(Color::Cyan)), Span::raw("Execute Query (or selected text)")]),
                     Line::from(vec![Span::styled(" Ctrl+G    ", Style::default().fg(Color::Cyan)), Span::raw("Visualize Schema (Graph)")]),
+                    Line::from(vec![Span::styled(" Ctrl+A    ", Style::default().fg(Color::Cyan)), Span::raw("Attach Database (DuckDB, SQLite, PG, etc.)")]),
                     Line::from(vec![Span::styled(" Ctrl+C/V  ", Style::default().fg(Color::Cyan)), Span::raw("Copy / Paste")]),
                     Line::from(vec![Span::styled(" Ctrl+S    ", Style::default().fg(Color::Cyan)), Span::raw("Save Query")]),
                     Line::from(vec![Span::styled(" Ctrl+F    ", Style::default().fg(Color::Cyan)), Span::raw("Format Query")]),
                     Line::from(vec![Span::styled(" Ctrl+Space", Style::default().fg(Color::Cyan)), Span::raw("Autocomplete")]),
                     Line::from(vec![Span::styled(" n / p     ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Page (in Results pane)")]),
                     Line::from(vec![Span::styled(" r / R     ", Style::default().fg(Color::Cyan)), Span::raw("Refresh Explorer (when in Explorer pane)")]),
+                    Line::from(vec![Span::styled(" q / s     ", Style::default().fg(Color::Cyan)), Span::raw("Query Table (in Explorer pane)")]),
+                    Line::from(vec![Span::styled(" d         ", Style::default().fg(Color::Cyan)), Span::raw("Detach Database (in Explorer pane)")]),
                     Line::from(vec![Span::styled(" ◄ / ►     ", Style::default().fg(Color::Cyan)), Span::raw("Scroll Columns (Shift+◄/► fast)")]),
                     Line::from(vec![Span::styled(" Home/End  ", Style::default().fg(Color::Cyan)), Span::raw("First/Last Column (in Results pane)")]),
                     Line::from(""),
@@ -1066,6 +1467,84 @@ pub fn run_ide_loop(
                         .alignment(Alignment::Left)
                         .scroll((schema_scroll, 0));
                 f.render_widget(tree_paragraph, popup_area);
+            } else if attach_modal.is_open {
+                let popup_width = 64.min(f.area().width.saturating_sub(4));
+                let popup_height = 18.min(f.area().height.saturating_sub(2));
+                let popup_area = ratatui::layout::Rect {
+                    x: (f.area().width.saturating_sub(popup_width)) / 2,
+                    y: (f.area().height.saturating_sub(popup_height)) / 2,
+                    width: popup_width,
+                    height: popup_height,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+
+                let modal_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" 🔌 Attach Database (Ctrl+A) ")
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                f.render_widget(modal_block.clone(), popup_area);
+
+                let inner_area = modal_block.inner(popup_area);
+                let field_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), // 0: Path
+                        Constraint::Length(3), // 1: Alias
+                        Constraint::Length(3), // 2: Type
+                        Constraint::Length(2), // 3: Read-Only toggle
+                        Constraint::Length(2), // 4: Error/hint
+                        Constraint::Length(3), // 5: Buttons
+                    ])
+                    .split(inner_area);
+
+                // Field 0: Path
+                let f0_style = if attach_modal.active_field == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let p0 = Paragraph::new(format!("{}{}", attach_modal.path, if attach_modal.active_field == 0 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Path or URI ").border_style(f0_style));
+                f.render_widget(p0, field_layout[0]);
+
+                // Field 1: Alias
+                let f1_style = if attach_modal.active_field == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let p1 = Paragraph::new(format!("{}{}", attach_modal.alias, if attach_modal.active_field == 1 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Catalog Alias ").border_style(f1_style));
+                f.render_widget(p1, field_layout[1]);
+
+                // Field 2: Type
+                let f2_style = if attach_modal.active_field == 2 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let p2 = Paragraph::new(format!("{}{}", attach_modal.db_type, if attach_modal.active_field == 2 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Type (Optional: SQLITE, POSTGRES, MYSQL) ").border_style(f2_style));
+                f.render_widget(p2, field_layout[2]);
+
+                // Field 3: Read-Only toggle
+                let f3_style = if attach_modal.active_field == 3 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                let ro_text = format!("  [{}] Read-Only Mode (Space to toggle)", if attach_modal.read_only { "X" } else { " " });
+                f.render_widget(Paragraph::new(ro_text).style(f3_style), field_layout[3]);
+
+                // Error or navigation hint
+                if let Some(ref err) = attach_modal.error_msg {
+                    f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), field_layout[4]);
+                } else {
+                    f.render_widget(Paragraph::new("  Tab: Next Field | Enter: Attach | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), field_layout[4]);
+                }
+
+                // Buttons
+                let attach_btn_style = if attach_modal.active_field == 4 {
+                    Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                let cancel_btn_style = if attach_modal.active_field == 5 {
+                    Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let buttons = Line::from(vec![
+                    Span::styled(" [ Attach Database ] ", attach_btn_style),
+                    Span::raw("    "),
+                    Span::styled(" [ Cancel ] ", cancel_btn_style),
+                ]);
+                f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[5]);
             }
 
             // Status Bar
@@ -1161,7 +1640,9 @@ pub fn run_ide_loop(
                     }
 
                     // Explorer Click
-                    if mouse.row >= current_explorer_rect.top() + 1 && mouse.row < current_explorer_rect.bottom() - 1 {
+                    if mouse.row == current_explorer_rect.top() && mouse.column >= current_explorer_rect.right().saturating_sub(18) && mouse.column <= current_explorer_rect.right() {
+                        attach_modal.reset();
+                    } else if mouse.row >= current_explorer_rect.top() + 1 && mouse.row < current_explorer_rect.bottom() - 1 {
                         if mouse.column >= current_explorer_rect.left() + 1 && mouse.column < current_explorer_rect.right() - 1 {
                             let list_offset = explorer_state.offset();
                             let clicked_idx = (mouse.row - current_explorer_rect.top() - 1) as usize + list_offset;
@@ -1291,7 +1772,98 @@ pub fn run_ide_loop(
                 }
             }
             Event::Key(key) => {
-                if show_help || show_schema_visualizer {
+                if attach_modal.is_open {
+                    if key.code == KeyCode::Esc {
+                        attach_modal.is_open = false;
+                    } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
+                        attach_modal.active_field = (attach_modal.active_field + 1) % 6;
+                    } else if key.code == KeyCode::BackTab || key.code == KeyCode::Up {
+                        attach_modal.active_field = if attach_modal.active_field == 0 { 5 } else { attach_modal.active_field - 1 };
+                    } else if key.code == KeyCode::Enter {
+                        if attach_modal.active_field == 5 {
+                            attach_modal.is_open = false;
+                        } else if attach_modal.active_field == 3 {
+                            attach_modal.read_only = !attach_modal.read_only;
+                        } else {
+                            if attach_modal.path.trim().is_empty() {
+                                attach_modal.error_msg = Some("Database path or URI cannot be empty.".to_string());
+                            } else {
+                                let alias = if attach_modal.alias.trim().is_empty() {
+                                    Path::new(attach_modal.path.trim())
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("attached_db")
+                                        .to_string()
+                                } else {
+                                    attach_modal.alias.trim().to_string()
+                                };
+
+                                let safe_path = attach_modal.path.trim().replace("'", "''");
+                                let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, alias);
+                                let mut opts = Vec::new();
+                                if !attach_modal.db_type.trim().is_empty() {
+                                    opts.push(format!("TYPE {}", attach_modal.db_type.trim().to_uppercase()));
+                                }
+                                if attach_modal.read_only {
+                                    opts.push("READ_ONLY".to_string());
+                                }
+                                if !opts.is_empty() {
+                                    attach_sql.push_str(&format!(" ({})", opts.join(", ")));
+                                }
+                                attach_sql.push(';');
+
+                                match conn.execute(&attach_sql, []) {
+                                    Ok(_) => {
+                                        attach_modal.is_open = false;
+                                        status_msg = format!("Attached database '{}' successfully.", alias);
+                                        trigger_explorer_refresh = true;
+                                    }
+                                    Err(e) => {
+                                        attach_modal.error_msg = Some(format!("Attach Error: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                    } else if key.code == KeyCode::Char(' ') && attach_modal.active_field == 3 {
+                        attach_modal.read_only = !attach_modal.read_only;
+                    } else if key.code == KeyCode::Backspace {
+                        match attach_modal.active_field {
+                            0 => {
+                                attach_modal.path.pop();
+                                if !attach_modal.alias_is_custom {
+                                    let stem = Path::new(&attach_modal.path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                                    attach_modal.alias = stem.to_string();
+                                }
+                            }
+                            1 => {
+                                attach_modal.alias.pop();
+                                attach_modal.alias_is_custom = true;
+                            }
+                            2 => { attach_modal.db_type.pop(); }
+                            _ => {}
+                        }
+                    } else if let KeyCode::Char(c) = key.code {
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match attach_modal.active_field {
+                                0 => {
+                                    attach_modal.path.push(c);
+                                    if !attach_modal.alias_is_custom {
+                                        let stem = Path::new(&attach_modal.path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                                        attach_modal.alias = stem.to_string();
+                                    }
+                                }
+                                1 => {
+                                    attach_modal.alias.push(c);
+                                    attach_modal.alias_is_custom = true;
+                                }
+                                2 => { attach_modal.db_type.push(c); }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    attach_modal.reset();
+                } else if show_help || show_schema_visualizer {
                     if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') || key.code == KeyCode::Char('?') {
                         show_help = false;
                         show_schema_visualizer = false;
@@ -1302,10 +1874,8 @@ pub fn run_ide_loop(
                             schema_scroll = schema_scroll.saturating_sub(1);
                         }
                     }
-                    continue; // Block other inputs while help or visualizer is shown
-                }
-
-                if key.code == KeyCode::Char('?') {
+                } else {
+                    if key.code == KeyCode::Char('?') {
                     show_help = true;
                     continue;
                 }
@@ -1313,7 +1883,7 @@ pub fn run_ide_loop(
                 if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     show_schema_visualizer = true;
                     schema_scroll = 0;
-                    schema_ascii_tree = generate_schema_visualizer(&db_path, &mut os_clipboard).unwrap_or_else(|e| format!("Failed to generate schema visualizer: {}", e));
+                    schema_ascii_tree = generate_schema_visualizer(conn, &mut os_clipboard).unwrap_or_else(|e| format!("Failed to generate schema visualizer: {}", e));
                     continue;
                 }
 
@@ -1447,10 +2017,66 @@ pub fn run_ide_loop(
                             }
                         } else if key.code == KeyCode::Right {
                             explorer_horizontal_scroll += 1;
-                        } else if key.code == KeyCode::Enter {
+                        } else if key.code == KeyCode::Enter || key.code == KeyCode::Char(' ') {
                             trigger_explorer_action = true;
                         } else if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
                             trigger_explorer_refresh = true;
+                        } else if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('s') {
+                            if let Some(selected) = explorer_state.selected() {
+                                if selected < explorer_items.len() {
+                                    let item_type = &explorer_items[selected].node_type;
+                                    let item_name = &explorer_items[selected].name;
+                                    match item_type {
+                                        NodeType::Table { database, schema } | NodeType::View { database, schema } => {
+                                            let db_name = database.as_deref().unwrap_or(&meta.active_database);
+                                            let schema_name = schema.as_deref().unwrap_or("main");
+                                            let qualified_sql = if db_name == meta.active_database && schema_name == "main" {
+                                                format!("SELECT * FROM {} LIMIT 500;", item_name)
+                                            } else if schema_name == "main" {
+                                                format!("SELECT * FROM {}.{} LIMIT 500;", db_name, item_name)
+                                            } else {
+                                                format!("SELECT * FROM {}.{}.{} LIMIT 500;", db_name, schema_name, item_name)
+                                            };
+
+                                            let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
+                                            if !current_is_empty {
+                                                tabs.push(EditorTab::new());
+                                                active_tab_index = tabs.len() - 1;
+                                            }
+
+                                            tabs[active_tab_index].textarea = TextArea::from(vec![qualified_sql]);
+                                            tabs[active_tab_index].textarea.set_search_pattern("(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b").unwrap_or(());
+                                            tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                                            tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+                                            focus = FocusPane::Editor;
+                                            execute_query = true;
+                                            status_msg = format!("Queried table '{}'", item_name);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        } else if key.code == KeyCode::Char('d') || key.code == KeyCode::Delete {
+                            if let Some(selected) = explorer_state.selected() {
+                                if selected < explorer_items.len() {
+                                    if let NodeType::Database { is_active, .. } = &explorer_items[selected].node_type {
+                                        if *is_active {
+                                            status_msg = "⚠️ Cannot detach the primary active database.".to_string();
+                                        } else {
+                                            let db_name = explorer_items[selected].name.strip_prefix("db:").unwrap_or(&explorer_items[selected].name);
+                                            match conn.execute(&format!("DETACH {};", db_name), []) {
+                                                Ok(_) => {
+                                                    status_msg = format!("Detached database '{}' successfully.", db_name);
+                                                    trigger_explorer_refresh = true;
+                                                }
+                                                Err(e) => {
+                                                    status_msg = format!("Failed to detach '{}': {}", db_name, e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     FocusPane::Editor => {
@@ -1464,7 +2090,7 @@ pub fn run_ide_loop(
                                     let char_idx = cursor.1;
                                     let prefix: String = line.chars().take(char_idx).collect();
                                     
-                                    let word_start = prefix.rfind(|c: char| !c.is_alphanumeric() && c != '_').map(|i| i + 1).unwrap_or(0);
+                                    let word_start = prefix.rfind(|c: char| !c.is_alphanumeric() && c != '_' && c != '.').map(|i| i + 1).unwrap_or(0);
                                     let current_word = &prefix[word_start..];
 
                                     if !current_word.is_empty() {
@@ -1565,6 +2191,7 @@ pub fn run_ide_loop(
                             active_tab.horizontal_scroll = active_tab.column_names.len().saturating_sub(1);
                         }
                     }
+                }
                 }
             }
             _ => {}
@@ -1740,8 +2367,6 @@ pub fn run_ide_loop(
                     exec_query.clone()
                 };
 
-                let _ = std::fs::write("debug_query.txt", format!("query: {}\nremote: {}\npag: {}\nfinal: {}", query_to_execute, is_explicit_remote, is_paginatable, final_query));
-
                 match conn.prepare(&final_query) {
                     Ok(mut stmt) => {
                         let mut exec_rows = Vec::new();
@@ -1774,10 +2399,17 @@ pub fn run_ide_loop(
                                 active_tab.results_state.select(Some(0));
                                 active_tab.horizontal_scroll = 0;
                                 let elapsed = start_time.elapsed();
+
+                                let lower = query_to_execute.to_lowercase();
+                                let is_catalog_mutation = lower.contains("attach ")
+                                    || lower.contains("detach ")
+                                    || lower.contains("create ")
+                                    || lower.contains("drop ")
+                                    || lower.contains("alter ")
+                                    || lower.contains("use ");
+
                                 if is_explicit_remote {
-                                    let lower = query_to_execute.to_lowercase();
-                                    let is_ddl = lower.contains("create ") || lower.contains("drop ") || lower.contains("alter ");
-                                    if is_ddl {
+                                    if is_catalog_mutation {
                                         refresh_attached_catalog(conn, db_path);
                                         trigger_explorer_refresh = true;
                                     }
@@ -1789,6 +2421,9 @@ pub fn run_ide_loop(
                                 } else if is_remote_db && is_unadorned_secret_or_setting(&query_to_execute) {
                                     status_msg = "⚠️ Applied LOCALLY on DuckPack! Use '-- @remote' at top of query to apply to remote Quack.".to_string();
                                 } else {
+                                    if is_catalog_mutation {
+                                        trigger_explorer_refresh = true;
+                                    }
                                     status_msg = format!("Query executed successfully. Returned {} rows in {:.2?}.", count, elapsed);
                                 }
 
@@ -1854,100 +2489,39 @@ pub fn run_ide_loop(
                 if selected < explorer_items.len() {
                     let item_type = explorer_items[selected].node_type.clone();
                     let item_name = explorer_items[selected].name.clone();
-                    let item_expanded = explorer_items[selected].is_expanded;
-                    let item_level = explorer_items[selected].level;
 
                     match item_type {
-                        NodeType::Table | NodeType::View => {
-                            if item_expanded {
-                                explorer_items[selected].is_expanded = false;
-                                expanded_tables.remove(&item_name);
-                                let j = selected + 1;
-                                while j < explorer_items.len() && explorer_items[j].level > item_level {
-                                    explorer_items.remove(j);
-                                }
+                        NodeType::Database { .. } => {
+                            if expanded_groups.contains(&item_name) {
+                                expanded_groups.remove(&item_name);
                             } else {
-                                explorer_items[selected].is_expanded = true;
-                                expanded_tables.insert(item_name.clone());
-                                let cols = load_table_columns(conn, &item_name, is_quack);
-                                let mut new_nodes = Vec::new();
-                                for (col_name, data_type) in cols {
-                                    new_nodes.push(ExplorerNode {
-                                        name: col_name.clone(),
-                                        display: format!("    └─ {} ({})", col_name, data_type),
-                                        level: item_level + 1,
-                                        is_expandable: false,
-                                        is_expanded: false,
-                                        node_type: NodeType::Column { data_type },
-                                    });
-                                }
-                                for (offset, node) in new_nodes.into_iter().enumerate() {
-                                    explorer_items.insert(selected + 1 + offset, node);
-                                }
+                                expanded_groups.insert(item_name);
                             }
+                            explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+                            explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                         }
                         NodeType::Group => {
-                            if item_expanded {
-                                explorer_items[selected].is_expanded = false;
+                            if expanded_groups.contains(&item_name) {
                                 expanded_groups.remove(&item_name);
-                                let j = selected + 1;
-                                while j < explorer_items.len() && explorer_items[j].level > item_level {
-                                    explorer_items.remove(j);
-                                }
                             } else {
-                                explorer_items[selected].is_expanded = true;
-                                expanded_groups.insert(item_name.clone());
-                                let mut new_nodes = Vec::new();
-                                if item_name == "Tables" {
-                                    for t in &meta.tables {
-                                        let count_str = meta.table_counts.get(t).map(|&c| format!(" ({})", format_row_count(c))).unwrap_or_default();
-                                        new_nodes.push(ExplorerNode {
-                                            name: t.clone(),
-                                            display: format!("  ├─ {}{}", t, count_str),
-                                            level: 1,
-                                            is_expandable: true,
-                                            is_expanded: false,
-                                            node_type: NodeType::Table,
-                                        });
-                                    }
-                                } else if item_name == "Views" {
-                                    for v in &meta.views {
-                                        new_nodes.push(ExplorerNode {
-                                            name: v.clone(),
-                                            display: format!("  ├─ {}", v),
-                                            level: 1,
-                                            is_expandable: true,
-                                            is_expanded: false,
-                                            node_type: NodeType::View,
-                                        });
-                                    }
-                                } else if item_name == "Macros" {
-                                    for m in &meta.macros {
-                                        new_nodes.push(ExplorerNode {
-                                            name: m.clone(),
-                                            display: format!("  ├─ {}", m),
-                                            level: 1,
-                                            is_expandable: false,
-                                            is_expanded: false,
-                                            node_type: NodeType::Macro,
-                                        });
-                                    }
-                                } else if item_name == "Queries" {
-                                    for q in &meta.queries {
-                                        new_nodes.push(ExplorerNode {
-                                            name: q.clone(),
-                                            display: format!("  ├─ {}", q),
-                                            level: 1,
-                                            is_expandable: false,
-                                            is_expanded: false,
-                                            node_type: NodeType::Query,
-                                        });
-                                    }
-                                }
-                                for (offset, node) in new_nodes.into_iter().enumerate() {
-                                    explorer_items.insert(selected + 1 + offset, node);
-                                }
+                                expanded_groups.insert(item_name);
                             }
+                            explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+                            explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
+                        }
+                        NodeType::Table { database, schema } | NodeType::View { database, schema } => {
+                            let key = match (&database, &schema) {
+                                (Some(db), Some(sch)) if meta.databases.len() > 1 => format!("{}.{}.{}", db, sch, item_name),
+                                _ => item_name.clone(),
+                            };
+                            if expanded_tables.contains(&key) || expanded_tables.contains(&item_name) {
+                                expanded_tables.remove(&key);
+                                expanded_tables.remove(&item_name);
+                            } else {
+                                expanded_tables.insert(key);
+                            }
+                            explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+                            explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                         }
                         NodeType::Query => {
                             let path = queries_dir.join(&item_name);
@@ -2073,45 +2647,54 @@ fn format_duckdb_value(v: duckdb::types::Value) -> String {
 }
 
 /// Generates an ASCII tree of the schema and copies a Mermaid diagram to the clipboard.
-fn generate_schema_visualizer(db_str: &str, os_clipboard: &mut Option<arboard::Clipboard>) -> Result<String, Box<dyn std::error::Error>> {
-    let conn = duckdb::Connection::open(db_str)?;
-    
-    // 1. Get Tables & Columns
-    let mut stmt = conn.prepare("SELECT table_name, column_name, data_type FROM duckdb_columns ORDER BY table_name, column_index;")?;
+fn generate_schema_visualizer(conn: &duckdb::Connection, os_clipboard: &mut Option<arboard::Clipboard>) -> Result<String, Box<dyn std::error::Error>> {
+    // 1. Get Tables & Columns across databases
+    let col_query = "SELECT database_name, schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false ORDER BY database_name, schema_name, table_name, column_index;";
+    let mut stmt = conn.prepare(col_query)?;
     let mut rows = stmt.query([])?;
     
-    let mut tables: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
+    let mut db_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut tables: std::collections::BTreeMap<(String, String, String), Vec<(String, String)>> = std::collections::BTreeMap::new();
     while let Some(row) = rows.next()? {
-        let table_name: String = row.get(0)?;
-        let col_name: String = row.get(1)?;
-        let data_type: String = row.get(2)?;
-        tables.entry(table_name).or_insert_with(Vec::new).push((col_name, data_type));
+        let db_name: String = row.get(0)?;
+        let schema_name: String = row.get(1)?;
+        let table_name: String = row.get(2)?;
+        let col_name: String = row.get(3)?;
+        let data_type: String = row.get(4)?;
+        db_set.insert(db_name.clone());
+        tables.entry((db_name, schema_name, table_name)).or_default().push((col_name, data_type));
     }
     
     // 2. Get Foreign Keys
-    let mut stmt_fk = conn.prepare("SELECT table_name, constraint_column_names[1], referenced_table, referenced_column_names[1] FROM duckdb_constraints WHERE constraint_type = 'FOREIGN KEY';")?;
-    let mut rows_fk = stmt_fk.query([])?;
-    
     let mut fks: Vec<(String, String, String, String)> = Vec::new();
-    while let Some(row) = rows_fk.next()? {
-        let table_name: String = row.get(0)?;
-        let col_name: String = row.get(1)?;
-        let ref_table: String = row.get(2)?;
-        let ref_col: String = row.get(3)?;
-        fks.push((table_name, col_name, ref_table, ref_col));
+    if let Ok(mut stmt_fk) = conn.prepare("SELECT table_name, constraint_column_names[1], referenced_table, referenced_column_names[1] FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY';") {
+        if let Ok(mut rows_fk) = stmt_fk.query([]) {
+            while let Ok(Some(row)) = rows_fk.next() {
+                if let (Ok(table_name), Ok(col_name), Ok(ref_table), Ok(ref_col)) = (row.get(0), row.get(1), row.get(2), row.get(3)) {
+                    fks.push((table_name, col_name, ref_table, ref_col));
+                }
+            }
+        }
     }
     
     // 3. Generate Mermaid
     let mut mermaid = String::from("erDiagram\n");
-    for (table, cols) in &tables {
-        mermaid.push_str(&format!("    {} {{\n", table));
+    for ((db, _schema, table), cols) in &tables {
+        let entity_name = if db_set.len() > 1 {
+            format!("{}_{}", db.replace(|c: char| !c.is_alphanumeric(), "_"), table.replace(|c: char| !c.is_alphanumeric(), "_"))
+        } else {
+            table.replace(|c: char| !c.is_alphanumeric(), "_")
+        };
+        mermaid.push_str(&format!("    {} {{\n", entity_name));
         for (col, dtype) in cols {
-            mermaid.push_str(&format!("        {} {}\n", dtype.replace(" ", "_"), col));
+            mermaid.push_str(&format!("        {} {}\n", dtype.replace(" ", "_"), col.replace(|c: char| !c.is_alphanumeric(), "_")));
         }
         mermaid.push_str("    }\n");
     }
     for (table, _col, ref_table, _ref_col) in &fks {
-        mermaid.push_str(&format!("    {} }}|--|| {} : \"\"\n", table, ref_table));
+        let t1 = table.replace(|c: char| !c.is_alphanumeric(), "_");
+        let t2 = ref_table.replace(|c: char| !c.is_alphanumeric(), "_");
+        mermaid.push_str(&format!("    {} }}|--|| {} : \"\"\n", t1, t2));
     }
     
     // Copy Mermaid diagram using multi-channel clipboard helper
@@ -2119,26 +2702,56 @@ fn generate_schema_visualizer(db_str: &str, os_clipboard: &mut Option<arboard::C
     
     // 4. Generate ASCII Tree
     let mut tree = String::from("Database Schema (Mermaid.js diagram copied to clipboard!)\n");
-    let mut sorted_tables: Vec<&String> = tables.keys().collect();
-    sorted_tables.sort();
-    
-    for (i, table) in sorted_tables.iter().enumerate() {
-        let is_last_table = i == sorted_tables.len() - 1;
-        let prefix = if is_last_table { "└──" } else { "├──" };
-        tree.push_str(&format!("{} {}\n", prefix, table));
-        
-        let cols = tables.get(*table).unwrap();
-        for (j, (col, dtype)) in cols.iter().enumerate() {
-            let is_last_col = j == cols.len() - 1;
-            let col_prefix = if is_last_table { "    " } else { "│   " };
-            let line_prefix = if is_last_col { "└──" } else { "├──" };
+    if db_set.len() > 1 {
+        let db_list: Vec<&String> = db_set.iter().collect();
+        for (i, &db) in db_list.iter().enumerate() {
+            let is_last_db = i == db_list.len() - 1;
+            let db_prefix = if is_last_db { "└──" } else { "├──" };
+            tree.push_str(&format!("{} 📁 {}\n", db_prefix, db));
             
-            // Check if col is a foreign key
-            let fk = fks.iter().find(|(t, c, _, _)| t == *table && c == col);
-            if let Some((_, _, ref_table, ref_col)) = fk {
-                tree.push_str(&format!("{}{} {} ({}) -> {}.{}\n", col_prefix, line_prefix, col, dtype, ref_table, ref_col));
-            } else {
-                tree.push_str(&format!("{}{} {} ({})\n", col_prefix, line_prefix, col, dtype));
+            let db_tables: Vec<(&(String, String, String), &Vec<(String, String)>)> = tables.iter().filter(|((d, _, _), _)| d == db).collect();
+            for (j, ((_, schema, table), cols)) in db_tables.iter().enumerate() {
+                let is_last_table = j == db_tables.len() - 1;
+                let table_prefix = if is_last_db { "    " } else { "│   " };
+                let branch = if is_last_table { "└──" } else { "├──" };
+                let display_tbl = if schema == "main" { table.clone() } else { format!("{}.{}", schema, table) };
+                tree.push_str(&format!("{}{} {}\n", table_prefix, branch, display_tbl));
+                
+                for (k, (col, dtype)) in cols.iter().enumerate() {
+                    let is_last_col = k == cols.len() - 1;
+                    let col_prefix = if is_last_db {
+                        if is_last_table { "        " } else { "    │   " }
+                    } else {
+                        if is_last_table { "│       " } else { "│   │   " }
+                    };
+                    let col_branch = if is_last_col { "└──" } else { "├──" };
+                    let fk = fks.iter().find(|(t, c, _, _)| t == table && c == col);
+                    if let Some((_, _, ref_table, ref_col)) = fk {
+                        tree.push_str(&format!("{}{}{} ({}) -> {}.{}\n", col_prefix, col_branch, col, dtype, ref_table, ref_col));
+                    } else {
+                        tree.push_str(&format!("{}{}{} ({})\n", col_prefix, col_branch, col, dtype));
+                    }
+                }
+            }
+        }
+    } else {
+        let tbl_list: Vec<(&(String, String, String), &Vec<(String, String)>)> = tables.iter().collect();
+        for (i, ((_, _schema, table), cols)) in tbl_list.iter().enumerate() {
+            let is_last_table = i == tbl_list.len() - 1;
+            let prefix = if is_last_table { "└──" } else { "├──" };
+            tree.push_str(&format!("{} {}\n", prefix, table));
+            
+            for (j, (col, dtype)) in cols.iter().enumerate() {
+                let is_last_col = j == cols.len() - 1;
+                let col_prefix = if is_last_table { "    " } else { "│   " };
+                let line_prefix = if is_last_col { "└──" } else { "├──" };
+                
+                let fk = fks.iter().find(|(t, c, _, _)| t == table && c == col);
+                if let Some((_, _, ref_table, ref_col)) = fk {
+                    tree.push_str(&format!("{}{} {} ({}) -> {}.{}\n", col_prefix, line_prefix, col, dtype, ref_table, ref_col));
+                } else {
+                    tree.push_str(&format!("{}{} {} ({})\n", col_prefix, line_prefix, col, dtype));
+                }
             }
         }
     }
@@ -2275,5 +2888,80 @@ mod tests {
         if let Some(ref text) = retrieved {
             assert_eq!(text, test_str);
         }
+    }
+
+    #[test]
+    fn test_load_explorer_metadata_single_and_attached() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER, name VARCHAR);", []).unwrap();
+        conn.execute("CREATE VIEW active_users AS SELECT * FROM users;", []).unwrap();
+
+        let temp_dir = std::env::temp_dir().join(format!("dp_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Single DB mode
+        let meta_single = load_explorer_metadata(&conn, &temp_dir, false);
+        assert_eq!(meta_single.databases.len(), 1);
+        assert_eq!(meta_single.tables, vec!["users".to_string()]);
+        assert_eq!(meta_single.views, vec!["active_users".to_string()]);
+
+        // Rebuild single DB nodes: flat layout
+        let mut expanded_groups = std::collections::HashSet::new();
+        let mut expanded_tables = std::collections::HashSet::new();
+        expanded_groups.insert("Tables".to_string());
+        let nodes_single = rebuild_explorer_nodes(&meta_single, &expanded_groups, &expanded_tables, &conn, false);
+        assert!(nodes_single.iter().any(|n| n.display.contains("Tables (1)")));
+        assert!(nodes_single.iter().any(|n| n.name == "users"));
+
+        // 2. Attach a second database
+        let attached_db_path = temp_dir.join("analytics.duckdb");
+        conn.execute(&format!("ATTACH '{}' AS analytics;", attached_db_path.display()), []).unwrap();
+        conn.execute("CREATE TABLE analytics.events (event_id BIGINT, event_name VARCHAR);", []).unwrap();
+
+        let meta_multi = load_explorer_metadata(&conn, &temp_dir, false);
+        assert_eq!(meta_multi.databases.len(), 2);
+        assert!(meta_multi.databases.iter().any(|d| d.name == "memory" && d.is_active));
+        assert!(meta_multi.databases.iter().any(|d| d.name == "analytics" && !d.is_active));
+
+        // Rebuild multi-DB nodes: catalog-aware hierarchy
+        expanded_groups.clear();
+        expanded_tables.clear();
+        expanded_groups.insert("db:analytics".to_string());
+        expanded_groups.insert("analytics:Tables".to_string());
+        expanded_tables.insert("analytics.main.events".to_string());
+
+        let nodes_multi = rebuild_explorer_nodes(&meta_multi, &expanded_groups, &expanded_tables, &conn, false);
+        assert!(nodes_multi.iter().any(|n| n.name == "db:analytics" && n.display.contains("analytics")));
+        assert!(nodes_multi.iter().any(|n| n.name == "analytics:Tables"));
+        assert!(nodes_multi.iter().any(|n| n.name == "events"));
+        assert!(nodes_multi.iter().any(|n| n.name == "event_id"));
+
+        // 3. Schema visualizer with attached database
+        let mut cb = None;
+        let visualizer_result = generate_schema_visualizer(&conn, &mut cb);
+        assert!(visualizer_result.is_ok());
+        let tree_text = visualizer_result.unwrap();
+        assert!(tree_text.contains("📁 memory"));
+        assert!(tree_text.contains("📁 analytics"));
+        assert!(tree_text.contains("events"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_dot_autocomplete_word_extraction() {
+        // Multi-part dot-qualified identifiers extraction
+        let line = "SELECT analytics.main.events.event_id FROM t";
+        let cursor_char_idx = 37; // right at the end of "event_id" (len of "SELECT analytics.main.events.event_id")
+        let prefix: String = line.chars().take(cursor_char_idx).collect();
+        let word_start = prefix.rfind(|c: char| !c.is_alphanumeric() && c != '_' && c != '.').map(|i| i + 1).unwrap_or(0);
+        let current_word = &prefix[word_start..];
+        assert_eq!(current_word, "analytics.main.events.event_id");
+
+        let line2 = "SELECT db.";
+        let prefix2: String = line2.chars().collect();
+        let word_start2 = prefix2.rfind(|c: char| !c.is_alphanumeric() && c != '_' && c != '.').map(|i| i + 1).unwrap_or(0);
+        let current_word2 = &prefix2[word_start2..];
+        assert_eq!(current_word2, "db.");
     }
 }
