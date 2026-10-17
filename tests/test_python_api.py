@@ -128,3 +128,17 @@ def test_duckdbignore_rules(tmp_path):
     assert "active" in tables
     assert "temp_staging" not in tables
 
+def test_explore_non_tty_mode(capfd):
+    con = duckdb.connect()
+    con.execute("CREATE TABLE products (sku VARCHAR PRIMARY KEY, price DOUBLE);")
+    con.execute("INSERT INTO products VALUES ('ABC', 19.99);")
+
+    # explore in automated test/non-TTY environment should print formatted summary without error
+    duckpack.explore(con)
+    captured = capfd.readouterr()
+    assert "DuckPack Database Explorer (Notebook / Non-TTY Mode)" in captured.out
+    assert "products" in captured.out
+    assert "sku" in captured.out
+
+
+

@@ -2,6 +2,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::diff as schema_diff;
@@ -90,7 +91,16 @@ pub struct TerminalGuard;
 
 impl TerminalGuard {
     pub fn enter() -> anyhow::Result<Self> {
-        ratatui::crossterm::terminal::enable_raw_mode()?;
+        ratatui::crossterm::terminal::enable_raw_mode().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to initialize terminal (raw mode): {}. \
+                duckpack.explore() requires an interactive terminal (TTY). \
+                Interactive full-screen TUI cannot run inside non-TTY environments \
+                (such as Jupyter notebooks, web cells, or piped stdout). \
+                Please run from a terminal shell.",
+                e
+            )
+        })?;
         let mut stdout = std::io::stdout();
         ratatui::crossterm::execute!(
             stdout,
@@ -110,6 +120,127 @@ impl Drop for TerminalGuard {
             ratatui::crossterm::event::DisableMouseCapture
         );
     }
+}
+
+fn is_interactive_terminal() -> bool {
+    std::io::stdout().is_terminal() && std::io::stdin().is_terminal()
+}
+
+fn find_available_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .unwrap_or(9494)
+}
+
+fn print_non_terminal_explorer(executor: &mut PyDbExecutor) -> PyResult<()> {
+    let (_schemas, table_map, view_map, macro_map) = introspect_py_catalog(executor)?;
+
+    println!("======================================================================");
+    println!("🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode)");
+    println!("======================================================================");
+
+    if table_map.is_empty() {
+        println!("📊 Tables: (none)");
+    } else {
+        println!("📊 Tables ({}):", table_map.len());
+        let mut sorted_tables: Vec<_> = table_map.iter().collect();
+        sorted_tables.sort_by_key(|(name, _)| (*name).clone());
+        for (name, schema) in sorted_tables {
+            let row_count = executor
+                .query_rows(&format!("SELECT count(*) FROM {}", name))
+                .ok()
+                .and_then(|(_, rows)| rows.into_iter().next())
+                .and_then(|r| r.into_iter().next())
+                .unwrap_or_else(|| "?".to_string());
+
+            println!("  • {} ({} rows)", name, row_count);
+            let mut sorted_cols: Vec<_> = schema.columns.iter().collect();
+            sorted_cols.sort_by_key(|(col, _)| (*col).clone());
+            for (col, dtype) in sorted_cols {
+                println!("    - {}: {}", col, dtype);
+            }
+        }
+    }
+
+    if !view_map.is_empty() {
+        println!("\n🔍 Views ({}):", view_map.len());
+        for name in view_map.keys() {
+            println!("  • {}", name);
+        }
+    }
+
+    if !macro_map.is_empty() {
+        println!("\n🔧 Macros ({}):", macro_map.len());
+        for name in macro_map.keys() {
+            println!("  • {}", name);
+        }
+    }
+
+    println!("======================================================================");
+    println!("💡 Note: Full interactive TUI (multi-tab SQL editor, autocompletion,");
+    println!("   ERD diagram) requires an interactive terminal (TTY).");
+    println!("   To launch the interactive IDE, run your script from a terminal shell:");
+    println!("   $ python -c \"import duckdb, duckpack; con = duckdb.connect(...); duckpack.explore(con)\"");
+    println!("======================================================================");
+
+    Ok(())
+}
+
+fn print_non_terminal_db(conn: &duckdb::Connection, db_name: &str) -> PyResult<()> {
+    let tables = schema_diff::get_schema(conn).unwrap_or_default();
+    let views = schema_diff::get_views(conn).unwrap_or_default();
+    let macros = schema_diff::get_macros(conn).unwrap_or_default();
+
+    println!("======================================================================");
+    println!("🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: {})", db_name);
+    println!("======================================================================");
+
+    if tables.is_empty() {
+        println!("📊 Tables: (none)");
+    } else {
+        println!("📊 Tables ({}):", tables.len());
+        let mut sorted_tables: Vec<_> = tables.iter().collect();
+        sorted_tables.sort_by_key(|(name, _)| (*name).clone());
+        for (name, schema) in sorted_tables {
+            let row_count: String = conn
+                .query_row(&format!("SELECT count(*) FROM {}", name), [], |r| {
+                    let c: i64 = r.get(0)?;
+                    Ok(c.to_string())
+                })
+                .unwrap_or_else(|_| "?".to_string());
+
+            println!("  • {} ({} rows)", name, row_count);
+            let mut sorted_cols: Vec<_> = schema.columns.iter().collect();
+            sorted_cols.sort_by_key(|(col, _)| (*col).clone());
+            for (col, dtype) in sorted_cols {
+                println!("    - {}: {}", col, dtype);
+            }
+        }
+    }
+
+    if !views.is_empty() {
+        println!("\n🔍 Views ({}):", views.len());
+        for name in views.keys() {
+            println!("  • {}", name);
+        }
+    }
+
+    if !macros.is_empty() {
+        println!("\n🔧 Macros ({}):", macros.len());
+        for name in macros.keys() {
+            println!("  • {}", name);
+        }
+    }
+
+    println!("======================================================================");
+    println!("💡 Note: Full interactive TUI (multi-tab SQL editor, autocompletion,");
+    println!("   ERD diagram) requires an interactive terminal (TTY).");
+    println!("   To launch the interactive IDE, run your script from a terminal shell:");
+    println!("   $ python -c \"import duckdb, duckpack; con = duckdb.connect(...); duckpack.explore(con)\"");
+    println!("======================================================================");
+
+    Ok(())
 }
 
 /// Structured result of schema changes applied via `duckpack.apply()`
@@ -463,6 +594,7 @@ fn introspect_py_catalog(
 }
 
 /// Launch the interactive DuckPack IDE terminal UI against a target database.
+/// In non-terminal environments (such as Jupyter notebooks), prints a formatted database overview.
 #[pyfunction]
 #[pyo3(signature = (target, project_dir = "."))]
 pub fn explore(_py: Python<'_>, target: &Bound<'_, PyAny>, project_dir: &str) -> PyResult<()> {
@@ -471,6 +603,10 @@ pub fn explore(_py: Python<'_>, target: &Bound<'_, PyAny>, project_dir: &str) ->
     if let Ok(db_str) = target.extract::<String>() {
         let conn = engine::connect_target_db(&db_str, None, false)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
+
+        if !is_interactive_terminal() {
+            return print_non_terminal_db(&conn, &db_str);
+        }
 
         let _guard = TerminalGuard::enter()
             .map_err(|e| ExecutionError::new_err(format!("Failed to initialize terminal: {}", e)))?;
@@ -486,6 +622,12 @@ pub fn explore(_py: Python<'_>, target: &Bound<'_, PyAny>, project_dir: &str) ->
         Ok(())
     } else {
         // Live Python connection
+        let mut executor = PyDbExecutor::new(target.clone().unbind());
+
+        if !is_interactive_terminal() {
+            return print_non_terminal_explorer(&mut executor);
+        }
+
         let _guard = TerminalGuard::enter()
             .map_err(|e| ExecutionError::new_err(format!("Failed to initialize terminal: {}", e)))?;
 
@@ -515,26 +657,23 @@ pub fn explore(_py: Python<'_>, target: &Bound<'_, PyAny>, project_dir: &str) ->
             engine::connect_target_db(&db_name, None, false)
                 .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_name, e)))?
         } else {
-            // For pure in-memory, start quack_serve on localhost port so the Rust IDE has full interactive access!
-            let start_server_sql = "INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:0', token := 'duckpack_py');";
-            let _ = target.call_method1("execute", (start_server_sql,));
+            // For in-memory connection, start quack_serve on an available port
+            let port = find_available_port();
+            let start_server_sql = format!(
+                "INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:{}', token := 'duckpack_py');",
+                port
+            );
+            if let Err(e) = target.call_method1("execute", (start_server_sql,)) {
+                return Err(ExecutionError::new_err(format!(
+                    "Unable to start local quack bridge for in-memory DuckDB connection: {}. \
+                    Tip: Ensure the 'quack' extension can be loaded, or explore a persistent database file via duckpack.explore('path.duckdb').",
+                    e
+                )));
+            }
 
-            let server_uri = target
-                .call_method1("execute", ("SELECT uri FROM quack_servers();",))
-                .ok()
-                .and_then(|res| res.call_method0("fetchone").ok())
-                .and_then(|row| {
-                    if let Ok(r) = row.extract::<(String,)>() {
-                        Some(r.0)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| "quack:localhost:9494".to_string());
-
-            let conn = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
-                .map_err(|e| ExecutionError::new_err(format!("Failed to attach to Python in-memory DuckDB: {}", e)))?;
-            conn
+            let server_uri = format!("quack:localhost:{}", port);
+            engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
+                .map_err(|e| ExecutionError::new_err(format!("Failed to attach to Python in-memory DuckDB: {}", e)))?
         };
 
         crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, ":memory:")
