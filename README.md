@@ -55,6 +55,15 @@ Download `duckpack-windows-amd64.exe` from the Releases page and add it to your 
 
 *No Rust installation is required!*
 
+**Python (pip / uv):**
+Install the Python extension and CLI simultaneously:
+```bash
+pip install duckpack
+# or
+uv add duckpack
+```
+*(Provides both `import duckpack` in Python and the `duckpack` CLI binary in your shell!)*
+
 ### 2. Initialize a Project
 
 Initialize a new declarative project directory:
@@ -259,3 +268,67 @@ duckpack explore --db quack:0.0.0.0:9494 --quack-token <token> --insecure
 - **Schema Discovery & Diffing (`duckpack apply`)**: You can inspect and diff schemas directly against a remote Quack instance.
 - **Upstream `ALTER TABLE` Note**: The experimental upstream DuckDB Quack extension does not yet support `ALTER TABLE` statements over its HTTP wire protocol. Live in-place alterations (such as adding or renaming columns) will return a `Not implemented` error from the remote engine.
 - **Recommended for Full Remote Deployments (`duckpack deploy`)**: For remote production deployments that require schema modifications, use `duckpack deploy`. This compiles an immutable `.duckpack` bundle and executes migrations locally on the remote server's disk over SSH with 100% full DuckDB engine support.
+
+## 🐍 Python Integration
+
+DuckPack provides first-class Python bindings! You can programmatically inspect in-memory databases, run declarative migrations in test fixtures, and launch the interactive terminal IDE directly from your Python pipeline or debug session.
+
+### 1. Interactive In-Memory Exploration
+Drop into the full DuckPack terminal IDE during pipeline development or at a `breakpoint()`:
+
+```python
+import duckdb
+import duckpack
+
+con = duckdb.connect()  # in-memory database
+con.execute("CREATE TABLE users AS SELECT 1 AS id, 'Alice' AS name;")
+
+# Launches the interactive DuckPack TUI directly in your active terminal:
+duckpack.explore(con)
+
+# When you exit the TUI (Esc / q), Python execution resumes seamlessly!
+print("Pipeline continuing...")
+```
+
+### 2. Programmatic Migrations (Great for Pytest & Pipelines)
+Apply your declarative schema SQL files directly to in-memory or on-disk databases:
+
+```python
+import duckdb
+import duckpack
+import pytest
+
+@pytest.fixture
+def db():
+    con = duckdb.connect()
+    # Apply your declarative project into the test database:
+    result = duckpack.apply(con, project_dir="./schema", auto_approve=True)
+    assert result.success
+    return con
+```
+
+### 3. Schema Drift Detection
+Check if a target database is in sync with your declarative `.sql` definitions:
+
+```python
+import duckdb
+import duckpack
+
+con = duckdb.connect("prod.duckdb")
+diff = duckpack.diff(con, project_dir="./schema")
+
+if diff.has_changes:
+    print(f"Warning: {diff.change_count} schema drift items detected: {diff.items}")
+```
+
+### 4. CLI Python Management
+Manage the Python environment directly from the standalone DuckPack CLI:
+
+```bash
+# Check if DuckPack is available in active Python environment
+duckpack python status
+
+# Install or upgrade DuckPack into active Python environment
+duckpack python install --upgrade
+```
+

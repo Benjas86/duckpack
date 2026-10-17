@@ -6,3 +6,9 @@ duck-project.toml
 *.png
 *.duckpack
 /demo_project/*
+.venv/
+__pycache__/
+*.so
+*.pyd
+*.whl
+.pytest_cache/
