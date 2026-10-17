@@ -5,7 +5,7 @@ use duckpack::ide;
 use duckpack::tui;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use duckdb::Connection;
 use std::fs;
 use std::path::PathBuf;
@@ -156,7 +156,10 @@ enum PythonCommands {
 /// Parses the arguments and delegates to the appropriate command handler.
 fn main() -> Result<()> {
     panic::set_hook(Box::new(|info| { let bt = std::backtrace::Backtrace::force_capture(); let _ = std::fs::write("panic.log", format!("Panic: {:?}\n\n{}", info, bt)); }));
-    let mut cli = Cli::parse();
+    let embedded_ver = duckpack::engine::embedded_duckdb_version();
+    let version_str: &'static str = Box::leak(format!("{} (DuckDB engine: {})", env!("CARGO_PKG_VERSION"), embedded_ver).into_boxed_str());
+    let matches = Cli::command().version(version_str).get_matches();
+    let mut cli = Cli::from_arg_matches(&matches)?;
 
     let default_dir = PathBuf::from(".");
     let project_dir = match &cli.command {
@@ -694,18 +697,37 @@ fn main() -> Result<()> {
         Commands::Python { command } => {
             match command {
                 PythonCommands::Status => {
-                    println!("Checking Python environment for DuckPack...");
-                    let output = std::process::Command::new("python3")
+                    let embedded_ver = duckpack::engine::embedded_duckdb_version();
+                    println!("🦆 DuckPack CLI: v{}", env!("CARGO_PKG_VERSION"));
+                    println!("   Embedded DuckDB engine: {}", embedded_ver);
+                    println!("\nChecking active Python environment (python3)...");
+
+                    let duckpack_py_out = std::process::Command::new("python3")
                         .args(["-c", "import duckpack; print(duckpack.__version__)"])
                         .output();
-                    match output {
+                    match duckpack_py_out {
                         Ok(out) if out.status.success() => {
                             let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                            println!("✓ DuckPack Python package (v{}) is installed and available in python3.", ver);
+                            let dp_str = if ver.starts_with('v') { ver } else { format!("v{}", ver) };
+                            println!("✓ DuckPack Python package: {} (installed)", dp_str);
                         }
                         _ => {
-                            println!("✗ DuckPack Python package is not installed in the active Python environment.");
+                            println!("✗ DuckPack Python package: not installed");
                             println!("  Run 'duckpack python install' to install it via pip.");
+                        }
+                    }
+
+                    let duckdb_py_out = std::process::Command::new("python3")
+                        .args(["-c", "import duckdb; print(duckdb.__version__)"])
+                        .output();
+                    match duckdb_py_out {
+                        Ok(out) if out.status.success() => {
+                            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            let ddb_str = if ver.starts_with('v') { ver } else { format!("v{}", ver) };
+                            println!("✓ Python DuckDB package: {}", ddb_str);
+                        }
+                        _ => {
+                            println!("- Python DuckDB package: not found");
                         }
                     }
                 }

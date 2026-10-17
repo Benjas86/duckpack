@@ -130,6 +130,41 @@ pub fn build_quack_attach_sql(db: &str, disable_ssl: bool) -> String {
     }
 }
 
+/// Returns the version string of the embedded DuckDB C++ engine (e.g. "v1.1.3").
+pub fn embedded_duckdb_version() -> String {
+    Connection::open_in_memory()
+        .and_then(|c| c.query_row("SELECT version();", [], |r| r.get::<_, String>(0)))
+        .unwrap_or_else(|_| "1.1.x".to_string())
+}
+
+/// Diagnoses DuckDB storage version mismatch errors when attempting to open a database file.
+pub fn diagnose_storage_version_error(err_str: &str, db_path: &str) -> Option<String> {
+    let lower = err_str.to_lowercase();
+    if lower.contains("storage version")
+        || lower.contains("serialization error")
+        || lower.contains("different version of duckdb")
+        || lower.contains("created by a newer version")
+        || (lower.contains("cannot open database") && lower.contains("version"))
+    {
+        Some(format!(
+            "DuckDB Storage Version Mismatch: The database file '{}' appears to have been created or modified by a newer or different version of DuckDB than DuckPack's embedded engine ({}).\n\n\
+            Remediation Options:\n\
+              1. Upgrade DuckPack: Run `duckpack python install --upgrade` or download the latest CLI release.\n\
+              2. Python One-Liner (Auto-Bridged): Run using your active Python environment's DuckDB:\n\
+                 $ python -c \"import duckdb, duckpack; con = duckdb.connect('{}'); duckpack.explore(con)\"\n\
+              3. Serve via your local DuckDB CLI:\n\
+                 $ duckdb {} -c \"INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:9494');\"\n\
+                 $ duckpack explore --db quack:localhost:9494",
+            db_path,
+            embedded_duckdb_version(),
+            db_path,
+            db_path
+        ))
+    } else {
+        None
+    }
+}
+
 /// Connects to the target DuckDB database (local, motherduck remote, or quack remote).
 pub fn connect_target_db(
     db: &str,
@@ -173,8 +208,14 @@ pub fn connect_target_db(
         let conn = Connection::open_in_memory()
             .with_context(|| "Failed to open in-memory DB for local ATTACH")?;
         let safe_db = db.replace("'", "''");
-        conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-            .with_context(|| "Failed to attach local database")?;
+        let attach_res = conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), []);
+        if let Err(e) = attach_res {
+            let err_msg = e.to_string();
+            if let Some(diagnostic) = diagnose_storage_version_error(&err_msg, db) {
+                return Err(anyhow::anyhow!("{}\n\nOriginal error: {}", diagnostic, err_msg));
+            }
+            return Err(anyhow::anyhow!("Failed to attach local database '{}': {}", db, err_msg));
+        }
         conn.execute("USE target_db;", [])
             .with_context(|| "Failed to switch to target database")?;
         Ok(conn)
@@ -481,4 +522,31 @@ pub fn load_ignore_rules(project_dir: &Path) -> Vec<String> {
         }
     }
     rules
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_embedded_duckdb_version() {
+        let v = embedded_duckdb_version();
+        assert!(!v.is_empty());
+        assert!(v.starts_with('v') || v.chars().next().map_or(false, |c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_diagnose_storage_version_error() {
+        let err1 = "Serialization Error: Cannot open database \"prod.duckdb\" with storage version 4 because it was created by a newer version of DuckDB (storage version 5)";
+        let diag1 = diagnose_storage_version_error(err1, "prod.duckdb");
+        assert!(diag1.is_some());
+        let msg = diag1.unwrap();
+        assert!(msg.contains("DuckDB Storage Version Mismatch"));
+        assert!(msg.contains("prod.duckdb"));
+        assert!(msg.contains("Remediation Options"));
+
+        let err2 = "IO Error: File not found";
+        let diag2 = diagnose_storage_version_error(err2, "prod.duckdb");
+        assert!(diag2.is_none());
+    }
 }
