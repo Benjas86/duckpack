@@ -23,6 +23,10 @@ classifiers = [
     "Topic :: Database",
 ]
 
+[project.scripts]
+duckpack = "duckpack.cli:main"
+
+
 [tool.maturin]
 features = ["python"]
 bindings = "pyo3"
