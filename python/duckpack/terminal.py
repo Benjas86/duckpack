@@ -113,7 +113,7 @@ def launch_terminal_window(
 
             def cleanup():
                 try:
-                    target.execute("CALL quack_stop();")
+                    target.execute(f"CALL quack_stop('{db_arg}');")
                 except Exception:
                     pass
 
