@@ -24,7 +24,7 @@ enum FocusPane {
 
 /// Categorizes the type of entity currently being rendered in the Explorer tree.
 #[derive(Clone, Debug, PartialEq)]
-enum NodeType {
+pub(crate) enum NodeType {
     Database { db_type: String, is_active: bool, path: Option<String> },
     Group,
     Table { database: Option<String>, schema: Option<String> },
@@ -133,13 +133,13 @@ impl AttachModalState {
 /// Represents a single renderable node in the Explorer sidebar.
 /// Tracks its hierarchical depth (`level`) and expandability state for collapsing/expanding tables.
 #[derive(Clone, Debug)]
-struct ExplorerNode {
-    name: String,
-    display: String,
-    level: usize,
-    is_expandable: bool,
-    is_expanded: bool,
-    node_type: NodeType,
+pub(crate) struct ExplorerNode {
+    pub(crate) name: String,
+    pub(crate) display: String,
+    pub(crate) level: usize,
+    pub(crate) is_expandable: bool,
+    pub(crate) is_expanded: bool,
+    pub(crate) node_type: NodeType,
 }
 
 /// Represents an individual open Query Tab within the IDE.
@@ -206,8 +206,26 @@ pub fn load_table_columns_for(
 ) -> Vec<(String, String)> {
     let mut cols = Vec::new();
 
-    // 1. Check duckdb_columns() (via target_db.query if on quack)
-    if is_quack {
+    // 1. Direct query on db if it is target_db
+    if is_quack && db == "target_db" {
+        let col_query = format!(
+            "SELECT column_name, data_type FROM target_db.query('SELECT column_name, data_type FROM duckdb_columns() WHERE schema_name = ''{}'' AND table_name = ''{}'' ORDER BY column_index')",
+            schema.replace("'", "''"),
+            table.replace("'", "''")
+        );
+        if let Ok(mut stmt) = conn.prepare(&col_query) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        cols.push((name, typ));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check duckdb_columns() via target_db.query (for remote multi-database mode)
+    if cols.is_empty() && is_quack {
         let col_query = format!(
             "SELECT column_name, data_type FROM target_db.query('SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = ''{}'' AND schema_name = ''{}'' AND table_name = ''{}'' ORDER BY column_index')",
             db.replace("'", "''"),
@@ -223,7 +241,10 @@ pub fn load_table_columns_for(
                 }
             }
         }
-    if cols.is_empty() && is_quack {
+    }
+
+    // 3. Nested quack query if on remote multi-db (e.g. remote_db attached inside target_db)
+    if cols.is_empty() && is_quack && db != "target_db" && db != "memory" {
         let nested_col_query = format!(
             "SELECT * FROM target_db.query('SELECT column_name, data_type FROM {}.query(''SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = ''''{}'''' ORDER BY column_index'')')",
             db.replace("'", "''"),
@@ -240,6 +261,7 @@ pub fn load_table_columns_for(
         }
     }
 
+    // 4. Query {db}.query directly if db is an attached quack DB on conn
     if cols.is_empty() {
         let direct_quack_col = format!(
             "SELECT column_name, data_type FROM {}.query('SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = ''{}'' ORDER BY column_index')",
@@ -256,6 +278,9 @@ pub fn load_table_columns_for(
             }
         }
     }
+
+    // 5. Query local duckdb_columns() on conn
+    if cols.is_empty() {
         let col_query = format!(
             "SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = '{}' AND schema_name = '{}' AND table_name = '{}' ORDER BY column_index",
             db.replace("'", "''"),
@@ -273,15 +298,20 @@ pub fn load_table_columns_for(
         }
     }
 
+    // 6. PRAGMA table_info fallback
     if cols.is_empty() {
-        // 2. Try PRAGMA table_info('db.table') or PRAGMA table_info('db.schema.table')
         let qualified = if schema == "main" {
             format!("{}.{}", db, table)
         } else {
             format!("{}.{}.{}", db, schema, table)
         };
         let safe_qualified = qualified.replace("'", "''");
-        let pragma_queries = if is_quack {
+        let pragma_queries = if is_quack && db == "target_db" {
+            vec![
+                format!("SELECT * FROM target_db.query('PRAGMA table_info(''{table}'')')"),
+                format!("PRAGMA table_info('{}')", safe_qualified),
+            ]
+        } else if is_quack {
             vec![
                 format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_qualified}'')')"),
                 format!("PRAGMA table_info('{}')", safe_qualified),
@@ -289,7 +319,6 @@ pub fn load_table_columns_for(
         } else {
             vec![
                 format!("PRAGMA table_info('{}')", safe_qualified),
-                format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_qualified}'')')"),
             ]
         };
 
@@ -340,24 +369,12 @@ pub struct ExplorerMetadata {
     pub dictionary: Vec<String>,
 }
 
-fn load_explorer_metadata(
+pub fn load_explorer_metadata(
     conn: &Connection,
     project_dir: &Path,
     is_quack: bool,
 ) -> ExplorerMetadata {
-    let active_database: String = if is_quack {
-        conn.query_row(
-            "SELECT * FROM target_db.query('SELECT current_database()')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or_else(|_| "memory".to_string())
-    } else {
-        conn.query_row("SELECT current_database();", [], |r| r.get(0))
-            .unwrap_or_else(|_| "memory".to_string())
-    };
-
-    let mut raw_dbs: Vec<(String, String, Option<String>, bool)> = Vec::new();
+    let mut remote_dbs: Vec<(String, String, Option<String>, bool)> = Vec::new();
     if is_quack {
         let quack_db_sql = "SELECT database_name, type, path, readonly FROM target_db.query('SELECT database_name, type, path, readonly FROM duckdb_databases() WHERE internal = false')";
         if let Ok(mut stmt) = conn.prepare(quack_db_sql) {
@@ -366,14 +383,31 @@ fn load_explorer_metadata(
                     if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
                         let path: Option<String> = row.get(2).ok();
                         let readonly: bool = row.get(3).unwrap_or(false);
-                        raw_dbs.push((name, typ, path, readonly));
+                        remote_dbs.push((name, typ, path, readonly));
                     }
                 }
             }
         }
     }
 
-    if raw_dbs.is_empty() {
+    let is_remote_multi_db = remote_dbs.len() > 1;
+
+    let active_database: String = if is_remote_multi_db {
+        conn.query_row(
+            "SELECT * FROM target_db.query('SELECT current_database()')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "memory".to_string())
+    } else {
+        conn.query_row("SELECT current_database();", [], |r| r.get(0))
+            .unwrap_or_else(|_| if is_quack { "target_db".to_string() } else { "memory".to_string() })
+    };
+
+    let mut raw_dbs: Vec<(String, String, Option<String>, bool)> = Vec::new();
+    if is_remote_multi_db {
+        raw_dbs = remote_dbs;
+    } else {
         if let Ok(mut stmt) = conn.prepare("SELECT database_name, type, path, readonly FROM duckdb_databases() WHERE internal = false") {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
@@ -391,7 +425,7 @@ fn load_explorer_metadata(
     }
 
     let mut all_tables: Vec<TableEntry> = Vec::new();
-    if is_quack {
+    if is_remote_multi_db {
         let quack_tbl_sql = "SELECT database_name, schema_name, table_name, estimated_size FROM target_db.query('SELECT database_name, schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false')";
         if let Ok(mut stmt) = conn.prepare(quack_tbl_sql) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -408,9 +442,8 @@ fn load_explorer_metadata(
                 }
             }
         }
-    }
-
-    if all_tables.is_empty() {
+    } else {
+        // Query tables on conn (local and non-quack attached databases)
         if let Ok(mut stmt) = conn.prepare("SELECT database_name, schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false") {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
@@ -428,29 +461,11 @@ fn load_explorer_metadata(
         }
     }
 
-    // Information schema fallback if tables still empty
-    if all_tables.is_empty() {
-        if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('information_schema', 'pg_catalog')") {
-            if let Ok(mut rows) = stmt.query([]) {
-                while let Ok(Some(row)) = rows.next() {
-                    if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
-                        all_tables.push(TableEntry {
-                            database: active_database.clone(),
-                            schema,
-                            name,
-                            row_count: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
     // Query tables from attached quack databases
     for (name, typ, _, _) in &raw_dbs {
         if typ.eq_ignore_ascii_case("quack") {
             let safe_name = name.replace("'", "''");
-            let sql = if is_quack {
+            let sql = if is_remote_multi_db {
                 format!(
                     "SELECT * FROM target_db.query('SELECT ''{}'' AS database_name, schema_name, table_name, estimated_size FROM {}.query(''SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false'')')",
                     safe_name, safe_name
@@ -479,8 +494,26 @@ fn load_explorer_metadata(
         }
     }
 
+    // Information schema fallback if tables still empty
+    if all_tables.is_empty() {
+        if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('information_schema', 'pg_catalog')") {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        all_tables.push(TableEntry {
+                            database: active_database.clone(),
+                            schema,
+                            name,
+                            row_count: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     let mut all_views: Vec<ViewEntry> = Vec::new();
-    if is_quack {
+    if is_remote_multi_db {
         let quack_view_sql = "SELECT database_name, schema_name, view_name FROM target_db.query('SELECT database_name, schema_name, view_name FROM duckdb_views() WHERE internal = false')";
         if let Ok(mut stmt) = conn.prepare(quack_view_sql) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -495,9 +528,7 @@ fn load_explorer_metadata(
                 }
             }
         }
-    }
-
-    if all_views.is_empty() {
+    } else {
         if let Ok(mut stmt) = conn.prepare("SELECT database_name, schema_name, view_name FROM duckdb_views() WHERE internal = false") {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
@@ -513,28 +544,11 @@ fn load_explorer_metadata(
         }
     }
 
-    // Information schema fallback if views still empty
-    if all_views.is_empty() {
-        if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'VIEW' AND table_schema NOT IN ('information_schema', 'pg_catalog')") {
-            if let Ok(mut rows) = stmt.query([]) {
-                while let Ok(Some(row)) = rows.next() {
-                    if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
-                        all_views.push(ViewEntry {
-                            database: active_database.clone(),
-                            schema,
-                            name,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
     // Query views from attached quack databases
     for (name, typ, _, _) in &raw_dbs {
         if typ.eq_ignore_ascii_case("quack") {
             let safe_name = name.replace("'", "''");
-            let sql = if is_quack {
+            let sql = if is_remote_multi_db {
                 format!(
                     "SELECT * FROM target_db.query('SELECT ''{}'' AS database_name, schema_name, view_name FROM {}.query(''SELECT schema_name, view_name FROM duckdb_views() WHERE internal = false'')')",
                     safe_name, safe_name
@@ -561,13 +575,31 @@ fn load_explorer_metadata(
         }
     }
 
+    // Information schema fallback if views still empty
+    if all_views.is_empty() {
+        if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'VIEW' AND table_schema NOT IN ('information_schema', 'pg_catalog')") {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        all_views.push(ViewEntry {
+                            database: active_database.clone(),
+                            schema,
+                            name,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     let mut databases: Vec<DatabaseInfo> = Vec::new();
+    let is_remote_quack = is_quack || raw_dbs.iter().any(|d| d.0 == "target_db" || d.1.eq_ignore_ascii_case("quack"));
     for (name, db_type, path, readonly) in &raw_dbs {
         let db_tables: Vec<TableEntry> = all_tables.iter().filter(|t| &t.database == name).cloned().collect();
         let db_views: Vec<ViewEntry> = all_views.iter().filter(|v| &v.database == name).cloned().collect();
 
-        // If 'memory' is empty and not the active database, skip it (scratch pad created by open_in_memory)
-        if name == "memory" && active_database != "memory" && db_tables.is_empty() && db_views.is_empty() {
+        // If 'memory' is empty and not the active database, skip it only in classic single local DB mode
+        if !is_remote_quack && raw_dbs.len() <= 1 && name == "memory" && active_database != "memory" && db_tables.is_empty() && db_views.is_empty() {
             continue;
         }
 
@@ -613,7 +645,18 @@ fn load_explorer_metadata(
     }
 
     let mut macros: Vec<String> = Vec::new();
-    if is_quack {
+    if is_remote_multi_db {
+        let quack_macro_sql = "SELECT function_name FROM target_db.query('SELECT CASE WHEN schema_name = ''main'' THEN function_name ELSE schema_name || ''.'' || function_name END AS function_name FROM duckdb_functions() WHERE function_type = ''macro'' AND internal = false ORDER BY 1')";
+        if let Ok(mut stmt) = conn.prepare(quack_macro_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(name) = row.get::<_, String>(0) {
+                        if !macros.contains(&name) { macros.push(name); }
+                    }
+                }
+            }
+        }
+    } else if is_quack {
         let quack_macro_sql = "SELECT function_name FROM target_db.query('SELECT CASE WHEN schema_name = ''main'' THEN function_name ELSE schema_name || ''.'' || function_name END AS function_name FROM duckdb_functions() WHERE function_type = ''macro'' AND internal = false ORDER BY 1')";
         if let Ok(mut stmt) = conn.prepare(quack_macro_sql) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -668,7 +711,7 @@ fn load_explorer_metadata(
         }
     }
 
-    if is_quack {
+    if is_remote_multi_db {
         let quack_col_sql = "SELECT database_name, schema_name, table_name, column_name FROM target_db.query('SELECT database_name, schema_name, table_name, column_name FROM duckdb_columns() WHERE internal = false')";
         if let Ok(mut stmt) = conn.prepare(quack_col_sql) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -687,7 +730,7 @@ fn load_explorer_metadata(
     for (name, typ, _, _) in &raw_dbs {
         if typ.eq_ignore_ascii_case("quack") {
             let safe_name = name.replace("'", "''");
-            let sql = if is_quack {
+            let sql = if is_remote_multi_db {
                 format!(
                     "SELECT * FROM target_db.query('SELECT ''{}'' AS database_name, schema_name, table_name, column_name FROM {}.query(''SELECT schema_name, table_name, column_name FROM duckdb_columns() WHERE internal = false'')')",
                     safe_name, safe_name
@@ -746,7 +789,7 @@ fn load_explorer_metadata(
     }
 }
 
-fn rebuild_explorer_nodes(
+pub(crate) fn rebuild_explorer_nodes(
     meta: &ExplorerMetadata,
     expanded_groups: &HashSet<String>,
     expanded_tables: &HashSet<String>,
@@ -2205,11 +2248,17 @@ pub fn run_ide_loop(
                                         NodeType::Table { database, schema } | NodeType::View { database, schema } => {
                                             let db_name = database.as_deref().unwrap_or(&meta.active_database);
                                             let schema_name = schema.as_deref().unwrap_or("main");
-                                            let qualified_sql = if is_quack && db_name != meta.active_database {
+                                            let qualified_sql = if is_quack && db_name != meta.active_database && db_name != "memory" && db_name != "target_db" {
                                                 if schema_name == "main" {
                                                     format!("-- @remote\nSELECT * FROM {}.{} LIMIT 500;", db_name, item_name)
                                                 } else {
                                                     format!("-- @remote\nSELECT * FROM {}.{}.{} LIMIT 500;", db_name, schema_name, item_name)
+                                                }
+                                            } else if meta.databases.len() > 1 {
+                                                if schema_name == "main" {
+                                                    format!("SELECT * FROM {}.{} LIMIT 500;", db_name, item_name)
+                                                } else {
+                                                    format!("SELECT * FROM {}.{}.{} LIMIT 500;", db_name, schema_name, item_name)
                                                 }
                                             } else if db_name == meta.active_database && schema_name == "main" {
                                                 format!("SELECT * FROM {} LIMIT 500;", item_name)
@@ -2915,32 +2964,67 @@ fn format_duckdb_value(v: duckdb::types::Value) -> String {
 
 /// Generates an ASCII tree of the schema and copies a Mermaid diagram to the clipboard.
 fn generate_schema_visualizer(conn: &duckdb::Connection, os_clipboard: &mut Option<arboard::Clipboard>, is_quack: bool) -> Result<String, Box<dyn std::error::Error>> {
-    // 1. Get Tables & Columns across databases
-    let col_query = if is_quack {
-        "SELECT database_name, schema_name, table_name, column_name, data_type FROM target_db.query('SELECT database_name, schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false ORDER BY database_name, schema_name, table_name, column_index');".to_string()
-    } else {
-        "SELECT database_name, schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false ORDER BY database_name, schema_name, table_name, column_index;".to_string()
-    };
-    let mut stmt = match conn.prepare(&col_query) {
-        Ok(s) => s,
-        Err(_) => conn.prepare("SELECT database_name, schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false ORDER BY database_name, schema_name, table_name, column_index;")?,
-    };
-    let mut rows = stmt.query([])?;
-    
+    let mut remote_dbs: Vec<(String, String)> = Vec::new();
+    if is_quack {
+        let quack_db_sql = "SELECT database_name, type FROM target_db.query('SELECT database_name, type FROM duckdb_databases() WHERE internal = false')";
+        if let Ok(mut stmt) = conn.prepare(quack_db_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        remote_dbs.push((name, typ));
+                    }
+                }
+            }
+        }
+    }
+    let is_remote_multi_db = remote_dbs.len() > 1;
+
     let mut db_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut tables: std::collections::BTreeMap<(String, String, String), Vec<(String, String)>> = std::collections::BTreeMap::new();
-    while let Some(row) = rows.next()? {
-        let db_name: String = row.get(0)?;
-        let schema_name: String = row.get(1)?;
-        let table_name: String = row.get(2)?;
-        let col_name: String = row.get(3)?;
-        let data_type: String = row.get(4)?;
-        db_set.insert(db_name.clone());
-        tables.entry((db_name, schema_name, table_name)).or_default().push((col_name, data_type));
+
+    if is_remote_multi_db {
+        let col_query = "SELECT database_name, schema_name, table_name, column_name, data_type FROM target_db.query('SELECT database_name, schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false ORDER BY database_name, schema_name, table_name, column_index');";
+        if let Ok(mut stmt) = conn.prepare(col_query) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(db_name), Ok(schema_name), Ok(table_name), Ok(col_name), Ok(data_type)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, String>(3), row.get::<_, String>(4)) {
+                        db_set.insert(db_name.clone());
+                        tables.entry((db_name, schema_name, table_name)).or_default().push((col_name, data_type));
+                    }
+                }
+            }
+        }
+    } else {
+        // Query local columns on conn
+        let col_query = "SELECT database_name, schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false ORDER BY database_name, schema_name, table_name, column_index;";
+        if let Ok(mut stmt) = conn.prepare(col_query) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(db_name), Ok(schema_name), Ok(table_name), Ok(col_name), Ok(data_type)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, String>(3), row.get::<_, String>(4)) {
+                        db_set.insert(db_name.clone());
+                        tables.entry((db_name, schema_name, table_name)).or_default().push((col_name, data_type));
+                    }
+                }
+            }
+        }
+        // If single remote quack is attached, query target_db columns directly
+        if is_quack {
+            let quack_cols = "SELECT 'target_db' AS database_name, schema_name, table_name, column_name, data_type FROM target_db.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false ORDER BY schema_name, table_name, column_index')";
+            if let Ok(mut stmt) = conn.prepare(quack_cols) {
+                if let Ok(mut rows) = stmt.query([]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        if let (Ok(db_name), Ok(schema_name), Ok(table_name), Ok(col_name), Ok(data_type)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, String>(3), row.get::<_, String>(4)) {
+                            db_set.insert(db_name.clone());
+                            tables.entry((db_name, schema_name, table_name)).or_default().push((col_name, data_type));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Also get columns from attached quack databases
-    let dbs_query = if is_quack {
+    let dbs_query = if is_remote_multi_db {
         "SELECT database_name, type FROM target_db.query('SELECT database_name, type FROM duckdb_databases() WHERE internal = false')".to_string()
     } else {
         "SELECT database_name, type FROM duckdb_databases() WHERE internal = false".to_string()
@@ -2950,8 +3034,12 @@ fn generate_schema_visualizer(conn: &duckdb::Connection, os_clipboard: &mut Opti
             while let Ok(Some(row)) = d_rows.next() {
                 if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
                     if typ.eq_ignore_ascii_case("quack") {
+                        if !is_remote_multi_db && name == "target_db" {
+                            // Already queried above
+                            continue;
+                        }
                         let safe_name = name.replace("'", "''");
-                        let q = if is_quack {
+                        let q = if is_remote_multi_db {
                             format!(
                                 "SELECT * FROM target_db.query('SELECT ''{}'' AS database_name, schema_name, table_name, column_name, data_type FROM {}.query(''SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false ORDER BY table_name, column_index'')')",
                                 safe_name, safe_name
@@ -3262,6 +3350,25 @@ mod tests {
     }
 
     #[test]
+    fn test_quack_attach_preserves_target_db_and_memory() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute("ATTACH ':memory:' AS target_db;", []).unwrap();
+        conn.execute("CREATE TABLE target_db.remote_tbl (col1 INTEGER, col2 VARCHAR);", []).unwrap();
+        conn.execute("USE target_db;", []).unwrap();
+
+        let temp_dir = std::env::temp_dir().join(format!("dp_test_quack_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // When target_db is attached (e.g. Quack attach), both target_db and empty memory are preserved
+        let meta = load_explorer_metadata(&conn, &temp_dir, false);
+        assert_eq!(meta.databases.len(), 2);
+        assert!(meta.databases.iter().any(|d| d.name == "target_db" && d.is_active));
+        assert!(meta.databases.iter().any(|d| d.name == "memory" && !d.is_active));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn test_dot_autocomplete_word_extraction() {
         // Multi-part dot-qualified identifiers extraction
         let line = "SELECT analytics.main.events.event_id FROM t";
@@ -3276,5 +3383,46 @@ mod tests {
         let word_start2 = prefix2.rfind(|c: char| !c.is_alphanumeric() && c != '_' && c != '.').map(|i| i + 1).unwrap_or(0);
         let current_word2 = &prefix2[word_start2..];
         assert_eq!(current_word2, "db.");
+    }
+
+    #[test]
+    fn test_live_quack_metadata_loading() {
+        let db_uri = "quack:0.0.0.0:9494";
+        let token = "your_quack_token_here";
+        // Connect to live quack container if running
+        let conn_res = crate::engine::connect_target_db(db_uri, Some(token), true);
+        if let Ok(conn) = conn_res {
+            let temp_dir = std::env::temp_dir().join(format!("dp_live_quack_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            let _ = std::fs::create_dir_all(&temp_dir);
+
+            let meta = load_explorer_metadata(&conn, &temp_dir, true);
+            println!("Databases found: {:?}", meta.databases.iter().map(|d| (&d.name, &d.db_type, d.is_active, d.tables.len())).collect::<Vec<_>>());
+            assert_eq!(meta.databases.len(), 2, "Expected target_db and memory");
+            assert!(meta.databases.iter().any(|d| d.name == "target_db" && d.is_active));
+            assert!(meta.databases.iter().any(|d| d.name == "memory" && !d.is_active));
+
+            let target_db = meta.databases.iter().find(|d| d.name == "target_db").unwrap();
+            assert!(target_db.tables.iter().any(|t| t.name == "test_tbl"), "Expected test_tbl in target_db");
+
+            let mut expanded_groups = std::collections::HashSet::new();
+            let expanded_tables = std::collections::HashSet::new();
+            expanded_groups.insert("db:target_db".to_string());
+            expanded_groups.insert("target_db:Tables".to_string());
+            expanded_groups.insert("db:memory".to_string());
+
+            let nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, true);
+            let node_displays: Vec<String> = nodes.iter().map(|n| n.display.clone()).collect();
+            println!("Nodes rendered:\n{}", node_displays.join("\n"));
+
+            assert!(nodes.iter().any(|n| n.name == "db:target_db" && n.display.contains("target_db")));
+            assert!(nodes.iter().any(|n| n.name == "db:memory" && n.display.contains("memory")));
+            assert!(nodes.iter().any(|n| n.name == "test_tbl"));
+
+            let cols = load_table_columns_for("target_db", "main", "test_tbl", &conn, true);
+            println!("Columns for test_tbl: {:?}", cols);
+            assert!(cols.iter().any(|c| c.0 == "column_a"));
+
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
     }
 }
