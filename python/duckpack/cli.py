@@ -37,6 +37,8 @@ def main():
     p_explore = subparsers.add_parser("explore", help="Launch interactive terminal IDE")
     p_explore.add_argument("-p", "--project-dir", default=".", help="Project directory (default: .)")
     p_explore.add_argument("-d", "--db", default="local.duckdb", help="Target database path/URI (default: local.duckdb)")
+    p_explore.add_argument("--quack-token", default=None, help="Authentication token for Quack protocol")
+    p_explore.add_argument("--insecure", action="store_true", help="Disable SSL/TLS verification")
 
     args = parser.parse_args()
 
@@ -61,7 +63,7 @@ def main():
         compile(args.project_dir, args.out)
         print(f"Compiled snapshot to {args.out}")
     elif args.command == "explore":
-        explore(args.db, project_dir=args.project_dir)
+        explore(args.db, project_dir=args.project_dir, quack_token=args.quack_token, insecure=args.insecure)
 
 if __name__ == "__main__":
     main()

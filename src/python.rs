@@ -596,12 +596,18 @@ fn introspect_py_catalog(
 /// Launch the interactive DuckPack IDE terminal UI against a target database.
 /// In non-terminal environments (such as Jupyter notebooks), prints a formatted database overview.
 #[pyfunction]
-#[pyo3(signature = (target, project_dir = "."))]
-pub fn explore(_py: Python<'_>, target: &Bound<'_, PyAny>, project_dir: &str) -> PyResult<()> {
+#[pyo3(signature = (target, project_dir = ".", quack_token = None, insecure = false))]
+pub fn explore(
+    _py: Python<'_>,
+    target: &Bound<'_, PyAny>,
+    project_dir: &str,
+    quack_token: Option<&str>,
+    insecure: bool,
+) -> PyResult<()> {
     let p_dir = PathBuf::from(project_dir);
 
     if let Ok(db_str) = target.extract::<String>() {
-        let conn = engine::connect_target_db(&db_str, None, false)
+        let conn = engine::connect_target_db(&db_str, quack_token, insecure)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
 
         if !is_interactive_terminal() {
