@@ -12,3 +12,4 @@ __pycache__/
 *.pyd
 *.whl
 .pytest_cache/
+debug_query.txt
