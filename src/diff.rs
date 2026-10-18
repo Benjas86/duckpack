@@ -93,6 +93,36 @@ pub struct AttachedDatabase {
 }
 
 pub fn list_attached_databases(conn: &Connection) -> Result<Vec<AttachedDatabase>> {
+    let is_quack = conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) > 0;
+
+    if is_quack {
+        let quack_db_sql = "SELECT database_name, type, path, readonly FROM target_db.query('SELECT database_name, type, path, readonly FROM duckdb_databases() WHERE internal = false')";
+        if let Ok(mut stmt) = conn.prepare(quack_db_sql) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok(AttachedDatabase {
+                    name: r.get(0)?,
+                    db_type: r.get(1)?,
+                    path: r.get(2).ok(),
+                    readonly: r.get(3).unwrap_or(false),
+                })
+            }) {
+                let mut remote_dbs = Vec::new();
+                for row in rows.flatten() {
+                    remote_dbs.push(row);
+                }
+                if !remote_dbs.is_empty() {
+                    return Ok(remote_dbs);
+                }
+            }
+        }
+    }
+
     let mut stmt = conn.prepare("SELECT database_name, type, path, readonly FROM duckdb_databases() WHERE internal = false")?;
     let rows = stmt.query_map([], |r| {
         Ok(AttachedDatabase {
@@ -107,9 +137,8 @@ pub fn list_attached_databases(conn: &Connection) -> Result<Vec<AttachedDatabase
         dbs.push(row?);
     }
     // If other databases are attached to this connection (e.g. target_db or secondary catalogs),
-    // filter out the client's internal default "memory" harness so users don't mistakenly
-    // target the ephemeral local client scratchpad for declarative schema migrations.
-    if dbs.len() > 1 {
+    // and target_db represents an attached local file, filter out the client's internal default "memory" harness.
+    if dbs.len() > 1 && dbs.iter().any(|d| d.name == "target_db") {
         dbs.retain(|d| d.name != "memory");
     }
     Ok(dbs)
@@ -117,17 +146,26 @@ pub fn list_attached_databases(conn: &Connection) -> Result<Vec<AttachedDatabase
 
 pub fn validate_target_catalog(conn: &Connection, catalog: Option<&str>, for_apply: bool) -> Result<String> {
     let attached = list_attached_databases(conn).unwrap_or_default();
-    let mut target = match catalog {
-        Some(c) => c.to_string(),
-        None => conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_else(|_| "memory".to_string()),
-    };
+    let is_quack = conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) > 0;
 
-    // If caller explicitly targeted "memory" (e.g. from Python where in-memory connection is named "memory"),
-    // but the connection attached the target as "target_db" and "memory" is filtered out,
-    // seamlessly map "memory" to the attached "target_db".
-    if target.eq_ignore_ascii_case("memory") && attached.iter().any(|d| d.name.eq_ignore_ascii_case("target_db")) && !attached.iter().any(|d| d.name == "memory") {
-        target = "target_db".to_string();
-    }
+    let target = match catalog {
+        Some(c) => c.to_string(),
+        None => {
+            if is_quack {
+                conn.query_row("SELECT * FROM target_db.query('SELECT current_database()')", [], |r| r.get(0))
+                    .unwrap_or_else(|_| "memory".to_string())
+            } else {
+                conn.query_row("SELECT current_database()", [], |r| r.get(0))
+                    .unwrap_or_else(|_| "memory".to_string())
+            }
+        }
+    };
 
     if let Some(db_info) = attached.iter().find(|d| d.name.eq_ignore_ascii_case(&target)) {
         if for_apply {
@@ -721,9 +759,9 @@ mod tests {
         let default_target = validate_target_catalog(&conn, None, true).unwrap();
         assert_eq!(default_target, "target_db");
 
-        // When user asks for "memory" on this attached connection, it maps to "target_db"
-        let mapped_target = validate_target_catalog(&conn, Some("memory"), true).unwrap();
-        assert_eq!(mapped_target, "target_db");
+        // Explicit target_db request
+        let target_res = validate_target_catalog(&conn, Some("target_db"), true).unwrap();
+        assert_eq!(target_res, "target_db");
     }
 }
 

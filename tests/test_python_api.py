@@ -168,6 +168,30 @@ def test_in_memory_and_attached_catalog_targeting(tmp_path):
     analytics_tables = [t[0] for t in con.execute("SHOW TABLES FROM analytics;").fetchall()]
     assert "events" in analytics_tables
 
+def test_multi_catalog_toml_headless_apply(tmp_path):
+    proj_dir = str(tmp_path / "multi_cat_proj")
+    duckpack.init(proj_dir)
 
+    # Configure multiple target catalogs in duckpack.toml
+    with open(os.path.join(proj_dir, "duckpack.toml"), "w") as f:
+        f.write('[target]\ndatabase = ["memory", "quack_orders"]\n')
 
+    with open(os.path.join(proj_dir, "tables", "users.sql"), "w") as f:
+        f.write("CREATE TABLE users (id INT, email VARCHAR);")
 
+    con = duckdb.connect()
+    con.execute("ATTACH '' AS quack_orders;")
+
+    # Headless apply with auto_approve=True without explicit database arg
+    # duckpack must automatically resolve and migrate both configured catalogs!
+    res = duckpack.apply(con, proj_dir, auto_approve=True)
+    assert res.success is True
+    assert res.applied_count == 2
+    assert "users" in res.items
+
+    # Verify both catalogs have the users table
+    mem_tables = [t[0] for t in con.execute("SHOW TABLES FROM memory;").fetchall()]
+    assert "users" in mem_tables
+
+    orders_tables = [t[0] for t in con.execute("SHOW TABLES FROM quack_orders;").fetchall()]
+    assert "users" in orders_tables
