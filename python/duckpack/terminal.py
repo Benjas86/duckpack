@@ -58,6 +58,8 @@ def find_terminal_emulator():
 def launch_terminal_window(
     target,
     project_dir=".",
+    database=None,
+    catalog=None,
     mode="explore",
     force_drop=False,
     quack_token=None,
@@ -78,6 +80,7 @@ def launch_terminal_window(
         return False
 
     term_name, term_prefix = term_info
+    active_cat = database or catalog
 
     # 1. Resolve database target and quack bridge if in-memory
     cleanup_fn = None
@@ -131,6 +134,8 @@ def launch_terminal_window(
     else:
         cli_cmd = [sys.executable, "-m", "duckpack", "explore", "-p", project_dir, "-d", db_arg]
 
+    if active_cat:
+        cli_cmd.extend(["--database", active_cat])
     if token_arg:
         cli_cmd.extend(["--quack-token", token_arg])
     if insecure_arg:

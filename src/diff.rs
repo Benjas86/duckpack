@@ -84,8 +84,79 @@ impl DiffResult {
 /// We query `duckdb_tables()` to get the raw `CREATE TABLE` SQL, 
 /// and `duckdb_columns()` to map column names to data types.
 /// Returns a HashMap mapping `schema.table` -> `TableSchema`.
-pub fn get_schema(conn: &Connection) -> Result<HashMap<String, TableSchema>> {
-    let mut stmt = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, COALESCE(sql, '/* Remote table: ' || table_name || ' */') FROM duckdb_tables() WHERE internal = false")?;
+#[derive(Debug, Clone)]
+pub struct AttachedDatabase {
+    pub name: String,
+    pub db_type: String,
+    pub path: Option<String>,
+    pub readonly: bool,
+}
+
+pub fn list_attached_databases(conn: &Connection) -> Result<Vec<AttachedDatabase>> {
+    let mut stmt = conn.prepare("SELECT database_name, type, path, readonly FROM duckdb_databases() WHERE internal = false")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(AttachedDatabase {
+            name: r.get(0)?,
+            db_type: r.get(1)?,
+            path: r.get(2).ok(),
+            readonly: r.get(3).unwrap_or(false),
+        })
+    })?;
+    let mut dbs = Vec::new();
+    for row in rows {
+        dbs.push(row?);
+    }
+    Ok(dbs)
+}
+
+pub fn validate_target_catalog(conn: &Connection, catalog: Option<&str>, for_apply: bool) -> Result<String> {
+    let attached = list_attached_databases(conn).unwrap_or_default();
+    let target = match catalog {
+        Some(c) => c.to_string(),
+        None => conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_else(|_| "memory".to_string()),
+    };
+
+    if let Some(db_info) = attached.iter().find(|d| d.name.eq_ignore_ascii_case(&target)) {
+        if for_apply {
+            if db_info.readonly {
+                anyhow::bail!("Cannot apply migrations to database '{}': attached in READ_ONLY mode.", db_info.name);
+            }
+            let typ = db_info.db_type.to_lowercase();
+            if typ != "duckdb" && typ != "quack" {
+                anyhow::bail!(
+                    "Cannot apply declarative schema migrations to '{}' (engine type: {}). \
+                    DuckPack declarative schema management is designed specifically for DuckDB catalogs. \
+                    External attached engines are supported for querying and DML, but schema DDL is managed externally.",
+                    db_info.name, db_info.db_type
+                );
+            }
+        }
+        Ok(db_info.name.clone())
+    } else if attached.is_empty() {
+        Ok(target)
+    } else {
+        let available: Vec<_> = attached.iter().map(|d| d.name.as_str()).collect();
+        anyhow::bail!("Attached database '{}' not found on connection. Available databases: {:?}", target, available);
+    }
+}
+
+/// Extracts the entire table schema from a DuckDB connection for a specific catalog.
+/// It queries `duckdb_tables()` for table definitions and `duckdb_columns()` for specific datatypes.
+/// Returns a HashMap mapping `schema.table` -> `TableSchema`.
+pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<String, TableSchema>> {
+    let target_cat = match catalog {
+        Some(c) => c.to_string(),
+        None => conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_else(|_| "memory".to_string()),
+    };
+    let safe_cat = target_cat.replace('\'', "''");
+
+    let sql = format!(
+        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+         COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
+         FROM duckdb_tables() WHERE internal = false AND database_name = '{}'",
+        safe_cat
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let mut tables: HashMap<String, TableSchema> = HashMap::new();
     
     let rows = stmt.query_map([], |row| {
@@ -101,7 +172,13 @@ pub fn get_schema(conn: &Connection) -> Result<HashMap<String, TableSchema>> {
     }
 
     if tables.is_empty() {
-        if let Ok(mut q_stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, COALESCE(sql, '/* Remote table: ' || table_name || ' */') FROM target_db.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false')") {
+        let q_sql = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+             COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
+             FROM target_db.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND database_name = ''{}''')",
+            safe_cat
+        );
+        if let Ok(mut q_stmt) = conn.prepare(&q_sql) {
             if let Ok(rows) = q_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
                 for row in rows.flatten() {
                     let (table_name, sql) = row;
@@ -114,7 +191,13 @@ pub fn get_schema(conn: &Connection) -> Result<HashMap<String, TableSchema>> {
         }
     }
 
-    let mut col_stmt = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type FROM duckdb_columns() WHERE internal = false")?;
+    let col_sql = format!(
+        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+         column_name, data_type \
+         FROM duckdb_columns() WHERE internal = false AND database_name = '{}'",
+        safe_cat
+    );
+    let mut col_stmt = conn.prepare(&col_sql)?;
     let col_rows = col_stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
     })?;
@@ -128,7 +211,13 @@ pub fn get_schema(conn: &Connection) -> Result<HashMap<String, TableSchema>> {
 
     let any_col_empty = tables.values().any(|t| t.columns.is_empty());
     if any_col_empty {
-        if let Ok(mut q_col_stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type FROM target_db.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false')") {
+        let q_col_sql = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+             column_name, data_type \
+             FROM target_db.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false AND database_name = ''{}''')",
+            safe_cat
+        );
+        if let Ok(mut q_col_stmt) = conn.prepare(&q_col_sql) {
             if let Ok(q_col_rows) = q_col_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))) {
                 for row in q_col_rows.flatten() {
                     let (table_name, column_name, data_type) = row;
@@ -143,9 +232,21 @@ pub fn get_schema(conn: &Connection) -> Result<HashMap<String, TableSchema>> {
     Ok(tables)
 }
 
-/// Extracts all view definitions from a DuckDB connection using `sqlite_master`.
-pub fn get_views(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, COALESCE(sql, '/* Remote view: ' || view_name || ' */') FROM duckdb_views() WHERE internal = false")?;
+/// Extracts all view definitions from a DuckDB connection for a specific catalog.
+pub fn get_views(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<String, String>> {
+    let target_cat = match catalog {
+        Some(c) => c.to_string(),
+        None => conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_else(|_| "memory".to_string()),
+    };
+    let safe_cat = target_cat.replace('\'', "''");
+
+    let sql = format!(
+        "SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, \
+         COALESCE(sql, '/* Remote view: ' || view_name || ' */') \
+         FROM duckdb_views() WHERE internal = false AND database_name = '{}'",
+        safe_cat
+    );
+    let mut stmt = conn.prepare(&sql)?;
     
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -156,7 +257,13 @@ pub fn get_views(conn: &Connection) -> Result<HashMap<String, String>> {
         views.insert(name, sql);
     }
     if views.is_empty() {
-        if let Ok(mut q_stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, COALESCE(sql, '/* Remote view: ' || view_name || ' */') FROM target_db.query('SELECT schema_name, view_name, sql FROM duckdb_views() WHERE internal = false')") {
+        let q_sql = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, \
+             COALESCE(sql, '/* Remote view: ' || view_name || ' */') \
+             FROM target_db.query('SELECT schema_name, view_name, sql FROM duckdb_views() WHERE internal = false AND database_name = ''{}''')",
+            safe_cat
+        );
+        if let Ok(mut q_stmt) = conn.prepare(&q_sql) {
             if let Ok(rows) = q_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
                 for row in rows.flatten() {
                     let (name, sql) = row;
@@ -168,9 +275,21 @@ pub fn get_views(conn: &Connection) -> Result<HashMap<String, String>> {
     Ok(views)
 }
 
-/// Extracts all macro (function) definitions from a DuckDB connection using `duckdb_functions()`.
-pub fn get_macros(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END, macro_definition, CAST(parameters AS VARCHAR) FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false")?;
+/// Extracts all macro (function) definitions from a DuckDB connection for a specific catalog.
+pub fn get_macros(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<String, String>> {
+    let target_cat = match catalog {
+        Some(c) => c.to_string(),
+        None => conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_else(|_| "memory".to_string()),
+    };
+    let safe_cat = target_cat.replace('\'', "''");
+
+    let sql = format!(
+        "SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END, \
+         macro_definition, CAST(parameters AS VARCHAR) \
+         FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false AND database_name = '{}'",
+        safe_cat
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
     let mut macros = HashMap::new();
     for row in rows {
@@ -182,16 +301,30 @@ pub fn get_macros(conn: &Connection) -> Result<HashMap<String, String>> {
     Ok(macros)
 }
 
-/// Extracts all schema names (excluding system schemas) from a DuckDB connection.
-pub fn get_schemas(conn: &Connection) -> Result<std::collections::HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog', 'main')")?;
+/// Extracts all schema names (excluding system schemas) from a DuckDB connection for a specific catalog.
+pub fn get_schemas(conn: &Connection, catalog: Option<&str>) -> Result<std::collections::HashSet<String>> {
+    let target_cat = match catalog {
+        Some(c) => c.to_string(),
+        None => conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_else(|_| "memory".to_string()),
+    };
+    let safe_cat = target_cat.replace('\'', "''");
+
+    let sql = format!(
+        "SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND database_name = '{}' AND schema_name NOT IN ('information_schema', 'pg_catalog', 'main')",
+        safe_cat
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| Ok(row.get::<_, String>(0)?))?;
     let mut schemas = std::collections::HashSet::new();
     for row in rows {
         schemas.insert(row?);
     }
     if schemas.is_empty() {
-        if let Ok(mut q_stmt) = conn.prepare("SELECT schema_name FROM target_db.query('SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN (''information_schema'', ''pg_catalog'', ''main'')')") {
+        let q_sql = format!(
+            "SELECT schema_name FROM target_db.query('SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND database_name = ''{}'' AND schema_name NOT IN (''information_schema'', ''pg_catalog'', ''main'')')",
+            safe_cat
+        );
+        if let Ok(mut q_stmt) = conn.prepare(&q_sql) {
             if let Ok(rows) = q_stmt.query_map([], |row| Ok(row.get::<_, String>(0)?)) {
                 for row in rows.flatten() {
                     schemas.insert(row);
@@ -542,4 +675,28 @@ mod tests {
         assert_eq!(diff.items.len(), 1);
         assert_eq!(diff.items[0].item_type, DiffItemType::CreateTable);
     }
+
+    #[test]
+    fn test_validate_target_catalog_and_isolation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE memory_tbl (id INT);").unwrap();
+        
+        // Default target catalog
+        let default_cat = validate_target_catalog(&conn, None, false).unwrap();
+        assert_eq!(default_cat, "memory");
+
+        // Specific target catalog
+        let val_cat = validate_target_catalog(&conn, Some("memory"), true).unwrap();
+        assert_eq!(val_cat, "memory");
+
+        // Missing catalog error
+        let err = validate_target_catalog(&conn, Some("nonexistent"), false);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("not found on connection"));
+
+        // Schema isolation test
+        let schema_mem = get_schema(&conn, Some("memory")).unwrap();
+        assert!(schema_mem.contains_key("memory_tbl"));
+    }
 }
+

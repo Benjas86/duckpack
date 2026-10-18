@@ -15,11 +15,14 @@ from ._duckpack import (
     compile as _native_compile,
     build as _native_build,
     init as _native_init,
+    __duckdb_version__,
 )
 
 def explore(
     target,
     project_dir=".",
+    database=None,
+    catalog=None,
     quack_token=None,
     insecure=False,
     open_window=True,
@@ -37,14 +40,17 @@ def explore(
         to the database (including live in-memory DuckDB connections).
       • When `open_window=False` or in headless environments (no GUI display),
         prints a clean, formatted schema overview directly into the notebook cell.
+    - database: Target database catalog name when multiple databases are attached (alias: catalog).
     """
     project_dir = str(project_dir)
+    active_cat = database or catalog
 
     # 1. If running in an active terminal shell, run directly in-process
     if sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty():
         return _native_explore(
             target,
             project_dir=project_dir,
+            database=active_cat,
             quack_token=quack_token,
             insecure=insecure,
         )
@@ -55,6 +61,7 @@ def explore(
         launched = launch_terminal_window(
             target,
             project_dir=project_dir,
+            database=active_cat,
             quack_token=quack_token,
             insecure=insecure,
             wait=wait,
@@ -66,6 +73,7 @@ def explore(
     return _native_explore(
         target,
         project_dir=project_dir,
+        database=active_cat,
         quack_token=quack_token,
         insecure=insecure,
     )
@@ -74,6 +82,8 @@ def explore(
 def apply(
     target,
     project_dir=".",
+    database=None,
+    catalog=None,
     auto_approve=True,
     force_drop=False,
     interactive=False,
@@ -85,6 +95,7 @@ def apply(
 
     - target: duckdb connection (con) or string path/URI
     - project_dir: path to directory with declarative definitions (str or Path)
+    - database: target database catalog name when multiple databases are attached (alias: catalog)
     - auto_approve: apply migrations automatically without user confirmation
     - force_drop: permit destructive drops (tables/columns/views)
     - interactive: launch interactive Ratatui Diff & Apply TUI screen
@@ -92,6 +103,7 @@ def apply(
     - insecure: disable SSL for local/plain HTTP Quack connections
     """
     project_dir = str(project_dir)
+    active_cat = database or catalog
 
     is_tty = bool(sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty())
 
@@ -100,6 +112,7 @@ def apply(
         return _native_apply(
             target,
             project_dir=project_dir,
+            database=active_cat,
             auto_approve=True,
             force_drop=force_drop,
             interactive=False,
@@ -111,11 +124,13 @@ def apply(
     diff_before = diff(
         target,
         project_dir=project_dir,
+        database=active_cat,
         quack_token=quack_token,
         insecure=insecure,
     )
     if not diff_before.has_changes:
-        print("🦆 DuckPack: Database is already up to date (0 pending changes).")
+        cat_suffix = f" for catalog '{active_cat}'" if active_cat else ""
+        print(f"🦆 DuckPack: Database is already up to date (0 pending changes){cat_suffix}.")
         return ApplyResult(success=True, applied_count=0, items=[])
 
     # 1. If running inside an interactive terminal shell (TTY), run in-process TUI:
@@ -123,6 +138,7 @@ def apply(
         return _native_apply(
             target,
             project_dir=project_dir,
+            database=active_cat,
             auto_approve=False,
             force_drop=force_drop,
             interactive=True,
@@ -136,6 +152,7 @@ def apply(
     launched = launch_terminal_window(
         target,
         project_dir=project_dir,
+        database=active_cat,
         mode="apply",
         force_drop=force_drop,
         quack_token=quack_token,
@@ -146,6 +163,7 @@ def apply(
         diff_after = diff(
             target,
             project_dir=project_dir,
+            database=active_cat,
             quack_token=quack_token,
             insecure=insecure,
         )
@@ -167,11 +185,13 @@ def apply(
     )
 
 
-def diff(target, project_dir=".", quack_token=None, insecure=False):
+def diff(target, project_dir=".", database=None, catalog=None, quack_token=None, insecure=False):
     """Compute differences between project declarative definitions and the target database."""
+    active_cat = database or catalog
     return _native_diff(
         target,
         project_dir=str(project_dir),
+        database=active_cat,
         quack_token=quack_token,
         insecure=insecure,
     )
@@ -204,6 +224,8 @@ __all__ = [
     "compile",
     "build",
     "init",
+    "__version__",
+    "__duckdb_version__",
 ]
 
 __version__ = "0.2.0"
