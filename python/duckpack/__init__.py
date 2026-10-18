@@ -87,58 +87,83 @@ def apply(
     - project_dir: path to directory with declarative definitions (str or Path)
     - auto_approve: apply migrations automatically without user confirmation
     - force_drop: permit destructive drops (tables/columns/views)
-    - interactive: request interactive review before applying
+    - interactive: launch interactive Ratatui Diff & Apply TUI screen
     - quack_token: auth token for remote Quack connections
     - insecure: disable SSL for local/plain HTTP Quack connections
     """
     project_dir = str(project_dir)
 
-    # In non-TTY environments (such as Jupyter notebooks in VS Code):
-    if not auto_approve or interactive:
-        diff_summary = diff(
+    is_tty = bool(sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty())
+
+    # Fast path: automated execution without review
+    if auto_approve and not interactive:
+        return _native_apply(
+            target,
+            project_dir=project_dir,
+            auto_approve=True,
+            force_drop=force_drop,
+            interactive=False,
+            quack_token=quack_token,
+            insecure=insecure,
+        )
+
+    # Interactive review requested (either interactive=True or auto_approve=False)
+    diff_before = diff(
+        target,
+        project_dir=project_dir,
+        quack_token=quack_token,
+        insecure=insecure,
+    )
+    if not diff_before.has_changes:
+        print("🦆 DuckPack: Database is already up to date (0 pending changes).")
+        return ApplyResult(success=True, applied_count=0, items=[])
+
+    # 1. If running inside an interactive terminal shell (TTY), run in-process TUI:
+    if is_tty:
+        return _native_apply(
+            target,
+            project_dir=project_dir,
+            auto_approve=False,
+            force_drop=force_drop,
+            interactive=True,
+            quack_token=quack_token,
+            insecure=insecure,
+        )
+
+    # 2. In non-TTY environments (e.g. Jupyter Notebook in VS Code):
+    # Automatically pop open external connected terminal window with the full Diff & Apply TUI
+    from .terminal import launch_terminal_window
+    launched = launch_terminal_window(
+        target,
+        project_dir=project_dir,
+        mode="apply",
+        force_drop=force_drop,
+        quack_token=quack_token,
+        insecure=insecure,
+        wait=True,
+    )
+    if launched:
+        diff_after = diff(
             target,
             project_dir=project_dir,
             quack_token=quack_token,
             insecure=insecure,
         )
-        if not diff_summary.has_changes:
-            return ApplyResult(success=True, applied_count=0, items=[])
+        applied = [item for item in diff_before.items if item not in diff_after.items]
+        if diff_after.change_count < diff_before.change_count or len(applied) > 0:
+            print(f"🦆 DuckPack: Applied {len(applied)} change(s) successfully.")
+            return ApplyResult(success=True, applied_count=len(applied), items=applied)
+        else:
+            print("🦆 DuckPack: Migration cancelled by user (0 changes applied).")
+            return ApplyResult(success=False, applied_count=0, items=[])
 
-        # If not in an interactive terminal (e.g. Jupyter notebook):
-        if not (sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty()):
-            print(f"🦆 DuckPack: Found {diff_summary.change_count} change(s) to apply:")
-            for item in diff_summary.items:
-                print(f"  • {item}")
-            try:
-                ans = input("Apply changes? [y/N]: ")
-                if ans.strip().lower() in ("y", "yes"):
-                    return _native_apply(
-                        target,
-                        project_dir=project_dir,
-                        auto_approve=True,
-                        force_drop=force_drop,
-                        interactive=False,
-                        quack_token=quack_token,
-                        insecure=insecure,
-                    )
-                else:
-                    print("Migration cancelled by user.")
-                    return ApplyResult(success=False, applied_count=0, items=[])
-            except (EOFError, OSError):
-                if not auto_approve:
-                    raise ExecutionError(
-                        "Cannot apply schema changes: auto_approve is False in a non-interactive environment. "
-                        "Pass auto_approve=True to approve and apply migrations automatically."
-                    )
-
-    return _native_apply(
-        target,
-        project_dir=project_dir,
-        auto_approve=auto_approve,
-        force_drop=force_drop,
-        interactive=interactive,
-        quack_token=quack_token,
-        insecure=insecure,
+    # 3. Headless fallback (no display / CI / Docker container without GUI):
+    print(f"🦆 DuckPack: Found {diff_before.change_count} pending change(s) to apply:")
+    for item in diff_before.items:
+        print(f"  • {item}")
+    raise ExecutionError(
+        "Cannot run interactive apply in a headless environment without a display. "
+        "Pass auto_approve=True to apply automatically."
     )
 
 

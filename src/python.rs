@@ -415,6 +415,245 @@ pub fn diff(
     })
 }
 
+fn run_apply_tui(
+    conn: &duckdb::Connection,
+    project_dir: &PathBuf,
+    db_target: &str,
+    force_drop: bool,
+) -> PyResult<ApplyResult> {
+    let _guard = TerminalGuard::enter()
+        .map_err(|e| ExecutionError::new_err(format!("Failed to initialize terminal: {}", e)))?;
+
+    let stdout = std::io::stdout();
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = ratatui::Terminal::new(backend)
+        .map_err(|e| ExecutionError::new_err(format!("Terminal backend error: {}", e)))?;
+
+    let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh, 'q' to Quit.");
+    let mut current_force_drop = force_drop;
+    let mut inspect_data: Option<(String, Vec<String>, Vec<Vec<String>>, i64)> = None;
+
+    loop {
+        let shadow_conn = engine::build_shadow_db(project_dir)
+            .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
+
+        let shadow_schemas = schema_diff::get_schemas(&shadow_conn)
+            .map_err(|e| SchemaError::new_err(e.to_string()))?;
+        let target_schemas = schema_diff::get_schemas(conn)
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+        let shadow_schema = schema_diff::get_schema(&shadow_conn)
+            .map_err(|e| SchemaError::new_err(e.to_string()))?;
+        let target_schema = schema_diff::get_schema(conn)
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+        let shadow_views = schema_diff::get_views(&shadow_conn)
+            .map_err(|e| SchemaError::new_err(e.to_string()))?;
+        let target_views = schema_diff::get_views(conn)
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+        let shadow_macros = schema_diff::get_macros(&shadow_conn)
+            .map_err(|e| SchemaError::new_err(e.to_string()))?;
+        let target_macros = schema_diff::get_macros(conn)
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+        let ignore_list = engine::load_ignore_rules(project_dir);
+
+        let mut diff_result = schema_diff::compute_diff(
+            &shadow_schemas,
+            &target_schemas,
+            &shadow_schema,
+            &target_schema,
+            &shadow_views,
+            &target_views,
+            &shadow_macros,
+            &target_macros,
+            project_dir,
+            &ignore_list,
+        );
+
+        let action = crate::tui::draw_and_handle_events(
+            &mut terminal,
+            &mut diff_result,
+            current_force_drop,
+            &status_msg,
+            false,
+            &inspect_data,
+            db_target,
+        ).map_err(|e| ExecutionError::new_err(format!("TUI error: {}", e)))?;
+
+        match action {
+            crate::tui::TuiAction::Quit => {
+                return Ok(ApplyResult {
+                    success: false,
+                    applied_count: 0,
+                    items: vec![],
+                });
+            }
+            crate::tui::TuiAction::CopyStatus => {
+                let _ = std::fs::write("duckpack.log", &status_msg);
+                status_msg = "Status text copied to duckpack.log!".to_string();
+                continue;
+            }
+            crate::tui::TuiAction::Refresh => {
+                status_msg = "Refreshed schema from disk.".to_string();
+                continue;
+            }
+            crate::tui::TuiAction::ToggleDestructiveMode => {
+                current_force_drop = !current_force_drop;
+                status_msg = if current_force_drop {
+                    "Destructive Mode ENABLED. Drops will be executed.".to_string()
+                } else {
+                    "Destructive Mode DISABLED. Drops will be ignored.".to_string()
+                };
+                continue;
+            }
+            crate::tui::TuiAction::Inspect { obj_name } => {
+                let safe_obj = obj_name.replace('\'', "''");
+                let mut cols = Vec::new();
+                if let Ok(mut pragma_stmt) = conn.prepare(&format!("PRAGMA table_info('{}')", safe_obj)) {
+                    if let Ok(mut pragma_rows) = pragma_stmt.query([]) {
+                        while let Ok(Some(row)) = pragma_rows.next() {
+                            if let Ok(col_name) = row.get::<_, String>(1) {
+                                cols.push(col_name);
+                            }
+                        }
+                    }
+                }
+
+                if cols.is_empty() {
+                    status_msg = format!("Cannot inspect '{}': Does not exist in target database yet.", obj_name);
+                } else {
+                    let mut row_count = 0;
+                    if let Ok(mut count_stmt) = conn.prepare(&format!("SELECT count(*) FROM \"{}\"", safe_obj)) {
+                        if let Ok(mut count_rows) = count_stmt.query([]) {
+                            if let Ok(Some(row)) = count_rows.next() {
+                                row_count = row.get::<_, i64>(0).unwrap_or(0);
+                            }
+                        }
+                    }
+
+                    let cast_cols = cols.iter().map(|c| format!("CAST(\"{}\" AS VARCHAR)", c)).collect::<Vec<_>>().join(", ");
+                    if let Ok(mut stmt) = conn.prepare(&format!("SELECT {} FROM \"{}\" LIMIT 5", cast_cols, safe_obj)) {
+                        if let Ok(mut db_rows) = stmt.query([]) {
+                            let mut rows = Vec::new();
+                            while let Ok(Some(row)) = db_rows.next() {
+                                let mut str_row = Vec::new();
+                                for i in 0..cols.len() {
+                                    let val: String = row.get(i).unwrap_or_else(|_| "NULL".to_string());
+                                    str_row.push(val);
+                                }
+                                rows.push(str_row);
+                            }
+                            inspect_data = Some((obj_name, cols, rows, row_count));
+                        }
+                    }
+                }
+                continue;
+            }
+            crate::tui::TuiAction::CloseInspect => {
+                inspect_data = None;
+                continue;
+            }
+            crate::tui::TuiAction::Explore => {
+                let _ = crate::ide::run_ide_loop(&mut terminal, conn, project_dir, db_target);
+                terminal.clear().ok();
+                continue;
+            }
+            crate::tui::TuiAction::Pull { obj_name, item_type } => {
+                let sql = match item_type {
+                    crate::diff::DiffItemType::DropTable => {
+                        target_schema.get(&obj_name).map(|t| t.create_sql.clone())
+                    }
+                    crate::diff::DiffItemType::DropView => target_views.get(&obj_name).cloned(),
+                    crate::diff::DiffItemType::DropMacro => target_macros.get(&obj_name).cloned(),
+                    _ => None,
+                };
+                if let Some(sql) = sql {
+                    let mut path = project_dir.to_path_buf();
+                    match item_type {
+                        crate::diff::DiffItemType::DropTable => path.push("tables"),
+                        crate::diff::DiffItemType::DropView => path.push("views"),
+                        crate::diff::DiffItemType::DropMacro => path.push("macros"),
+                        _ => {}
+                    }
+                    path.push(format!("{}.sql", obj_name));
+                    if let Err(e) = std::fs::write(&path, sql) {
+                        status_msg = format!("Error pulling '{}': {}", obj_name, e);
+                    } else {
+                        status_msg = format!("Successfully pulled '{}' back into local project!", obj_name);
+                    }
+                } else {
+                    status_msg = format!("Cannot pull '{}': Definition not found in remote DB.", obj_name);
+                }
+                continue;
+            }
+            crate::tui::TuiAction::Apply => {
+                status_msg = "Applying changes...".to_string();
+                let _ = crate::tui::draw_and_handle_events(
+                    &mut terminal,
+                    &mut diff_result,
+                    current_force_drop,
+                    &status_msg,
+                    true,
+                    &inspect_data,
+                    db_target,
+                );
+
+                let remote = engine::is_remote(db_target);
+                let applied_items: Vec<String> = diff_result
+                    .items
+                    .iter()
+                    .filter(|i| i.selected && !i.ignored)
+                    .map(|i| i.obj_name.clone())
+                    .collect();
+                let applied_count = applied_items.len();
+
+                if !remote && !db_target.starts_with("quack:") {
+                    let db_path = PathBuf::from(db_target);
+                    let mut b_path = db_path.clone();
+                    b_path.set_extension("duckdb.bak");
+                    if db_path.exists() {
+                        let _ = std::fs::copy(&db_path, &b_path);
+                    }
+                    let apply_res = engine::apply_diff(conn, &diff_result, current_force_drop, remote, project_dir);
+                    match apply_res {
+                        Ok(_) => {
+                            if b_path.exists() {
+                                std::fs::remove_file(&b_path).ok();
+                            }
+                            return Ok(ApplyResult {
+                                success: true,
+                                applied_count,
+                                items: applied_items,
+                            });
+                        }
+                        Err(e) => {
+                            if b_path.exists() {
+                                let _ = std::fs::copy(&b_path, &db_path);
+                                std::fs::remove_file(&b_path).ok();
+                            }
+                            status_msg = format!("Apply error: {}", e);
+                            continue;
+                        }
+                    }
+                } else {
+                    let apply_res = engine::apply_diff(conn, &diff_result, current_force_drop, remote, project_dir);
+                    match apply_res {
+                        Ok(_) => {
+                            return Ok(ApplyResult {
+                                success: true,
+                                applied_count,
+                                items: applied_items,
+                            });
+                        }
+                        Err(e) => {
+                            status_msg = format!("Apply error: {}", e);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Apply declarative schema migrations to the target database.
 #[pyfunction]
 #[pyo3(signature = (target, project_dir = ".", auto_approve = true, force_drop = false, interactive = false, quack_token = None, insecure = false))]
@@ -464,44 +703,26 @@ pub fn apply(
             &ignore_list,
         );
 
-        if !auto_approve || interactive {
-            let pending_items: Vec<_> = diff_result
-                .items
-                .iter()
-                .filter(|i| i.selected && !i.ignored)
-                .collect();
-            if pending_items.is_empty() {
-                return Ok(ApplyResult {
-                    success: true,
-                    applied_count: 0,
-                    items: vec![],
-                });
-            }
+        let pending_items: Vec<_> = diff_result
+            .items
+            .iter()
+            .filter(|i| i.selected && !i.ignored)
+            .collect();
+        if pending_items.is_empty() {
+            return Ok(ApplyResult {
+                success: true,
+                applied_count: 0,
+                items: vec![],
+            });
+        }
 
-            if is_interactive_terminal() {
-                println!("🦆 DuckPack: Found {} change(s) to apply:", pending_items.len());
-                for item in &pending_items {
-                    println!("  • {:?}: {}", item.item_type, item.obj_name);
-                }
-                use std::io::Write;
-                print!("Apply changes? [y/N]: ");
-                std::io::stdout().flush().ok();
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).ok();
-                if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
-                    println!("Migration cancelled by user.");
-                    return Ok(ApplyResult {
-                        success: false,
-                        applied_count: 0,
-                        items: vec![],
-                    });
-                }
-            } else if !auto_approve {
-                return Err(ExecutionError::new_err(
-                    "Cannot apply schema changes: auto_approve is False in a non-interactive environment. \
-                     Pass auto_approve=True to approve and apply migrations automatically.",
-                ));
-            }
+        if (!auto_approve || interactive) && is_interactive_terminal() {
+            return run_apply_tui(&conn, &p_dir, &db_str, force_drop);
+        } else if !auto_approve {
+            return Err(ExecutionError::new_err(
+                "Cannot apply schema changes: auto_approve is False in a non-interactive environment. \
+                 Pass auto_approve=True to approve and apply migrations automatically.",
+            ));
         }
 
         let remote = engine::is_remote(&db_str);
@@ -546,44 +767,85 @@ pub fn apply(
             &ignore_list,
         );
 
-        if !auto_approve || interactive {
-            let pending_items: Vec<_> = diff_result
-                .items
-                .iter()
-                .filter(|i| i.selected && !i.ignored)
-                .collect();
-            if pending_items.is_empty() {
-                return Ok(ApplyResult {
-                    success: true,
-                    applied_count: 0,
-                    items: vec![],
-                });
-            }
+        let pending_items: Vec<_> = diff_result
+            .items
+            .iter()
+            .filter(|i| i.selected && !i.ignored)
+            .collect();
+        if pending_items.is_empty() {
+            return Ok(ApplyResult {
+                success: true,
+                applied_count: 0,
+                items: vec![],
+            });
+        }
 
-            if is_interactive_terminal() {
-                println!("🦆 DuckPack: Found {} change(s) to apply:", pending_items.len());
-                for item in &pending_items {
-                    println!("  • {:?}: {}", item.item_type, item.obj_name);
+        if (!auto_approve || interactive) && is_interactive_terminal() {
+            let db_name = target
+                .getattr("execute")
+                .ok()
+                .and_then(|_| {
+                    target.call_method1("execute", ("PRAGMA database_list;",)).ok()
+                })
+                .and_then(|res| res.call_method0("fetchall").ok())
+                .and_then(|rows| {
+                    if let Ok(r) = rows.extract::<Vec<(Bound<'_, PyAny>, Bound<'_, PyAny>, String)>>() {
+                        r.into_iter().next().map(|t| t.2)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| ":memory:".to_string());
+
+            let (conn, active_db_target) = if !db_name.is_empty() && db_name != ":memory:" {
+                match engine::connect_target_db(&db_name, None, false) {
+                    Ok(c) => (c, db_name),
+                    Err(_) => {
+                        let port = find_available_port();
+                        let start_server_sql = format!(
+                            "INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:{}', token := 'duckpack_py');",
+                            port
+                        );
+                        if let Err(serve_err) = target.call_method1("execute", (start_server_sql,)) {
+                            return Err(ExecutionError::new_err(format!(
+                                "Unable to start local quack bridge: {}", serve_err
+                            )));
+                        }
+                        let server_uri = format!("quack:localhost:{}", port);
+                        let c = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
+                            .map_err(|e| ExecutionError::new_err(format!("Failed to attach to Python Quack bridge: {}", e)))?;
+                        (c, server_uri)
+                    }
                 }
-                use std::io::Write;
-                print!("Apply changes? [y/N]: ");
-                std::io::stdout().flush().ok();
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).ok();
-                if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
-                    println!("Migration cancelled by user.");
-                    return Ok(ApplyResult {
-                        success: false,
-                        applied_count: 0,
-                        items: vec![],
-                    });
+            } else {
+                let port = find_available_port();
+                let start_server_sql = format!(
+                    "INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:{}', token := 'duckpack_py');",
+                    port
+                );
+                if let Err(e) = target.call_method1("execute", (start_server_sql,)) {
+                    return Err(ExecutionError::new_err(format!(
+                        "Unable to start local quack bridge for in-memory DuckDB connection: {}. \
+                        Tip: Ensure the 'quack' extension can be loaded.",
+                        e
+                    )));
                 }
-            } else if !auto_approve {
-                return Err(ExecutionError::new_err(
-                    "Cannot apply schema changes: auto_approve is False in a non-interactive environment. \
-                     Pass auto_approve=True to approve and apply migrations automatically.",
-                ));
+                let server_uri = format!("quack:localhost:{}", port);
+                let c = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
+                    .map_err(|e| ExecutionError::new_err(format!("Failed to attach to Python in-memory DuckDB: {}", e)))?;
+                (c, server_uri)
+            };
+
+            let res = run_apply_tui(&conn, &p_dir, &active_db_target, force_drop);
+            if active_db_target.starts_with("quack:") {
+                let _ = target.call_method1("execute", (format!("CALL quack_stop('{}');", active_db_target),));
             }
+            return res;
+        } else if !auto_approve {
+            return Err(ExecutionError::new_err(
+                "Cannot apply schema changes: auto_approve is False in a non-interactive environment. \
+                 Pass auto_approve=True to approve and apply migrations automatically.",
+            ));
         }
 
         for item in &diff_result.items {

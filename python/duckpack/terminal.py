@@ -58,12 +58,16 @@ def find_terminal_emulator():
 def launch_terminal_window(
     target,
     project_dir=".",
+    mode="explore",
+    force_drop=False,
     quack_token=None,
     insecure=False,
     wait=True,
 ) -> bool:
     """
-    Spawns an external terminal window running `duckpack explore` connected to the target database.
+    Spawns an external terminal window running DuckPack connected to the target database.
+    - mode="explore": Launches the full-screen Ratatui Terminal IDE.
+    - mode="apply": Launches the interactive Ratatui Diff & Apply migration screen.
     Returns True if successfully launched, False otherwise.
     """
     if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST"):
@@ -120,7 +124,13 @@ def launch_terminal_window(
             cleanup_fn = cleanup
 
     # 2. Build the command to run inside the terminal
-    cli_cmd = [sys.executable, "-m", "duckpack", "explore", "-p", project_dir, "-d", db_arg]
+    if mode == "apply":
+        cli_cmd = [sys.executable, "-m", "duckpack", "apply", "-p", project_dir, "-d", db_arg, "--interactive"]
+        if force_drop:
+            cli_cmd.append("--force-drop")
+    else:
+        cli_cmd = [sys.executable, "-m", "duckpack", "explore", "-p", project_dir, "-d", db_arg]
+
     if token_arg:
         cli_cmd.extend(["--quack-token", token_arg])
     if insecure_arg:
@@ -139,16 +149,22 @@ def launch_terminal_window(
             full_cmd = term_prefix + cli_cmd
             proc = subprocess.Popen(full_cmd)
 
-        print(f"🦆 Launched DuckPack Terminal IDE in new window ({term_name})...")
+        session_type = "Diff & Apply Screen" if mode == "apply" else "Terminal IDE"
+        print(f"🦆 Launched DuckPack {session_type} in new window ({term_name})...")
 
         if wait:
-            print("[Running interactively. Close the terminal window to return to notebook cell...]")
+            instructions = (
+                "[Review diff and press Enter to apply, or q to cancel. Close the window to resume notebook...]"
+                if mode == "apply"
+                else "[Running interactively. Close the terminal window to return to notebook cell...]"
+            )
+            print(instructions)
             try:
                 proc.wait()
             finally:
                 if cleanup_fn:
                     cleanup_fn()
-            print("✓ Terminal IDE session closed.")
+            print(f"✓ DuckPack {session_type.lower()} session closed.")
         return True
     except Exception as e:
         print(f"Warning: Failed to launch terminal window: {e}")
