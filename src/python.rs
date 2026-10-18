@@ -257,6 +257,12 @@ pub struct ApplyResult {
 
 #[pymethods]
 impl ApplyResult {
+    #[new]
+    #[pyo3(signature = (success = true, applied_count = 0, items = Vec::new()))]
+    fn new(success: bool, applied_count: usize, items: Vec<String>) -> Self {
+        Self { success, applied_count, items }
+    }
+
     fn __repr__(&self) -> String {
         format!("<ApplyResult success={} applied_count={}>", self.success, self.applied_count)
     }
@@ -276,6 +282,12 @@ pub struct DiffSummary {
 
 #[pymethods]
 impl DiffSummary {
+    #[new]
+    #[pyo3(signature = (has_changes = false, change_count = 0, items = Vec::new()))]
+    fn new(has_changes: bool, change_count: usize, items: Vec<String>) -> Self {
+        Self { has_changes, change_count, items }
+    }
+
     fn __repr__(&self) -> String {
         format!("<DiffSummary has_changes={} change_count={}>", self.has_changes, self.change_count)
     }
