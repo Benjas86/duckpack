@@ -195,3 +195,41 @@ def test_multi_catalog_toml_headless_apply(tmp_path):
 
     orders_tables = [t[0] for t in con.execute("SHOW TABLES FROM quack_orders;").fetchall()]
     assert "users" in orders_tables
+
+def test_explore_temporary_tables_and_views_in_non_tty(capfd):
+    con = duckdb.connect()
+    con.execute("CREATE TEMP TABLE staging_data (metric VARCHAR, val DOUBLE);")
+    con.execute("INSERT INTO staging_data VALUES ('cpu', 78.5), ('mem', 42.0);")
+    con.execute("CREATE TEMP VIEW staging_summary AS SELECT metric FROM staging_data;")
+
+    duckpack.explore(con)
+    captured = capfd.readouterr()
+    assert "staging_data [temp] (2 rows)" in captured.out
+    assert "metric" in captured.out
+    assert "staging_summary [temp]" in captured.out
+
+def test_diff_and_apply_ignore_temporary_tables(tmp_path):
+    proj_dir = str(tmp_path / "temp_isolation_proj")
+    duckpack.init(proj_dir)
+
+    with open(os.path.join(proj_dir, "tables", "permanent.sql"), "w") as f:
+        f.write("CREATE TABLE permanent (id INT PRIMARY KEY);")
+
+    con = duckdb.connect()
+    con.execute("CREATE TEMP TABLE temp_scratch (val INT);")
+
+    diff_res = duckpack.diff(con, proj_dir)
+    assert diff_res.has_changes is True
+    # diff should only see the permanent table in the project vs the database
+    # and must never propose dropping or migrating temp_scratch
+    assert any("permanent" in item for item in diff_res.items)
+    assert not any("temp_scratch" in item for item in diff_res.items)
+
+    apply_res = duckpack.apply(con, proj_dir)
+    assert apply_res.success is True
+
+    # temp_scratch should still exist unharmed in session
+    assert con.execute("SELECT * FROM temp_scratch;").fetchall() == []
+    post_diff = duckpack.diff(con, proj_dir)
+    assert post_diff.has_changes is False
+
