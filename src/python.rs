@@ -1287,6 +1287,8 @@ fn introspect_py_catalog(
 }
 
 fn stage_host_temp_tables(target: &Bound<'_, PyAny>) -> (Vec<String>, Vec<(String, String)>) {
+    let _ = target.call_method1("execute", ("ATTACH IF NOT EXISTS ':memory:' AS memory;",));
+
     let temp_tables: Vec<String> = target
         .call_method1("execute", ("SELECT table_name FROM duckdb_tables() WHERE temporary = true AND internal = false;",))
         .ok()
@@ -1310,71 +1312,94 @@ fn stage_host_temp_tables(target: &Bound<'_, PyAny>) -> (Vec<String>, Vec<(Strin
         .and_then(|rows| rows.extract::<Vec<(String, String)>>().ok())
         .unwrap_or_default();
 
+    if !temp_views.is_empty() {
+        let _ = target.call_method1("execute", ("CREATE OR REPLACE TABLE memory.__duckpack_temp_views_registry (view_name VARCHAR, view_sql VARCHAR);",));
+        for (vname, vsql) in &temp_views {
+            let safe_vname = vname.replace('\'', "''");
+            let safe_vsql = vsql.replace('\'', "''");
+            let ins_sql = format!("INSERT INTO memory.__duckpack_temp_views_registry VALUES ('{}', '{}');", safe_vname, safe_vsql);
+            let _ = target.call_method1("execute", (ins_sql,));
+        }
+    }
+
     (temp_tables, temp_views)
 }
 
 fn restore_client_temp_tables(
     conn: &duckdb::Connection,
-    target: &Bound<'_, PyAny>,
-    temp_tables: &[String],
-    temp_views: &[(String, String)],
+    _target: &Bound<'_, PyAny>,
+    _temp_tables: &[String],
+    _temp_views: &[(String, String)],
 ) {
-    for t in temp_tables {
-        let safe_t = t.replace('\"', "\"\"");
-        let restore_sql = format!("CREATE TEMP TABLE \"{}\" AS SELECT * FROM target_db.\"__duckpack_temp_bridge_{}\";", safe_t, safe_t);
-        let _ = conn.execute(&restore_sql, []);
-        let cleanup_sql = format!("DROP TABLE IF EXISTS memory.\"__duckpack_temp_bridge_{}\";", safe_t);
-        let _ = target.call_method1("execute", (cleanup_sql,));
-    }
-    for (_vname, vsql) in temp_views {
-        let _ = conn.execute(vsql, []);
-    }
+    engine::restore_quack_temp_bridge(conn);
 }
 
 fn sync_back_client_temp_tables(
     conn: &duckdb::Connection,
     target: &Bound<'_, PyAny>,
 ) {
-    let mut client_temp_tables: Vec<String> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT table_name FROM duckdb_tables() WHERE temporary = true AND internal = false") {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(tname) = row.get::<_, String>(0) {
-                    client_temp_tables.push(tname);
-                }
-            }
+    engine::sync_back_quack_temp_bridge(conn);
+
+    let _ = target.call_method1("execute", ("ATTACH IF NOT EXISTS ':memory:' AS memory;",));
+
+    // 1. Restore tables from server default db
+    let bridge_tables: Vec<String> = target
+        .call_method1("execute", ("SELECT table_name FROM duckdb_tables() WHERE table_name LIKE '__duckpack_temp_bridge_%' AND internal = false;",))
+        .ok()
+        .and_then(|res| res.call_method0("fetchall").ok())
+        .and_then(|rows| rows.extract::<Vec<(String,)>>().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(t,)| t)
+        .collect();
+
+    for bt in bridge_tables {
+        if let Some(orig) = bt.strip_prefix("__duckpack_temp_bridge_") {
+            let safe_orig = orig.replace('\"', "\"\"");
+            let safe_bt = bt.replace('\"', "\"\"");
+            let restore_sql = format!(
+                "CREATE OR REPLACE TEMP TABLE \"{}\" AS SELECT * FROM \"{}\"; DROP TABLE IF EXISTS \"{}\";",
+                safe_orig, safe_bt, safe_bt
+            );
+            let _ = target.call_method1("execute", (restore_sql,));
         }
     }
 
-    for t in &client_temp_tables {
-        let safe_t = t.replace('\"', "\"\"");
-        let stage_sql = format!("CREATE OR REPLACE TABLE target_db.\"__duckpack_temp_bridge_{}\" AS SELECT * FROM \"{}\";", safe_t, safe_t);
-        let _ = conn.execute(&stage_sql, []);
-    }
+    // 2. Restore tables from memory
+    let mem_bridges: Vec<String> = target
+        .call_method1("execute", ("SELECT table_name FROM duckdb_tables() WHERE database_name = 'memory' AND table_name LIKE '__duckpack_temp_bridge_%' AND internal = false;",))
+        .ok()
+        .and_then(|res| res.call_method0("fetchall").ok())
+        .and_then(|rows| rows.extract::<Vec<(String,)>>().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(t,)| t)
+        .collect();
 
-    let mut client_temp_views: Vec<(String, String)> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT view_name, sql FROM duckdb_views() WHERE temporary = true AND internal = false") {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let (Ok(vname), Ok(vsql)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
-                    client_temp_views.push((vname, vsql));
-                }
-            }
+    for bt in mem_bridges {
+        if let Some(orig) = bt.strip_prefix("__duckpack_temp_bridge_") {
+            let safe_orig = orig.replace('\"', "\"\"");
+            let safe_bt = bt.replace('\"', "\"\"");
+            let restore_sql = format!(
+                "CREATE OR REPLACE TEMP TABLE \"{}\" AS SELECT * FROM memory.\"{}\"; DROP TABLE IF EXISTS memory.\"{}\";",
+                safe_orig, safe_bt, safe_bt
+            );
+            let _ = target.call_method1("execute", (restore_sql,));
         }
     }
 
-    for t in &client_temp_tables {
-        let safe_t = t.replace('\"', "\"\"");
-        let restore_sql = format!(
-            "CREATE OR REPLACE TEMP TABLE \"{}\" AS SELECT * FROM memory.\"__duckpack_temp_bridge_{}\"; DROP TABLE IF EXISTS memory.\"__duckpack_temp_bridge_{}\";",
-            safe_t, safe_t, safe_t
-        );
-        let _ = target.call_method1("execute", (restore_sql,));
-    }
+    // 3. Restore views
+    let views_to_sync: Vec<(String, String)> = target
+        .call_method1("execute", ("SELECT view_name, view_sql FROM memory.__duckpack_temp_views_sync_back;",))
+        .ok()
+        .and_then(|res| res.call_method0("fetchall").ok())
+        .and_then(|rows| rows.extract::<Vec<(String, String)>>().ok())
+        .unwrap_or_default();
 
-    for (_vname, vsql) in &client_temp_views {
-        let _ = target.call_method1("execute", (vsql.clone(),));
+    for (_vname, vsql) in views_to_sync {
+        let _ = target.call_method1("execute", (vsql,));
     }
+    let _ = target.call_method1("execute", ("DROP TABLE IF EXISTS memory.__duckpack_temp_views_sync_back;",));
 }
 
 /// Launch the interactive DuckPack IDE terminal UI against a target database.
@@ -1462,7 +1487,15 @@ pub fn explore(
 
         let mut staged_state: Option<(Vec<String>, Vec<(String, String)>)> = None;
 
-        let (conn, active_db_target) = if !db_name.is_empty() && db_name != ":memory:" {
+        let has_temp = target
+            .call_method1("execute", ("SELECT count(*) FROM duckdb_tables() WHERE temporary = true AND internal = false;",))
+            .ok()
+            .and_then(|res| res.call_method0("fetchone").ok())
+            .and_then(|row| row.extract::<(i64,)>().ok())
+            .map(|(c,)| c > 0)
+            .unwrap_or(false);
+
+        let (conn, active_db_target) = if !db_name.is_empty() && db_name != ":memory:" && !has_temp {
             match engine::connect_target_db(&db_name, None, false) {
                 Ok(c) => (c, db_name),
                 Err(e) => {

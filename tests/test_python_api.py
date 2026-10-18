@@ -233,3 +233,35 @@ def test_diff_and_apply_ignore_temporary_tables(tmp_path):
     post_diff = duckpack.diff(con, proj_dir)
     assert post_diff.has_changes is False
 
+
+def test_terminal_staging_and_sync_back_temp_objects():
+    from duckpack.terminal import stage_connection_temp_objects, sync_back_connection_temp_objects
+    con = duckdb.connect()
+    con.execute("CREATE TEMP TABLE t_temp (x INT, y VARCHAR);")
+    con.execute("INSERT INTO t_temp VALUES (1, 'apple'), (2, 'banana');")
+    con.execute("CREATE TEMP VIEW v_temp AS SELECT y FROM t_temp WHERE x = 1;")
+
+    stage_connection_temp_objects(con)
+
+    # Verify staging bridge table in memory
+    staged = [r[0] for r in con.execute("SELECT table_name FROM duckdb_tables() WHERE database_name = 'memory' AND table_name LIKE '__duckpack_temp_bridge_%';").fetchall()]
+    assert "__duckpack_temp_bridge_t_temp" in staged
+
+    # Simulate client modifying table and creating new one
+    con.execute("CREATE OR REPLACE TABLE memory.__duckpack_temp_bridge_t_temp AS SELECT 3 AS x, 'cherry' AS y;")
+    con.execute("CREATE OR REPLACE TABLE memory.__duckpack_temp_bridge_new_table AS SELECT 42 AS val;")
+
+    sync_back_connection_temp_objects(con)
+
+    # Verify restored changes in session
+    rows = con.execute("SELECT x, y FROM t_temp;").fetchall()
+    assert rows == [(3, 'cherry')]
+
+    new_rows = con.execute("SELECT val FROM new_table;").fetchall()
+    assert new_rows == [(42,)]
+
+    # Cleaned up bridge tables
+    remaining = [r[0] for r in con.execute("SELECT table_name FROM duckdb_tables() WHERE table_name LIKE '__duckpack_temp_bridge_%';").fetchall()]
+    assert len(remaining) == 0
+
+

@@ -222,6 +222,96 @@ pub fn connect_target_db(
     }
 }
 
+/// Restores temporary tables and views staged by Python across the Quack loopback bridge.
+pub fn restore_quack_temp_bridge(conn: &Connection) {
+    // 1. Restore tables
+    let tbl_sql = "SELECT * FROM target_db.query('SELECT table_name FROM duckdb_tables() WHERE table_name LIKE ''__duckpack_temp_bridge_%'' AND internal = false;')";
+    if let Ok(mut stmt) = conn.prepare(tbl_sql) {
+        let mut bridges = Vec::new();
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(tname) = row.get::<_, String>(0) {
+                    bridges.push(tname);
+                }
+            }
+        }
+        for bt in bridges {
+            if let Some(orig) = bt.strip_prefix("__duckpack_temp_bridge_") {
+                let safe_orig = orig.replace('\"', "\"\"");
+                let safe_bt = bt.replace('\"', "\"\"");
+                let restore_sql = format!(
+                    "CREATE OR REPLACE TEMP TABLE \"{}\" AS SELECT * FROM target_db.query('SELECT * FROM memory.\"{}\"');",
+                    safe_orig, safe_bt
+                );
+                let _ = conn.execute(&restore_sql, []);
+                let drop_sql = format!(
+                    "CALL target_db.query('DROP TABLE IF EXISTS memory.\"{}\";');",
+                    safe_bt.replace('\'', "''")
+                );
+                let _ = conn.execute(&drop_sql, []);
+            }
+        }
+    }
+
+    // 2. Restore views
+    let view_sql = "SELECT * FROM target_db.query('SELECT view_name, view_sql FROM memory.__duckpack_temp_views_registry;')";
+    if let Ok(mut stmt) = conn.prepare(view_sql) {
+        let mut views = Vec::new();
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(vname), Ok(vsql)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                    views.push((vname, vsql));
+                }
+            }
+        }
+        for (_vname, vsql) in views {
+            let _ = conn.execute(&vsql, []);
+        }
+        let _ = conn.execute("CALL target_db.query('DROP TABLE IF EXISTS memory.__duckpack_temp_views_registry;');", []);
+    }
+}
+
+/// Syncs back client temporary tables and views to target_db before closing Quack connection.
+pub fn sync_back_quack_temp_bridge(conn: &Connection) {
+    let mut client_temp_tables = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT table_name FROM duckdb_tables() WHERE (temporary = true OR database_name = 'temp') AND internal = false;") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(tname) = row.get::<_, String>(0) {
+                    client_temp_tables.push(tname);
+                }
+            }
+        }
+    }
+
+    for t in &client_temp_tables {
+        let safe_t = t.replace('\"', "\"\"");
+        let stage_sql = format!("CREATE OR REPLACE TABLE target_db.\"__duckpack_temp_bridge_{}\" AS SELECT * FROM \"{}\";", safe_t, safe_t);
+        let _ = conn.execute(&stage_sql, []);
+    }
+
+    let mut client_temp_views = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT view_name, sql FROM duckdb_views() WHERE (temporary = true OR database_name = 'temp') AND internal = false;") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(vname), Ok(vsql)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                    client_temp_views.push((vname, vsql));
+                }
+            }
+        }
+    }
+
+    if !client_temp_views.is_empty() {
+        let _ = conn.execute("CALL target_db.query('CREATE OR REPLACE TABLE memory.__duckpack_temp_views_sync_back (view_name VARCHAR, view_sql VARCHAR);');", []);
+        for (vname, vsql) in &client_temp_views {
+            let safe_vname = vname.replace('\'', "''");
+            let safe_vsql = vsql.replace('\'', "''");
+            let ins_sql = format!("CALL target_db.query('INSERT INTO memory.__duckpack_temp_views_sync_back VALUES (''{}'', ''{}'');');", safe_vname, safe_vsql);
+            let _ = conn.execute(&ins_sql, []);
+        }
+    }
+}
+
 /// Executes the computed schema differences against the target database.
 /// If running against a remote database, it encapsulates the entire deployment inside a single transaction
 /// so it can rollback gracefully upon failure.

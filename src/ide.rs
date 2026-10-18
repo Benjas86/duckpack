@@ -535,6 +535,26 @@ pub fn load_explorer_metadata(
         }
     }
 
+    // Ensure all local temporary tables directly on conn are merged into all_tables under active_database
+    if let Ok(mut stmt) = conn.prepare("SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE (temporary = true OR database_name = 'temp') AND internal = false") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                    let est: Option<i64> = row.get(2).ok();
+                    if !all_tables.iter().any(|t| t.is_temporary && t.name.eq_ignore_ascii_case(&table) && t.schema.eq_ignore_ascii_case(&schema)) {
+                        all_tables.push(TableEntry {
+                            database: active_database.clone(),
+                            schema,
+                            name: table,
+                            row_count: est,
+                            is_temporary: true,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // Information schema fallback if tables still empty
     if all_tables.is_empty() {
         if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('information_schema', 'pg_catalog')") {
@@ -617,6 +637,24 @@ pub fn load_explorer_metadata(
                                 is_temporary: is_temp,
                             });
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Ensure all local temporary views directly on conn are merged into all_views under active_database
+    if let Ok(mut stmt) = conn.prepare("SELECT schema_name, view_name FROM duckdb_views() WHERE (temporary = true OR database_name = 'temp') AND internal = false") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                    if !all_views.iter().any(|v| v.is_temporary && v.name.eq_ignore_ascii_case(&name) && v.schema.eq_ignore_ascii_case(&schema)) {
+                        all_views.push(ViewEntry {
+                            database: active_database.clone(),
+                            schema,
+                            name,
+                            is_temporary: true,
+                        });
                     }
                 }
             }

@@ -771,7 +771,15 @@ fn main() -> Result<()> {
                 let _ = target_conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
             }
 
-            ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db)?;
+            if db.starts_with("quack:") {
+                restore_quack_temp_bridge(&target_conn);
+            }
+
+            let ide_res = ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db);
+
+            if db.starts_with("quack:") {
+                sync_back_quack_temp_bridge(&target_conn);
+            }
 
             ratatui::crossterm::terminal::disable_raw_mode()?;
             ratatui::crossterm::execute!(
@@ -779,6 +787,8 @@ fn main() -> Result<()> {
                 ratatui::crossterm::terminal::LeaveAlternateScreen,
                 ratatui::crossterm::event::DisableMouseCapture
             )?;
+
+            ide_res?;
         }
         Commands::Deploy { project_dir, remote, db, port, auto_install } => {
             println!("Deploying {} to {} at {}", project_dir.display(), remote, db);
