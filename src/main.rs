@@ -297,12 +297,74 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
+            if *auto_approve {
+                let configured_catalogs = if let Some(d) = database {
+                    vec![d.clone()]
+                } else {
+                    let cats = resolve_project_catalogs(project_dir, cli.env.as_deref());
+                    if cats.is_empty() {
+                        let init_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                        let active = diff::validate_target_catalog(&init_conn, None, true)?;
+                        vec![active]
+                    } else {
+                        cats
+                    }
+                };
+
+                let remote = is_remote(db);
+                let mut total_applied = 0;
+                for target_cat in &configured_catalogs {
+                    let target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                    let active_catalog = diff::validate_target_catalog(&target_conn, Some(target_cat), true)?;
+                    let shadow_conn = build_shadow_db(project_dir)?;
+                    let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
+                    let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
+                    let shadow_schema = diff::get_schema(&shadow_conn, None)?;
+                    let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
+                    let shadow_views = diff::get_views(&shadow_conn, None)?;
+                    let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
+                    let shadow_macros = diff::get_macros(&shadow_conn, None)?;
+                    let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
+                    let ignore_list = load_ignore_rules(project_dir);
+
+                    let diff_result = diff::compute_diff(
+                        &shadow_schemas,
+                        &target_schemas,
+                        &shadow_schema, 
+                        &target_schema, 
+                        &shadow_views, 
+                        &target_views, 
+                        &shadow_macros, 
+                        &target_macros, 
+                        project_dir,
+                        &ignore_list
+                    );
+
+                    let pending_count = diff_result.items.iter().filter(|i| i.selected && !i.ignored).count();
+                    if pending_count == 0 {
+                        println!("Target catalog '{}' is up to date (0 pending changes).", active_catalog);
+                        continue;
+                    }
+
+                    let apply_success = apply_diff(&target_conn, &diff_result, *force_drop, remote, project_dir, Some(&active_catalog));
+                    if apply_success.is_ok() {
+                        println!("✓ Successfully applied {} change(s) automatically to catalog '{}'!", pending_count, active_catalog);
+                        total_applied += pending_count;
+                    } else {
+                        eprintln!("Error applying schema to catalog '{}': {:?}", active_catalog, apply_success.err());
+                        return Err(anyhow::anyhow!("Apply failed for catalog '{}'", active_catalog));
+                    }
+                }
+                println!("🦆 DuckPack CI/CD: Migration completed. Applied {} total change(s) across {} catalog(s).", total_applied, configured_catalogs.len());
+                return Ok(());
+            }
+
             let configured_catalog = database.clone().or_else(|| resolve_project_catalog(project_dir, cli.env.as_deref()));
             let init_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
             let mut active_catalog = diff::validate_target_catalog(&init_conn, configured_catalog.as_deref(), true)?;
             drop(init_conn);
 
-            let mut terminal = if !*auto_approve && out.is_none() {
+            let mut terminal = if out.is_none() {
                 ratatui::crossterm::terminal::enable_raw_mode()?;
                 let mut stdout = std::io::stdout();
                 ratatui::crossterm::execute!(stdout, ratatui::crossterm::terminal::EnterAlternateScreen, ratatui::crossterm::event::EnableMouseCapture)?;
@@ -312,9 +374,11 @@ fn main() -> Result<()> {
                 None
             };
 
-            let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh, 'b' to switch catalog.");
+            let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh, 'b' to switch catalog, 'q' to Quit.");
             let mut current_force_drop = *force_drop;
             let mut inspect_data: Option<(String, Vec<String>, Vec<Vec<String>>, i64)> = None;
+            let mut total_applied: usize = 0;
+            let mut applied_catalogs: Vec<String> = Vec::new();
 
             loop {
                 let shadow_conn = build_shadow_db(project_dir)?;
@@ -362,17 +426,6 @@ fn main() -> Result<()> {
                         eprintln!("Error writing dry-run script: {}", e);
                     } else {
                         println!("Dry-run script successfully written to {}", out_file);
-                    }
-                    break;
-                }
-
-                if *auto_approve {
-                    let remote = is_remote(db);
-                    let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
-                    if apply_success.is_ok() {
-                        println!("Changes applied automatically to catalog '{}'!", active_catalog);
-                    } else {
-                        eprintln!("Error applying schema: {:?}", apply_success.err());
                     }
                     break;
                 }
@@ -484,8 +537,9 @@ fn main() -> Result<()> {
                         }
 
                         let remote = is_remote(db);
+                        let is_quack = db.starts_with("quack:");
                         let applied_count = diff_result.items.iter().filter(|i| i.selected && !i.ignored).count();
-                        if !remote {
+                        if !remote && !is_quack {
                             let db_path = PathBuf::from(db);
                             let mut b_path = db_path.clone();
                             b_path.set_extension("duckdb.bak");
@@ -499,14 +553,12 @@ fn main() -> Result<()> {
                                 if b_path.exists() {
                                     fs::remove_file(&b_path).ok();
                                 }
-                                if let Some(term) = &mut terminal {
-                                    ratatui::crossterm::terminal::disable_raw_mode()?;
-                                    ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen, ratatui::crossterm::event::DisableMouseCapture)?;
-                                    term.show_cursor()?;
+                                total_applied += applied_count;
+                                if !applied_catalogs.contains(&active_catalog) && applied_count > 0 {
+                                    applied_catalogs.push(active_catalog.clone());
                                 }
-                                terminal = None;
-                                println!("🦆 DuckPack: Applied {} change(s) successfully to '{}'.", applied_count, active_catalog);
-                                break;
+                                status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
+                                continue;
                             } else {
                                 status_msg = format!("Error applying schema: {:?}", apply_success.err());
                                 drop(target_conn); 
@@ -514,20 +566,20 @@ fn main() -> Result<()> {
                                     let _ = fs::copy(&b_path, &db_path);
                                     fs::remove_file(&b_path).ok();
                                 }
+                                continue;
                             }
                         } else {
                             let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
                             if apply_success.is_ok() {
-                                if let Some(term) = &mut terminal {
-                                    ratatui::crossterm::terminal::disable_raw_mode()?;
-                                    ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen, ratatui::crossterm::event::DisableMouseCapture)?;
-                                    term.show_cursor()?;
+                                total_applied += applied_count;
+                                if !applied_catalogs.contains(&active_catalog) && applied_count > 0 {
+                                    applied_catalogs.push(active_catalog.clone());
                                 }
-                                terminal = None;
-                                println!("🦆 DuckPack: Applied {} change(s) successfully to remote database ('{}').", applied_count, active_catalog);
-                                break;
+                                status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
+                                continue;
                             } else {
                                 status_msg = format!("Error applying schema to remote database: {:?}", apply_success.err());
+                                continue;
                             }
                         }
                     }
@@ -566,12 +618,15 @@ fn main() -> Result<()> {
                 }
             }
 
-            if !*auto_approve {
-                if let Some(term) = &mut terminal {
-                    ratatui::crossterm::terminal::disable_raw_mode()?;
-                    ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen, ratatui::crossterm::event::DisableMouseCapture)?;
-                    term.show_cursor()?;
-                }
+            if let Some(term) = &mut terminal {
+                ratatui::crossterm::terminal::disable_raw_mode()?;
+                ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen, ratatui::crossterm::event::DisableMouseCapture)?;
+                term.show_cursor()?;
+            }
+            if total_applied > 0 {
+                println!("🦆 DuckPack: Applied {} total change(s) across catalog(s): [{}].", total_applied, applied_catalogs.join(", "));
+            } else {
+                println!("🦆 DuckPack: Exited without applying changes.");
             }
         }
         Commands::Compile { project_dir, out } => {

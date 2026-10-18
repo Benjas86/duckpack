@@ -451,6 +451,8 @@ fn run_apply_tui(
     let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh, 'b' to switch catalog, 'q' to Quit.");
     let mut current_force_drop = force_drop;
     let mut inspect_data: Option<(String, Vec<String>, Vec<Vec<String>>, i64)> = None;
+    let mut total_applied_count: usize = 0;
+    let mut total_applied_items: Vec<String> = Vec::new();
 
     loop {
         let shadow_conn = engine::build_shadow_db(project_dir)
@@ -506,9 +508,9 @@ fn run_apply_tui(
         match action {
             crate::tui::TuiAction::Quit => {
                 return Ok(ApplyResult {
-                    success: false,
-                    applied_count: 0,
-                    items: vec![],
+                    success: total_applied_count > 0,
+                    applied_count: total_applied_count,
+                    items: total_applied_items,
                 });
             }
             crate::tui::TuiAction::SwitchCatalog => {
@@ -659,11 +661,10 @@ fn run_apply_tui(
                             if b_path.exists() {
                                 std::fs::remove_file(&b_path).ok();
                             }
-                            return Ok(ApplyResult {
-                                success: true,
-                                applied_count,
-                                items: applied_items,
-                            });
+                            total_applied_count += applied_count;
+                            total_applied_items.extend(applied_items);
+                            status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
+                            continue;
                         }
                         Err(e) => {
                             if b_path.exists() {
@@ -678,11 +679,10 @@ fn run_apply_tui(
                     let apply_res = engine::apply_diff(conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
                     match apply_res {
                         Ok(_) => {
-                            return Ok(ApplyResult {
-                                success: true,
-                                applied_count,
-                                items: applied_items,
-                            });
+                            total_applied_count += applied_count;
+                            total_applied_items.extend(applied_items);
+                            status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
+                            continue;
                         }
                         Err(e) => {
                             status_msg = format!("Apply error: {}", e);
@@ -715,56 +715,25 @@ pub fn apply(
         return Err(SchemaError::new_err(format!("Project directory {} does not exist", p_dir.display())));
     }
 
-    let req_catalog = database.or(catalog).map(|s| s.to_string()).or_else(|| engine::resolve_project_catalog(&p_dir, None));
+    let req_catalogs = if let Some(cat) = database.or(catalog) {
+        vec![cat.to_string()]
+    } else {
+        let cats = engine::resolve_project_catalogs(&p_dir, None);
+        if cats.is_empty() {
+            vec![]
+        } else {
+            cats
+        }
+    };
     let ignore_list = engine::load_ignore_rules(&p_dir);
 
     if let Ok(db_str) = target.extract::<String>() {
         let conn = engine::connect_target_db(&db_str, quack_token, insecure)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
 
-        let active_catalog = schema_diff::validate_target_catalog(&conn, req_catalog.as_deref(), true)
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-
-        let shadow_conn = engine::build_shadow_db(&p_dir)
-            .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
-
-        let shadow_schemas = schema_diff::get_schemas(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let target_schemas = schema_diff::get_schemas(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
-        let shadow_schema = schema_diff::get_schema(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let target_schema = schema_diff::get_schema(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
-        let shadow_views = schema_diff::get_views(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let target_views = schema_diff::get_views(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
-        let shadow_macros = schema_diff::get_macros(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let target_macros = schema_diff::get_macros(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
-
-        let diff_result = schema_diff::compute_diff(
-            &shadow_schemas,
-            &target_schemas,
-            &shadow_schema,
-            &target_schema,
-            &shadow_views,
-            &target_views,
-            &shadow_macros,
-            &target_macros,
-            &p_dir,
-            &ignore_list,
-        );
-
-        let pending_items: Vec<_> = diff_result
-            .items
-            .iter()
-            .filter(|i| i.selected && !i.ignored)
-            .collect();
-        if pending_items.is_empty() {
-            return Ok(ApplyResult {
-                success: true,
-                applied_count: 0,
-                items: vec![],
-            });
-        }
-
         if (!auto_approve || interactive) && is_interactive_terminal() {
-            return run_apply_tui(&conn, &p_dir, &db_str, force_drop, Some(&active_catalog));
+            let start_cat = req_catalogs.first().map(|s| s.as_str());
+            return run_apply_tui(&conn, &p_dir, &db_str, force_drop, start_cat);
         } else if !auto_approve {
             return Err(ExecutionError::new_err(
                 "Cannot apply schema changes: auto_approve is False in a non-interactive environment. \
@@ -772,63 +741,70 @@ pub fn apply(
             ));
         }
 
-        let remote = engine::is_remote(&db_str);
-        engine::apply_diff(&conn, &diff_result, force_drop, remote, &p_dir, Some(&active_catalog))
-            .map_err(|e| ExecutionError::new_err(format!("Apply error: {}", e)))?;
+        let catalogs_to_apply = if req_catalogs.is_empty() {
+            let active = schema_diff::validate_target_catalog(&conn, None, true)
+                .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+            vec![active]
+        } else {
+            req_catalogs
+        };
 
-        let applied_items: Vec<String> = diff_result
-            .items
-            .iter()
-            .filter(|i| i.selected && !i.ignored)
-            .map(|i| i.obj_name.clone())
-            .collect();
-        let applied_count = applied_items.len();
+        let remote = engine::is_remote(&db_str);
+        let mut total_applied_items = Vec::new();
+
+        for target_cat in &catalogs_to_apply {
+            let active_catalog = schema_diff::validate_target_catalog(&conn, Some(target_cat), true)
+                .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+
+            let shadow_conn = engine::build_shadow_db(&p_dir)
+                .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
+
+            let shadow_schemas = schema_diff::get_schemas(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
+            let target_schemas = schema_diff::get_schemas(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
+            let shadow_schema = schema_diff::get_schema(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
+            let target_schema = schema_diff::get_schema(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
+            let shadow_views = schema_diff::get_views(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
+            let target_views = schema_diff::get_views(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
+            let shadow_macros = schema_diff::get_macros(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
+            let target_macros = schema_diff::get_macros(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
+
+            let diff_result = schema_diff::compute_diff(
+                &shadow_schemas,
+                &target_schemas,
+                &shadow_schema,
+                &target_schema,
+                &shadow_views,
+                &target_views,
+                &shadow_macros,
+                &target_macros,
+                &p_dir,
+                &ignore_list,
+            );
+
+            let pending_items: Vec<_> = diff_result
+                .items
+                .iter()
+                .filter(|i| i.selected && !i.ignored)
+                .collect();
+            if pending_items.is_empty() {
+                continue;
+            }
+
+            engine::apply_diff(&conn, &diff_result, force_drop, remote, &p_dir, Some(&active_catalog))
+                .map_err(|e| ExecutionError::new_err(format!("Apply error for catalog '{}': {}", active_catalog, e)))?;
+
+            for i in pending_items {
+                total_applied_items.push(i.obj_name.clone());
+            }
+        }
+
+        let applied_count = total_applied_items.len();
         Ok(ApplyResult {
             success: true,
             applied_count,
-            items: applied_items,
+            items: total_applied_items,
         })
     } else {
-        // Live Python connection
-        let mut executor = PyDbExecutor::new(target.clone().unbind());
-        let active_catalog = validate_py_target_catalog(&mut executor, req_catalog.as_deref(), true)?;
-
-        let shadow_conn = engine::build_shadow_db(&p_dir)
-            .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
-
-        let shadow_schemas = schema_diff::get_schemas(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let shadow_schema = schema_diff::get_schema(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let shadow_views = schema_diff::get_views(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let shadow_macros = schema_diff::get_macros(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-
-        let (target_schemas, target_schema, target_views, target_macros) = introspect_py_catalog(&mut executor, Some(&active_catalog))?;
-
-        let diff_result = schema_diff::compute_diff(
-            &shadow_schemas,
-            &target_schemas,
-            &shadow_schema,
-            &target_schema,
-            &shadow_views,
-            &target_views,
-            &shadow_macros,
-            &target_macros,
-            &p_dir,
-            &ignore_list,
-        );
-
-        let pending_items: Vec<_> = diff_result
-            .items
-            .iter()
-            .filter(|i| i.selected && !i.ignored)
-            .collect();
-        if pending_items.is_empty() {
-            return Ok(ApplyResult {
-                success: true,
-                applied_count: 0,
-                items: vec![],
-            });
-        }
-
         if (!auto_approve || interactive) && is_interactive_terminal() {
             let db_name = target
                 .getattr("execute")
@@ -885,7 +861,8 @@ pub fn apply(
                 (c, server_uri)
             };
 
-            let res = run_apply_tui(&conn, &p_dir, &active_db_target, force_drop, Some(&active_catalog));
+            let start_cat = req_catalogs.first().map(|s| s.as_str());
+            let res = run_apply_tui(&conn, &p_dir, &active_db_target, force_drop, start_cat);
             if active_db_target.starts_with("quack:") {
                 let _ = target.call_method1("execute", (format!("CALL quack_stop('{}');", active_db_target),));
             }
@@ -897,54 +874,98 @@ pub fn apply(
             ));
         }
 
-        let orig_cat: Option<String> = executor
-            .query_rows("SELECT current_database()")
-            .ok()
-            .and_then(|(_, r)| r.into_iter().next())
-            .and_then(|r| r.into_iter().next());
-        if let Some(ref orig) = orig_cat {
-            if !orig.eq_ignore_ascii_case(&active_catalog) {
-                executor.execute(&format!("USE \"{}\";", active_catalog.replace('\"', "\"\"")))
-                    .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-            }
-        }
+        let mut executor = PyDbExecutor::new(target.clone().unbind());
+        let catalogs_to_apply = if req_catalogs.is_empty() {
+            let active = validate_py_target_catalog(&mut executor, None, true)?;
+            vec![active]
+        } else {
+            req_catalogs
+        };
 
-        for item in &diff_result.items {
-            if !item.selected || item.ignored { continue; }
-            let is_drop = matches!(
-                item.item_type,
-                schema_diff::DiffItemType::DropTable
-                    | schema_diff::DiffItemType::DropColumn
-                    | schema_diff::DiffItemType::DropView
-                    | schema_diff::DiffItemType::DropMacro
-                    | schema_diff::DiffItemType::DropSchema
+        let mut total_applied_items = Vec::new();
+
+        for target_cat in &catalogs_to_apply {
+            let active_catalog = validate_py_target_catalog(&mut executor, Some(target_cat), true)?;
+
+            let shadow_conn = engine::build_shadow_db(&p_dir)
+                .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
+
+            let shadow_schemas = schema_diff::get_schemas(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
+            let shadow_schema = schema_diff::get_schema(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
+            let shadow_views = schema_diff::get_views(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
+            let shadow_macros = schema_diff::get_macros(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
+
+            let (target_schemas, target_schema, target_views, target_macros) = introspect_py_catalog(&mut executor, Some(&active_catalog))?;
+
+            let diff_result = schema_diff::compute_diff(
+                &shadow_schemas,
+                &target_schemas,
+                &shadow_schema,
+                &target_schema,
+                &shadow_views,
+                &target_views,
+                &shadow_macros,
+                &target_macros,
+                &p_dir,
+                &ignore_list,
             );
-            if is_drop && !force_drop {
+
+            let pending_items: Vec<_> = diff_result
+                .items
+                .iter()
+                .filter(|i| i.selected && !i.ignored)
+                .collect();
+            if pending_items.is_empty() {
                 continue;
             }
-            if !item.sql.trim().is_empty() {
-                executor.execute(&item.sql)
-                    .map_err(|e| ExecutionError::new_err(format!("Failed applying {}: {}", item.obj_name, e)))?;
+
+            let orig_cat: Option<String> = executor
+                .query_rows("SELECT current_database()")
+                .ok()
+                .and_then(|(_, r)| r.into_iter().next())
+                .and_then(|r| r.into_iter().next());
+            if let Some(ref orig) = orig_cat {
+                if !orig.eq_ignore_ascii_case(&active_catalog) {
+                    executor.execute(&format!("USE \"{}\";", active_catalog.replace('\"', "\"\"")))
+                        .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+                }
+            }
+
+            for item in &diff_result.items {
+                if !item.selected || item.ignored { continue; }
+                let is_drop = matches!(
+                    item.item_type,
+                    schema_diff::DiffItemType::DropTable
+                        | schema_diff::DiffItemType::DropColumn
+                        | schema_diff::DiffItemType::DropView
+                        | schema_diff::DiffItemType::DropMacro
+                        | schema_diff::DiffItemType::DropSchema
+                );
+                if is_drop && !force_drop {
+                    continue;
+                }
+                if !item.sql.trim().is_empty() {
+                    executor.execute(&item.sql)
+                        .map_err(|e| ExecutionError::new_err(format!("Failed applying {}: {}", item.obj_name, e)))?;
+                }
+            }
+
+            if let Some(ref orig) = orig_cat {
+                if !orig.eq_ignore_ascii_case(&active_catalog) {
+                    let _ = executor.execute(&format!("USE \"{}\";", orig.replace('\"', "\"\"")));
+                }
+            }
+
+            for i in pending_items {
+                total_applied_items.push(i.obj_name.clone());
             }
         }
 
-        if let Some(ref orig) = orig_cat {
-            if !orig.eq_ignore_ascii_case(&active_catalog) {
-                let _ = executor.execute(&format!("USE \"{}\";", orig.replace('\"', "\"\"")));
-            }
-        }
-
-        let applied_items: Vec<String> = diff_result
-            .items
-            .iter()
-            .filter(|i| i.selected && !i.ignored)
-            .map(|i| i.obj_name.clone())
-            .collect();
-        let applied_count = applied_items.len();
+        let applied_count = total_applied_items.len();
         Ok(ApplyResult {
             success: true,
             applied_count,
-            items: applied_items,
+            items: total_applied_items,
         })
     }
 }

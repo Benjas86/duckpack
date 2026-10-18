@@ -233,25 +233,51 @@ pub fn apply_diff(
     project_dir: &PathBuf,
     catalog: Option<&str>,
 ) -> Result<()> {
-    let orig_db: String = conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_default();
-    let effective_cat = match catalog {
-        Some(c) if c.eq_ignore_ascii_case("memory") && orig_db.eq_ignore_ascii_case("target_db") => "target_db",
-        Some(c) => c,
-        None => &orig_db,
+    let is_quack = conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) > 0;
+
+    let orig_db: String = if is_quack {
+        conn.query_row("SELECT * FROM target_db.query('SELECT current_database()')", [], |r| r.get(0))
+            .unwrap_or_else(|_| "memory".to_string())
+    } else {
+        conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_default()
     };
-    let should_switch = !effective_cat.is_empty() && effective_cat != orig_db;
-    if should_switch {
-        conn.execute_batch(&format!("USE \"{}\";", effective_cat.replace('\"', "\"\"")))?;
+
+    let target_cat = catalog.unwrap_or(&orig_db);
+
+    if !is_quack && !target_cat.is_empty() && target_cat != orig_db {
+        conn.execute_batch(&format!("USE \"{}\";", target_cat.replace('\"', "\"\"")))?;
     }
 
     if is_remote {
-        conn.execute_batch("BEGIN TRANSACTION;")?;
+        if is_quack {
+            let _ = conn.execute_batch("CALL target_db.query('BEGIN TRANSACTION;');");
+        } else {
+            conn.execute_batch("BEGIN TRANSACTION;")?;
+        }
     }
+
+    let execute_sql = |sql: &str| -> Result<()> {
+        if is_quack {
+            let safe_cat = target_cat.replace('\'', "''");
+            let safe_sql = sql.replace('\'', "''");
+            conn.execute_batch(&format!("CALL target_db.query('USE \"{}\"; {}')", safe_cat, safe_sql))
+                .with_context(|| format!("Failed executing DDL on catalog '{}' via Quack", target_cat))?;
+        } else {
+            conn.execute_batch(sql)?;
+        }
+        Ok(())
+    };
 
     let result = (|| -> Result<()> {
         let pre_deploy_dir = project_dir.join("scripts").join("pre-deploy");
         if pre_deploy_dir.exists() {
-            execute_directory(conn, &pre_deploy_dir)?;
+            execute_directory_custom(&pre_deploy_dir, &execute_sql)?;
         }
 
         let mut views_to_apply = Vec::new();
@@ -262,7 +288,7 @@ pub fn apply_diff(
         for item in &diff.items {
             if !item.selected || item.ignored { continue; }
             if item.item_type == diff::DiffItemType::CreateSchema {
-                conn.execute_batch(&item.sql)?;
+                execute_sql(&item.sql)?;
             }
         }
 
@@ -291,25 +317,25 @@ pub fn apply_diff(
         }
 
         if !structure_to_apply.is_empty() {
-            execute_sqls_with_retry(conn, structure_to_apply)?;
+            execute_sqls_with_retry_custom(structure_to_apply, &execute_sql)?;
         }
 
         // 3. Views
         if !views_to_apply.is_empty() {
-            execute_sqls_with_retry(conn, views_to_apply)?;
+            execute_sqls_with_retry_custom(views_to_apply, &execute_sql)?;
         }
 
         // 4. Drops
         for drop_sql in drops_to_apply {
-            let _ = conn.execute_batch(&drop_sql); // Ignore errors if already dropped by cascade
+            let _ = execute_sql(&drop_sql); // Ignore errors if already dropped by cascade
         }
         for drop_sql in drop_schemas {
-            let _ = conn.execute_batch(&drop_sql);
+            let _ = execute_sql(&drop_sql);
         }
 
         let post_deploy_dir = project_dir.join("scripts").join("post-deploy");
         if post_deploy_dir.exists() {
-            execute_directory(conn, &post_deploy_dir)?;
+            execute_directory_custom(&post_deploy_dir, &execute_sql)?;
         }
 
         Ok(())
@@ -317,41 +343,62 @@ pub fn apply_diff(
 
     if is_remote {
         if result.is_ok() {
-            conn.execute_batch("COMMIT;")?;
+            if is_quack {
+                let _ = conn.execute_batch("CALL target_db.query('COMMIT;');");
+            } else {
+                conn.execute_batch("COMMIT;")?;
+            }
         } else {
-            conn.execute_batch("ROLLBACK;")?;
+            if is_quack {
+                let _ = conn.execute_batch("CALL target_db.query('ROLLBACK;');");
+            } else {
+                conn.execute_batch("ROLLBACK;")?;
+            }
         }
     }
 
-    if should_switch && !orig_db.is_empty() {
+    if !is_quack && !orig_db.is_empty() && target_cat != orig_db {
         let _ = conn.execute_batch(&format!("USE \"{}\";", orig_db.replace('\"', "\"\"")));
     }
 
     result
 }
 
-/// Resolves target catalog from duckpack.toml if configured.
-pub fn resolve_project_catalog(project_dir: &std::path::Path, env_profile: Option<&str>) -> Option<String> {
+/// Resolves target catalogs from duckpack.toml if configured. Supports a single string or an array of catalog names.
+pub fn resolve_project_catalogs(project_dir: &std::path::Path, env_profile: Option<&str>) -> Vec<String> {
     let toml_path = project_dir.join("duckpack.toml");
     if toml_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&toml_path) {
             if let Ok(value) = toml::from_str::<toml::Value>(&content) {
                 if let Some(env_str) = env_profile {
                     if let Some(env_tbl) = value.get("env").and_then(|e| e.get(env_str)) {
-                        if let Some(cat) = env_tbl.get("database").or_else(|| env_tbl.get("catalog")).and_then(|v| v.as_str()) {
-                            return Some(cat.to_string());
+                        if let Some(val) = env_tbl.get("database").or_else(|| env_tbl.get("catalog")) {
+                            if let Some(s) = val.as_str() {
+                                return vec![s.to_string()];
+                            } else if let Some(arr) = val.as_array() {
+                                return arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                            }
                         }
                     }
                 }
                 if let Some(target_tbl) = value.get("target") {
-                    if let Some(cat) = target_tbl.get("database").or_else(|| target_tbl.get("catalog")).and_then(|v| v.as_str()) {
-                        return Some(cat.to_string());
+                    if let Some(val) = target_tbl.get("database").or_else(|| target_tbl.get("catalog")) {
+                        if let Some(s) = val.as_str() {
+                            return vec![s.to_string()];
+                        } else if let Some(arr) = val.as_array() {
+                            return arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                        }
                     }
                 }
             }
         }
     }
-    None
+    Vec::new()
+}
+
+/// Resolves target catalog from duckpack.toml if configured (returns first configured catalog).
+pub fn resolve_project_catalog(project_dir: &std::path::Path, env_profile: Option<&str>) -> Option<String> {
+    resolve_project_catalogs(project_dir, env_profile).into_iter().next()
 }
 
 /// Scaffolds a new declarative database project by generating the standard directory structure,
@@ -466,10 +513,11 @@ pub fn build_shadow_db(project_dir: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// A helper utility to iterate over a directory of `.sql` files and execute them against a connection.
-/// This uses a retry loop because tables/views often depend on each other (e.g. foreign keys or nested views).
-/// If one fails, it is pushed to the back of the queue. The loop terminates once all succeed, or if no progress is made.
-pub fn execute_directory(conn: &Connection, dir: &Path) -> Result<()> {
+/// A helper utility to iterate over a directory of `.sql` files and execute them using a custom executor function.
+pub fn execute_directory_custom<F>(dir: &Path, exec_fn: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let mut pending_sqls = Vec::new();
     let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.path());
@@ -481,41 +529,20 @@ pub fn execute_directory(conn: &Connection, dir: &Path) -> Result<()> {
         }
     }
     
-    let mut last_error: Option<anyhow::Error> = None;
-    let mut progress_made = true;
-
-    while !pending_sqls.is_empty() && progress_made {
-        progress_made = false;
-        let mut remaining = Vec::new();
-
-        for sql in pending_sqls {
-            match conn.execute_batch(&sql) {
-                Ok(_) => {
-                    progress_made = true;
-                }
-                Err(e) => {
-                    last_error = Some(anyhow::anyhow!("Failed: {}", e));
-                    remaining.push(sql);
-                }
-            }
-        }
-        pending_sqls = remaining;
-    }
-
-    if !pending_sqls.is_empty() {
-        if let Some(e) = last_error {
-            return Err(e).context(format!("Failed to compile SQL files in {} due to unresolvable dependencies or syntax errors", dir.display()));
-        }
-    }
-
-    Ok(())
+    execute_sqls_with_retry_custom(pending_sqls, exec_fn)
+        .context(format!("Failed to compile SQL files in {}", dir.display()))
 }
 
-/// A specialized execution engine for arbitrary SQLs.
-/// Because objects often depend on each other, this algorithm continuously loops over the list of statements
-/// and attempts to execute them. If one fails, it is pushed to the back of the queue.
-/// The loop terminates once all succeed, or if it completes a full pass without making any progress (circular dependency).
-pub fn execute_sqls_with_retry(conn: &Connection, mut pending_sqls: Vec<String>) -> Result<()> {
+/// A helper utility to iterate over a directory of `.sql` files and execute them against a connection.
+pub fn execute_directory(conn: &Connection, dir: &Path) -> Result<()> {
+    execute_directory_custom(dir, |sql| conn.execute_batch(sql).map_err(|e| anyhow::anyhow!(e)))
+}
+
+/// A specialized execution engine for arbitrary SQLs with custom executor function.
+pub fn execute_sqls_with_retry_custom<F>(mut pending_sqls: Vec<String>, mut exec_fn: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let mut last_error: Option<anyhow::Error> = None;
     let mut progress_made = true;
 
@@ -524,7 +551,7 @@ pub fn execute_sqls_with_retry(conn: &Connection, mut pending_sqls: Vec<String>)
         let mut remaining = Vec::new();
 
         for sql in pending_sqls {
-            match conn.execute_batch(&sql) {
+            match exec_fn(&sql) {
                 Ok(_) => {
                     progress_made = true;
                 }
@@ -544,6 +571,11 @@ pub fn execute_sqls_with_retry(conn: &Connection, mut pending_sqls: Vec<String>)
     }
 
     Ok(())
+}
+
+/// A specialized execution engine for arbitrary SQLs against a connection.
+pub fn execute_sqls_with_retry(conn: &Connection, pending_sqls: Vec<String>) -> Result<()> {
+    execute_sqls_with_retry_custom(pending_sqls, |sql| conn.execute_batch(sql).map_err(|e| anyhow::anyhow!(e)))
 }
 
 /// Loads ignore patterns from `.duckdbignore` (or legacy `.duckignore`).
