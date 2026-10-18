@@ -106,15 +106,28 @@ pub fn list_attached_databases(conn: &Connection) -> Result<Vec<AttachedDatabase
     for row in rows {
         dbs.push(row?);
     }
+    // If other databases are attached to this connection (e.g. target_db or secondary catalogs),
+    // filter out the client's internal default "memory" harness so users don't mistakenly
+    // target the ephemeral local client scratchpad for declarative schema migrations.
+    if dbs.len() > 1 {
+        dbs.retain(|d| d.name != "memory");
+    }
     Ok(dbs)
 }
 
 pub fn validate_target_catalog(conn: &Connection, catalog: Option<&str>, for_apply: bool) -> Result<String> {
     let attached = list_attached_databases(conn).unwrap_or_default();
-    let target = match catalog {
+    let mut target = match catalog {
         Some(c) => c.to_string(),
         None => conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_else(|_| "memory".to_string()),
     };
+
+    // If caller explicitly targeted "memory" (e.g. from Python where in-memory connection is named "memory"),
+    // but the connection attached the target as "target_db" and "memory" is filtered out,
+    // seamlessly map "memory" to the attached "target_db".
+    if target.eq_ignore_ascii_case("memory") && attached.iter().any(|d| d.name.eq_ignore_ascii_case("target_db")) && !attached.iter().any(|d| d.name == "memory") {
+        target = "target_db".to_string();
+    }
 
     if let Some(db_info) = attached.iter().find(|d| d.name.eq_ignore_ascii_case(&target)) {
         if for_apply {
@@ -697,6 +710,20 @@ mod tests {
         // Schema isolation test
         let schema_mem = get_schema(&conn, Some("memory")).unwrap();
         assert!(schema_mem.contains_key("memory_tbl"));
+
+        // Attach secondary database target_db
+        conn.execute_batch("ATTACH '' AS target_db; USE target_db;").unwrap();
+        let attached = list_attached_databases(&conn).unwrap();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].name, "target_db");
+
+        // When target_db is active, validate_target_catalog resolves to target_db
+        let default_target = validate_target_catalog(&conn, None, true).unwrap();
+        assert_eq!(default_target, "target_db");
+
+        // When user asks for "memory" on this attached connection, it maps to "target_db"
+        let mapped_target = validate_target_catalog(&conn, Some("memory"), true).unwrap();
+        assert_eq!(mapped_target, "target_db");
     }
 }
 

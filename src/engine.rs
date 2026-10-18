@@ -234,11 +234,14 @@ pub fn apply_diff(
     catalog: Option<&str>,
 ) -> Result<()> {
     let orig_db: String = conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_default();
-    let should_switch = catalog.map(|c| c != orig_db && !c.is_empty()).unwrap_or(false);
+    let effective_cat = match catalog {
+        Some(c) if c.eq_ignore_ascii_case("memory") && orig_db.eq_ignore_ascii_case("target_db") => "target_db",
+        Some(c) => c,
+        None => &orig_db,
+    };
+    let should_switch = !effective_cat.is_empty() && effective_cat != orig_db;
     if should_switch {
-        if let Some(cat) = catalog {
-            conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")))?;
-        }
+        conn.execute_batch(&format!("USE \"{}\";", effective_cat.replace('\"', "\"\"")))?;
     }
 
     if is_remote {

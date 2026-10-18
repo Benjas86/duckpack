@@ -140,5 +140,34 @@ def test_explore_non_tty_mode(capfd):
     assert "products" in captured.out
     assert "sku" in captured.out
 
+def test_in_memory_and_attached_catalog_targeting(tmp_path):
+    proj_dir = str(tmp_path / "catalog_proj")
+    duckpack.init(proj_dir)
+
+    with open(os.path.join(proj_dir, "tables", "events.sql"), "w") as f:
+        f.write("CREATE TABLE events (event_id INT, event_name VARCHAR);")
+
+    con = duckdb.connect()
+
+    # Explicitly specifying database="memory" on in-memory connection
+    diff_mem = duckpack.diff(con, proj_dir, database="memory")
+    assert diff_mem.has_changes is True
+    assert diff_mem.change_count == 1
+
+    apply_mem = duckpack.apply(con, proj_dir, database="memory")
+    assert apply_mem.success is True
+    assert apply_mem.applied_count == 1
+    assert "events" in [t[0] for t in con.execute("SHOW TABLES;").fetchall()]
+
+    # Attach secondary database 'analytics'
+    con.execute("ATTACH '' AS analytics;")
+    # Apply to attached secondary database
+    apply_analytics = duckpack.apply(con, proj_dir, database="analytics")
+    assert apply_analytics.success is True
+    assert apply_analytics.applied_count == 1
+    analytics_tables = [t[0] for t in con.execute("SHOW TABLES FROM analytics;").fetchall()]
+    assert "events" in analytics_tables
+
+
 
 
