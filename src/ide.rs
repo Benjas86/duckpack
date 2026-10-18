@@ -27,8 +27,8 @@ enum FocusPane {
 pub(crate) enum NodeType {
     Database { db_type: String, is_active: bool, path: Option<String> },
     Group,
-    Table { database: Option<String>, schema: Option<String> },
-    View { database: Option<String>, schema: Option<String> },
+    Table { database: Option<String>, schema: Option<String>, is_temporary: bool },
+    View { database: Option<String>, schema: Option<String>, is_temporary: bool },
     Query,
     Macro,
     Column { data_type: String },
@@ -41,6 +41,7 @@ pub struct TableEntry {
     pub schema: String,
     pub name: String,
     pub row_count: Option<i64>,
+    pub is_temporary: bool,
 }
 
 impl TableEntry {
@@ -63,6 +64,7 @@ pub struct ViewEntry {
     pub database: String,
     pub schema: String,
     pub name: String,
+    pub is_temporary: bool,
 }
 
 impl ViewEntry {
@@ -227,7 +229,7 @@ pub fn load_table_columns_for(
     // 2. Check duckdb_columns() via target_db.query (for remote multi-database mode)
     if cols.is_empty() && is_quack {
         let col_query = format!(
-            "SELECT column_name, data_type FROM target_db.query('SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = ''{}'' AND schema_name = ''{}'' AND table_name = ''{}'' ORDER BY column_index')",
+            "SELECT column_name, data_type FROM target_db.query('SELECT column_name, data_type FROM duckdb_columns() WHERE (database_name = ''{}'' OR database_name = ''temp'') AND schema_name = ''{}'' AND table_name = ''{}'' ORDER BY column_index')",
             db.replace("'", "''"),
             schema.replace("'", "''"),
             table.replace("'", "''")
@@ -282,7 +284,7 @@ pub fn load_table_columns_for(
     // 5. Query local duckdb_columns() on conn
     if cols.is_empty() {
         let col_query = format!(
-            "SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = '{}' AND schema_name = '{}' AND table_name = '{}' ORDER BY column_index",
+            "SELECT column_name, data_type FROM duckdb_columns() WHERE (database_name = '{}' OR database_name = 'temp') AND schema_name = '{}' AND table_name = '{}' ORDER BY column_index",
             db.replace("'", "''"),
             schema.replace("'", "''"),
             table.replace("'", "''")
@@ -364,6 +366,8 @@ pub struct ExplorerMetadata {
     pub tables: Vec<String>,
     pub table_counts: HashMap<String, i64>,
     pub views: Vec<String>,
+    pub temp_tables: HashSet<String>,
+    pub temp_views: HashSet<String>,
     pub macros: Vec<String>,
     pub queries: Vec<String>,
     pub dictionary: Vec<String>,
@@ -457,17 +461,19 @@ pub fn load_explorer_metadata(
 
     let mut all_tables: Vec<TableEntry> = Vec::new();
     if is_remote_multi_db {
-        let quack_tbl_sql = "SELECT database_name, schema_name, table_name, estimated_size FROM target_db.query('SELECT database_name, schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false')";
+        let quack_tbl_sql = "SELECT database_name, schema_name, table_name, estimated_size, temporary FROM target_db.query('SELECT database_name, schema_name, table_name, estimated_size, temporary FROM duckdb_tables() WHERE internal = false')";
         if let Ok(mut stmt) = conn.prepare(quack_tbl_sql) {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(db), Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
                         let est: Option<i64> = row.get(3).ok();
+                        let is_temp: bool = row.get(4).unwrap_or(false) || db == "temp";
                         all_tables.push(TableEntry {
-                            database: db,
+                            database: if is_temp { active_database.clone() } else { db },
                             schema,
                             name: table,
                             row_count: est,
+                            is_temporary: is_temp,
                         });
                     }
                 }
@@ -475,16 +481,18 @@ pub fn load_explorer_metadata(
         }
     } else {
         // Query tables on conn (local and non-quack attached databases)
-        if let Ok(mut stmt) = conn.prepare("SELECT database_name, schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false") {
+        if let Ok(mut stmt) = conn.prepare("SELECT database_name, schema_name, table_name, estimated_size, temporary FROM duckdb_tables() WHERE internal = false") {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(db), Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
                         let est: Option<i64> = row.get(3).ok();
+                        let is_temp: bool = row.get(4).unwrap_or(false) || db == "temp";
                         all_tables.push(TableEntry {
-                            database: db,
+                            database: if is_temp { active_database.clone() } else { db },
                             schema,
                             name: table,
                             row_count: est,
+                            is_temporary: is_temp,
                         });
                     }
                 }
@@ -498,12 +506,12 @@ pub fn load_explorer_metadata(
             let safe_name = name.replace("'", "''");
             let sql = if is_remote_multi_db {
                 format!(
-                    "SELECT * FROM target_db.query('SELECT ''{}'' AS database_name, schema_name, table_name, estimated_size FROM {}.query(''SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false'')')",
+                    "SELECT * FROM target_db.query('SELECT ''{}'' AS database_name, schema_name, table_name, estimated_size, temporary FROM {}.query(''SELECT schema_name, table_name, estimated_size, temporary FROM duckdb_tables() WHERE internal = false'')')",
                     safe_name, safe_name
                 )
             } else {
                 format!(
-                    "SELECT '{}' AS database_name, schema_name, table_name, estimated_size FROM {}.query('SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE internal = false')",
+                    "SELECT '{}' AS database_name, schema_name, table_name, estimated_size, temporary FROM {}.query('SELECT schema_name, table_name, estimated_size, temporary FROM duckdb_tables() WHERE internal = false')",
                     safe_name, safe_name
                 )
             };
@@ -512,11 +520,13 @@ pub fn load_explorer_metadata(
                     while let Ok(Some(row)) = rows.next() {
                         if let (Ok(db), Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
                             let est: Option<i64> = row.get(3).ok();
+                            let is_temp: bool = row.get(4).unwrap_or(false) || db == "temp";
                             all_tables.push(TableEntry {
-                                database: db,
+                                database: if is_temp { active_database.clone() } else { db },
                                 schema,
                                 name: table,
                                 row_count: est,
+                                is_temporary: is_temp,
                             });
                         }
                     }
@@ -536,6 +546,7 @@ pub fn load_explorer_metadata(
                             schema,
                             name,
                             row_count: None,
+                            is_temporary: false,
                         });
                     }
                 }
@@ -545,29 +556,33 @@ pub fn load_explorer_metadata(
 
     let mut all_views: Vec<ViewEntry> = Vec::new();
     if is_remote_multi_db {
-        let quack_view_sql = "SELECT database_name, schema_name, view_name FROM target_db.query('SELECT database_name, schema_name, view_name FROM duckdb_views() WHERE internal = false')";
+        let quack_view_sql = "SELECT database_name, schema_name, view_name, temporary FROM target_db.query('SELECT database_name, schema_name, view_name, temporary FROM duckdb_views() WHERE internal = false')";
         if let Ok(mut stmt) = conn.prepare(quack_view_sql) {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(db), Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                        let is_temp: bool = row.get(3).unwrap_or(false) || db == "temp";
                         all_views.push(ViewEntry {
-                            database: db,
+                            database: if is_temp { active_database.clone() } else { db },
                             schema,
                             name,
+                            is_temporary: is_temp,
                         });
                     }
                 }
             }
         }
     } else {
-        if let Ok(mut stmt) = conn.prepare("SELECT database_name, schema_name, view_name FROM duckdb_views() WHERE internal = false") {
+        if let Ok(mut stmt) = conn.prepare("SELECT database_name, schema_name, view_name, temporary FROM duckdb_views() WHERE internal = false") {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(db), Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                        let is_temp: bool = row.get(3).unwrap_or(false) || db == "temp";
                         all_views.push(ViewEntry {
-                            database: db,
+                            database: if is_temp { active_database.clone() } else { db },
                             schema,
                             name,
+                            is_temporary: is_temp,
                         });
                     }
                 }
@@ -581,12 +596,12 @@ pub fn load_explorer_metadata(
             let safe_name = name.replace("'", "''");
             let sql = if is_remote_multi_db {
                 format!(
-                    "SELECT * FROM target_db.query('SELECT ''{}'' AS database_name, schema_name, view_name FROM {}.query(''SELECT schema_name, view_name FROM duckdb_views() WHERE internal = false'')')",
+                    "SELECT * FROM target_db.query('SELECT ''{}'' AS database_name, schema_name, view_name, temporary FROM {}.query(''SELECT schema_name, view_name, temporary FROM duckdb_views() WHERE internal = false'')')",
                     safe_name, safe_name
                 )
             } else {
                 format!(
-                    "SELECT '{}' AS database_name, schema_name, view_name FROM {}.query('SELECT schema_name, view_name FROM duckdb_views() WHERE internal = false')",
+                    "SELECT '{}' AS database_name, schema_name, view_name, temporary FROM {}.query('SELECT schema_name, view_name, temporary FROM duckdb_views() WHERE internal = false')",
                     safe_name, safe_name
                 )
             };
@@ -594,10 +609,12 @@ pub fn load_explorer_metadata(
                 if let Ok(mut rows) = stmt.query([]) {
                     while let Ok(Some(row)) = rows.next() {
                         if let (Ok(db), Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                            let is_temp: bool = row.get(3).unwrap_or(false) || db == "temp";
                             all_views.push(ViewEntry {
-                                database: db,
+                                database: if is_temp { active_database.clone() } else { db },
                                 schema,
                                 name,
+                                is_temporary: is_temp,
                             });
                         }
                     }
@@ -616,6 +633,7 @@ pub fn load_explorer_metadata(
                             database: active_database.clone(),
                             schema,
                             name,
+                            is_temporary: false,
                         });
                     }
                 }
@@ -626,8 +644,10 @@ pub fn load_explorer_metadata(
     let mut databases: Vec<DatabaseInfo> = Vec::new();
     let is_remote_quack = is_quack || raw_dbs.iter().any(|d| d.0 == "target_db" || d.1.eq_ignore_ascii_case("quack"));
     for (name, db_type, path, readonly) in &raw_dbs {
-        let db_tables: Vec<TableEntry> = all_tables.iter().filter(|t| &t.database == name).cloned().collect();
-        let db_views: Vec<ViewEntry> = all_views.iter().filter(|v| &v.database == name).cloned().collect();
+        let mut db_tables: Vec<TableEntry> = all_tables.iter().filter(|t| &t.database == name).cloned().collect();
+        let mut db_views: Vec<ViewEntry> = all_views.iter().filter(|v| &v.database == name).cloned().collect();
+        db_tables.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        db_views.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
         // If 'memory' is empty and not the active database, skip it only in classic single local DB mode
         if !is_remote_quack && raw_dbs.len() <= 1 && name == "memory" && active_database != "memory" && db_tables.is_empty() && db_views.is_empty() {
@@ -661,6 +681,21 @@ pub fn load_explorer_metadata(
     let mut tables: Vec<String> = Vec::new();
     let mut table_counts: HashMap<String, i64> = HashMap::new();
     let mut views: Vec<String> = Vec::new();
+    let mut temp_tables: HashSet<String> = HashSet::new();
+    let mut temp_views: HashSet<String> = HashSet::new();
+
+    for t in &all_tables {
+        if t.is_temporary {
+            temp_tables.insert(t.name.clone());
+            temp_tables.insert(t.display_name());
+        }
+    }
+    for v in &all_views {
+        if v.is_temporary {
+            temp_views.insert(v.name.clone());
+            temp_views.insert(v.display_name());
+        }
+    }
 
     if let Some(active_info) = databases.iter().find(|d| d.is_active).or_else(|| databases.first()) {
         for t in &active_info.tables {
@@ -804,6 +839,8 @@ pub fn load_explorer_metadata(
         tables,
         table_counts,
         views,
+        temp_tables,
+        temp_views,
         macros,
         queries,
         dictionary,
@@ -862,17 +899,19 @@ pub(crate) fn rebuild_explorer_nodes(
                     if is_tbl_group_expanded {
                         for t in &db.tables {
                             let table_key = t.qualified_name();
-                            let is_tbl_expanded = expanded_tables.contains(&table_key) || expanded_tables.contains(&t.display_name());
+                            let is_tbl_expanded = expanded_tables.contains(&table_key) || expanded_tables.contains(&t.display_name()) || expanded_tables.contains(&t.name);
                             let count_str = t.row_count.map(|c| format!(" ({})", format_row_count(c))).unwrap_or_default();
+                            let temp_tag = if t.is_temporary { " [temp]" } else { "" };
                             items.push(ExplorerNode {
                                 name: t.name.clone(),
-                                display: format!("    ├─ {}{}", t.display_name(), count_str),
+                                display: format!("    ├─ {}{}{}", t.display_name(), temp_tag, count_str),
                                 level: 2,
                                 is_expandable: true,
                                 is_expanded: is_tbl_expanded,
                                 node_type: NodeType::Table {
                                     database: Some(db.name.clone()),
                                     schema: Some(t.schema.clone()),
+                                    is_temporary: t.is_temporary,
                                 },
                             });
 
@@ -908,16 +947,18 @@ pub(crate) fn rebuild_explorer_nodes(
                     if is_view_group_expanded {
                         for v in &db.views {
                             let view_key = v.qualified_name();
-                            let is_view_expanded = expanded_tables.contains(&view_key) || expanded_tables.contains(&v.display_name());
+                            let is_view_expanded = expanded_tables.contains(&view_key) || expanded_tables.contains(&v.display_name()) || expanded_tables.contains(&v.name);
+                            let temp_tag = if v.is_temporary { " [temp]" } else { "" };
                             items.push(ExplorerNode {
                                 name: v.name.clone(),
-                                display: format!("    ├─ {}", v.display_name()),
+                                display: format!("    ├─ {}{}", v.display_name(), temp_tag),
                                 level: 2,
                                 is_expandable: true,
                                 is_expanded: is_view_expanded,
                                 node_type: NodeType::View {
                                     database: Some(db.name.clone()),
                                     schema: Some(v.schema.clone()),
+                                    is_temporary: v.is_temporary,
                                 },
                             });
 
@@ -954,16 +995,19 @@ pub(crate) fn rebuild_explorer_nodes(
             if is_expanded {
                 for t in &meta.tables {
                     let is_tbl_expanded = expanded_tables.contains(t);
+                    let is_temp = meta.temp_tables.contains(t);
+                    let temp_tag = if is_temp { " [temp]" } else { "" };
                     let count_str = meta.table_counts.get(t).map(|&c| format!(" ({})", format_row_count(c))).unwrap_or_default();
                     items.push(ExplorerNode {
                         name: t.clone(),
-                        display: format!("  ├─ {}{}", t, count_str),
+                        display: format!("  ├─ {}{}{}", t, temp_tag, count_str),
                         level: 1,
                         is_expandable: true,
                         is_expanded: is_tbl_expanded,
                         node_type: NodeType::Table {
                             database: Some(meta.active_database.clone()),
                             schema: Some("main".to_string()),
+                            is_temporary: is_temp,
                         },
                     });
                     if is_tbl_expanded {
@@ -996,15 +1040,18 @@ pub(crate) fn rebuild_explorer_nodes(
             if is_expanded {
                 for v in &meta.views {
                     let is_view_expanded = expanded_tables.contains(v);
+                    let is_temp = meta.temp_views.contains(v);
+                    let temp_tag = if is_temp { " [temp]" } else { "" };
                     items.push(ExplorerNode {
                         name: v.clone(),
-                        display: format!("  ├─ {}", v),
+                        display: format!("  ├─ {}{}", v, temp_tag),
                         level: 1,
                         is_expandable: true,
                         is_expanded: is_view_expanded,
                         node_type: NodeType::View {
                             database: Some(meta.active_database.clone()),
                             schema: Some("main".to_string()),
+                            is_temporary: is_temp,
                         },
                     });
                     if is_view_expanded {
@@ -2266,10 +2313,12 @@ pub fn run_ide_loop(
                                     let item_type = &explorer_items[selected].node_type;
                                     let item_name = &explorer_items[selected].name;
                                     match item_type {
-                                        NodeType::Table { database, schema } | NodeType::View { database, schema } => {
+                                        NodeType::Table { database, schema, is_temporary } | NodeType::View { database, schema, is_temporary } => {
                                             let db_name = database.as_deref().unwrap_or(&meta.active_database);
                                             let schema_name = schema.as_deref().unwrap_or("main");
-                                            let qualified_sql = if is_quack && db_name != meta.active_database && db_name != "memory" && db_name != "target_db" {
+                                            let qualified_sql = if *is_temporary {
+                                                format!("SELECT * FROM {} LIMIT 500;", item_name)
+                                            } else if is_quack && db_name != meta.active_database && db_name != "memory" && db_name != "target_db" {
                                                 if schema_name == "main" {
                                                     format!("-- @remote\nSELECT * FROM {}.{} LIMIT 500;", db_name, item_name)
                                                 } else {
@@ -2849,7 +2898,7 @@ pub fn run_ide_loop(
                             explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
                             explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                         }
-                        NodeType::Table { database, schema } | NodeType::View { database, schema } => {
+                        NodeType::Table { database, schema, is_temporary: _ } | NodeType::View { database, schema, is_temporary: _ } => {
                             let key = match (&database, &schema) {
                                 (Some(db), Some(sch)) if meta.databases.len() > 1 => format!("{}.{}.{}", db, sch, item_name),
                                 _ => item_name.clone(),
@@ -3473,6 +3522,55 @@ mod tests {
         assert!(queries.contains(&"mssql/orders.sql".to_string()));
         assert!(!queries.contains(&".history.sql".to_string()));
         assert!(!queries.contains(&"notes.txt".to_string()));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_temporary_tables_and_views_in_explorer() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_temp_tbl_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TEMP TABLE staging_tbl (id INT, label VARCHAR);", []).unwrap();
+        conn.execute("INSERT INTO staging_tbl VALUES (1, 'alpha'), (2, 'beta');", []).unwrap();
+        conn.execute("CREATE TEMP VIEW staging_view AS SELECT id, label FROM staging_tbl;", []).unwrap();
+
+        let meta = load_explorer_metadata(&conn, &temp_dir, false);
+        assert!(meta.temp_tables.contains("staging_tbl"));
+        assert!(meta.temp_views.contains("staging_view"));
+        assert!(meta.tables.contains(&"staging_tbl".to_string()));
+        assert!(meta.views.contains(&"staging_view".to_string()));
+
+        let mut expanded_groups = HashSet::new();
+        expanded_groups.insert("Tables".to_string());
+        expanded_groups.insert("Views".to_string());
+        let expanded_tables = HashSet::new();
+
+        let nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
+        let tbl_node = nodes.iter().find(|n| n.name == "staging_tbl").expect("staging_tbl node not found");
+        assert!(tbl_node.display.contains("[temp]"), "Expected [temp] in display: {}", tbl_node.display);
+        match &tbl_node.node_type {
+            NodeType::Table { is_temporary, .. } => assert!(*is_temporary),
+            _ => panic!("Expected NodeType::Table"),
+        }
+
+        let view_node = nodes.iter().find(|n| n.name == "staging_view").expect("staging_view node not found");
+        assert!(view_node.display.contains("[temp]"), "Expected [temp] in display: {}", view_node.display);
+        match &view_node.node_type {
+            NodeType::View { is_temporary, .. } => assert!(*is_temporary),
+            _ => panic!("Expected NodeType::View"),
+        }
+
+        let cols = load_table_columns_for(&meta.active_database, "main", "staging_tbl", &conn, false);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].0, "id");
+        assert_eq!(cols[1].0, "label");
+
+        let view_cols = load_table_columns_for(&meta.active_database, "main", "staging_view", &conn, false);
+        assert_eq!(view_cols.len(), 2);
+        assert_eq!(view_cols[0].0, "id");
+        assert_eq!(view_cols[1].0, "label");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -136,6 +136,37 @@ fn find_available_port() -> u16 {
 fn print_non_terminal_explorer(executor: &mut PyDbExecutor, catalog: Option<&str>) -> PyResult<()> {
     let (_schemas, table_map, view_map, macro_map) = introspect_py_catalog(executor, catalog)?;
 
+    // Discover temporary tables
+    let mut temp_tables: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    if let Ok((_, rows)) = executor.query_rows("SELECT table_name FROM duckdb_tables() WHERE temporary = true AND internal = false ORDER BY table_name") {
+        for r in rows {
+            if let Some(tname) = r.into_iter().next() {
+                let mut cols = Vec::new();
+                if let Ok((_, col_rows)) = executor.query_rows(&format!(
+                    "SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '{}' ORDER BY column_index",
+                    tname.replace('\'', "''")
+                )) {
+                    for crow in col_rows {
+                        if crow.len() >= 2 {
+                            cols.push((crow[0].clone(), crow[1].clone()));
+                        }
+                    }
+                }
+                temp_tables.push((tname, cols));
+            }
+        }
+    }
+
+    // Discover temporary views
+    let mut temp_views: Vec<String> = Vec::new();
+    if let Ok((_, rows)) = executor.query_rows("SELECT view_name FROM duckdb_views() WHERE temporary = true AND internal = false ORDER BY view_name") {
+        for r in rows {
+            if let Some(vname) = r.into_iter().next() {
+                temp_views.push(vname);
+            }
+        }
+    }
+
     println!("======================================================================");
     if let Some(cat) = catalog {
         println!("🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: catalog '{}')", cat);
@@ -144,10 +175,11 @@ fn print_non_terminal_explorer(executor: &mut PyDbExecutor, catalog: Option<&str
     }
     println!("======================================================================");
 
-    if table_map.is_empty() {
+    let total_tables = table_map.len() + temp_tables.len();
+    if total_tables == 0 {
         println!("📊 Tables: (none)");
     } else {
-        println!("📊 Tables ({}):", table_map.len());
+        println!("📊 Tables ({}):", total_tables);
         let mut sorted_tables: Vec<_> = table_map.iter().collect();
         sorted_tables.sort_by_key(|(name, _)| (*name).clone());
         for (name, schema) in sorted_tables {
@@ -165,12 +197,30 @@ fn print_non_terminal_explorer(executor: &mut PyDbExecutor, catalog: Option<&str
                 println!("    - {}: {}", col, dtype);
             }
         }
+
+        for (tname, cols) in &temp_tables {
+            let row_count = executor
+                .query_rows(&format!("SELECT count(*) FROM \"{}\"", tname.replace('\"', "\"\"")))
+                .ok()
+                .and_then(|(_, rows)| rows.into_iter().next())
+                .and_then(|r| r.into_iter().next())
+                .unwrap_or_else(|| "?".to_string());
+
+            println!("  • {} [temp] ({} rows)", tname, row_count);
+            for (col, dtype) in cols {
+                println!("    - {}: {}", col, dtype);
+            }
+        }
     }
 
-    if !view_map.is_empty() {
-        println!("\n🔍 Views ({}):", view_map.len());
+    let total_views = view_map.len() + temp_views.len();
+    if total_views > 0 {
+        println!("\n🔍 Views ({}):", total_views);
         for name in view_map.keys() {
             println!("  • {}", name);
+        }
+        for name in &temp_views {
+            println!("  • {} [temp]", name);
         }
     }
 
@@ -196,6 +246,44 @@ fn print_non_terminal_db(conn: &duckdb::Connection, db_name: &str, catalog: Opti
     let views = schema_diff::get_views(conn, catalog).unwrap_or_default();
     let macros = schema_diff::get_macros(conn, catalog).unwrap_or_default();
 
+    // Discover temporary tables
+    let mut temp_tables: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT table_name FROM duckdb_tables() WHERE temporary = true AND internal = false ORDER BY table_name") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(tname) = row.get::<_, String>(0) {
+                    let mut cols = Vec::new();
+                    let col_sql = format!(
+                        "SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '{}' ORDER BY column_index",
+                        tname.replace('\'', "''")
+                    );
+                    if let Ok(mut cstmt) = conn.prepare(&col_sql) {
+                        if let Ok(mut crows) = cstmt.query([]) {
+                            while let Ok(Some(crow)) = crows.next() {
+                                if let (Ok(cname), Ok(ctype)) = (crow.get::<_, String>(0), crow.get::<_, String>(1)) {
+                                    cols.push((cname, ctype));
+                                }
+                            }
+                        }
+                    }
+                    temp_tables.push((tname, cols));
+                }
+            }
+        }
+    }
+
+    // Discover temporary views
+    let mut temp_views: Vec<String> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT view_name FROM duckdb_views() WHERE temporary = true AND internal = false ORDER BY view_name") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(vname) = row.get::<_, String>(0) {
+                    temp_views.push(vname);
+                }
+            }
+        }
+    }
+
     println!("======================================================================");
     if let Some(cat) = catalog {
         println!("🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: {} [catalog '{}'])", db_name, cat);
@@ -204,10 +292,11 @@ fn print_non_terminal_db(conn: &duckdb::Connection, db_name: &str, catalog: Opti
     }
     println!("======================================================================");
 
-    if tables.is_empty() {
+    let total_tables = tables.len() + temp_tables.len();
+    if total_tables == 0 {
         println!("📊 Tables: (none)");
     } else {
-        println!("📊 Tables ({}):", tables.len());
+        println!("📊 Tables ({}):", total_tables);
         let mut sorted_tables: Vec<_> = tables.iter().collect();
         sorted_tables.sort_by_key(|(name, _)| (*name).clone());
         for (name, schema) in sorted_tables {
@@ -225,12 +314,30 @@ fn print_non_terminal_db(conn: &duckdb::Connection, db_name: &str, catalog: Opti
                 println!("    - {}: {}", col, dtype);
             }
         }
+
+        for (tname, cols) in &temp_tables {
+            let row_count: String = conn
+                .query_row(&format!("SELECT count(*) FROM \"{}\"", tname.replace('\"', "\"\"")), [], |r| {
+                    let c: i64 = r.get(0)?;
+                    Ok(c.to_string())
+                })
+                .unwrap_or_else(|_| "?".to_string());
+
+            println!("  • {} [temp] ({} rows)", tname, row_count);
+            for (col, dtype) in cols {
+                println!("    - {}: {}", col, dtype);
+            }
+        }
     }
 
-    if !views.is_empty() {
-        println!("\n🔍 Views ({}):", views.len());
+    let total_views = views.len() + temp_views.len();
+    if total_views > 0 {
+        println!("\n🔍 Views ({}):", total_views);
         for name in views.keys() {
             println!("  • {}", name);
+        }
+        for name in &temp_views {
+            println!("  • {} [temp]", name);
         }
     }
 
@@ -1179,6 +1286,97 @@ fn introspect_py_catalog(
     Ok((schemas, table_map, view_map, macro_map))
 }
 
+fn stage_host_temp_tables(target: &Bound<'_, PyAny>) -> (Vec<String>, Vec<(String, String)>) {
+    let temp_tables: Vec<String> = target
+        .call_method1("execute", ("SELECT table_name FROM duckdb_tables() WHERE temporary = true AND internal = false;",))
+        .ok()
+        .and_then(|res| res.call_method0("fetchall").ok())
+        .and_then(|rows| rows.extract::<Vec<(String,)>>().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(t,)| t)
+        .collect();
+
+    for t in &temp_tables {
+        let safe_t = t.replace('\"', "\"\"");
+        let stage_sql = format!("CREATE OR REPLACE TABLE memory.\"__duckpack_temp_bridge_{}\" AS SELECT * FROM \"{}\";", safe_t, safe_t);
+        let _ = target.call_method1("execute", (stage_sql,));
+    }
+
+    let temp_views: Vec<(String, String)> = target
+        .call_method1("execute", ("SELECT view_name, sql FROM duckdb_views() WHERE temporary = true AND internal = false;",))
+        .ok()
+        .and_then(|res| res.call_method0("fetchall").ok())
+        .and_then(|rows| rows.extract::<Vec<(String, String)>>().ok())
+        .unwrap_or_default();
+
+    (temp_tables, temp_views)
+}
+
+fn restore_client_temp_tables(
+    conn: &duckdb::Connection,
+    target: &Bound<'_, PyAny>,
+    temp_tables: &[String],
+    temp_views: &[(String, String)],
+) {
+    for t in temp_tables {
+        let safe_t = t.replace('\"', "\"\"");
+        let restore_sql = format!("CREATE TEMP TABLE \"{}\" AS SELECT * FROM target_db.\"__duckpack_temp_bridge_{}\";", safe_t, safe_t);
+        let _ = conn.execute(&restore_sql, []);
+        let cleanup_sql = format!("DROP TABLE IF EXISTS memory.\"__duckpack_temp_bridge_{}\";", safe_t);
+        let _ = target.call_method1("execute", (cleanup_sql,));
+    }
+    for (_vname, vsql) in temp_views {
+        let _ = conn.execute(vsql, []);
+    }
+}
+
+fn sync_back_client_temp_tables(
+    conn: &duckdb::Connection,
+    target: &Bound<'_, PyAny>,
+) {
+    let mut client_temp_tables: Vec<String> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT table_name FROM duckdb_tables() WHERE temporary = true AND internal = false") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(tname) = row.get::<_, String>(0) {
+                    client_temp_tables.push(tname);
+                }
+            }
+        }
+    }
+
+    for t in &client_temp_tables {
+        let safe_t = t.replace('\"', "\"\"");
+        let stage_sql = format!("CREATE OR REPLACE TABLE target_db.\"__duckpack_temp_bridge_{}\" AS SELECT * FROM \"{}\";", safe_t, safe_t);
+        let _ = conn.execute(&stage_sql, []);
+    }
+
+    let mut client_temp_views: Vec<(String, String)> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT view_name, sql FROM duckdb_views() WHERE temporary = true AND internal = false") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(vname), Ok(vsql)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                    client_temp_views.push((vname, vsql));
+                }
+            }
+        }
+    }
+
+    for t in &client_temp_tables {
+        let safe_t = t.replace('\"', "\"\"");
+        let restore_sql = format!(
+            "CREATE OR REPLACE TEMP TABLE \"{}\" AS SELECT * FROM memory.\"__duckpack_temp_bridge_{}\"; DROP TABLE IF EXISTS memory.\"__duckpack_temp_bridge_{}\";",
+            safe_t, safe_t, safe_t
+        );
+        let _ = target.call_method1("execute", (restore_sql,));
+    }
+
+    for (_vname, vsql) in &client_temp_views {
+        let _ = target.call_method1("execute", (vsql.clone(),));
+    }
+}
+
 /// Launch the interactive DuckPack IDE terminal UI against a target database.
 /// In non-terminal environments (such as Jupyter notebooks), prints a formatted database overview.
 #[pyfunction]
@@ -1262,6 +1460,8 @@ pub fn explore(
             })
             .unwrap_or_else(|| ":memory:".to_string());
 
+        let mut staged_state: Option<(Vec<String>, Vec<(String, String)>)> = None;
+
         let (conn, active_db_target) = if !db_name.is_empty() && db_name != ":memory:" {
             match engine::connect_target_db(&db_name, None, false) {
                 Ok(c) => (c, db_name),
@@ -1269,6 +1469,9 @@ pub fn explore(
                     // Fall back to serving via Python's active connection using the Quack bridge
                     eprintln!("💡 Notice: Direct connection to target database file '{}' failed: {}.", db_name, e);
                     eprintln!("   Seamlessly falling back to live Python Quack bridge...");
+
+                    let staged = stage_host_temp_tables(target);
+                    staged_state = Some(staged);
 
                     let port = find_available_port();
                     let start_server_sql = format!(
@@ -1291,6 +1494,9 @@ pub fn explore(
             }
         } else {
             // For in-memory connection, start quack_serve on an available port
+            let staged = stage_host_temp_tables(target);
+            staged_state = Some(staged);
+
             let port = find_available_port();
             let start_server_sql = format!(
                 "INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:{}', token := 'duckpack_py');",
@@ -1310,12 +1516,17 @@ pub fn explore(
             (c, server_uri)
         };
 
+        if let Some((staged_tables, staged_views)) = staged_state {
+            restore_client_temp_tables(&conn, target, &staged_tables, &staged_views);
+        }
+
         if let Some(cat) = &req_catalog {
             let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
         }
 
         let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &active_db_target);
         if active_db_target.starts_with("quack:") {
+            sync_back_client_temp_tables(&conn, target);
             let _ = target.call_method1("execute", (format!("CALL quack_stop('{}');", active_db_target),));
         }
         ide_res.map_err(|e| ExecutionError::new_err(format!("IDE error: {}", e)))?;
