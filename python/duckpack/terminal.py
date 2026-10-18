@@ -18,6 +18,101 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def stage_connection_temp_objects(target):
+    try:
+        target.execute("ATTACH IF NOT EXISTS ':memory:' AS memory;")
+    except Exception:
+        pass
+
+    try:
+        temp_tables = [
+            r[0]
+            for r in target.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE temporary = true AND internal = false;"
+            ).fetchall()
+        ]
+        for t in temp_tables:
+            safe_t = t.replace('"', '""')
+            target.execute(
+                f'CREATE OR REPLACE TABLE memory."__duckpack_temp_bridge_{safe_t}" AS SELECT * FROM "{safe_t}";'
+            )
+    except Exception:
+        pass
+
+    try:
+        temp_views = target.execute(
+            "SELECT view_name, sql FROM duckdb_views() WHERE temporary = true AND internal = false;"
+        ).fetchall()
+        if temp_views:
+            target.execute(
+                'CREATE OR REPLACE TABLE memory."__duckpack_temp_views_registry" (view_name VARCHAR, view_sql VARCHAR);'
+            )
+            for vname, vsql in temp_views:
+                safe_vname = vname.replace("'", "''")
+                safe_vsql = vsql.replace("'", "''")
+                target.execute(
+                    f"INSERT INTO memory.__duckpack_temp_views_registry VALUES ('{safe_vname}', '{safe_vsql}');"
+                )
+    except Exception:
+        pass
+
+
+def sync_back_connection_temp_objects(target):
+    try:
+        target.execute("ATTACH IF NOT EXISTS ':memory:' AS memory;")
+    except Exception:
+        pass
+
+    # 1. Sync back tables from server default db
+    try:
+        bridge_tables = [
+            r[0]
+            for r in target.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE table_name LIKE '__duckpack_temp_bridge_%' AND internal = false;"
+            ).fetchall()
+        ]
+        for bt in bridge_tables:
+            orig = bt[len("__duckpack_temp_bridge_") :]
+            safe_orig = orig.replace('"', '""')
+            safe_bt = bt.replace('"', '""')
+            target.execute(
+                f'CREATE OR REPLACE TEMP TABLE "{safe_orig}" AS SELECT * FROM "{safe_bt}";'
+            )
+            target.execute(f'DROP TABLE IF EXISTS "{safe_bt}";')
+    except Exception:
+        pass
+
+    # 2. Sync back tables from memory
+    try:
+        mem_bridges = [
+            r[0]
+            for r in target.execute(
+                "SELECT table_name FROM duckdb_tables() WHERE database_name = 'memory' AND table_name LIKE '__duckpack_temp_bridge_%' AND internal = false;"
+            ).fetchall()
+        ]
+        for bt in mem_bridges:
+            orig = bt[len("__duckpack_temp_bridge_") :]
+            safe_orig = orig.replace('"', '""')
+            safe_bt = bt.replace('"', '""')
+            target.execute(
+                f'CREATE OR REPLACE TEMP TABLE "{safe_orig}" AS SELECT * FROM memory."{safe_bt}";'
+            )
+            target.execute(f'DROP TABLE IF EXISTS memory."{safe_bt}";')
+    except Exception:
+        pass
+
+    # 3. Sync back views
+    try:
+        views_to_restore = target.execute(
+            "SELECT view_name, view_sql FROM memory.__duckpack_temp_views_sync_back;"
+        ).fetchall()
+        for _vname, vsql in views_to_restore:
+            target.execute(vsql)
+        target.execute("DROP TABLE IF EXISTS memory.__duckpack_temp_views_sync_back;")
+    except Exception:
+        pass
+
+
 def find_terminal_emulator():
     """
     Finds a supported graphical terminal emulator on the system.
@@ -98,12 +193,29 @@ def launch_terminal_window(
         except Exception:
             db_path = None
 
-        if db_path and db_path != ":memory:" and os.path.exists(db_path):
+        has_temp = False
+        try:
+            cnt = target.execute(
+                "SELECT count(*) FROM duckdb_tables() WHERE temporary = true AND internal = false;"
+            ).fetchone()
+            if cnt and cnt[0] > 0:
+                has_temp = True
+            if not has_temp:
+                cnt_v = target.execute(
+                    "SELECT count(*) FROM duckdb_views() WHERE temporary = true AND internal = false;"
+                ).fetchone()
+                if cnt_v and cnt_v[0] > 0:
+                    has_temp = True
+        except Exception:
+            pass
+
+        if db_path and db_path != ":memory:" and os.path.exists(db_path) and not has_temp:
             db_arg = db_path
             token_arg = None
             insecure_arg = False
         else:
-            # Live in-memory DuckDB connection! Spin up local Quack bridge:
+            # Live in-memory DuckDB connection or connection with temporary tables! Spin up local Quack bridge:
+            stage_connection_temp_objects(target)
             port = find_free_port()
             try:
                 target.execute("INSTALL quack; LOAD quack;")
@@ -119,6 +231,10 @@ def launch_terminal_window(
             insecure_arg = False
 
             def cleanup():
+                try:
+                    sync_back_connection_temp_objects(target)
+                except Exception:
+                    pass
                 try:
                     target.execute(f"CALL quack_stop('{db_arg}');")
                 except Exception:
