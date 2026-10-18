@@ -225,7 +225,22 @@ pub fn connect_target_db(
 /// Executes the computed schema differences against the target database.
 /// If running against a remote database, it encapsulates the entire deployment inside a single transaction
 /// so it can rollback gracefully upon failure.
-pub fn apply_diff(conn: &Connection, diff: &diff::DiffResult, force_drop: bool, is_remote: bool, project_dir: &PathBuf) -> Result<()> {
+pub fn apply_diff(
+    conn: &Connection,
+    diff: &diff::DiffResult,
+    force_drop: bool,
+    is_remote: bool,
+    project_dir: &PathBuf,
+    catalog: Option<&str>,
+) -> Result<()> {
+    let orig_db: String = conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_default();
+    let should_switch = catalog.map(|c| c != orig_db && !c.is_empty()).unwrap_or(false);
+    if should_switch {
+        if let Some(cat) = catalog {
+            conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")))?;
+        }
+    }
+
     if is_remote {
         conn.execute_batch("BEGIN TRANSACTION;")?;
     }
@@ -304,7 +319,36 @@ pub fn apply_diff(conn: &Connection, diff: &diff::DiffResult, force_drop: bool, 
             conn.execute_batch("ROLLBACK;")?;
         }
     }
+
+    if should_switch && !orig_db.is_empty() {
+        let _ = conn.execute_batch(&format!("USE \"{}\";", orig_db.replace('\"', "\"\"")));
+    }
+
     result
+}
+
+/// Resolves target catalog from duckpack.toml if configured.
+pub fn resolve_project_catalog(project_dir: &std::path::Path, env_profile: Option<&str>) -> Option<String> {
+    let toml_path = project_dir.join("duckpack.toml");
+    if toml_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&toml_path) {
+            if let Ok(value) = toml::from_str::<toml::Value>(&content) {
+                if let Some(env_str) = env_profile {
+                    if let Some(env_tbl) = value.get("env").and_then(|e| e.get(env_str)) {
+                        if let Some(cat) = env_tbl.get("database").or_else(|| env_tbl.get("catalog")).and_then(|v| v.as_str()) {
+                            return Some(cat.to_string());
+                        }
+                    }
+                }
+                if let Some(target_tbl) = value.get("target") {
+                    if let Some(cat) = target_tbl.get("database").or_else(|| target_tbl.get("catalog")).and_then(|v| v.as_str()) {
+                        return Some(cat.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Scaffolds a new declarative database project by generating the standard directory structure,

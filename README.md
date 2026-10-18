@@ -16,9 +16,9 @@
 
 ---
 
-DuckPack transforms how you develop with and manage DuckDB. Instead of maintaining fragile imperative `UP` and `DOWN` migration files, you define your desired database state as plain SQL files. DuckPack automatically computes the structural delta, detects renames heuristically, and applies non-destructive updates.
+DuckPack transforms how you develop with and manage DuckDB. Instead of maintaining fragile imperative `UP` and `DOWN` migration files, you define your desired database state as plain SQL files. Acting as a modern **SQL Server Data Tools (SSDT) for DuckDB**, DuckPack automatically computes structural deltas, detects renames heuristically, and applies non-destructive schema migrations.
 
-DuckPack includes a **rich terminal IDE** for live database exploration and first-class **Python bindings** to query and migrate in-memory databases directly inside your Python pipelines and test suites.
+DuckPack includes a **rich terminal IDE** for live database exploration and first-class **Python bindings** to query, migrate, and inspect in-memory and persistent databases directly inside your Python pipelines, test suites, and Jupyter notebooks.
 
 ## 📌 Table of Contents
 
@@ -28,6 +28,12 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
   - [Python Package (pip / uv)](#2-python-package-pip--uv)
   - [Cargo (Rust Developers)](#3-cargo-rust-developers)
 - [📋 CLI Command Reference](#-cli-command-reference)
+- [🏛️ Architecture & Design Philosophy](#️-architecture--design-philosophy)
+  - [DuckPack as "SSDT for DuckDB"](#duckpack-as-ssdt-for-duckdb)
+  - [Engine Scope: DuckDB DDL vs External Query Federation](#engine-scope-duckdb-ddl-vs-external-query-federation)
+  - [Multi-Database Catalog Targeting](#multi-database-catalog-targeting)
+  - [Interactive Apply & Notebook Parity](#interactive-apply--notebook-parity)
+  - [Embedded DuckDB Version Transparency & Diagnostics](#embedded-duckdb-version-transparency--diagnostics)
 - [🧑‍💻 DuckPack Terminal IDE](#-duckpack-terminal-ide)
   - [Keyboard Shortcuts Cheat Sheet](#keyboard-shortcuts-cheat-sheet)
   - [Catalog-Aware Multi-Database Exploration & Cross-DB Joins](#catalog-aware-multi-database-exploration--cross-db-joins)
@@ -37,10 +43,11 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
   - [Dynamic Status Bar & Error Interception](#dynamic-status-bar--error-interception)
 - [🐍 Python Integration](#-python-integration)
   - [1. Interactive In-Memory Debugging (`explore`)](#1-interactive-in-memory-debugging)
-  - [Jupyter Notebook & VS Code Pop-Out Terminal Support](#jupyter-notebook--vs-code-pop-out-terminal-support)
-  - [2. Automated Testing with Pytest (`apply`)](#2-automated-testing-with-pytest)
-  - [3. Pipeline Schema Drift Detection (`diff`)](#3-pipeline-schema-drift-detection)
-  - [4. Python API Reference](#4-python-api-reference)
+    - [Jupyter Notebook & VS Code Pop-Out Terminal Support](#jupyter-notebook--vs-code-pop-out-terminal-support)
+  - [2. Declarative Migrations in Pytest & Pipelines (`apply`)](#2-declarative-migrations-in-pytest--pipelines-apply)
+  - [3. Pipeline Schema Drift Detection (`diff`)](#3-pipeline-schema-drift-detection-diff)
+  - [4. Multi-Database Catalog Targeting in Python](#4-multi-database-catalog-targeting-in-python)
+  - [5. Python API Reference](#5-python-api-reference)
   - [CLI Python Management](#cli-python-management)
 - [🦆 Quack Remote Server Integration](#-quack-remote-server-integration)
   - [Exploring Remote Quack Servers from CLI](#exploring-remote-quack-servers-from-cli)
@@ -58,12 +65,17 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
 
 ## ✨ Features
 
-- **Declarative Schemas:** Define your schemas, tables, views, and macros as raw `.sql` files. No migration timestamps or versions to manage.
+- **Declarative Schema Management ("SSDT for DuckDB"):** Define your schemas, tables, views, and macros as raw `.sql` files. No migration timestamps, sequence numbers, or rollback scripts to maintain.
+- **Catalog-Aware Multi-Database Targeting:** Seamlessly target specific attached databases (via `--database <name>`, `duckpack.toml [target] database = "..."`, or Python `duckpack.apply(con, database="analytics")`) with strict catalog isolation.
+- **Clear Engine Boundary (SSDT vs Federation):** Full declarative DDL lifecycle management specifically engineered for DuckDB, Quack, and MotherDuck. External attached engines (MSSQL, PostgreSQL, MySQL, SQLite) are first-class citizens in Explore for ad-hoc querying, cross-DB joins, and DML (`INSERT INTO`, `UPDATE`), with schema DDL safely managed by external native tools.
+- **Interactive Apply Parity (CLI & Notebook):** Review visual colored diffs and apply migrations interactively with live confirmation prompts in terminal, Python scripts, or Jupyter notebooks (with automated external terminal pop-out).
+- **Schema Drift Detection (`duckpack diff`):** Instant dry-run inspection to detect divergence between your declarative codebase and live databases without mutating state.
 - **Git-Style Smart Renames:** Uses Jaro-Winkler similarity matching (>80%) to detect renamed tables or columns, issuing non-destructive `ALTER TABLE RENAME` statements instead of dropping and recreating data.
 - **Built-in Interactive Terminal IDE:** Explore live databases, write queries with syntax highlighting and autocompletion (`Ctrl+Space`), and manage independent query tabs.
 - **Catalog-Aware Multi-Database Exploration:** Inspect multiple attached catalogs (local DuckDB, in-memory `memory` scratchpad, attached SQLite/Postgres/MySQL/MSSQL, and remote Quack `target_db` instances) in a unified hierarchical tree with catalog-qualified query generation and cross-database joins.
-- **Live Catalog Attach & Detach (`Ctrl+A` / `d`):** Dynamically attach third-party databases, DuckDB files, or remote Quack instances directly inside the IDE without restarting.
+- **Live Catalog Attach & Detach (`Ctrl+A` / `d` / `b`):** Dynamically attach third-party databases, DuckDB files, or remote Quack instances directly inside the IDE without restarting; cycle target catalogs on the fly.
 - **Python Integration with Jupyter / VS Code Support:** Import `duckpack` into Python pipelines, pytest fixtures, or Jupyter notebooks (`duckpack.explore(con)`). Automatically spawns a connected native terminal window in non-interactive notebook environments.
+- **Embedded DuckDB Version Transparency:** Engine version reporting via `duckpack --version` and Python `__duckdb_version__`, backed by proactive storage format compatibility diagnostics.
 - **In-Memory & Remote Attach:** Connect to local files, `:memory:` instances, MotherDuck (`md:...`), or remote DuckDB instances over the [Quack](https://duckdb.org/) protocol.
 - **Remote Query Directive (`-- @remote`):** Forward session-scoped statements (e.g. S3 secrets, settings, and catalog scans) directly to remote engines with automated diagnostic hints.
 - **ASCII & Mermaid.js Schema Visualizer:** Press `Ctrl+G` (or `F2`) to view table relationships and automatically copy formatted Mermaid.js Entity-Relationship diagrams to your system clipboard.
@@ -148,12 +160,101 @@ cargo install duckpack
 | :--- | :--- | :--- | :--- |
 | `duckpack init` | Scaffold a new declarative database project | `-p, --project-dir <DIR>` | `.` |
 | `duckpack build` | Validate SQL syntax against an in-memory Shadow DB | `-p, --project-dir <DIR>` | `.` |
-| `duckpack apply` | Compute diff and apply migrations to target database | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--auto-approve`<br>`--force-drop`<br>`--out <FILE>`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`false`<br>`false`<br>`None`<br>`None`<br>`false` |
-| `duckpack explore` | Open the interactive terminal IDE / query editor | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--remote <SSH_TARGET>`<br>`-P, --port <PORT>`<br>`--auto-install`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`22`<br>`false`<br>`None`<br>`false` |
+| `duckpack diff` | Compare declarative project state against target database without applying changes | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`None`<br>`false` |
+| `duckpack apply` | Compute diff and apply migrations to target database | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--auto-approve`<br>`--interactive`<br>`--force-drop`<br>`--out <FILE>`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`false`<br>`false`<br>`false`<br>`None`<br>`None`<br>`false` |
+| `duckpack explore` | Open the interactive terminal IDE / query editor | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--remote <SSH_TARGET>`<br>`-P, --port <PORT>`<br>`--auto-install`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`None`<br>`22`<br>`false`<br>`None`<br>`false` |
 | `duckpack compile` | Package project into an immutable `.duckpack` snapshot | `-p, --project-dir <DIR>`<br>`-o, --out <FILE>` | `.`<br>*(Required)* |
 | `duckpack deploy` | Deploy compiled project to a remote server over SSH | `-p, --project-dir <DIR>`<br>`-r, --remote <HOST>`<br>`-d, --db <URI>`<br>`-P, --port <PORT>`<br>`--auto-install` | `.`<br>*(Required)*<br>`local.duckdb`<br>`22`<br>`false` |
 | `duckpack python status` | Check if Python bindings are installed in active environment | — | — |
 | `duckpack python install` | Install/upgrade `duckpack` Python package via pip | `--upgrade` | `false` |
+
+---
+
+## 🏛️ Architecture & Design Philosophy
+
+DuckPack is built on core design principles established to provide reliable, enterprise-grade declarative schema management and database exploration for the modern DuckDB ecosystem.
+
+### DuckPack as "SSDT for DuckDB"
+
+For decades, Microsoft's **SQL Server Data Tools (SSDT)** defined the gold standard for enterprise database lifecycle management: developers maintain their desired database state as plain SQL DDL files in source control, and a compiler/engine determines the exact delta and migration plan to bring a live database into alignment.
+
+Traditional data tooling often relies on **imperative migration files** (`001_create_users.sql`, `002_add_email.sql`, `002_rollback.sql`). In analytical and serverless data environments, this model leads to friction:
+- Migrations drift out of sync when schemas are iterated rapidly.
+- Rollbacks are difficult or untested.
+- Branch merges in Git create migration ordering conflicts.
+
+**DuckPack brings the SSDT paradigm to DuckDB:**
+1. **Desired-State First:** You define the current desired state of tables, views, schemas, and macros as plain `.sql` files in your repository (`tables/users.sql`, `views/active_orders.sql`).
+2. **Automated Delta Calculation:** DuckPack parses your codebase into an in-memory Shadow database, inspects the target database catalog, and computes the exact difference (tables to create, columns to alter, views to replace).
+3. **Smart Heuristic Renames:** DuckPack employs Jaro-Winkler string similarity analysis (>80% threshold) on column signatures. If you rename `user_email` to `email_address`, DuckPack issues a non-destructive `ALTER TABLE RENAME COLUMN` rather than dropping the column and losing data.
+4. **Deterministic & Safe Deployments:** In production and CI/CD pipelines, changes can be packaged into an immutable `.duckpack` snapshot artifact or verified dry-run via `duckpack diff`.
+
+### Engine Scope: DuckDB DDL vs External Query Federation
+
+DuckDB has powerful native federation capabilities: via official extensions, DuckDB can attach external relational engines such as PostgreSQL, MySQL, SQLite, and Microsoft SQL Server (MSSQL via ODBC).
+
+A common question is: *Can DuckPack act as a declarative SSDT schema manager for MSSQL or Postgres through DuckDB?*
+
+**The architectural boundary is strictly defined:**
+
+| Capability | DuckDB Native / Quack / MotherDuck | External Engines (MSSQL, Postgres, MySQL, SQLite) |
+| :--- | :---: | :---: |
+| **Interactive Terminal IDE (Explore)** | ✅ Full Support | ✅ Full Support (browse catalogs, inspect tables/columns) |
+| **Cross-Database Joins & Queries** | ✅ Full Support | ✅ Full Support (`SELECT * FROM mssql.tbl JOIN duckdb.tbl`) |
+| **Data Manipulation (DML: `INSERT`, `UPDATE`)** | ✅ Full Support | ✅ Full Support |
+| **Declarative Schema Management (`apply`, `diff`)** | ✅ **Core Purpose** | ❌ **Intentionally Excluded & Guarded** |
+
+#### Why External DDL is Out of Scope for `apply`:
+1. **Dialect Mismatches:** DuckDB's SQL parser and pushdown DDL cannot express enterprise engine-specific features such as SQL Server `IDENTITY(1,1)`, `CLUSTERED INDEX`, `NVARCHAR(MAX) FILESTREAM`, partitioned tables, or T-SQL triggers.
+2. **Silent Failure & Loss of Semantics:** Applying DuckDB DDL to an attached external engine strips database-specific column constraints, default expressions, and index options.
+3. **Guardrails:** If you accidentally attempt to run `duckpack apply --database mssql_db`, DuckPack inspects `duckdb_databases()`, detects the engine type, and halts immediately with an informative message guiding you to use native tools (SSDT, Flyway, Liquibase, Alembic) for external engines while keeping DuckPack for your DuckDB workloads.
+
+### Multi-Database Catalog Targeting
+
+Modern analytical setups attach multiple databases simultaneously (e.g. `ATTACH 'analytics.duckdb' AS analytics;`). DuckPack provides fine-grained catalog targeting across the CLI, configuration files, Python API, and TUI:
+
+#### Resolution Hierarchy:
+1. **CLI Flag:** `--database <NAME>` or `--catalog <NAME>` (e.g. `duckpack apply --database analytics`).
+2. **Python Parameter:** `duckpack.apply(con, database="analytics")` or `duckpack.diff(con, database="analytics")`.
+3. **Configuration File:** `duckpack.toml` target or environment setting:
+   ```toml
+   [target]
+   database = "analytics"
+   ```
+4. **Active Fallback:** The active database returned by `current_database()` (or `memory` for standalone in-memory sessions).
+
+#### Strict Catalog Isolation:
+When a specific catalog is targeted:
+- DuckPack introspects *only* tables, views, and macros belonging to that specific catalog (`database_name = '<name>'`), ignoring objects in other attached databases.
+- Migrations are executed within the target database context using safe `USE "<database>"` switching, ensuring unqualified DDL statements deploy cleanly without touching default or scratchpad databases.
+- In the TUI Explorer, press **`b`** to cycle between attached writable DuckDB catalogs for diff and apply operations.
+
+### Interactive Apply & Notebook Parity
+
+DuckPack bridges the gap between terminal CLI power users, CI/CD pipelines, and Python data scientists:
+
+- **CLI Workflow:** By default, `duckpack apply` opens a rich, color-coded visual confirmation screen listing every added table, altered column, and replaced view before applying changes. Press `y` to confirm, `n` / `Esc` to cancel, or `e` to jump directly into the Explore IDE. (Pass `--auto-approve` for non-interactive CI/CD runs).
+- **Python Script Parity:** Calling `duckpack.apply(con, auto_approve=False)` (or `interactive=True`) brings the exact same interactive visual approval workflow to Python scripts.
+- **Jupyter & VS Code Notebook Parity:** In notebook environments lacking an interactive TTY, DuckPack automatically spins up a background bridge and spawns a connected external terminal window (Ghostty, Foot, Kitty, WezTerm, Alacritty, GNOME Terminal, Konsole, Windows Terminal, or macOS Terminal.app). Developers get the full interactive confirmation UI without notebook hang-ups.
+
+### Embedded DuckDB Version Transparency & Diagnostics
+
+DuckPack embeds DuckDB directly as an in-process engine:
+
+- **Storage Stability:** DuckDB has guaranteed forward and backward storage format compatibility for `.duckdb` files across minor versions following DuckDB v1.0.0.
+- **Engine Transparency:** Check the exact embedded DuckDB engine version anytime via:
+  ```bash
+  duckpack --version
+  # DuckPack v0.2.0 (embedded DuckDB v1.2.0)
+  ```
+  Or in Python:
+  ```python
+  import duckpack
+
+  print(duckpack.__version__)         # e.g. "0.2.0"
+  print(duckpack.__duckdb_version__)  # e.g. "1.2.0"
+  ```
+- **Proactive Storage Diagnostics:** If an older database file with an incompatible legacy storage format is encountered, DuckPack catches the internal engine error and prints clear migration guidance rather than an unhelpful internal crash dump.
 
 ---
 
@@ -215,7 +316,11 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | | `q` / `s` | **Query table/view** (generates catalog-qualified SQL into editor) |
 | | `Ctrl+A` | **Attach Database** dialog (DuckDB, SQLite, Postgres, MySQL, MSSQL, Quack) |
 | | `d` | **Detach Database** from current session |
+| | `b` | **Cycle Target Catalog** for diff/apply operations |
 | | `r` / `R` | **Refresh catalog** from live/remote database (preserves open state) |
+| **Apply Review Screen** | `y` | **Confirm and apply** all pending declarative migrations |
+| | `n` / `Esc` | **Abort and cancel** migrations without modifying database |
+| | `e` | **Explore IDE:** launch full terminal query IDE on target database |
 | **Results Grid** | `Arrows` | Scroll vertically through rows and horizontally through columns |
 | | `Shift + ◄ / ►` | Fast horizontal scroll across wide result tables |
 | | `Home` / `End` | Jump directly to the **First** / **Last** column |
@@ -310,7 +415,7 @@ duckpack.explore(con)
 
 ---
 
-### 2. Automated Testing with Pytest
+### 2. Declarative Migrations in Pytest & Pipelines (`apply`)
 
 Maintain a single declarative SQL project and automatically apply it to fresh in-memory test databases:
 
@@ -322,26 +427,33 @@ import pytest
 
 @pytest.fixture
 def db():
-  # Spin up an isolated in-memory test database
-  con = duckdb.connect()
+    # Spin up an isolated in-memory test database
+    con = duckdb.connect()
 
-  # Apply all schemas, tables, views, and macros from your declarative project:
-  result = duckpack.apply(con, project_dir="./duckdb_project", auto_approve=True)
-  assert result.success
+    # Apply all schemas, tables, views, and macros from your declarative project:
+    result = duckpack.apply(con, project_dir="./duckdb_project", auto_approve=True)
+    assert result.success
 
-  yield con
-  con.close()
+    yield con
+    con.close()
 
 
 def test_user_creation(db):
-  db.execute("INSERT INTO users (id, name) VALUES (42, 'Bob');")
-  count = db.execute("SELECT count(*) FROM users;").fetchone()[0]
-  assert count == 1
+    db.execute("INSERT INTO users (id, name) VALUES (42, 'Bob');")
+    count = db.execute("SELECT count(*) FROM users;").fetchone()[0]
+    assert count == 1
+```
+
+For interactive review before applying changes in your Python scripts or Jupyter notebooks, set `auto_approve=False` (or `interactive=True`). In Jupyter or VS Code, DuckPack automatically launches a connected native terminal window:
+
+```python
+# Launch interactive TUI diff review screen before applying:
+result = duckpack.apply(con, project_dir="./duckdb_project", auto_approve=False)
 ```
 
 ---
 
-### 3. Pipeline Schema Drift Detection
+### 3. Pipeline Schema Drift Detection (`diff`)
 
 Check if an analytical database matches your version-controlled SQL definitions before running ETL/ELT pipelines:
 
@@ -355,30 +467,65 @@ con = duckdb.connect("production.duckdb")
 diff = duckpack.diff(con, project_dir="./duckdb_project")
 
 if diff.has_changes:
-  print(f"Schema drift detected ({diff.change_count} changes):")
-  for change in diff.items:
-    print(f" - {change}")
-  raise RuntimeError("Database schema does not match codebase!")
+    print(f"Schema drift detected ({diff.change_count} changes):")
+    for change in diff.items:
+        print(f" - {change}")
+    raise RuntimeError("Database schema does not match codebase!")
 ```
 
 ---
 
-### 4. Python API Reference
+### 4. Multi-Database Catalog Targeting in Python
+
+When working with DuckDB connections that attach multiple databases, use the `database` (or `catalog`) parameter to isolate migrations and drift checks to that specific catalog:
+
+```python
+import duckdb
+import duckpack
+
+con = duckdb.connect()
+
+# Attach an external analytics database
+con.execute("ATTACH 'analytics.duckdb' AS analytics;")
+
+# Target only 'analytics' (ignores tables in default/memory catalog)
+diff = duckpack.diff(con, project_dir="./analytics_repo", database="analytics")
+
+if diff.has_changes:
+    print(f"Pending changes for analytics: {diff.change_count}")
+
+# Interactively review diff and apply to 'analytics'
+# (Spawns a connected terminal pop-out in Jupyter / VS Code)
+result = duckpack.apply(
+    con,
+    project_dir="./analytics_repo",
+    database="analytics",
+    auto_approve=False  # or interactive=True
+)
+```
+
+---
+
+### 5. Python API Reference
 
 ```python
 import duckpack
 ```
 
+#### Engine Version Properties
+- **`duckpack.__version__: str`**: The version of DuckPack (e.g. `"0.2.0"`).
+- **`duckpack.__duckdb_version__: str`**: The embedded DuckDB engine version (e.g. `"1.2.0"`).
+
 #### Functions
 
-- **`duckpack.explore(target, project_dir=".", quack_token=None, insecure=False, open_window=True, wait=True) -> None`**
-  Launches the interactive TUI IDE against a live connection (`duckdb.DuckDBPyConnection`) or database URI (`str`). In non-TTY environments (Jupyter/VS Code), automatically launches a connected terminal window.
+- **`duckpack.explore(target, project_dir=".", quack_token=None, insecure=False, open_window=True, wait=True, database=None, catalog=None) -> None`**
+  Launches the interactive TUI IDE against a live connection (`duckdb.DuckDBPyConnection`) or database URI (`str`). In non-TTY environments (Jupyter/VS Code), automatically launches a connected terminal window. Pass `database` to focus on a specific attached catalog.
 
-- **`duckpack.apply(target, project_dir=".", auto_approve=True, force_drop=False, interactive=False) -> ApplyResult`**
-  Computes schema diffs and applies declarative migrations. Returns an `ApplyResult`.
+- **`duckpack.apply(target, project_dir=".", auto_approve=True, force_drop=False, interactive=False, database=None, catalog=None) -> ApplyResult`**
+  Computes schema diffs and applies declarative migrations. In interactive mode (`auto_approve=False` or `interactive=True`), opens the visual review TUI. Pass `database` to target an attached catalog. Returns an `ApplyResult`.
 
-- **`duckpack.diff(target, project_dir=".") -> DiffSummary`**
-  Compares declarative project state against target database. Returns a `DiffSummary`.
+- **`duckpack.diff(target, project_dir=".", database=None, catalog=None) -> DiffSummary`**
+  Compares declarative project state against target database or attached catalog without mutating data. Returns a `DiffSummary`.
 
 - **`duckpack.compile(project_dir, out) -> None`**
   Compiles project SQL definitions into an immutable `.duckpack` snapshot file.
@@ -517,7 +664,7 @@ my_project/
 
 ### Configuration (`duckpack.toml`)
 
-Define multiple environments to avoid hardcoding database paths:
+Define multiple environments and default attached catalogs to avoid hardcoding database paths:
 
 ```toml
 [project]
@@ -526,21 +673,25 @@ version = "0.2.0"
 
 [target]
 default_db = "dev.duckdb"
+database = "analytics"     # Optional: default attached catalog name to target
 
 [env.dev]
 db = "dev.duckdb"
 
 [env.staging]
 db = "staging.duckdb"
+database = "analytics_stg"
 
 [env.prod]
 db = "md:prod_db" # Points directly to MotherDuck!
+database = "analytics"
 ```
 
 Deploy or explore against any profile:
 ```bash
 duckpack apply --env staging
 duckpack explore --env prod
+duckpack diff --env dev --database analytics
 ```
 
 ### Environment Variables (`.env`)

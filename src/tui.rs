@@ -24,6 +24,7 @@ pub enum TuiAction {
     Pull { obj_name: String, item_type: DiffItemType },
     Explore,
     CopyStatus,
+    SwitchCatalog,
 }
 
 /// Recalculates the locked state of all diff items based on their dependencies.
@@ -344,7 +345,7 @@ pub fn draw_and_handle_events(
             } else if show_help {
                 "Press 'Esc' or 'q' to close help"
             } else {
-                "Press 'Enter' to Apply, 'Space' to toggle, '?' or 'h' for Help, 'Esc' or 'q' to Quit"
+                "Press 'Enter' to Apply, 'Space' to toggle, 'b' to switch DB, '?' for Help, 'Esc' or 'q' to Quit"
             };
 
             let footer = Paragraph::new(Span::styled(footer_text, Style::default().fg(Color::Cyan)))
@@ -403,6 +404,7 @@ pub fn draw_and_handle_events(
 
                 let help_lines = vec![
                     ratatui::text::Line::from(vec![ratatui::text::Span::styled(" [?]       ", Style::default().fg(Color::Cyan)), ratatui::text::Span::raw("Toggle Help Menu")]),
+                    ratatui::text::Line::from(vec![ratatui::text::Span::styled(" [b]       ", Style::default().fg(Color::Cyan)), ratatui::text::Span::raw("Switch target database catalog")]),
                     ratatui::text::Line::from(vec![ratatui::text::Span::styled(" [p]       ", Style::default().fg(Color::Cyan)), ratatui::text::Span::raw("Pull dropped item down to local files")]),
                     ratatui::text::Line::from(vec![ratatui::text::Span::styled(" [v]       ", Style::default().fg(Color::Cyan)), ratatui::text::Span::raw("Toggle visibility of .duckdbignore items")]),
                     ratatui::text::Line::from(vec![ratatui::text::Span::styled(" [d]       ", Style::default().fg(Color::Cyan)), ratatui::text::Span::raw("Toggle destructive mode (force drop)")]),
@@ -466,6 +468,9 @@ pub fn draw_and_handle_events(
                         if key.modifiers.contains(event::KeyModifiers::CONTROL) || !key.modifiers.contains(event::KeyModifiers::CONTROL) {
                             return Ok(TuiAction::Refresh);
                         }
+                    }
+                    KeyCode::Char('b') => {
+                        return Ok(TuiAction::SwitchCatalog);
                     }
                     KeyCode::Char('e') => {
                         return Ok(TuiAction::Explore);

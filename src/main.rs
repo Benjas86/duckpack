@@ -64,6 +64,9 @@ enum Commands {
         /// The connection string or path to the target DuckDB database
         #[arg(short, long, default_value = "local.duckdb")]
         db: String,
+        /// Target database catalog name if multiple databases are attached
+        #[arg(long, visible_alias = "catalog")]
+        database: Option<String>,
         /// Allow destructive drops (tables/columns)
         #[arg(long)]
         force_drop: bool,
@@ -76,6 +79,28 @@ enum Commands {
         /// Quack authentication token
         #[arg(long)]
         quack_token: Option<String>,
+        /// Disable SSL/TLS verification for Quack connection (plain HTTP)
+        #[arg(long, visible_alias = "insecure", alias = "quack-insecure")]
+        quack_disable_ssl: bool,
+    },
+    /// Show schema differences between project and target database
+    Diff {
+        /// The path to the DuckDB project directory
+        #[arg(short, long, default_value = ".")]
+        project_dir: PathBuf,
+
+        /// The connection string or path to the target DuckDB database
+        #[arg(short, long, default_value = "local.duckdb")]
+        db: String,
+
+        /// Target database catalog name if multiple databases are attached
+        #[arg(long, visible_alias = "catalog")]
+        database: Option<String>,
+
+        /// Quack authentication token
+        #[arg(long)]
+        quack_token: Option<String>,
+
         /// Disable SSL/TLS verification for Quack connection (plain HTTP)
         #[arg(long, visible_alias = "insecure", alias = "quack-insecure")]
         quack_disable_ssl: bool,
@@ -116,6 +141,9 @@ enum Commands {
         /// The connection string or path to the target DuckDB database
         #[arg(short, long, default_value = "local.duckdb")]
         db: String,
+        /// Target database catalog name if multiple databases are attached
+        #[arg(long, visible_alias = "catalog")]
+        database: Option<String>,
         /// The remote server SSH target (e.g. user@10.0.0.5)
         #[arg(long)]
         remote: Option<String>,
@@ -166,6 +194,7 @@ fn main() -> Result<()> {
         Commands::Init { project_dir } => project_dir,
         Commands::Build { project_dir } => project_dir,
         Commands::Apply { project_dir, .. } => project_dir,
+        Commands::Diff { project_dir, .. } => project_dir,
         Commands::Compile { project_dir, .. } => project_dir,
         Commands::Deploy { project_dir, .. } => project_dir,
         Commands::Explore { project_dir, .. } => project_dir,
@@ -192,6 +221,7 @@ fn main() -> Result<()> {
                                 // Override the db argument for applicable commands
                                 match &mut cli.command {
                                     Commands::Apply { db, .. } |
+                                    Commands::Diff { db, .. } |
                                     Commands::Deploy { db, .. } |
                                     Commands::Explore { db, .. } => {
                                         *db = toml_db.clone();
@@ -217,11 +247,60 @@ fn main() -> Result<()> {
             let _ = build_shadow_db(project_dir)?;
             println!("Build successful! All SQL syntax is valid.");
         }
-        Commands::Apply { project_dir, db, force_drop, auto_approve, out, quack_token, quack_disable_ssl } => {
+        Commands::Diff { project_dir, db, database, quack_token, quack_disable_ssl } => {
             if !project_dir.exists() {
                 eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
                 return Ok(());
             }
+
+            let configured_catalog = database.clone().or_else(|| resolve_project_catalog(project_dir, cli.env.as_deref()));
+            let shadow_conn = build_shadow_db(project_dir)?;
+            let target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+            let active_catalog = diff::validate_target_catalog(&target_conn, configured_catalog.as_deref(), false)?;
+
+            let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
+            let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
+            let shadow_schema = diff::get_schema(&shadow_conn, None)?;
+            let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
+            let shadow_views = diff::get_views(&shadow_conn, None)?;
+            let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
+            let shadow_macros = diff::get_macros(&shadow_conn, None)?;
+            let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
+            let ignore_list = load_ignore_rules(project_dir);
+
+            let diff_result = diff::compute_diff(
+                &shadow_schemas,
+                &target_schemas,
+                &shadow_schema, 
+                &target_schema, 
+                &shadow_views, 
+                &target_views, 
+                &shadow_macros, 
+                &target_macros, 
+                project_dir,
+                &ignore_list
+            );
+
+            let unignored_items: Vec<_> = diff_result.items.iter().filter(|i| !i.ignored).collect();
+            if unignored_items.is_empty() {
+                println!("Target database catalog '{}' is up to date (0 pending changes).", active_catalog);
+            } else {
+                println!("Found {} pending change(s) for catalog '{}':", unignored_items.len(), active_catalog);
+                for item in unignored_items {
+                    println!("  • {:?}: {}", item.item_type, item.obj_name);
+                }
+            }
+        }
+        Commands::Apply { project_dir, db, database, force_drop, auto_approve, out, quack_token, quack_disable_ssl } => {
+            if !project_dir.exists() {
+                eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
+                return Ok(());
+            }
+
+            let configured_catalog = database.clone().or_else(|| resolve_project_catalog(project_dir, cli.env.as_deref()));
+            let init_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+            let mut active_catalog = diff::validate_target_catalog(&init_conn, configured_catalog.as_deref(), true)?;
+            drop(init_conn);
 
             let mut terminal = if !*auto_approve && out.is_none() {
                 ratatui::crossterm::terminal::enable_raw_mode()?;
@@ -233,23 +312,22 @@ fn main() -> Result<()> {
                 None
             };
 
-            let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh.");
+            let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh, 'b' to switch catalog.");
             let mut current_force_drop = *force_drop;
             let mut inspect_data: Option<(String, Vec<String>, Vec<Vec<String>>, i64)> = None;
 
             loop {
                 let shadow_conn = build_shadow_db(project_dir)?;
-                
                 let target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
                 
-                let shadow_schemas = diff::get_schemas(&shadow_conn)?;
-                let target_schemas = diff::get_schemas(&target_conn)?;
-                let shadow_schema = diff::get_schema(&shadow_conn)?;
-                let target_schema = diff::get_schema(&target_conn)?;
-                let shadow_views = diff::get_views(&shadow_conn)?;
-                let target_views = diff::get_views(&target_conn)?;
-                let shadow_macros = diff::get_macros(&shadow_conn)?;
-                let target_macros = diff::get_macros(&target_conn)?;
+                let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
+                let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
+                let shadow_schema = diff::get_schema(&shadow_conn, None)?;
+                let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
+                let shadow_views = diff::get_views(&shadow_conn, None)?;
+                let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
+                let shadow_macros = diff::get_macros(&shadow_conn, None)?;
+                let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
                 let ignore_list = load_ignore_rules(project_dir);
 
                 let mut diff_result = diff::compute_diff(
@@ -290,9 +368,9 @@ fn main() -> Result<()> {
 
                 if *auto_approve {
                     let remote = is_remote(db);
-                    let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir);
+                    let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
                     if apply_success.is_ok() {
-                        println!("Changes applied automatically!");
+                        println!("Changes applied automatically to catalog '{}'!", active_catalog);
                     } else {
                         eprintln!("Error applying schema: {:?}", apply_success.err());
                     }
@@ -300,10 +378,27 @@ fn main() -> Result<()> {
                 }
 
                 if let Some(term) = &mut terminal {
-                    match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data, &db)? {
+                    let title = format!("{} [{}]", db, active_catalog);
+                    match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data, &title)? {
                         tui::TuiAction::Quit => {
                             break;
                         }
+                    tui::TuiAction::SwitchCatalog => {
+                        let attached = diff::list_attached_databases(&target_conn).unwrap_or_default();
+                        let writable_dbs: Vec<_> = attached
+                            .into_iter()
+                            .filter(|d| !d.readonly && (d.db_type.eq_ignore_ascii_case("duckdb") || d.db_type.eq_ignore_ascii_case("quack")))
+                            .collect();
+                        if writable_dbs.len() > 1 {
+                            let curr_idx = writable_dbs.iter().position(|d| d.name.eq_ignore_ascii_case(&active_catalog)).unwrap_or(0);
+                            let next_idx = (curr_idx + 1) % writable_dbs.len();
+                            active_catalog = writable_dbs[next_idx].name.clone();
+                            status_msg = format!("Switched target catalog to '{}'", active_catalog);
+                        } else {
+                            status_msg = format!("Catalog '{}' is the only writable DuckDB database attached.", active_catalog);
+                        }
+                        continue;
+                    }
                     tui::TuiAction::CopyStatus => {
                         let _ = std::fs::write("duckpack.log", &status_msg);
                         status_msg = "Status text copied to duckpack.log!".to_string();
@@ -392,7 +487,7 @@ fn main() -> Result<()> {
                                 let _ = fs::copy(&db_path, &b_path);
                             }
                             
-                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir);
+                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
                             
                             if apply_success.is_ok() {
                                 status_msg = "Changes applied successfully!".to_string();
@@ -408,7 +503,7 @@ fn main() -> Result<()> {
                                 }
                             }
                         } else {
-                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir);
+                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
                             if apply_success.is_ok() {
                                 status_msg = "Changes applied successfully to remote database!".to_string();
                             } else {
@@ -486,7 +581,7 @@ fn main() -> Result<()> {
             }
             println!("Compilation complete! Artifact: {}", out);
         }
-        Commands::Explore { project_dir, db, remote, port, auto_install, quack_token, quack_disable_ssl } => {
+        Commands::Explore { project_dir, db, database, remote, port, auto_install, quack_token, quack_disable_ssl } => {
             if let Some(r) = remote {
                 let mut remote_bin = "duckpack".to_string();
                 let mut remote_tmp_bin = None;
@@ -533,6 +628,9 @@ fn main() -> Result<()> {
                 
                 println!("Launching remote TUI over SSH...");
                 let mut remote_cmd = format!("{} explore --project-dir {} --db {}", remote_bin, remote_tmp_proj, db);
+                if let Some(cat) = database {
+                    remote_cmd.push_str(&format!(" --database {}", cat));
+                }
                 if let Some(token) = quack_token {
                     remote_cmd.push_str(&format!(" --quack-token {}", token));
                 }
@@ -588,6 +686,10 @@ fn main() -> Result<()> {
             let mut terminal = ratatui::Terminal::new(backend)?;
 
             let target_conn = connect_target_db(&db, quack_token.as_deref(), *quack_disable_ssl)?;
+            let configured_catalog = database.clone().or_else(|| resolve_project_catalog(&project_dir, cli.env.as_deref()));
+            if let Some(cat) = configured_catalog {
+                let _ = target_conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
+            }
 
             ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db)?;
 
