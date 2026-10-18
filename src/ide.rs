@@ -369,6 +369,37 @@ pub struct ExplorerMetadata {
     pub dictionary: Vec<String>,
 }
 
+fn collect_queries_recursive(dir: &Path, base: &Path, queries: &mut Vec<String>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut sorted_entries: Vec<_> = entries.flatten().collect();
+        sorted_entries.sort_by_key(|e| e.path());
+        for entry in sorted_entries {
+            let path = entry.path();
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            // Ignore hidden files and directories (like .history.sql or .git)
+            if file_name.starts_with('.') {
+                continue;
+            }
+
+            if path.is_dir() {
+                collect_queries_recursive(&path, base, queries);
+            } else if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if ext.eq_ignore_ascii_case("sql") {
+                        if let Ok(rel) = path.strip_prefix(base) {
+                            queries.push(rel.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn load_explorer_metadata(
     conn: &Connection,
     project_dir: &Path,
@@ -763,17 +794,7 @@ pub fn load_explorer_metadata(
     let mut queries: Vec<String> = Vec::new();
     let queries_dir = project_dir.join("queries");
     if queries_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&queries_dir) {
-            for entry in entries.flatten() {
-                if let Some(ext) = entry.path().extension() {
-                    if ext == "sql" {
-                        if let Some(name) = entry.file_name().to_str() {
-                            queries.push(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
+        collect_queries_recursive(&queries_dir, &queries_dir, &mut queries);
     }
     queries.sort();
 
@@ -2791,6 +2812,9 @@ pub fn run_ide_loop(
             meta = load_explorer_metadata(conn, project_dir, is_quack);
             dictionary = meta.dictionary.clone();
             autocomplete_matches.clear();
+            if !meta.queries.is_empty() {
+                expanded_groups.insert("Queries".to_string());
+            }
             explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
             if let Some(sel) = prev_selected {
                 explorer_state.select(Some(sel.min(explorer_items.len().saturating_sub(1))));
@@ -3424,5 +3448,32 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&temp_dir);
         }
+    }
+
+    #[test]
+    fn test_collect_queries_recursive() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_queries_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let queries_dir = temp_dir.join("queries");
+        let mssql_sub = queries_dir.join("mssql");
+        std::fs::create_dir_all(&mssql_sub).unwrap();
+
+        std::fs::write(queries_dir.join("test_root.sql"), "SELECT 1;").unwrap();
+        std::fs::write(queries_dir.join("UPPERCASE.SQL"), "SELECT 2;").unwrap();
+        std::fs::write(queries_dir.join(".history.sql"), "SELECT 3;").unwrap();
+        std::fs::write(queries_dir.join("notes.txt"), "some notes").unwrap();
+        std::fs::write(mssql_sub.join("orders.sql"), "SELECT * FROM mssql.orders;").unwrap();
+
+        let mut queries = Vec::new();
+        collect_queries_recursive(&queries_dir, &queries_dir, &mut queries);
+        queries.sort();
+
+        assert_eq!(queries.len(), 3);
+        assert!(queries.contains(&"UPPERCASE.SQL".to_string()));
+        assert!(queries.contains(&"test_root.sql".to_string()));
+        assert!(queries.contains(&"mssql/orders.sql".to_string()));
+        assert!(!queries.contains(&".history.sql".to_string()));
+        assert!(!queries.contains(&"notes.txt".to_string()));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

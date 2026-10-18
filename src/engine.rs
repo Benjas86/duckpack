@@ -568,6 +568,65 @@ pub fn load_ignore_rules(project_dir: &Path) -> Vec<String> {
     rules
 }
 
+/// Auto-discovers the active DuckPack project directory.
+/// If `start` contains `duckpack.toml`, `queries/`, `tables/`, or `schemas/`, it is returned.
+/// Otherwise, checks candidate subdirectories (e.g. `duckpack/`, `duckdb_project/`, `demo_project/`),
+/// and then checks parent directories.
+pub fn discover_project_dir(start: &Path) -> PathBuf {
+    // 1. If start already has duckpack markers, use it
+    if is_project_root(start) {
+        return start.to_path_buf();
+    }
+
+    // 2. Check candidate subdirectories
+    let candidates = ["duckpack", "duckdb_project", "duckdb", "project", "demo_project"];
+    for sub in &candidates {
+        let sub_path = start.join(sub);
+        if sub_path.is_dir() && is_project_root(&sub_path) {
+            return sub_path;
+        }
+    }
+
+    // Check all immediate subdirectories
+    if let Ok(entries) = fs::read_dir(start) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    let p = entry.path();
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                    if !name.starts_with('.')
+                        && !name.starts_with("target")
+                        && !name.starts_with("node_modules")
+                        && !name.starts_with("venv")
+                        && is_project_root(&p)
+                    {
+                        return p;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Check parent directories up to root
+    let mut current = start.parent();
+    while let Some(parent) = current {
+        if is_project_root(parent) {
+            return parent.to_path_buf();
+        }
+        current = parent.parent();
+    }
+
+    // Default fallback
+    start.to_path_buf()
+}
+
+fn is_project_root(path: &Path) -> bool {
+    path.join("duckpack.toml").exists()
+        || path.join("queries").is_dir()
+        || path.join("tables").is_dir()
+        || path.join("schemas").is_dir()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +651,23 @@ mod tests {
         let err2 = "IO Error: File not found";
         let diag2 = diagnose_storage_version_error(err2, "prod.duckdb");
         assert!(diag2.is_none());
+    }
+
+    #[test]
+    fn test_discover_project_dir() {
+        let temp_dir = std::env::temp_dir().join(format!("duckpack_test_disc_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let sub_proj = temp_dir.join("duckpack");
+        std::fs::create_dir_all(sub_proj.join("queries")).unwrap();
+        std::fs::write(sub_proj.join("duckpack.toml"), "[project]\nname=\"test\"").unwrap();
+
+        // From root temp_dir, it should discover sub_proj
+        let discovered = discover_project_dir(&temp_dir);
+        assert_eq!(discovered, sub_proj);
+
+        // From inside sub_proj, it should discover sub_proj directly
+        let direct = discover_project_dir(&sub_proj);
+        assert_eq!(direct, sub_proj);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
