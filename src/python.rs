@@ -1166,7 +1166,13 @@ pub fn explore(
     quack_token: Option<&str>,
     insecure: bool,
 ) -> PyResult<()> {
-    let p_dir = PathBuf::from(project_dir);
+    let mut p_dir = PathBuf::from(project_dir);
+    if p_dir == PathBuf::from(".") {
+        let disc = engine::discover_project_dir(&p_dir);
+        if disc != p_dir {
+            p_dir = disc;
+        }
+    }
     let req_catalog = database.or(catalog).map(|s| s.to_string()).or_else(|| engine::resolve_project_catalog(&p_dir, None));
 
     if let Ok(db_str) = target.extract::<String>() {

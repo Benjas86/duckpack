@@ -665,11 +665,16 @@ fn main() -> Result<()> {
             }
 
             let mut project_dir = project_dir.clone();
-            if project_dir == std::path::PathBuf::from(".") && !db.starts_with("quack:") && !is_remote(&db) {
-                let db_path = std::path::PathBuf::from(&db);
-                if let Some(parent) = db_path.parent() {
-                    if parent != std::path::Path::new("") {
-                        project_dir = parent.to_path_buf();
+            if project_dir == std::path::PathBuf::from(".") {
+                let discovered = discover_project_dir(&project_dir);
+                if discovered != project_dir {
+                    project_dir = discovered;
+                } else if !db.starts_with("quack:") && !is_remote(&db) {
+                    let db_path = std::path::PathBuf::from(&db);
+                    if let Some(parent) = db_path.parent() {
+                        if parent != std::path::Path::new("") {
+                            project_dir = parent.to_path_buf();
+                        }
                     }
                 }
             }

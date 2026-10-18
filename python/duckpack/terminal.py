@@ -127,12 +127,22 @@ def launch_terminal_window(
             cleanup_fn = cleanup
 
     # 2. Build the command to run inside the terminal
+    eff_proj = project_dir
+    if eff_proj == ".":
+        for cand in ["duckpack", "duckdb_project", "duckdb", "demo_project"]:
+            if os.path.isdir(cand) and (
+                os.path.isdir(os.path.join(cand, "queries"))
+                or os.path.exists(os.path.join(cand, "duckpack.toml"))
+            ):
+                eff_proj = cand
+                break
+
     if mode == "apply":
-        cli_cmd = [sys.executable, "-m", "duckpack", "apply", "-p", project_dir, "-d", db_arg, "--interactive"]
+        cli_cmd = [sys.executable, "-m", "duckpack", "apply", "-p", eff_proj, "-d", db_arg, "--interactive"]
         if force_drop:
             cli_cmd.append("--force-drop")
     else:
-        cli_cmd = [sys.executable, "-m", "duckpack", "explore", "-p", project_dir, "-d", db_arg]
+        cli_cmd = [sys.executable, "-m", "duckpack", "explore", "-p", eff_proj, "-d", db_arg]
 
     if active_cat:
         cli_cmd.extend(["--database", active_cat])
