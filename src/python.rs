@@ -487,7 +487,12 @@ fn run_apply_tui(
             &ignore_list,
         );
 
-        let title = format!("{} [{}]", db_target, active_catalog);
+        let display_target = if db_target.starts_with("quack:localhost:") || db_target.starts_with("quack:127.0.0.1:") {
+            format!("{} (Python In-Memory)", db_target)
+        } else {
+            db_target.to_string()
+        };
+        let title = format!("{} [{}]", display_target, active_catalog);
         let action = crate::tui::draw_and_handle_events(
             &mut terminal,
             &mut diff_result,

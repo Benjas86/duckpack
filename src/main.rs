@@ -378,7 +378,12 @@ fn main() -> Result<()> {
                 }
 
                 if let Some(term) = &mut terminal {
-                    let title = format!("{} [{}]", db, active_catalog);
+                    let display_db = if db.starts_with("quack:localhost:") || db.starts_with("quack:127.0.0.1:") {
+                        format!("{} (Python In-Memory)", db)
+                    } else {
+                        db.clone()
+                    };
+                    let title = format!("{} [{}]", display_db, active_catalog);
                     match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data, &title)? {
                         tui::TuiAction::Quit => {
                             break;
@@ -475,10 +480,11 @@ fn main() -> Result<()> {
                     tui::TuiAction::Apply => {
                         status_msg = "Applying changes...".to_string();
                         if let Some(term) = &mut terminal {
-                            let _ = tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, true, &inspect_data, &db);
+                            let _ = tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, true, &inspect_data, &title);
                         }
 
                         let remote = is_remote(db);
+                        let applied_count = diff_result.items.iter().filter(|i| i.selected && !i.ignored).count();
                         if !remote {
                             let db_path = PathBuf::from(db);
                             let mut b_path = db_path.clone();
@@ -490,10 +496,17 @@ fn main() -> Result<()> {
                             let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
                             
                             if apply_success.is_ok() {
-                                status_msg = "Changes applied successfully!".to_string();
                                 if b_path.exists() {
                                     fs::remove_file(&b_path).ok();
                                 }
+                                if let Some(term) = &mut terminal {
+                                    ratatui::crossterm::terminal::disable_raw_mode()?;
+                                    ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen, ratatui::crossterm::event::DisableMouseCapture)?;
+                                    term.show_cursor()?;
+                                }
+                                terminal = None;
+                                println!("🦆 DuckPack: Applied {} change(s) successfully to '{}'.", applied_count, active_catalog);
+                                break;
                             } else {
                                 status_msg = format!("Error applying schema: {:?}", apply_success.err());
                                 drop(target_conn); 
@@ -505,7 +518,14 @@ fn main() -> Result<()> {
                         } else {
                             let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
                             if apply_success.is_ok() {
-                                status_msg = "Changes applied successfully to remote database!".to_string();
+                                if let Some(term) = &mut terminal {
+                                    ratatui::crossterm::terminal::disable_raw_mode()?;
+                                    ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen, ratatui::crossterm::event::DisableMouseCapture)?;
+                                    term.show_cursor()?;
+                                }
+                                terminal = None;
+                                println!("🦆 DuckPack: Applied {} change(s) successfully to remote database ('{}').", applied_count, active_catalog);
+                                break;
                             } else {
                                 status_msg = format!("Error applying schema to remote database: {:?}", apply_success.err());
                             }
