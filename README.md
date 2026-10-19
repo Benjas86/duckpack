@@ -406,8 +406,14 @@ con.execute(
     " range(500);"
 )
 
-# Automatically pops open an external connected terminal window:
+# Option A: Zero arguments (auto-resolves target, endpoint, and credentials from duckpack.toml / .env)
+duckpack.explore()
+
+# Option B: Pass live in-memory connection (auto-attaches external databases from duckpack.toml)
 duckpack.explore(con)
+
+# Option C: Switch environment profile directly in Python
+duckpack.explore(env="staging")
 
 # Optional controls:
 # duckpack.explore(con, open_window=False)  # Force in-cell formatted overview (headless mode)
@@ -519,14 +525,14 @@ import duckpack
 
 #### Functions
 
-- **`duckpack.explore(target, project_dir=".", quack_token=None, insecure=False, open_window=True, wait=True, database=None, catalog=None) -> None`**
-  Launches the interactive TUI IDE against a live connection (`duckdb.DuckDBPyConnection`) or database URI (`str`). In non-TTY environments (Jupyter/VS Code), automatically launches a connected terminal window. Pass `database` to focus on a specific attached catalog.
+- **`duckpack.explore(target=None, project_dir=".", quack_token=None, insecure=False, open_window=True, wait=True, database=None, catalog=None, env=None) -> None`**
+  Launches the interactive TUI IDE against a live connection (`duckdb.DuckDBPyConnection`), database URI (`str`), or `None` (auto-resolves from `duckpack.toml` and `.env`). When passing an existing in-memory connection `con`, automatically attaches configured external databases from `duckpack.toml`. In non-TTY environments (Jupyter/VS Code), automatically launches a connected terminal window. Pass `env` to switch environment profiles (e.g. `env="staging"`).
 
-- **`duckpack.apply(target, project_dir=".", auto_approve=True, force_drop=False, interactive=False, database=None, catalog=None) -> ApplyResult`**
-  Computes schema diffs and applies declarative migrations. In interactive mode (`auto_approve=False` or `interactive=True`), opens the visual review TUI. Pass `database` to target an attached catalog. Returns an `ApplyResult`.
+- **`duckpack.apply(target=None, project_dir=".", auto_approve=True, force_drop=False, interactive=False, database=None, catalog=None, env=None) -> ApplyResult`**
+  Computes schema diffs and applies declarative migrations. In interactive mode (`auto_approve=False` or `interactive=True`), opens the visual review TUI. When `target=None`, auto-resolves database targets from `duckpack.toml`. Returns an `ApplyResult`.
 
-- **`duckpack.diff(target, project_dir=".", database=None, catalog=None) -> DiffSummary`**
-  Compares declarative project state against target database or attached catalog without mutating data. Returns a `DiffSummary`.
+- **`duckpack.diff(target=None, project_dir=".", database=None, catalog=None, env=None) -> DiffSummary`**
+  Compares declarative project state against target database or attached catalog without mutating data. When `target=None`, auto-resolves from `duckpack.toml`. Returns a `DiffSummary`.
 
 - **`duckpack.compile(project_dir, out) -> None`**
   Compiles project SQL definitions into an immutable `.duckpack` snapshot file.
