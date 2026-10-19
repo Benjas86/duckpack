@@ -463,15 +463,16 @@ pub fn compile(project_dir: &str, out: &str) -> PyResult<()> {
 
 /// Compute differences between project declarative definitions and the target database.
 #[pyfunction]
-#[pyo3(signature = (target, project_dir = ".", database = None, catalog = None, quack_token = None, insecure = false))]
+#[pyo3(signature = (target = None, project_dir = ".", database = None, catalog = None, quack_token = None, insecure = false, env = None))]
 pub fn diff(
     _py: Python<'_>,
-    target: &Bound<'_, PyAny>,
+    target: Option<&Bound<'_, PyAny>>,
     project_dir: &str,
     database: Option<&str>,
     catalog: Option<&str>,
     quack_token: Option<&str>,
     insecure: bool,
+    env: Option<&str>,
 ) -> PyResult<DiffSummary> {
     let p_dir = PathBuf::from(project_dir);
     let shadow_conn = engine::build_shadow_db(&p_dir)
@@ -486,13 +487,29 @@ pub fn diff(
     let shadow_macros = schema_diff::get_macros(&shadow_conn, None)
         .map_err(|e| SchemaError::new_err(format!("Error extracting shadow macros: {}", e)))?;
 
-    let req_catalog = database.or(catalog).map(|s| s.to_string()).or_else(|| engine::resolve_project_catalog(&p_dir, None));
+    let env_file = if let Some(e) = env {
+        format!(".env.{}", e)
+    } else {
+        ".env".to_string()
+    };
+    dotenvy::from_path(p_dir.join(env_file)).ok();
+
+    let target_cfg = engine::resolve_target_config(&p_dir, env);
+    let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
+    let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
+
+    let req_catalog = database
+        .or(catalog)
+        .map(|s| s.to_string())
+        .or_else(|| target_cfg.catalogs.first().cloned());
+
+    let target_str: Option<String> = match target {
+        None => Some(target_cfg.db.clone().unwrap_or_else(|| "local.duckdb".to_string())),
+        Some(t) => t.extract::<String>().ok(),
+    };
 
     // Determine target connection
-    let (target_schemas, target_schema, target_views, target_macros) = if let Ok(db_str) = target.extract::<String>() {
-        let target_cfg = engine::resolve_target_config(&p_dir, None);
-        let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
-        let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
+    let (target_schemas, target_schema, target_views, target_macros) = if let Some(db_str) = target_str {
         let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
         let active_cat = schema_diff::validate_target_catalog(&conn, req_catalog.as_deref(), false)
@@ -505,7 +522,8 @@ pub fn diff(
         )
     } else {
         // Live Python connection: introspect catalog directly
-        let mut executor = PyDbExecutor::new(target.clone().unbind());
+        let t = target.unwrap();
+        let mut executor = PyDbExecutor::new(t.clone().unbind());
         let active_cat = validate_py_target_catalog(&mut executor, req_catalog.as_deref(), false)?;
         introspect_py_catalog(&mut executor, Some(&active_cat))?
     };
@@ -807,10 +825,10 @@ fn run_apply_tui(
 
 /// Apply declarative schema migrations to the target database.
 #[pyfunction]
-#[pyo3(signature = (target, project_dir = ".", database = None, catalog = None, auto_approve = true, force_drop = false, interactive = false, quack_token = None, insecure = false))]
+#[pyo3(signature = (target = None, project_dir = ".", database = None, catalog = None, auto_approve = true, force_drop = false, interactive = false, quack_token = None, insecure = false, env = None))]
 pub fn apply(
     _py: Python<'_>,
-    target: &Bound<'_, PyAny>,
+    target: Option<&Bound<'_, PyAny>>,
     project_dir: &str,
     database: Option<&str>,
     catalog: Option<&str>,
@@ -819,16 +837,30 @@ pub fn apply(
     interactive: bool,
     quack_token: Option<&str>,
     insecure: bool,
+    env: Option<&str>,
 ) -> PyResult<ApplyResult> {
     let p_dir = PathBuf::from(project_dir);
     if !p_dir.exists() {
         return Err(SchemaError::new_err(format!("Project directory {} does not exist", p_dir.display())));
     }
 
+    let env_file = if let Some(e) = env {
+        format!(".env.{}", e)
+    } else {
+        ".env".to_string()
+    };
+    dotenvy::from_path(p_dir.join(env_file)).ok();
+
+    let target_cfg = engine::resolve_target_config(&p_dir, env);
+    let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
+    let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
+
     let req_catalogs = if let Some(cat) = database.or(catalog) {
         vec![cat.to_string()]
+    } else if !target_cfg.catalogs.is_empty() {
+        target_cfg.catalogs.clone()
     } else {
-        let cats = engine::resolve_project_catalogs(&p_dir, None);
+        let cats = engine::resolve_project_catalogs(&p_dir, env);
         if cats.is_empty() {
             vec![]
         } else {
@@ -837,10 +869,12 @@ pub fn apply(
     };
     let ignore_list = engine::load_ignore_rules(&p_dir);
 
-    if let Ok(db_str) = target.extract::<String>() {
-        let target_cfg = engine::resolve_target_config(&p_dir, None);
-        let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
-        let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
+    let target_str: Option<String> = match target {
+        None => Some(target_cfg.db.clone().unwrap_or_else(|| "local.duckdb".to_string())),
+        Some(t) => t.extract::<String>().ok(),
+    };
+
+    if let Some(db_str) = target_str {
         let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
 
@@ -918,6 +952,7 @@ pub fn apply(
             items: total_applied_items,
         })
     } else {
+        let target = target.unwrap();
         if (!auto_approve || interactive) && is_interactive_terminal() {
             let db_name = target
                 .getattr("execute")
@@ -1411,15 +1446,16 @@ fn sync_back_client_temp_tables(
 /// Launch the interactive DuckPack IDE terminal UI against a target database.
 /// In non-terminal environments (such as Jupyter notebooks), prints a formatted database overview.
 #[pyfunction]
-#[pyo3(signature = (target, project_dir = ".", database = None, catalog = None, quack_token = None, insecure = false))]
+#[pyo3(signature = (target = None, project_dir = ".", database = None, catalog = None, quack_token = None, insecure = false, env = None))]
 pub fn explore(
     _py: Python<'_>,
-    target: &Bound<'_, PyAny>,
+    target: Option<&Bound<'_, PyAny>>,
     project_dir: &str,
     database: Option<&str>,
     catalog: Option<&str>,
     quack_token: Option<&str>,
     insecure: bool,
+    env: Option<&str>,
 ) -> PyResult<()> {
     let mut p_dir = PathBuf::from(project_dir);
     if p_dir == PathBuf::from(".") {
@@ -1428,12 +1464,29 @@ pub fn explore(
             p_dir = disc;
         }
     }
-    let req_catalog = database.or(catalog).map(|s| s.to_string()).or_else(|| engine::resolve_project_catalog(&p_dir, None));
 
-    if let Ok(db_str) = target.extract::<String>() {
-        let target_cfg = engine::resolve_target_config(&p_dir, None);
-        let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
-        let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
+    let env_file = if let Some(e) = env {
+        format!(".env.{}", e)
+    } else {
+        ".env".to_string()
+    };
+    dotenvy::from_path(p_dir.join(env_file)).ok();
+
+    let target_cfg = engine::resolve_target_config(&p_dir, env);
+    let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
+    let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
+
+    let req_catalog = database
+        .or(catalog)
+        .map(|s| s.to_string())
+        .or_else(|| target_cfg.catalogs.first().cloned());
+
+    let target_str: Option<String> = match target {
+        None => Some(target_cfg.db.clone().unwrap_or_else(|| "local.duckdb".to_string())),
+        Some(t) => t.extract::<String>().ok(),
+    };
+
+    if let Some(db_str) = target_str {
         let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
 
@@ -1453,11 +1506,21 @@ pub fn explore(
             let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
         }
 
-        crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &db_str)
-            .map_err(|e| ExecutionError::new_err(format!("IDE error: {}", e)))?;
+        if db_str.starts_with("quack:") {
+            engine::restore_quack_temp_bridge(&conn);
+        }
+
+        let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &db_str);
+
+        if db_str.starts_with("quack:") {
+            engine::sync_back_quack_temp_bridge(&conn);
+        }
+
+        ide_res.map_err(|e| ExecutionError::new_err(format!("IDE error: {}", e)))?;
 
         Ok(())
     } else {
+        let target = target.unwrap();
         // Live Python connection
         let mut executor = PyDbExecutor::new(target.clone().unbind());
 
@@ -1577,6 +1640,41 @@ pub fn explore(
     }
 }
 
+/// Helper function to inspect the resolved target configuration from duckpack.toml and .env.
+#[pyfunction]
+#[pyo3(signature = (project_dir = ".", env = None))]
+pub fn get_target_config(
+    py: Python<'_>,
+    project_dir: &str,
+    env: Option<&str>,
+) -> PyResult<PyObject> {
+    let mut p_dir = PathBuf::from(project_dir);
+    if p_dir == PathBuf::from(".") {
+        let disc = engine::discover_project_dir(&p_dir);
+        if disc != p_dir {
+            p_dir = disc;
+        }
+    }
+
+    let env_file = if let Some(e) = env {
+        format!(".env.{}", e)
+    } else {
+        ".env".to_string()
+    };
+    dotenvy::from_path(p_dir.join(env_file)).ok();
+
+    let cfg = engine::resolve_target_config(&p_dir, env);
+    let token = engine::resolve_quack_token(None, cfg.token_env.as_deref());
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("db", cfg.db)?;
+    dict.set_item("catalogs", cfg.catalogs)?;
+    dict.set_item("token_env", cfg.token_env)?;
+    dict.set_item("insecure", cfg.insecure.unwrap_or(false))?;
+    dict.set_item("token", token)?;
+    Ok(dict.into())
+}
+
 /// Python module definition
 #[pymodule]
 pub fn _duckpack(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1591,6 +1689,7 @@ pub fn _duckpack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build, m)?)?;
     m.add_function(wrap_pyfunction!(init, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
+    m.add_function(wrap_pyfunction!(get_target_config, m)?)?;
     m.add("__duckdb_version__", crate::engine::embedded_duckdb_version())?;
     Ok(())
 }

@@ -1,4 +1,4 @@
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 import duckdb
 
 class Error(Exception): ...
@@ -28,33 +28,42 @@ def compile(project_dir: str, out: str) -> None:
     ...
 
 def diff(
-    target: Union[duckdb.DuckDBPyConnection, str],
+    target: Optional[Union[duckdb.DuckDBPyConnection, str]] = None,
     project_dir: str = ".",
+    database: Optional[str] = None,
+    catalog: Optional[str] = None,
     quack_token: Optional[str] = None,
     insecure: bool = False,
+    env: Optional[str] = None,
 ) -> DiffSummary:
     """Compute differences between project declarative definitions and the target database."""
     ...
 
 def apply(
-    target: Union[duckdb.DuckDBPyConnection, str],
+    target: Optional[Union[duckdb.DuckDBPyConnection, str]] = None,
     project_dir: str = ".",
+    database: Optional[str] = None,
+    catalog: Optional[str] = None,
     auto_approve: bool = True,
     force_drop: bool = False,
     interactive: bool = False,
     quack_token: Optional[str] = None,
     insecure: bool = False,
+    env: Optional[str] = None,
 ) -> ApplyResult:
     """Apply declarative schema migrations to the target database."""
     ...
 
 def explore(
-    target: Union[duckdb.DuckDBPyConnection, str],
+    target: Optional[Union[duckdb.DuckDBPyConnection, str]] = None,
     project_dir: str = ".",
+    database: Optional[str] = None,
+    catalog: Optional[str] = None,
     quack_token: Optional[str] = None,
     insecure: bool = False,
     open_window: bool = True,
     wait: bool = True,
+    env: Optional[str] = None,
 ) -> None:
     """Launch the interactive DuckPack IDE terminal UI against a target database or live connection.
 
@@ -63,4 +72,8 @@ def explore(
       • When open_window=True (default), automatically launches a connected terminal window.
       • When open_window=False or in headless environments, prints a formatted schema overview.
     """
+    ...
+
+def get_target_config(project_dir: str = ".", env: Optional[str] = None) -> Dict[str, Any]:
+    """Inspect resolved target configuration and credentials from duckpack.toml and .env."""
     ...

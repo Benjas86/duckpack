@@ -160,6 +160,7 @@ def launch_terminal_window(
     quack_token=None,
     insecure=False,
     wait=True,
+    env=None,
 ) -> bool:
     """
     Spawns an external terminal window running DuckPack connected to the target database.
@@ -266,6 +267,8 @@ def launch_terminal_window(
         cli_cmd.extend(["--quack-token", token_arg])
     if insecure_arg:
         cli_cmd.append("--insecure")
+    if env:
+        cli_cmd.extend(["--env", env])
 
     # 3. Launch the terminal emulator
     try:

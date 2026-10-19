@@ -317,3 +317,75 @@ def test_quack_env_and_config_resolution(tmp_path):
         assert "Could not find a Quack authentication token" not in res3.stderr
 
 
+def test_python_target_none_auto_resolution(tmp_path):
+    proj_dir = str(tmp_path / "target_none_proj")
+    duckpack.init(proj_dir)
+
+    target_db_path = str(tmp_path / "target_none_proj" / "configured.duckdb")
+    with open(os.path.join(proj_dir, "duckpack.toml"), "w") as f:
+        f.write(f'[project]\nname = "test"\n\n[target]\ndefault_db = "{target_db_path}"\n')
+
+    with open(os.path.join(proj_dir, "tables", "products.sql"), "w") as f:
+        f.write("CREATE TABLE products (sku VARCHAR PRIMARY KEY, price DOUBLE);\n")
+
+    # 1. diff() with target=None should resolve to configured.duckdb
+    diff_res = duckpack.diff(project_dir=proj_dir)
+    assert diff_res.has_changes is True
+    assert diff_res.change_count == 1
+    assert any("products" in item for item in diff_res.items)
+
+    # 2. apply() with target=None should apply to configured.duckdb
+    apply_res = duckpack.apply(project_dir=proj_dir, auto_approve=True)
+    assert apply_res.success is True
+    assert apply_res.applied_count == 1
+
+    # Verify table in configured.duckdb
+    chk = duckdb.connect(target_db_path)
+    tbls = [r[0] for r in chk.execute("SELECT table_name FROM duckdb_tables();").fetchall()]
+    assert "products" in tbls
+    chk.close()
+
+    # 3. explore() with target=None and open_window=False should print non-terminal overview
+    duckpack.explore(project_dir=proj_dir, open_window=False)
+
+
+def test_python_connection_auto_attach_toml_target(tmp_path, capsys):
+    proj_dir = str(tmp_path / "auto_attach_proj")
+    duckpack.init(proj_dir)
+
+    # Create a secondary external database to simulate analytical warehouse
+    ext_db_path = str(tmp_path / "ext_warehouse.duckdb")
+    ext_con = duckdb.connect(ext_db_path)
+    ext_con.execute("CREATE TABLE orders (id INT, total DOUBLE);")
+    ext_con.execute("INSERT INTO orders VALUES (101, 49.99), (102, 199.50);")
+    ext_con.close()
+
+    # Configure duckpack.toml with the external warehouse
+    with open(os.path.join(proj_dir, "duckpack.toml"), "w") as f:
+        f.write(f'[project]\nname = "auto_attach_test"\n\n[target]\ndb = "{ext_db_path}"\ndatabase = "orders_warehouse"\n')
+
+    # Create an in-memory session in Python with a local DataFrame/table
+    con = duckdb.connect()
+    con.execute("CREATE TABLE df_users (user_id INT, name VARCHAR);")
+    con.execute("INSERT INTO df_users VALUES (101, 'Alice'), (102, 'Bob');")
+
+    # Run explore against in-memory connection; should auto-attach orders_warehouse
+    duckpack.explore(con, project_dir=proj_dir, open_window=False)
+
+    captured = capsys.readouterr()
+    assert "[DuckPack] Attached 'orders_warehouse'" in captured.out
+
+    # Verify orders_warehouse is attached and accessible in con
+    attached_dbs = [r[0] for r in con.execute("SELECT database_name FROM duckdb_databases();").fetchall()]
+    assert "orders_warehouse" in attached_dbs
+
+    # Verify cross-database joins work natively in Python
+    joined = con.execute("""
+        SELECT u.name, o.total
+        FROM df_users u
+        JOIN orders_warehouse.orders o ON u.user_id = o.id
+        ORDER BY o.total ASC;
+    """).fetchall()
+    assert joined == [("Alice", 49.99), ("Bob", 199.50)]
+
+
