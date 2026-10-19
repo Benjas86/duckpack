@@ -17,3 +17,4 @@ debug_query.txt
 /medium
 *.jpg
 /decisions/
+.env*

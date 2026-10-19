@@ -9,18 +9,6 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use duckdb::Connection;
 use std::fs;
 use std::path::PathBuf;
-use serde::Deserialize;
-use std::collections::HashMap;
-
-#[derive(Deserialize, Debug)]
-struct DuckpackConfig {
-    env: Option<HashMap<String, EnvConfig>>,
-}
-
-#[derive(Deserialize, Debug)]
-struct EnvConfig {
-    db: Option<String>,
-}
 
 /// The core CLI argument parser configuration using `clap`.
 /// Dictates all available terminal commands for duckpack.
@@ -209,31 +197,50 @@ fn main() -> Result<()> {
     };
     dotenvy::from_path(project_dir.join(env_file)).ok();
 
-    // Check for duckpack.toml
-    let toml_path = project_dir.join("duckpack.toml");
-    if toml_path.exists() {
-        if let Ok(content) = fs::read_to_string(&toml_path) {
-            if let Ok(config) = toml::from_str::<DuckpackConfig>(&content) {
-                if let Some(cli_env) = &cli.env {
-                    if let Some(envs) = config.env {
-                        if let Some(env_config) = envs.get(cli_env) {
-                            if let Some(toml_db) = &env_config.db {
-                                // Override the db argument for applicable commands
-                                match &mut cli.command {
-                                    Commands::Apply { db, .. } |
-                                    Commands::Diff { db, .. } |
-                                    Commands::Deploy { db, .. } |
-                                    Commands::Explore { db, .. } => {
-                                        *db = toml_db.clone();
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
+    let target_cfg = resolve_target_config(project_dir, cli.env.as_deref());
+
+    // Apply target/env configuration overrides, defaults, and token resolution
+    match &mut cli.command {
+        Commands::Apply { db, quack_token, quack_disable_ssl, .. } |
+        Commands::Diff { db, quack_token, quack_disable_ssl, .. } |
+        Commands::Explore { db, quack_token, quack_disable_ssl, .. } => {
+            // Override db if profile given, or fallback if db is still default "local.duckdb"
+            if cli.env.is_some() {
+                if let Some(cfg_db) = &target_cfg.db {
+                    *db = cfg_db.clone();
+                }
+            } else if db == "local.duckdb" {
+                if let Some(cfg_db) = &target_cfg.db {
+                    *db = cfg_db.clone();
+                }
+            }
+
+            // Fallback insecure / quack_disable_ssl
+            if !*quack_disable_ssl {
+                if let Some(ins) = target_cfg.insecure {
+                    *quack_disable_ssl = ins;
+                }
+            }
+
+            // Resolve Quack token with CLI security guardrail
+            if quack_token.is_some() {
+                eprintln!("Tip: Passing authentication tokens via CLI flags can expose credentials in shell history. Consider storing your token in .env (QUACK_TOKEN) or duckpack.toml.");
+            } else {
+                *quack_token = resolve_quack_token(None, target_cfg.token_env.as_deref());
+            }
+        }
+        Commands::Deploy { db, .. } => {
+            if cli.env.is_some() {
+                if let Some(cfg_db) = &target_cfg.db {
+                    *db = cfg_db.clone();
+                }
+            } else if db == "local.duckdb" {
+                if let Some(cfg_db) = &target_cfg.db {
+                    *db = cfg_db.clone();
                 }
             }
         }
+        _ => {}
     }
 
     match &cli.command {
