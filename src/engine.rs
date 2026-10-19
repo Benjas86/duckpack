@@ -1030,14 +1030,14 @@ token_env = "PROD_TOKEN"
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         // Base .env has common token and host
-        std::fs::write(temp_dir.join(".env"), "QUACK_TOKEN=base_secret_123\nCOMMON_VAR=base_val\n").unwrap();
-        // Profile .env.dev overrides COMMON_VAR but leaves QUACK_TOKEN
-        std::fs::write(temp_dir.join(".env.dev"), "COMMON_VAR=dev_val\n").unwrap();
+        std::fs::write(temp_dir.join(".env"), "DUCKPACK_TEST_BASE_TOKEN=base_secret_123\nDUCKPACK_TEST_COMMON_VAR=base_val\n").unwrap();
+        // Profile .env.dev overrides COMMON_VAR but leaves base token
+        std::fs::write(temp_dir.join(".env.dev"), "DUCKPACK_TEST_COMMON_VAR=dev_val\n").unwrap();
 
         load_env_files(&temp_dir, Some("dev"));
 
-        assert_eq!(std::env::var("QUACK_TOKEN").as_deref(), Ok("base_secret_123"));
-        assert_eq!(std::env::var("COMMON_VAR").as_deref(), Ok("dev_val"));
+        assert_eq!(std::env::var("DUCKPACK_TEST_BASE_TOKEN").as_deref(), Ok("base_secret_123"));
+        assert_eq!(std::env::var("DUCKPACK_TEST_COMMON_VAR").as_deref(), Ok("dev_val"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
