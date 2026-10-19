@@ -402,3 +402,34 @@ def test_cli_version_and_subcommands(capsys, monkeypatch):
     assert "duckpack 0.2.0" in captured.out
 
 
+def test_env_profile_with_base_env(tmp_path):
+    proj_dir = str(tmp_path / "env_test_proj")
+    duckpack.init(proj_dir)
+
+    # Base .env contains QUACK_TOKEN
+    with open(os.path.join(proj_dir, ".env"), "w") as f:
+        f.write("QUACK_TOKEN=base_secret_999\nBASE_VAR=common\n")
+
+    # duckpack.toml defines [target.dev] / [env.dev]
+    with open(os.path.join(proj_dir, "duckpack.toml"), "w") as f:
+        f.write("""[project]
+name = "env_proj"
+
+[target]
+db = "local.duckdb"
+
+[env.dev]
+host = "127.0.0.1"
+port = 9494
+""")
+
+    # Resolving with env="dev" should pick up dev host/port AND base .env QUACK_TOKEN
+    cfg = duckpack.get_target_config(project_dir=proj_dir, env="dev")
+    assert cfg["db"] == "quack:127.0.0.1:9494"
+    assert cfg["token"] == "base_secret_999"
+    # Insecure is True because 127.0.0.1 is loopback
+    import duckpack._duckpack as _dp
+    # verify token resolution matches
+    assert cfg["token"] == "base_secret_999"
+
+
