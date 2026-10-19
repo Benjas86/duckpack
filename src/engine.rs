@@ -110,14 +110,21 @@ pub fn is_quack_zero_host(db: &str) -> bool {
     stripped.starts_with("0.0.0.0") || stripped.starts_with("[::]")
 }
 
+/// Determines if the provided quack connection URI targets a loopback address (127.0.0.1, localhost, [::1]).
+pub fn is_quack_loopback(db: &str) -> bool {
+    let stripped = db.strip_prefix("quack://").or_else(|| db.strip_prefix("quack:")).unwrap_or(db);
+    stripped.starts_with("127.0.0.1") || stripped.starts_with("localhost") || stripped.starts_with("[::1]")
+}
+
 /// Determines if SSL should be disabled for a Quack connection.
-/// Returns true if explicitly flagged, if DUCKDB_QUACK_DISABLE_SSL is set, or if connecting to 0.0.0.0.
+/// Returns true if explicitly flagged, if DUCKDB_QUACK_DISABLE_SSL is set, or if connecting to 0.0.0.0 or loopback.
 pub fn should_disable_quack_ssl(db: &str, flag_disable_ssl: bool) -> bool {
     flag_disable_ssl
         || std::env::var("DUCKDB_QUACK_DISABLE_SSL")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
             .unwrap_or(false)
         || is_quack_zero_host(db)
+        || is_quack_loopback(db)
 }
 
 /// Builds the SQL ATTACH statement for a Quack database.
@@ -188,8 +195,22 @@ pub fn connect_target_db(
         let disable_ssl = should_disable_quack_ssl(db, quack_disable_ssl);
         let attach_sql = build_quack_attach_sql(db, disable_ssl);
 
-        conn.execute(&attach_sql, [])
-            .with_context(|| format!("Failed to attach remote database '{}'", db))?;
+        let attach_res = conn.execute(&attach_sql, []);
+        if let Err(e) = attach_res {
+            let err_msg = e.to_string();
+            if err_msg.contains("Could not find a Quack authentication token") || err_msg.contains("Authentication failed") {
+                return Err(anyhow::anyhow!(
+                    "Failed to attach remote database '{}': {}\n\n\
+                    Troubleshooting:\n\
+                      1. Check that your Quack token is set in .env (QUACK_TOKEN) or duckpack.toml (token_env).\n\
+                      2. If using --env <profile>, ensure either .env or .env.<profile> contains the token.\n\
+                      3. Alternatively, pass --quack-token <token> directly.",
+                    db,
+                    err_msg
+                ));
+            }
+            return Err(anyhow::anyhow!("Failed to attach remote database '{}': {}", db, err_msg));
+        }
         conn.execute("USE target_db;", [])
             .with_context(|| "Failed to switch to target database")?;
         Ok(conn)
@@ -197,8 +218,10 @@ pub fn connect_target_db(
         let conn = Connection::open_in_memory()
             .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
         let safe_db = db.replace("'", "''");
-        conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-            .with_context(|| format!("Failed to attach remote database '{}'", db))?;
+        let attach_res = conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), []);
+        if let Err(e) = attach_res {
+            return Err(anyhow::anyhow!("Failed to attach remote database '{}': {}", db, e));
+        }
         conn.execute("USE target_db;", [])
             .with_context(|| "Failed to switch to target database")?;
         Ok(conn)
@@ -496,8 +519,28 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
     cfg
 }
 
+/// Loads environment variables from project directory:
+/// 1. Always loads base `.env` if present.
+/// 2. If `env_profile` is provided (e.g. "dev"), loads `.env.<profile>` on top to override base variables.
+pub fn load_env_files(project_dir: &std::path::Path, env_profile: Option<&str>) {
+    let base_env = project_dir.join(".env");
+    if base_env.exists() {
+        let _ = dotenvy::from_path(&base_env);
+    }
+    if let Some(profile) = env_profile {
+        if !profile.is_empty() {
+            let profile_env = project_dir.join(format!(".env.{}", profile));
+            if profile_env.exists() {
+                let _ = dotenvy::from_path_override(&profile_env);
+            }
+        }
+    }
+}
+
 /// Resolves target configuration from duckpack.toml, supporting [target] defaults and [env.<profile>] overrides.
 pub fn resolve_target_config(project_dir: &std::path::Path, env_profile: Option<&str>) -> ResolvedTargetConfig {
+    load_env_files(project_dir, env_profile);
+
     let toml_path = project_dir.join("duckpack.toml");
     if !toml_path.exists() {
         return ResolvedTargetConfig::default();
@@ -516,7 +559,13 @@ pub fn resolve_target_config(project_dir: &std::path::Path, env_profile: Option<
     let target_defaults = value.get("target").map(parse_target_table).unwrap_or_default();
 
     if let Some(env_str) = env_profile {
-        if let Some(env_tbl) = value.get("env").and_then(|e| e.get(env_str)) {
+        let env_tbl = value
+            .get("env")
+            .and_then(|e| e.get(env_str))
+            .or_else(|| value.get("target").and_then(|t| t.get(env_str)))
+            .or_else(|| value.get("environments").and_then(|e| e.get(env_str)));
+
+        if let Some(env_tbl) = env_tbl {
             let env_cfg = parse_target_table(env_tbl);
             return ResolvedTargetConfig {
                 db: env_cfg.db.or(target_defaults.db),
@@ -973,5 +1022,23 @@ token_env = "PROD_TOKEN"
             std::env::remove_var("DUCKDB_QUACK_TOKEN");
             assert_eq!(resolve_quack_token(None, None), None);
         }
+    }
+
+    #[test]
+    fn test_load_env_files_base_and_profile_overrides() {
+        let temp_dir = std::env::temp_dir().join(format!("duckpack_test_env_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Base .env has common token and host
+        std::fs::write(temp_dir.join(".env"), "QUACK_TOKEN=base_secret_123\nCOMMON_VAR=base_val\n").unwrap();
+        // Profile .env.dev overrides COMMON_VAR but leaves QUACK_TOKEN
+        std::fs::write(temp_dir.join(".env.dev"), "COMMON_VAR=dev_val\n").unwrap();
+
+        load_env_files(&temp_dir, Some("dev"));
+
+        assert_eq!(std::env::var("QUACK_TOKEN").as_deref(), Ok("base_secret_123"));
+        assert_eq!(std::env::var("COMMON_VAR").as_deref(), Ok("dev_val"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

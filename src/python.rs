@@ -487,12 +487,7 @@ pub fn diff(
     let shadow_macros = schema_diff::get_macros(&shadow_conn, None)
         .map_err(|e| SchemaError::new_err(format!("Error extracting shadow macros: {}", e)))?;
 
-    let env_file = if let Some(e) = env {
-        format!(".env.{}", e)
-    } else {
-        ".env".to_string()
-    };
-    dotenvy::from_path(p_dir.join(env_file)).ok();
+    engine::load_env_files(&p_dir, env);
 
     let target_cfg = engine::resolve_target_config(&p_dir, env);
     let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
@@ -511,7 +506,7 @@ pub fn diff(
     // Determine target connection
     let (target_schemas, target_schema, target_views, target_macros) = if let Some(db_str) = target_str {
         let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
-            .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
+            .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
         let active_cat = schema_diff::validate_target_catalog(&conn, req_catalog.as_deref(), false)
             .map_err(|e| ExecutionError::new_err(e.to_string()))?;
         (
@@ -844,12 +839,7 @@ pub fn apply(
         return Err(SchemaError::new_err(format!("Project directory {} does not exist", p_dir.display())));
     }
 
-    let env_file = if let Some(e) = env {
-        format!(".env.{}", e)
-    } else {
-        ".env".to_string()
-    };
-    dotenvy::from_path(p_dir.join(env_file)).ok();
+    engine::load_env_files(&p_dir, env);
 
     let target_cfg = engine::resolve_target_config(&p_dir, env);
     let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
@@ -876,7 +866,7 @@ pub fn apply(
 
     if let Some(db_str) = target_str {
         let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
-            .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
+            .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
 
         if (!auto_approve || interactive) && is_interactive_terminal() {
             let start_cat = req_catalogs.first().map(|s| s.as_str());
@@ -1465,12 +1455,7 @@ pub fn explore(
         }
     }
 
-    let env_file = if let Some(e) = env {
-        format!(".env.{}", e)
-    } else {
-        ".env".to_string()
-    };
-    dotenvy::from_path(p_dir.join(env_file)).ok();
+    engine::load_env_files(&p_dir, env);
 
     let target_cfg = engine::resolve_target_config(&p_dir, env);
     let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
@@ -1488,7 +1473,7 @@ pub fn explore(
 
     if let Some(db_str) = target_str {
         let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
-            .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
+            .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
 
         if !is_interactive_terminal() {
             return print_non_terminal_db(&conn, &db_str, req_catalog.as_deref());
@@ -1656,12 +1641,7 @@ pub fn get_target_config(
         }
     }
 
-    let env_file = if let Some(e) = env {
-        format!(".env.{}", e)
-    } else {
-        ".env".to_string()
-    };
-    dotenvy::from_path(p_dir.join(env_file)).ok();
+    engine::load_env_files(&p_dir, env);
 
     let cfg = engine::resolve_target_config(&p_dir, env);
     let token = engine::resolve_quack_token(None, cfg.token_env.as_deref());

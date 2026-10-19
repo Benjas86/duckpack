@@ -189,13 +189,8 @@ fn main() -> Result<()> {
         Commands::Python { .. } => &default_dir,
     };
 
-    // Load .env file into process environment if it exists
-    let env_file = if let Some(e) = &cli.env {
-        format!(".env.{}", e)
-    } else {
-        ".env".to_string()
-    };
-    dotenvy::from_path(project_dir.join(env_file)).ok();
+    // Load .env and .env.<profile> into process environment
+    duckpack::engine::load_env_files(project_dir, cli.env.as_deref());
 
     let target_cfg = resolve_target_config(project_dir, cli.env.as_deref());
 
