@@ -665,7 +665,7 @@ my_project/
 
 ### Configuration (`duckpack.toml`)
 
-Define multiple environments and default attached catalogs to avoid hardcoding database paths:
+Define connection targets, remote Quack instances, and environment profiles without hardcoding sensitive credentials or database paths:
 
 ```toml
 [project]
@@ -676,27 +676,49 @@ version = "0.2.0"
 default_db = "dev.duckdb"
 database = "analytics"     # Optional: default attached catalog name to target
 
+# Or configure a default remote Quack target with structured host/port:
+# host = "analytics.internal"
+# port = 9494
+# insecure = false
+
 [env.dev]
 db = "dev.duckdb"
 
 [env.staging]
-db = "staging.duckdb"
+# Connect directly to a remote Quack server instance:
+db = "quack:staging.company.internal:9494"
 database = "analytics_stg"
+insecure = true            # Disable SSL for internal/self-signed deployments
 
 [env.prod]
-db = "md:prod_db" # Points directly to MotherDuck!
+# Connect to production Quack or MotherDuck:
+db = "quack:analytics.company.com:443"
 database = "analytics"
+token_env = "PROD_QUACK_TOKEN" # Look up token from PROD_QUACK_TOKEN in .env
 ```
 
-Deploy or explore against any profile:
+Deploy, diff, or explore against any profile:
 ```bash
-duckpack apply --env staging
-duckpack explore --env prod
-duckpack diff --env dev --database analytics
+duckpack explore                   # Automatically connects using [target] settings
+duckpack explore --env staging     # Connects to staging Quack server with no flags needed
+duckpack apply --env prod          # Applies migrations to prod with secrets loaded from .env
 ```
 
-### Environment Variables (`.env`)
+### Environment Variables & Credentials (`.env`)
 
+#### 1. Credential Safety (Zero Secrets in Shell History)
+Never pass raw API tokens on the command line where they are saved into `.bash_history` or `/proc/<pid>/cmdline`. DuckPack automatically loads `.env` (or `.env.<profile>` when using `--env <profile>`) and checks for:
+- `QUACK_TOKEN`: Default authentication token for remote Quack servers.
+- `DUCKDB_QUACK_TOKEN`: Standard DuckDB Quack token fallback.
+- Custom environment variable name defined via `token_env = "MY_TOKEN"` in `duckpack.toml`.
+
+```bash
+# .env (automatically ignored by git)
+QUACK_TOKEN=your_secure_quack_token_here
+PROD_QUACK_TOKEN=production_super_secret_token
+```
+
+#### 2. SQL Template Interpolation
 Write dynamic templates directly in your SQL files:
 ```sql
 CREATE TABLE ${ENV}_customers_${REGION} (

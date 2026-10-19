@@ -490,7 +490,10 @@ pub fn diff(
 
     // Determine target connection
     let (target_schemas, target_schema, target_views, target_macros) = if let Ok(db_str) = target.extract::<String>() {
-        let conn = engine::connect_target_db(&db_str, quack_token, insecure)
+        let target_cfg = engine::resolve_target_config(&p_dir, None);
+        let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
+        let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
+        let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
         let active_cat = schema_diff::validate_target_catalog(&conn, req_catalog.as_deref(), false)
             .map_err(|e| ExecutionError::new_err(e.to_string()))?;
@@ -835,7 +838,10 @@ pub fn apply(
     let ignore_list = engine::load_ignore_rules(&p_dir);
 
     if let Ok(db_str) = target.extract::<String>() {
-        let conn = engine::connect_target_db(&db_str, quack_token, insecure)
+        let target_cfg = engine::resolve_target_config(&p_dir, None);
+        let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
+        let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
+        let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
 
         if (!auto_approve || interactive) && is_interactive_terminal() {
@@ -1425,7 +1431,10 @@ pub fn explore(
     let req_catalog = database.or(catalog).map(|s| s.to_string()).or_else(|| engine::resolve_project_catalog(&p_dir, None));
 
     if let Ok(db_str) = target.extract::<String>() {
-        let conn = engine::connect_target_db(&db_str, quack_token, insecure)
+        let target_cfg = engine::resolve_target_config(&p_dir, None);
+        let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
+        let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
+        let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
             .map_err(|e| ExecutionError::new_err(format!("Failed to connect to {}: {}", db_str, e)))?;
 
         if !is_interactive_terminal() {

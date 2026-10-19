@@ -177,9 +177,7 @@ pub fn connect_target_db(
         conn.execute_batch("INSTALL quack; LOAD quack;")
             .with_context(|| "Failed to install/load quack extension")?;
 
-        let token = quack_token
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("DUCKDB_QUACK_TOKEN").ok());
+        let token = resolve_quack_token(quack_token, None);
 
         if let Some(token) = token {
             let safe_token = token.replace("'", "''");
@@ -191,7 +189,7 @@ pub fn connect_target_db(
         let attach_sql = build_quack_attach_sql(db, disable_ssl);
 
         conn.execute(&attach_sql, [])
-            .with_context(|| "Failed to attach remote database")?;
+            .with_context(|| format!("Failed to attach remote database '{}'", db))?;
         conn.execute("USE target_db;", [])
             .with_context(|| "Failed to switch to target database")?;
         Ok(conn)
@@ -200,7 +198,7 @@ pub fn connect_target_db(
             .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
         let safe_db = db.replace("'", "''");
         conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-            .with_context(|| "Failed to attach remote database")?;
+            .with_context(|| format!("Failed to attach remote database '{}'", db))?;
         conn.execute("USE target_db;", [])
             .with_context(|| "Failed to switch to target database")?;
         Ok(conn)
@@ -454,36 +452,122 @@ pub fn apply_diff(
     result
 }
 
-/// Resolves target catalogs from duckpack.toml if configured. Supports a single string or an array of catalog names.
-pub fn resolve_project_catalogs(project_dir: &std::path::Path, env_profile: Option<&str>) -> Vec<String> {
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResolvedTargetConfig {
+    pub db: Option<String>,
+    pub catalogs: Vec<String>,
+    pub token_env: Option<String>,
+    pub insecure: Option<bool>,
+}
+
+fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
+    let mut cfg = ResolvedTargetConfig::default();
+
+    if let Some(db_val) = tbl.get("db").or_else(|| tbl.get("default_db")).and_then(|v| v.as_str()) {
+        cfg.db = Some(db_val.to_string());
+    } else if let Some(host_val) = tbl.get("host").and_then(|v| v.as_str()) {
+        let clean_host = host_val
+            .strip_prefix("quack://")
+            .or_else(|| host_val.strip_prefix("quack:"))
+            .unwrap_or(host_val);
+        if let Some(port_val) = tbl.get("port").and_then(|v| v.as_integer()) {
+            cfg.db = Some(format!("quack:{}:{}", clean_host, port_val));
+        } else {
+            cfg.db = Some(format!("quack:{}", clean_host));
+        }
+    }
+
+    if let Some(val) = tbl.get("database").or_else(|| tbl.get("catalog")) {
+        if let Some(s) = val.as_str() {
+            cfg.catalogs = vec![s.to_string()];
+        } else if let Some(arr) = val.as_array() {
+            cfg.catalogs = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        }
+    }
+
+    if let Some(t_env) = tbl.get("token_env").and_then(|v| v.as_str()) {
+        cfg.token_env = Some(t_env.to_string());
+    }
+
+    if let Some(ins) = tbl.get("insecure").or_else(|| tbl.get("quack_disable_ssl")).and_then(|v| v.as_bool()) {
+        cfg.insecure = Some(ins);
+    }
+
+    cfg
+}
+
+/// Resolves target configuration from duckpack.toml, supporting [target] defaults and [env.<profile>] overrides.
+pub fn resolve_target_config(project_dir: &std::path::Path, env_profile: Option<&str>) -> ResolvedTargetConfig {
     let toml_path = project_dir.join("duckpack.toml");
-    if toml_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&toml_path) {
-            if let Ok(value) = toml::from_str::<toml::Value>(&content) {
-                if let Some(env_str) = env_profile {
-                    if let Some(env_tbl) = value.get("env").and_then(|e| e.get(env_str)) {
-                        if let Some(val) = env_tbl.get("database").or_else(|| env_tbl.get("catalog")) {
-                            if let Some(s) = val.as_str() {
-                                return vec![s.to_string()];
-                            } else if let Some(arr) = val.as_array() {
-                                return arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-                            }
-                        }
-                    }
-                }
-                if let Some(target_tbl) = value.get("target") {
-                    if let Some(val) = target_tbl.get("database").or_else(|| target_tbl.get("catalog")) {
-                        if let Some(s) = val.as_str() {
-                            return vec![s.to_string()];
-                        } else if let Some(arr) = val.as_array() {
-                            return arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-                        }
-                    }
-                }
+    if !toml_path.exists() {
+        return ResolvedTargetConfig::default();
+    }
+
+    let content = match std::fs::read_to_string(&toml_path) {
+        Ok(c) => c,
+        Err(_) => return ResolvedTargetConfig::default(),
+    };
+
+    let value: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return ResolvedTargetConfig::default(),
+    };
+
+    let target_defaults = value.get("target").map(parse_target_table).unwrap_or_default();
+
+    if let Some(env_str) = env_profile {
+        if let Some(env_tbl) = value.get("env").and_then(|e| e.get(env_str)) {
+            let env_cfg = parse_target_table(env_tbl);
+            return ResolvedTargetConfig {
+                db: env_cfg.db.or(target_defaults.db),
+                catalogs: if !env_cfg.catalogs.is_empty() {
+                    env_cfg.catalogs
+                } else {
+                    target_defaults.catalogs
+                },
+                token_env: env_cfg.token_env.or(target_defaults.token_env),
+                insecure: env_cfg.insecure.or(target_defaults.insecure),
+            };
+        }
+    }
+
+    target_defaults
+}
+
+/// Resolves the Quack authentication token following the multi-tier precedence:
+/// 1. Explicit CLI token if provided
+/// 2. Value of environment variable specified in `token_env` (if defined in active config)
+/// 3. Value of standard `QUACK_TOKEN` from process environment / .env
+/// 4. Value of standard `DUCKDB_QUACK_TOKEN` from process environment / .env
+pub fn resolve_quack_token(cli_token: Option<&str>, token_env: Option<&str>) -> Option<String> {
+    if let Some(t) = cli_token {
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    if let Some(var_name) = token_env {
+        if let Ok(val) = std::env::var(var_name) {
+            if !val.is_empty() {
+                return Some(val);
             }
         }
     }
-    Vec::new()
+    if let Ok(val) = std::env::var("QUACK_TOKEN") {
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+    if let Ok(val) = std::env::var("DUCKDB_QUACK_TOKEN") {
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Resolves target catalogs from duckpack.toml if configured. Supports a single string or an array of catalog names.
+pub fn resolve_project_catalogs(project_dir: &std::path::Path, env_profile: Option<&str>) -> Vec<String> {
+    resolve_target_config(project_dir, env_profile).catalogs
 }
 
 /// Resolves target catalog from duckpack.toml if configured (returns first configured catalog).
@@ -512,6 +596,24 @@ description = "A declarative DuckDB database project"
 
 [target]
 default_db = "local.duckdb"
+
+# Remote Quack example:
+# host = "analytics.company.internal"
+# port = 9494
+# database = "analytics"
+# token_env = "QUACK_TOKEN"
+# insecure = false
+
+# Multi-environment targets:
+# [env.staging]
+# db = "quack:staging.company.internal:9494"
+# database = "analytics_stg"
+# token_env = "STAGING_QUACK_TOKEN"
+
+# [env.prod]
+# db = "quack:prod.company.internal:9494"
+# database = "analytics"
+# token_env = "PROD_QUACK_TOKEN"
 "#;
         fs::write(&config_path, default_config).with_context(|| "Failed to write duckpack.toml")?;
         println!("Created config file: {}", config_path.display());
@@ -542,9 +644,12 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
 
     let env_path = project_dir.join(".env");
     if !env_path.exists() {
-        let env_content = r#"# Define environment variables here to interpolate into your SQL files.
-# Example: 
+        let env_content = r#"# Environment variables for DuckPack SQL template interpolation and Quack credentials.
+# Example SQL template variable: 
 # ENV=dev
+
+# Remote Quack server authentication token (avoids exposing credentials in shell history):
+# QUACK_TOKEN=your_quack_token_here
 "#;
         fs::write(&env_path, env_content).with_context(|| "Failed to write .env")?;
         println!("Created environment file: {}", env_path.display());
@@ -794,5 +899,79 @@ mod tests {
         assert_eq!(direct, sub_proj);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_target_config_structured_host_port() {
+        let temp_dir = std::env::temp_dir().join(format!("duckpack_test_cfg_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let toml_content = r#"
+[target]
+host = "analytics.company.com"
+port = 9494
+database = ["analytics", "orders"]
+insecure = true
+token_env = "MY_CUSTOM_TOKEN"
+
+[env.prod]
+db = "quack:prod.internal:443"
+database = "prod_cat"
+insecure = false
+token_env = "PROD_TOKEN"
+"#;
+        std::fs::write(temp_dir.join("duckpack.toml"), toml_content).unwrap();
+
+        // Target defaults
+        let cfg = resolve_target_config(&temp_dir, None);
+        assert_eq!(cfg.db.as_deref(), Some("quack:analytics.company.com:9494"));
+        assert_eq!(cfg.catalogs, vec!["analytics".to_string(), "orders".to_string()]);
+        assert_eq!(cfg.insecure, Some(true));
+        assert_eq!(cfg.token_env.as_deref(), Some("MY_CUSTOM_TOKEN"));
+
+        // Prod environment overrides
+        let prod_cfg = resolve_target_config(&temp_dir, Some("prod"));
+        assert_eq!(prod_cfg.db.as_deref(), Some("quack:prod.internal:443"));
+        assert_eq!(prod_cfg.catalogs, vec!["prod_cat".to_string()]);
+        assert_eq!(prod_cfg.insecure, Some(false));
+        assert_eq!(prod_cfg.token_env.as_deref(), Some("PROD_TOKEN"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_quack_token_hierarchy() {
+        // CLI token takes precedence
+        assert_eq!(
+            resolve_quack_token(Some("cli_override"), Some("CUSTOM_VAR")),
+            Some("cli_override".to_string())
+        );
+
+        unsafe {
+            // Custom token_env next
+            std::env::set_var("CUSTOM_QUACK_VAR", "secret_from_custom");
+            assert_eq!(
+                resolve_quack_token(None, Some("CUSTOM_QUACK_VAR")),
+                Some("secret_from_custom".to_string())
+            );
+
+            // QUACK_TOKEN next
+            std::env::remove_var("CUSTOM_QUACK_VAR");
+            std::env::set_var("QUACK_TOKEN", "secret_from_quack_token");
+            assert_eq!(
+                resolve_quack_token(None, None),
+                Some("secret_from_quack_token".to_string())
+            );
+
+            // DUCKDB_QUACK_TOKEN fallback
+            std::env::remove_var("QUACK_TOKEN");
+            std::env::set_var("DUCKDB_QUACK_TOKEN", "secret_from_duckdb_token");
+            assert_eq!(
+                resolve_quack_token(None, None),
+                Some("secret_from_duckdb_token".to_string())
+            );
+
+            std::env::remove_var("DUCKDB_QUACK_TOKEN");
+            assert_eq!(resolve_quack_token(None, None), None);
+        }
     }
 }

@@ -265,3 +265,55 @@ def test_terminal_staging_and_sync_back_temp_objects():
     assert len(remaining) == 0
 
 
+def test_quack_env_and_config_resolution(tmp_path):
+    import subprocess
+    proj_dir = str(tmp_path / "env_quack_proj")
+    duckpack.init(proj_dir)
+
+    # Verify .env generated with QUACK_TOKEN guidance
+    with open(os.path.join(proj_dir, ".env"), "r") as f:
+        env_content = f.read()
+    assert "QUACK_TOKEN" in env_content
+
+    # Verify duckpack.toml generated with remote Quack and token_env guidance
+    with open(os.path.join(proj_dir, "duckpack.toml"), "r") as f:
+        toml_content = f.read()
+    assert "QUACK_TOKEN" in toml_content
+
+    # Add a table to project
+    with open(os.path.join(proj_dir, "tables", "metrics.sql"), "w") as f:
+        f.write("CREATE TABLE metrics (id INT, value DOUBLE);")
+
+    cli_bin = os.path.join(os.path.dirname(os.path.dirname(__file__)), "target", "debug", "duckpack")
+    if os.path.exists(cli_bin):
+        # 1. Test CLI security guardrail when --quack-token is used on command line
+        res = subprocess.run(
+            [cli_bin, "diff", "--project-dir", proj_dir, "--quack-token", "test_exposed_token"],
+            capture_output=True,
+            text=True
+        )
+        assert "Tip: Passing authentication tokens via CLI flags can expose credentials in shell history" in res.stderr
+
+        # 2. Test [target] structured host and port fallback when --env is omitted
+        with open(os.path.join(proj_dir, "duckpack.toml"), "w") as f:
+            f.write('[target]\nhost = "127.0.0.1"\nport = 9494\ninsecure = true\n')
+        res2 = subprocess.run(
+            [cli_bin, "diff", "--project-dir", proj_dir],
+            capture_output=True,
+            text=True
+        )
+        combined_err = res2.stderr + res2.stdout
+        assert "quack:127.0.0.1:9494" in combined_err
+
+        # 3. Test .env loading of QUACK_TOKEN eliminates "Could not find a Quack authentication token"
+        with open(os.path.join(proj_dir, ".env"), "w") as f:
+            f.write("QUACK_TOKEN=my_quack_secret\n")
+        res3 = subprocess.run(
+            [cli_bin, "diff", "--project-dir", proj_dir],
+            capture_output=True,
+            text=True
+        )
+        # With QUACK_TOKEN supplied, it executes CREATE SECRET and attempts connection, so the "Could not find a Quack authentication token" error is gone
+        assert "Could not find a Quack authentication token" not in res3.stderr
+
+
