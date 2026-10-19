@@ -210,8 +210,22 @@ def apply(
             env=env,
         )
 
-    # 2. In non-TTY environments (e.g. Jupyter Notebook in VS Code):
-    # Automatically pop open external connected terminal window with the full Diff & Apply TUI
+    # 2. In notebook / VS Code interactive environments, render one-click terminal card
+    from .notebook import is_notebook_environment, render_notebook_card
+    if is_notebook_environment():
+        if render_notebook_card(
+            target,
+            project_dir=project_dir,
+            database=active_cat,
+            mode="apply",
+            force_drop=force_drop,
+            quack_token=quack_token,
+            insecure=insecure,
+            env=env,
+        ):
+            return ApplyResult(success=True, applied_count=0, items=[])
+
+    # 3. External GUI terminal emulator on Desktop (Ghostty, Foot, Windows Terminal, Terminal.app)
     if open_window:
         from .terminal import launch_terminal_window
         launched = launch_terminal_window(
@@ -308,7 +322,21 @@ def explore(
             env=env,
         )
 
-    # 2. In non-TTY environment (e.g. Jupyter notebook in VS Code):
+    # 2. In notebook / VS Code interactive environments, render one-click terminal card
+    from .notebook import is_notebook_environment, render_notebook_card
+    if is_notebook_environment():
+        if render_notebook_card(
+            target,
+            project_dir=project_dir,
+            database=active_cat,
+            mode="explore",
+            quack_token=quack_token,
+            insecure=insecure,
+            env=env,
+        ):
+            return None
+
+    # 3. External GUI terminal emulator on Desktop (Ghostty, Foot, Windows Terminal, Terminal.app)
     if open_window:
         from .terminal import launch_terminal_window
         launched = launch_terminal_window(
@@ -323,7 +351,7 @@ def explore(
         if launched:
             return None
 
-    # 3. Fallback to in-cell formatted overview
+    # 4. Fallback to formatted overview
     return _native_explore(
         target,
         project_dir=project_dir,
@@ -354,6 +382,9 @@ def get_target_config(project_dir=".", env=None):
     return _native_get_target_config(str(project_dir), env)
 
 
+from .notebook import stop_server
+
+
 __all__ = [
     "Error",
     "SchemaError",
@@ -367,6 +398,7 @@ __all__ = [
     "build",
     "init",
     "get_target_config",
+    "stop_server",
     "__version__",
     "__duckdb_version__",
 ]
