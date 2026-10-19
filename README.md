@@ -526,7 +526,10 @@ import duckpack
 #### Functions
 
 - **`duckpack.explore(target=None, project_dir=".", quack_token=None, insecure=False, open_window=True, wait=True, database=None, catalog=None, env=None) -> None`**
-  Launches the interactive TUI IDE against a live connection (`duckdb.DuckDBPyConnection`), database URI (`str`), or `None` (auto-resolves from `duckpack.toml` and `.env`). When passing an existing in-memory connection `con`, automatically attaches configured external databases from `duckpack.toml`. In non-TTY environments (Jupyter/VS Code), automatically launches a connected terminal window. Pass `env` to switch environment profiles (e.g. `env="staging"`).
+  Launches the interactive TUI IDE against a live connection (`duckdb.DuckDBPyConnection`), database URI (`str`), or `None` (auto-resolves from `duckpack.toml` and `.env`). When passing an existing in-memory connection `con`, automatically attaches configured external databases from `duckpack.toml`. In Jupyter Notebooks or VS Code Dev Containers, renders an interactive card with a 1-click **`▶ Open DuckPack in VS Code Terminal`** action and live background bridge. Pass `env` to switch environment profiles (e.g. `env="staging"`).
+
+- **`duckpack.stop_server() -> bool`**
+  Stops any active background Quack session bridge started by `duckpack.explore(con)` in a notebook.
 
 - **`duckpack.apply(target=None, project_dir=".", auto_approve=True, force_drop=False, interactive=False, database=None, catalog=None, env=None) -> ApplyResult`**
   Computes schema diffs and applies declarative migrations. In interactive mode (`auto_approve=False` or `interactive=True`), opens the visual review TUI. When `target=None`, auto-resolves database targets from `duckpack.toml`. Returns an `ApplyResult`.
