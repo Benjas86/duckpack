@@ -260,9 +260,13 @@ def apply(
     print(f"🦆 DuckPack: Found {diff_before.change_count} pending change(s) to apply:")
     for item in diff_before.items:
         print(f"  • {item}")
+    target_str = target if isinstance(target, str) else "local.duckdb"
+    print("\nℹ️  Dev Container / Headless Environment Detected.")
+    print("To review and apply these changes interactively, run in any terminal panel:")
+    print(f"  $ duckpack apply -p {project_dir} -d {target_str} --interactive\n")
     raise ExecutionError(
-        "Cannot run interactive apply in a headless environment without a display. "
-        "Pass auto_approve=True to apply automatically."
+        "Cannot run interactive apply in a headless environment without an interactive terminal. "
+        "Run the command above in a terminal, or pass auto_approve=True to apply automatically."
     )
 
 

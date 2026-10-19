@@ -433,28 +433,14 @@ port = 9494
     assert cfg["token"] == "base_secret_999"
 
 
-def test_notebook_integration_and_vscode_uri():
-    import json
-    import urllib.parse
+def test_notebook_integration():
     from duckpack.notebook import (
-        build_vscode_terminal_uri,
         introspect_schema_summary,
         render_notebook_card,
         stop_server,
     )
 
-    # 1. Test URI generation
-    cmd = "duckpack explore --db quack:127.0.0.1:9494"
-    uri = build_vscode_terminal_uri(cmd)
-    assert uri.startswith("command:runCommands?")
-    encoded_part = uri.split("command:runCommands?")[1]
-    decoded = json.loads(urllib.parse.unquote(encoded_part))
-    assert decoded["commands"][0] == "workbench.action.terminal.focus"
-    assert decoded["commands"][1]["command"] == "workbench.action.terminal.sendSequence"
-    assert cmd in decoded["commands"][1]["args"]["text"]
-    assert decoded["commands"][1]["args"]["text"].endswith("\r")
-
-    # 2. Test schema introspection
+    # 1. Test schema introspection
     con = duckdb.connect()
     con.execute("CREATE TABLE products (id INT, price DOUBLE, name VARCHAR);")
     con.execute("INSERT INTO products VALUES (1, 9.99, 'Widget'), (2, 19.99, 'Gadget');")
@@ -464,7 +450,7 @@ def test_notebook_integration_and_vscode_uri():
     assert prod["columns"] == 3
     assert prod["rows"] == 2
 
-    # 3. Test stop_server when no server active
+    # 2. Test stop_server when no server active
     assert stop_server() is False
 
 
@@ -479,10 +465,10 @@ def test_render_notebook_card_in_notebook_environment(monkeypatch):
     con.execute("CREATE TABLE users (id INT, name VARCHAR);")
     res = render_notebook_card(con, project_dir=".", mode="explore")
     assert res is True
-    assert len(rendered_html) == 1
-    assert "command:runCommands?" in rendered_html[0]
+    assert "duckpack explore" in rendered_html[0]
     assert "DuckPack Database Explorer" in rendered_html[0]
     assert "users" in rendered_html[0]
+    assert "Automatic terminal pop-out is disabled" in rendered_html[0]
     stop_server()
 
 
