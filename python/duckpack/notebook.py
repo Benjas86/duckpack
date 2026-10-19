@@ -1,15 +1,12 @@
 """
 DuckPack Notebook Integration:
-Provides rich, interactive rendering and integrated terminal launching for
+Provides rich, interactive rendering and terminal instructions for
 Jupyter Notebooks, VS Code Interactive Window, and Dev Containers.
 """
 
-import json
 import os
-import shutil
 import socket
 import sys
-import urllib.parse
 from pathlib import Path
 
 # Track active background bridge for in-memory notebook sessions
@@ -97,26 +94,6 @@ def introspect_schema_summary(target) -> list:
     return tables
 
 
-def build_vscode_terminal_uri(command: str) -> str:
-    """
-    Builds a VS Code Command URI that focuses or creates an integrated terminal
-    and sends the specified command sequence.
-    """
-    payload = {
-        "commands": [
-            "workbench.action.terminal.focus",
-            {
-                "command": "workbench.action.terminal.sendSequence",
-                "args": {
-                    "text": f"{command}\u000D"
-                }
-            }
-        ]
-    }
-    encoded = urllib.parse.quote(json.dumps(payload))
-    return f"command:runCommands?{encoded}"
-
-
 def render_notebook_card(
     target,
     project_dir=".",
@@ -129,8 +106,8 @@ def render_notebook_card(
     env=None,
 ) -> bool:
     """
-    Renders a rich interactive card in Jupyter / VS Code notebooks with a one-click
-    button to launch the full DuckPack TUI inside the VS Code integrated terminal.
+    Renders an informative, high-clarity card in Jupyter / VS Code notebooks with a
+    copyable code block to launch the full DuckPack TUI inside any VS Code terminal.
     """
     global _ACTIVE_NOTEBOOK_BRIDGE
 
@@ -211,7 +188,7 @@ def render_notebook_card(
             cmd_parts.append("--force-drop")
 
     terminal_cmd = " ".join(cmd_parts)
-    vscode_uri = build_vscode_terminal_uri(terminal_cmd)
+    safe_cmd_attr = terminal_cmd.replace("'", "\\'").replace('"', '&quot;')
 
     # Introspect tables for preview
     tables = introspect_schema_summary(target)
@@ -244,12 +221,12 @@ def render_notebook_card(
         </div>
         """
     else:
-        preview_table_html = "<div style='margin-top: 10px; font-size: 12px; opacity: 0.6;'>No user tables defined yet. Create tables or queries in the IDE.</div>"
+        preview_table_html = "<div style='margin-top: 12px; font-size: 12px; opacity: 0.6;'>No user tables defined in connection.</div>"
 
     bridge_status_html = ""
     if is_in_memory_bridge:
         bridge_status_html = f"""
-        <div style="display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 11px; opacity: 0.75;">
+        <div style="display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 11px; opacity: 0.8;">
             <span style="display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #10b981;"></span>
             <span>Live Python session bridged on <code>{db_arg}</code></span>
             <span>•</span>
@@ -257,7 +234,8 @@ def render_notebook_card(
         </div>
         """
 
-    button_text = "▶ Open DuckPack in VS Code Terminal" if mode == "explore" else "▶ Review & Apply in VS Code Terminal"
+    title = "DuckPack Database Explorer" if mode == "explore" else "DuckPack Diff & Apply"
+    action_desc = "launch the full-screen terminal IDE" if mode == "explore" else "review diffs and apply migrations interactively"
 
     html_content = f"""
     <div style="
@@ -269,50 +247,43 @@ def render_notebook_card(
         padding: 16px 20px;
         margin: 10px 0;
         box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-        max-width: 720px;
+        max-width: 740px;
     ">
         <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
             <div style="display: flex; align-items: center; gap: 10px;">
                 <span style="font-size: 22px;">🦆</span>
                 <div>
-                    <div style="font-weight: 700; font-size: 15px; letter-spacing: -0.2px;">DuckPack Database Explorer</div>
-                    <div style="font-size: 12px; opacity: 0.7;">Interactive Terminal IDE ready for VS Code</div>
+                    <div style="font-weight: 700; font-size: 15px; letter-spacing: -0.2px;">{title}</div>
+                    <div style="font-size: 12px; opacity: 0.7;">Dev Container / Notebook Environment</div>
                 </div>
             </div>
             <span style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 12px;">v0.2.0</span>
         </div>
 
-        <div style="margin: 14px 0 10px 0;">
-            <a href="{vscode_uri}" style="
-                display: inline-flex;
-                align-items: center;
-                gap: 8px;
-                background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
-                color: #111827 !important;
-                font-weight: 600;
-                font-size: 13px;
-                padding: 9px 20px;
-                border-radius: 6px;
-                text-decoration: none !important;
-                box-shadow: 0 2px 10px rgba(245, 158, 11, 0.35);
-                transition: transform 0.1s ease, box-shadow 0.1s ease;
-                cursor: pointer;
-            ">{button_text}</a>
+        <div style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 6px; padding: 10px 14px; font-size: 12px; line-height: 1.5; margin-bottom: 14px; color: #bae6fd;">
+            ℹ️ <strong>Automatic terminal pop-out is disabled</strong> by Dev Container and VS Code notebook sandbox restrictions. To {action_desc}, paste the command below into your VS Code terminal panel:
         </div>
 
-        <div style="margin-top: 10px;">
-            <div style="font-size: 11px; opacity: 0.6; margin-bottom: 4px;">Or run this command in your VS Code terminal panel:</div>
-            <div style="
-                background: var(--vscode-terminal-background, #0d1117);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                padding: 7px 11px;
-                border-radius: 5px;
-                font-family: var(--vscode-editor-font-family, monospace);
-                font-size: 12px;
-                color: #38bdf8;
-                user-select: all;
-                word-break: break-all;
-            ">$ {terminal_cmd}</div>
+        <div>
+            <div style="display: flex; align-items: center; justify-content: space-between; background: var(--vscode-terminal-background, #0d1117); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; padding: 10px 14px;">
+                <code style="font-family: var(--vscode-editor-font-family, monospace); font-size: 12.5px; color: #38bdf8; word-break: break-all; user-select: all;">$ {terminal_cmd}</code>
+                <button onclick="navigator.clipboard.writeText('{safe_cmd_attr}').then(() => {{ this.innerText = '✓ Copied!'; setTimeout(() => this.innerText = '📋 Copy', 2000); }})" style="
+                    background: rgba(255, 255, 255, 0.08);
+                    border: 1px solid rgba(255, 255, 255, 0.16);
+                    color: #e6edf3;
+                    padding: 5px 12px;
+                    border-radius: 4px;
+                    font-size: 11px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    white-space: nowrap;
+                    margin-left: 14px;
+                ">📋 Copy</button>
+            </div>
+        </div>
+
+        <div style="margin-top: 10px; font-size: 11px; opacity: 0.75; line-height: 1.4;">
+            💡 <strong>Pro-Tip:</strong> In VS Code, right-click your terminal tab and choose <em>"Move Terminal into Editor Area"</em> to run DuckPack side-by-side with your code in a dedicated full-size editor workspace!
         </div>
 
         {bridge_status_html}
