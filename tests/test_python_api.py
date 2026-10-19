@@ -389,3 +389,16 @@ def test_python_connection_auto_attach_toml_target(tmp_path, capsys):
     assert joined == [("Alice", 49.99), ("Bob", 199.50)]
 
 
+def test_cli_version_and_subcommands(capsys, monkeypatch):
+    from duckpack.cli import main
+    import pytest
+
+    # Test --version exits 0 and prints version string
+    monkeypatch.setattr("sys.argv", ["duckpack", "--version"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert "duckpack 0.2.0" in captured.out
+
+
