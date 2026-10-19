@@ -210,22 +210,8 @@ def apply(
             env=env,
         )
 
-    # 2. In notebook / VS Code interactive environments, render one-click terminal card
-    from .notebook import is_notebook_environment, render_notebook_card
-    if is_notebook_environment():
-        if render_notebook_card(
-            target,
-            project_dir=project_dir,
-            database=active_cat,
-            mode="apply",
-            force_drop=force_drop,
-            quack_token=quack_token,
-            insecure=insecure,
-            env=env,
-        ):
-            return ApplyResult(success=True, applied_count=0, items=[])
-
-    # 3. External GUI terminal emulator on Desktop (Ghostty, Foot, Windows Terminal, Terminal.app)
+    # 2. On Desktop systems with a graphical terminal emulator (Ghostty, Foot, Windows Terminal, Terminal.app),
+    # automatically pop open the native external terminal window connected to the database:
     if open_window:
         from .terminal import launch_terminal_window
         launched = launch_terminal_window(
@@ -256,7 +242,22 @@ def apply(
                 print("🦆 DuckPack: Migration cancelled by user (0 changes applied).")
                 return ApplyResult(success=False, applied_count=0, items=[])
 
-    # 3. Headless fallback (no display / CI / Docker container without GUI):
+    # 3. In Dev Containers, headless environments, or remote SSH without a GUI display server:
+    from .notebook import is_notebook_environment, render_notebook_card
+    if is_notebook_environment():
+        if render_notebook_card(
+            target,
+            project_dir=project_dir,
+            database=active_cat,
+            mode="apply",
+            force_drop=force_drop,
+            quack_token=quack_token,
+            insecure=insecure,
+            env=env,
+        ):
+            return ApplyResult(success=True, applied_count=0, items=[])
+
+    # 4. Headless fallback (no display / CI / Docker container without GUI):
     print(f"🦆 DuckPack: Found {diff_before.change_count} pending change(s) to apply:")
     for item in diff_before.items:
         print(f"  • {item}")
@@ -292,8 +293,9 @@ def explore(
       • When `open_window=True` (default), automatically pops open a graphical
         terminal window (Ghostty, Foot, Terminal.app, Windows Terminal) connected
         to the database (including live in-memory DuckDB connections).
-      • When `open_window=False` or in headless environments (no GUI display),
-        prints a clean, formatted schema overview directly into the notebook cell.
+      • In headless environments or Dev Containers without a desktop window manager,
+        renders an informative card with a 1-click copy block to launch the full-screen
+        interactive TUI in any VS Code terminal panel.
     - database: Target database catalog name when multiple databases are attached (alias: catalog).
     - env: optional environment profile name (e.g. 'staging', 'prod') to load from duckpack.toml and .env.<env>
     """
@@ -326,21 +328,8 @@ def explore(
             env=env,
         )
 
-    # 2. In notebook / VS Code interactive environments, render one-click terminal card
-    from .notebook import is_notebook_environment, render_notebook_card
-    if is_notebook_environment():
-        if render_notebook_card(
-            target,
-            project_dir=project_dir,
-            database=active_cat,
-            mode="explore",
-            quack_token=quack_token,
-            insecure=insecure,
-            env=env,
-        ):
-            return None
-
-    # 3. External GUI terminal emulator on Desktop (Ghostty, Foot, Windows Terminal, Terminal.app)
+    # 2. On Desktop systems with a graphical terminal emulator (Ghostty, Foot, Windows Terminal, Terminal.app),
+    # automatically pop open the native external terminal window connected to the database:
     if open_window:
         from .terminal import launch_terminal_window
         launched = launch_terminal_window(
@@ -355,7 +344,21 @@ def explore(
         if launched:
             return None
 
-    # 4. Fallback to formatted overview
+    # 3. In Dev Containers, headless environments, or remote SSH without a GUI display server:
+    from .notebook import is_notebook_environment, render_notebook_card
+    if is_notebook_environment():
+        if render_notebook_card(
+            target,
+            project_dir=project_dir,
+            database=active_cat,
+            mode="explore",
+            quack_token=quack_token,
+            insecure=insecure,
+            env=env,
+        ):
+            return None
+
+    # 4. Plain console fallback (headless CI / non-notebook script)
     return _native_explore(
         target,
         project_dir=project_dir,
