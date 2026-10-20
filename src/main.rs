@@ -61,6 +61,9 @@ enum Commands {
         /// Apply automatically without showing the TUI
         #[arg(long)]
         auto_approve: bool,
+        /// Launch the interactive TUI (default behavior unless --auto-approve is specified)
+        #[arg(short, long)]
+        interactive: bool,
         /// Dry run mode: output migration SQL script to this file instead of applying
         #[arg(long)]
         out: Option<String>,
@@ -84,6 +87,10 @@ enum Commands {
         /// Target database catalog name if multiple databases are attached
         #[arg(long, visible_alias = "catalog")]
         database: Option<String>,
+
+        /// Launch the interactive TUI to review schema diffs and migrations
+        #[arg(short, long)]
+        interactive: bool,
 
         /// Quack authentication token
         #[arg(long)]
@@ -236,10 +243,23 @@ fn main() -> Result<()> {
             let _ = build_shadow_db(project_dir)?;
             println!("Build successful! All SQL syntax is valid.");
         }
-        Commands::Diff { project_dir, db, database, quack_token, quack_disable_ssl } => {
+        Commands::Diff { project_dir, db, database, interactive, quack_token, quack_disable_ssl } => {
             if !project_dir.exists() {
                 eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
                 return Ok(());
+            }
+
+            if *interactive {
+                return run_diff_review_tui(
+                    project_dir,
+                    db,
+                    database.as_deref(),
+                    cli.env.as_deref(),
+                    quack_token.as_deref(),
+                    *quack_disable_ssl,
+                    false,
+                    None,
+                );
             }
 
             let configured_catalog = database.clone().or_else(|| resolve_project_catalog(project_dir, cli.env.as_deref()));
@@ -280,7 +300,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Apply { project_dir, db, database, force_drop, auto_approve, out, quack_token, quack_disable_ssl } => {
+        Commands::Apply { project_dir, db, database, force_drop, auto_approve, interactive: _, out, quack_token, quack_disable_ssl } => {
             if !project_dir.exists() {
                 eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
                 return Ok(());
@@ -348,275 +368,16 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let configured_catalog = database.clone().or_else(|| resolve_project_catalog(project_dir, cli.env.as_deref()));
-            let init_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
-            let mut active_catalog = diff::validate_target_catalog(&init_conn, configured_catalog.as_deref(), true)?;
-            drop(init_conn);
-
-            let mut terminal = if out.is_none() {
-                ratatui::crossterm::terminal::enable_raw_mode()?;
-                let mut stdout = std::io::stdout();
-                ratatui::crossterm::execute!(stdout, ratatui::crossterm::terminal::EnterAlternateScreen, ratatui::crossterm::event::EnableMouseCapture)?;
-                let backend = ratatui::backend::CrosstermBackend::new(stdout);
-                Some(ratatui::Terminal::new(backend)?)
-            } else {
-                None
-            };
-
-            let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh, 'b' to switch catalog, 'q' to Quit.");
-            let mut current_force_drop = *force_drop;
-            let mut inspect_data: Option<(String, Vec<String>, Vec<Vec<String>>, i64)> = None;
-            let mut total_applied: usize = 0;
-            let mut applied_catalogs: Vec<String> = Vec::new();
-
-            loop {
-                let shadow_conn = build_shadow_db(project_dir)?;
-                let target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
-                
-                let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
-                let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
-                let shadow_schema = diff::get_schema(&shadow_conn, None)?;
-                let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
-                let shadow_views = diff::get_views(&shadow_conn, None)?;
-                let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
-                let shadow_macros = diff::get_macros(&shadow_conn, None)?;
-                let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
-                let ignore_list = load_ignore_rules(project_dir);
-
-                let mut diff_result = diff::compute_diff(
-                    &shadow_schemas,
-                    &target_schemas,
-                    &shadow_schema, 
-                    &target_schema, 
-                    &shadow_views, 
-                    &target_views, 
-                    &shadow_macros, 
-                    &target_macros, 
-                    project_dir,
-                    &ignore_list
-                );
-
-                if let Some(out_file) = out {
-                    let mut script = String::new();
-                    for item in &diff_result.items {
-                        let is_drop = matches!(item.item_type, diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro);
-                        if is_drop && !*force_drop {
-                            continue;
-                        }
-                        if !item.sql.trim().is_empty() {
-                            script.push_str(&item.sql);
-                            if !item.sql.trim().ends_with(';') {
-                                script.push(';');
-                            }
-                            script.push_str("\n\n");
-                        }
-                    }
-                    if let Err(e) = std::fs::write(out_file, script) {
-                        eprintln!("Error writing dry-run script: {}", e);
-                    } else {
-                        println!("Dry-run script successfully written to {}", out_file);
-                    }
-                    break;
-                }
-
-                if let Some(term) = &mut terminal {
-                    let display_db = if db.starts_with("quack:localhost:") || db.starts_with("quack:127.0.0.1:") {
-                        format!("{} (Python In-Memory)", db)
-                    } else {
-                        db.clone()
-                    };
-                    let title = format!("{} [{}]", display_db, active_catalog);
-                    match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data, &title)? {
-                        tui::TuiAction::Quit => {
-                            break;
-                        }
-                    tui::TuiAction::SwitchCatalog => {
-                        let attached = diff::list_attached_databases(&target_conn).unwrap_or_default();
-                        let writable_dbs: Vec<_> = attached
-                            .into_iter()
-                            .filter(|d| !d.readonly && (d.db_type.eq_ignore_ascii_case("duckdb") || d.db_type.eq_ignore_ascii_case("quack")))
-                            .collect();
-                        if writable_dbs.len() > 1 {
-                            let curr_idx = writable_dbs.iter().position(|d| d.name.eq_ignore_ascii_case(&active_catalog)).unwrap_or(0);
-                            let next_idx = (curr_idx + 1) % writable_dbs.len();
-                            active_catalog = writable_dbs[next_idx].name.clone();
-                            status_msg = format!("Switched target catalog to '{}'", active_catalog);
-                        } else {
-                            status_msg = format!("Catalog '{}' is the only writable DuckDB database attached.", active_catalog);
-                        }
-                        continue;
-                    }
-                    tui::TuiAction::CopyStatus => {
-                        let _ = std::fs::write("duckpack.log", &status_msg);
-                        status_msg = "Status text copied to duckpack.log!".to_string();
-                        continue;
-                    }
-                    tui::TuiAction::Refresh => {
-                        status_msg = "Refreshed schema from disk.".to_string();
-                        continue;
-                    }
-                    tui::TuiAction::ToggleDestructiveMode => {
-                        current_force_drop = !current_force_drop;
-                        status_msg = if current_force_drop {
-                            "Destructive Mode ENABLED. Drops will be executed.".to_string()
-                        } else {
-                            "Destructive Mode DISABLED. Drops will be ignored.".to_string()
-                        };
-                        continue;
-                    }
-                    tui::TuiAction::Inspect { obj_name } => {
-                        let safe_obj = obj_name.replace("'", "''");
-                        
-                        let mut cols = Vec::new();
-                        if let Ok(mut pragma_stmt) = target_conn.prepare(&format!("PRAGMA table_info('{}')", safe_obj)) {
-                            if let Ok(mut pragma_rows) = pragma_stmt.query([]) {
-                                while let Ok(Some(row)) = pragma_rows.next() {
-                                    if let Ok(col_name) = row.get::<_, String>(1) {
-                                        cols.push(col_name);
-                                    }
-                                }
-                            }
-                        }
-
-                        if cols.is_empty() {
-                            status_msg = format!("Cannot inspect '{}': Does not exist in target database yet.", obj_name);
-                        } else {
-                            let mut row_count = 0;
-                            if let Ok(mut count_stmt) = target_conn.prepare(&format!("SELECT count(*) FROM \"{}\"", safe_obj)) {
-                                if let Ok(mut count_rows) = count_stmt.query([]) {
-                                    if let Ok(Some(row)) = count_rows.next() {
-                                        row_count = row.get::<_, i64>(0).unwrap_or(0);
-                                    }
-                                }
-                            }
-
-                            let cast_cols = cols.iter().map(|c| format!("CAST(\"{}\" AS VARCHAR)", c)).collect::<Vec<_>>().join(", ");
-                            if let Ok(mut stmt) = target_conn.prepare(&format!("SELECT {} FROM \"{}\" LIMIT 5", cast_cols, safe_obj)) {
-                                if let Ok(mut db_rows) = stmt.query([]) {
-                                    let mut rows = Vec::new();
-                                    while let Ok(Some(row)) = db_rows.next() {
-                                        let mut str_row = Vec::new();
-                                        for i in 0..cols.len() {
-                                            let val: String = row.get(i).unwrap_or_else(|_| "NULL".to_string());
-                                            str_row.push(val);
-                                        }
-                                        rows.push(str_row);
-                                    }
-                                    inspect_data = Some((obj_name, cols, rows, row_count));
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    tui::TuiAction::CloseInspect => {
-                        inspect_data = None;
-                        continue;
-                    }
-                    tui::TuiAction::Explore => {
-                        if let Some(term) = &mut terminal {
-                            ide::run_ide_loop(term, &target_conn, &project_dir, &db, *quack_disable_ssl)?;
-                            term.clear()?;
-                        }
-                        continue;
-                    }
-                    tui::TuiAction::Apply => {
-                        status_msg = "Applying changes...".to_string();
-                        if let Some(term) = &mut terminal {
-                            let _ = tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, true, &inspect_data, &title);
-                        }
-
-                        let remote = is_remote(db);
-                        let is_quack = db.starts_with("quack:");
-                        let applied_count = diff_result.items.iter().filter(|i| i.selected && !i.ignored).count();
-                        if !remote && !is_quack {
-                            let db_path = PathBuf::from(db);
-                            let mut b_path = db_path.clone();
-                            b_path.set_extension("duckdb.bak");
-                            if db_path.exists() {
-                                let _ = fs::copy(&db_path, &b_path);
-                            }
-                            
-                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
-                            
-                            if apply_success.is_ok() {
-                                if b_path.exists() {
-                                    fs::remove_file(&b_path).ok();
-                                }
-                                total_applied += applied_count;
-                                if !applied_catalogs.contains(&active_catalog) && applied_count > 0 {
-                                    applied_catalogs.push(active_catalog.clone());
-                                }
-                                status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
-                                continue;
-                            } else {
-                                status_msg = format!("Error applying schema: {:?}", apply_success.err());
-                                drop(target_conn); 
-                                if b_path.exists() {
-                                    let _ = fs::copy(&b_path, &db_path);
-                                    fs::remove_file(&b_path).ok();
-                                }
-                                continue;
-                            }
-                        } else {
-                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
-                            if apply_success.is_ok() {
-                                total_applied += applied_count;
-                                if !applied_catalogs.contains(&active_catalog) && applied_count > 0 {
-                                    applied_catalogs.push(active_catalog.clone());
-                                }
-                                status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
-                                continue;
-                            } else {
-                                status_msg = format!("Error applying schema to remote database: {:?}", apply_success.err());
-                                continue;
-                            }
-                        }
-                    }
-
-                    tui::TuiAction::Pull { obj_name, item_type } => {
-                        let sql = match item_type {
-                            diff::DiffItemType::DropTable => {
-                                if let Some(target) = target_schema.get(&obj_name) {
-                                    Some(target.create_sql.clone())
-                                } else { None }
-                            }
-                            diff::DiffItemType::DropView => target_views.get(&obj_name).cloned(),
-                            diff::DiffItemType::DropMacro => target_macros.get(&obj_name).cloned(),
-                            _ => None,
-                        };
-
-                        if let Some(sql) = sql {
-                            let mut path = project_dir.clone();
-                            match item_type {
-                                diff::DiffItemType::DropTable => path.push("tables"),
-                                diff::DiffItemType::DropView => path.push("views"),
-                                diff::DiffItemType::DropMacro => path.push("macros"),
-                                _ => {}
-                            }
-                            path.push(format!("{}.sql", obj_name));
-                            if let Err(e) = std::fs::write(&path, sql) {
-                                status_msg = format!("Error pulling '{}': {}", obj_name, e);
-                            } else {
-                                status_msg = format!("Successfully pulled '{}' back into local project!", obj_name);
-                            }
-                        } else {
-                            status_msg = format!("Cannot pull '{}': Definition not found in remote DB.", obj_name);
-                        }
-                    }
-                }
-                }
-            }
-
-            if let Some(term) = &mut terminal {
-                ratatui::crossterm::terminal::disable_raw_mode()?;
-                ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen, ratatui::crossterm::event::DisableMouseCapture)?;
-                term.show_cursor()?;
-            }
-            if total_applied > 0 {
-                println!("🦆 DuckPack: Applied {} total change(s) across catalog(s): [{}].", total_applied, applied_catalogs.join(", "));
-            } else {
-                println!("🦆 DuckPack: Exited without applying changes.");
-            }
+            run_diff_review_tui(
+                project_dir,
+                db,
+                database.as_deref(),
+                cli.env.as_deref(),
+                quack_token.as_deref(),
+                *quack_disable_ssl,
+                *force_drop,
+                out.as_deref(),
+            )?;
         }
         Commands::Compile { project_dir, out } => {
             println!("Compiling project {} into DuckPack: {}", project_dir.display(), out);
@@ -936,6 +697,308 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Launches the interactive visual diff & declarative migration review TUI.
+///
+/// Can be invoked via `duckpack diff --interactive` (or `-i`) or `duckpack apply` (default mode).
+fn run_diff_review_tui(
+    project_dir: &PathBuf,
+    db: &str,
+    database: Option<&str>,
+    env: Option<&str>,
+    quack_token: Option<&str>,
+    quack_disable_ssl: bool,
+    force_drop: bool,
+    out: Option<&str>,
+) -> Result<()> {
+    let configured_catalog = database.map(String::from).or_else(|| resolve_project_catalog(project_dir, env));
+    let init_conn = connect_target_db(db, quack_token, quack_disable_ssl)?;
+    let mut active_catalog = diff::validate_target_catalog(&init_conn, configured_catalog.as_deref(), true)?;
+    if db.starts_with("quack:") {
+        cleanup_orphaned_quack_bridges(&init_conn);
+    }
+    drop(init_conn);
+
+    let mut terminal = if out.is_none() {
+        ratatui::crossterm::terminal::enable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        ratatui::crossterm::execute!(stdout, ratatui::crossterm::terminal::EnterAlternateScreen, ratatui::crossterm::event::EnableMouseCapture)?;
+        let backend = ratatui::backend::CrosstermBackend::new(stdout);
+        Some(ratatui::Terminal::new(backend)?)
+    } else {
+        None
+    };
+
+    let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh, 'b' to switch catalog, 'q' to Quit.");
+    let mut current_force_drop = force_drop;
+    let mut inspect_data: Option<(String, Vec<String>, Vec<Vec<String>>, i64)> = None;
+    let mut total_applied: usize = 0;
+    let mut applied_catalogs: Vec<String> = Vec::new();
+    let project_dir_buf = project_dir.to_path_buf();
+
+    let loop_res = (|| -> Result<()> {
+        loop {
+            let shadow_conn = build_shadow_db(project_dir)?;
+            let target_conn = connect_target_db(db, quack_token, quack_disable_ssl)?;
+            
+            let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
+            let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
+            let shadow_schema = diff::get_schema(&shadow_conn, None)?;
+            let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
+            let shadow_views = diff::get_views(&shadow_conn, None)?;
+            let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
+            let shadow_macros = diff::get_macros(&shadow_conn, None)?;
+            let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
+            let ignore_list = load_ignore_rules(project_dir);
+
+            let mut diff_result = diff::compute_diff(
+                &shadow_schemas,
+                &target_schemas,
+                &shadow_schema, 
+                &target_schema, 
+                &shadow_views, 
+                &target_views, 
+                &shadow_macros, 
+                &target_macros, 
+                project_dir,
+                &ignore_list
+            );
+
+            if let Some(out_file) = out {
+                let mut script = String::new();
+                for item in &diff_result.items {
+                    let is_drop = matches!(item.item_type, diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro);
+                    if is_drop && !current_force_drop {
+                        continue;
+                    }
+                    if !item.sql.trim().is_empty() {
+                        script.push_str(&item.sql);
+                        if !item.sql.trim().ends_with(';') {
+                            script.push(';');
+                        }
+                        script.push_str("\n\n");
+                    }
+                }
+                if let Err(e) = std::fs::write(out_file, script) {
+                    eprintln!("Error writing dry-run script: {}", e);
+                } else {
+                    println!("Dry-run script successfully written to {}", out_file);
+                }
+                break;
+            }
+
+            if let Some(term) = &mut terminal {
+                let display_db = if db.starts_with("quack:localhost:") || db.starts_with("quack:127.0.0.1:") {
+                    format!("{} (Python In-Memory)", db)
+                } else {
+                    db.to_string()
+                };
+                let title = format!("{} [{}]", display_db, active_catalog);
+                match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data, &title)? {
+                    tui::TuiAction::Quit => {
+                        break;
+                    }
+                    tui::TuiAction::SwitchCatalog => {
+                        let attached = diff::list_attached_databases(&target_conn).unwrap_or_default();
+                        let writable_dbs: Vec<_> = attached
+                            .into_iter()
+                            .filter(|d| !d.readonly && (d.db_type.eq_ignore_ascii_case("duckdb") || d.db_type.eq_ignore_ascii_case("quack")))
+                            .collect();
+                        if writable_dbs.len() > 1 {
+                            let curr_idx = writable_dbs.iter().position(|d| d.name.eq_ignore_ascii_case(&active_catalog)).unwrap_or(0);
+                            let next_idx = (curr_idx + 1) % writable_dbs.len();
+                            active_catalog = writable_dbs[next_idx].name.clone();
+                            status_msg = format!("Switched target catalog to '{}'", active_catalog);
+                        } else {
+                            status_msg = format!("Catalog '{}' is the only writable DuckDB database attached.", active_catalog);
+                        }
+                        continue;
+                    }
+                    tui::TuiAction::CopyStatus => {
+                        let _ = std::fs::write("duckpack.log", &status_msg);
+                        status_msg = "Status text copied to duckpack.log!".to_string();
+                        continue;
+                    }
+                    tui::TuiAction::Refresh => {
+                        status_msg = "Refreshed schema from disk.".to_string();
+                        continue;
+                    }
+                    tui::TuiAction::ToggleDestructiveMode => {
+                        current_force_drop = !current_force_drop;
+                        status_msg = if current_force_drop {
+                            "Destructive Mode ENABLED. Drops will be executed.".to_string()
+                        } else {
+                            "Destructive Mode DISABLED. Drops will be ignored.".to_string()
+                        };
+                        continue;
+                    }
+                    tui::TuiAction::Inspect { obj_name } => {
+                        let safe_obj = obj_name.replace('\'', "''");
+                        
+                        let mut cols = Vec::new();
+                        if let Ok(mut pragma_stmt) = target_conn.prepare(&format!("PRAGMA table_info('{}')", safe_obj)) {
+                            if let Ok(mut pragma_rows) = pragma_stmt.query([]) {
+                                while let Ok(Some(row)) = pragma_rows.next() {
+                                    if let Ok(col_name) = row.get::<_, String>(1) {
+                                        cols.push(col_name);
+                                    }
+                                }
+                            }
+                        }
+
+                        if cols.is_empty() {
+                            status_msg = format!("Cannot inspect '{}': Does not exist in target database yet.", obj_name);
+                        } else {
+                            let mut row_count = 0;
+                            if let Ok(mut count_stmt) = target_conn.prepare(&format!("SELECT count(*) FROM \"{}\"", safe_obj)) {
+                                if let Ok(mut count_rows) = count_stmt.query([]) {
+                                    if let Ok(Some(row)) = count_rows.next() {
+                                        row_count = row.get::<_, i64>(0).unwrap_or(0);
+                                    }
+                                }
+                            }
+
+                            let cast_cols = cols.iter().map(|c| format!("CAST(\"{}\" AS VARCHAR)", c)).collect::<Vec<_>>().join(", ");
+                            if let Ok(mut stmt) = target_conn.prepare(&format!("SELECT {} FROM \"{}\" LIMIT 5", cast_cols, safe_obj)) {
+                                if let Ok(mut db_rows) = stmt.query([]) {
+                                    let mut rows = Vec::new();
+                                    while let Ok(Some(row)) = db_rows.next() {
+                                        let mut str_row = Vec::new();
+                                        for i in 0..cols.len() {
+                                            let val: String = row.get(i).unwrap_or_else(|_| "NULL".to_string());
+                                            str_row.push(val);
+                                        }
+                                        rows.push(str_row);
+                                    }
+                                    inspect_data = Some((obj_name, cols, rows, row_count));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    tui::TuiAction::CloseInspect => {
+                        inspect_data = None;
+                        continue;
+                    }
+                    tui::TuiAction::Explore => {
+                        if let Some(term) = &mut terminal {
+                            ide::run_ide_loop(term, &target_conn, &project_dir_buf, db, quack_disable_ssl)?;
+                            term.clear()?;
+                        }
+                        continue;
+                    }
+                    tui::TuiAction::Apply => {
+                        status_msg = "Applying changes...".to_string();
+                        if let Some(term) = &mut terminal {
+                            let _ = tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, true, &inspect_data, &title);
+                        }
+
+                        let remote = is_remote(db);
+                        let is_quack = db.starts_with("quack:");
+                        let applied_count = diff_result.items.iter().filter(|i| i.selected && !i.ignored).count();
+                        if !remote && !is_quack {
+                            let db_path = PathBuf::from(db);
+                            let mut b_path = db_path.clone();
+                            b_path.set_extension("duckdb.bak");
+                            if db_path.exists() {
+                                let _ = fs::copy(&db_path, &b_path);
+                            }
+                            
+                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
+                            
+                            if apply_success.is_ok() {
+                                if b_path.exists() {
+                                    fs::remove_file(&b_path).ok();
+                                }
+                                total_applied += applied_count;
+                                if !applied_catalogs.contains(&active_catalog) && applied_count > 0 {
+                                    applied_catalogs.push(active_catalog.clone());
+                                }
+                                status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
+                                continue;
+                            } else {
+                                status_msg = format!("Error applying schema: {:?}", apply_success.err());
+                                drop(target_conn); 
+                                if b_path.exists() {
+                                    let _ = fs::copy(&b_path, &db_path);
+                                    fs::remove_file(&b_path).ok();
+                                }
+                                continue;
+                            }
+                        } else {
+                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
+                            if apply_success.is_ok() {
+                                total_applied += applied_count;
+                                if !applied_catalogs.contains(&active_catalog) && applied_count > 0 {
+                                    applied_catalogs.push(active_catalog.clone());
+                                }
+                                status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
+                                continue;
+                            } else {
+                                status_msg = format!("Error applying schema to remote database: {:?}", apply_success.err());
+                                continue;
+                            }
+                        }
+                    }
+
+                    tui::TuiAction::Pull { obj_name, item_type } => {
+                        let sql = match item_type {
+                            diff::DiffItemType::DropTable => {
+                                if let Some(target) = target_schema.get(&obj_name) {
+                                    Some(target.create_sql.clone())
+                                } else { None }
+                            }
+                            diff::DiffItemType::DropView => target_views.get(&obj_name).cloned(),
+                            diff::DiffItemType::DropMacro => target_macros.get(&obj_name).cloned(),
+                            _ => None,
+                        };
+
+                        if let Some(sql) = sql {
+                            let mut path = project_dir.to_path_buf();
+                            match item_type {
+                                diff::DiffItemType::DropTable => path.push("tables"),
+                                diff::DiffItemType::DropView => path.push("views"),
+                                diff::DiffItemType::DropMacro => path.push("macros"),
+                                _ => {}
+                            }
+                            path.push(format!("{}.sql", obj_name));
+                            if let Err(e) = std::fs::write(&path, sql) {
+                                status_msg = format!("Error pulling '{}': {}", obj_name, e);
+                            } else {
+                                status_msg = format!("Successfully pulled '{}' back into local project!", obj_name);
+                            }
+                        } else {
+                            status_msg = format!("Cannot pull '{}': Definition not found in remote DB.", obj_name);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    if let Some(term) = &mut terminal {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::terminal::LeaveAlternateScreen,
+            ratatui::crossterm::event::DisableMouseCapture
+        );
+        let _ = term.show_cursor();
+    }
+
+    loop_res?;
+
+    if out.is_none() {
+        if total_applied > 0 {
+            println!("🦆 DuckPack: Applied {} total change(s) across catalog(s): [{}].", total_applied, applied_catalogs.join(", "));
+        } else {
+            println!("🦆 DuckPack: Exited without applying changes.");
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,4 +1102,32 @@ mod tests {
             _ => panic!("Expected Python install upgrade command"),
         }
     }
+
+    #[test]
+    fn test_cli_interactive_flags() {
+        let cli_diff = Cli::try_parse_from(&["duckpack", "diff", "--interactive"]).unwrap();
+        match cli_diff.command {
+            Commands::Diff { interactive, .. } => assert!(interactive),
+            _ => panic!("Expected Diff command"),
+        }
+
+        let cli_diff_short = Cli::try_parse_from(&["duckpack", "diff", "-i"]).unwrap();
+        match cli_diff_short.command {
+            Commands::Diff { interactive, .. } => assert!(interactive),
+            _ => panic!("Expected Diff command"),
+        }
+
+        let cli_apply = Cli::try_parse_from(&["duckpack", "apply", "--interactive"]).unwrap();
+        match cli_apply.command {
+            Commands::Apply { interactive, .. } => assert!(interactive),
+            _ => panic!("Expected Apply command"),
+        }
+
+        let cli_apply_short = Cli::try_parse_from(&["duckpack", "apply", "-i"]).unwrap();
+        match cli_apply_short.command {
+            Commands::Apply { interactive, .. } => assert!(interactive),
+            _ => panic!("Expected Apply command"),
+        }
+    }
 }
+
