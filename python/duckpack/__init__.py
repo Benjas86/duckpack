@@ -20,6 +20,7 @@ from ._duckpack import (
     SessionBridge,
     __duckdb_version__,
 )
+from .runner import InteractionRunner
 
 
 def _auto_attach_toml_target_if_needed(target, project_dir=".", env=None):
@@ -197,8 +198,7 @@ def apply(
         print(f"🦆 DuckPack: Database is already up to date (0 pending changes){cat_suffix}.")
         return ApplyResult(success=True, applied_count=0, items=[])
 
-    # 1. If running inside an interactive terminal shell (TTY), run in-process TUI:
-    if is_tty:
+    def run_tty():
         return _native_apply(
             target,
             project_dir=project_dir,
@@ -211,64 +211,50 @@ def apply(
             env=env,
         )
 
-    # 2. On Desktop systems with a graphical terminal emulator (Ghostty, Foot, Windows Terminal, Terminal.app),
-    # automatically pop open the native external terminal window connected to the database:
-    if open_window:
-        from .terminal import launch_terminal_window
-        launched = launch_terminal_window(
+    def on_window():
+        diff_after = diff(
             target,
             project_dir=project_dir,
             database=active_cat,
-            mode="apply",
-            force_drop=force_drop,
             quack_token=quack_token,
             insecure=insecure,
-            wait=wait,
             env=env,
         )
-        if launched:
-            diff_after = diff(
-                target,
-                project_dir=project_dir,
-                database=active_cat,
-                quack_token=quack_token,
-                insecure=insecure,
-                env=env,
-            )
-            applied = [item for item in diff_before.items if item not in diff_after.items]
-            if diff_after.change_count < diff_before.change_count or len(applied) > 0:
-                print(f"🦆 DuckPack: Applied {len(applied)} change(s) successfully.")
-                return ApplyResult(success=True, applied_count=len(applied), items=applied)
-            else:
-                print("🦆 DuckPack: Migration cancelled by user (0 changes applied).")
-                return ApplyResult(success=False, applied_count=0, items=[])
+        applied = [item for item in diff_before.items if item not in diff_after.items]
+        if diff_after.change_count < diff_before.change_count or len(applied) > 0:
+            print(f"🦆 DuckPack: Applied {len(applied)} change(s) successfully.")
+            return ApplyResult(success=True, applied_count=len(applied), items=applied)
+        else:
+            print("🦆 DuckPack: Migration cancelled by user (0 changes applied).")
+            return ApplyResult(success=False, applied_count=0, items=[])
 
-    # 3. In Dev Containers, headless environments, or remote SSH without a GUI display server:
-    from .notebook import is_notebook_environment, render_notebook_card
-    if is_notebook_environment():
-        if render_notebook_card(
-            target,
-            project_dir=project_dir,
-            database=active_cat,
-            mode="apply",
-            force_drop=force_drop,
-            quack_token=quack_token,
-            insecure=insecure,
-            env=env,
-        ):
-            return ApplyResult(success=True, applied_count=0, items=[])
+    def on_headless():
+        print(f"🦆 DuckPack: Found {diff_before.change_count} pending change(s) to apply:")
+        for item in diff_before.items:
+            print(f"  • {item}")
+        target_str = target if isinstance(target, str) else "local.duckdb"
+        print("\nℹ️  Dev Container / Headless Environment Detected.")
+        print("To review and apply these changes interactively, run in any terminal panel:")
+        print(f"  $ duckpack apply -p {project_dir} -d {target_str} --interactive\n")
+        raise ExecutionError(
+            "Cannot run interactive apply in a headless environment without an interactive terminal. "
+            "Run the command above in a terminal, or pass auto_approve=True to apply automatically."
+        )
 
-    # 4. Headless fallback (no display / CI / Docker container without GUI):
-    print(f"🦆 DuckPack: Found {diff_before.change_count} pending change(s) to apply:")
-    for item in diff_before.items:
-        print(f"  • {item}")
-    target_str = target if isinstance(target, str) else "local.duckdb"
-    print("\nℹ️  Dev Container / Headless Environment Detected.")
-    print("To review and apply these changes interactively, run in any terminal panel:")
-    print(f"  $ duckpack apply -p {project_dir} -d {target_str} --interactive\n")
-    raise ExecutionError(
-        "Cannot run interactive apply in a headless environment without an interactive terminal. "
-        "Run the command above in a terminal, or pass auto_approve=True to apply automatically."
+    return InteractionRunner.dispatch(
+        mode="apply",
+        target=target,
+        project_dir=project_dir,
+        database=active_cat,
+        force_drop=force_drop,
+        quack_token=quack_token,
+        insecure=insecure,
+        open_window=open_window,
+        wait=wait,
+        env=env,
+        on_tty=run_tty,
+        on_window_applied=on_window,
+        on_headless=on_headless,
     )
 
 
@@ -318,55 +304,32 @@ def explore(
         # If an existing Python connection was passed, auto-attach TOML target if configured
         _auto_attach_toml_target_if_needed(target, project_dir=project_dir, env=env)
 
-    # 1. If running in an active terminal shell, run directly in-process
-    if sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty():
-        return _native_explore(
-            target,
-            project_dir=project_dir,
-            database=active_cat,
-            quack_token=quack_token,
-            insecure=insecure,
-            env=env,
-        )
-
-    # 2. On Desktop systems with a graphical terminal emulator (Ghostty, Foot, Windows Terminal, Terminal.app),
-    # automatically pop open the native external terminal window connected to the database:
-    if open_window:
-        from .terminal import launch_terminal_window
-        launched = launch_terminal_window(
-            target,
-            project_dir=project_dir,
-            database=active_cat,
-            quack_token=quack_token,
-            insecure=insecure,
-            wait=wait,
-            env=env,
-        )
-        if launched:
-            return None
-
-    # 3. In Dev Containers, headless environments, or remote SSH without a GUI display server:
-    from .notebook import is_notebook_environment, render_notebook_card
-    if is_notebook_environment():
-        if render_notebook_card(
-            target,
-            project_dir=project_dir,
-            database=active_cat,
-            mode="explore",
-            quack_token=quack_token,
-            insecure=insecure,
-            env=env,
-        ):
-            return None
-
-    # 4. Plain console fallback (headless CI / non-notebook script)
-    return _native_explore(
-        target,
+    return InteractionRunner.dispatch(
+        mode="explore",
+        target=target,
         project_dir=project_dir,
         database=active_cat,
         quack_token=quack_token,
         insecure=insecure,
+        open_window=open_window,
+        wait=wait,
         env=env,
+        on_tty=lambda: _native_explore(
+            target,
+            project_dir=project_dir,
+            database=active_cat,
+            quack_token=quack_token,
+            insecure=insecure,
+            env=env,
+        ),
+        on_headless=lambda: _native_explore(
+            target,
+            project_dir=project_dir,
+            database=active_cat,
+            quack_token=quack_token,
+            insecure=insecure,
+            env=env,
+        ),
     )
 
 
@@ -408,6 +371,7 @@ __all__ = [
     "get_target_config",
     "stop_server",
     "SessionBridge",
+    "InteractionRunner",
     "__version__",
     "__duckdb_version__",
 ]

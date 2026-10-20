@@ -516,3 +516,60 @@ def test_render_notebook_card_in_notebook_environment(monkeypatch):
     stop_server()
 
 
+def test_interaction_runner_dispatch_hierarchy(monkeypatch):
+    from duckpack.runner import InteractionRunner
+
+    # 1. TTY priority
+    monkeypatch.setattr("duckpack.runner.is_interactive_tty", lambda: True)
+    res = InteractionRunner.dispatch(
+        mode="explore",
+        target="test.duckdb",
+        on_tty=lambda: "ran_tty",
+        on_headless=lambda: "ran_headless",
+    )
+    assert res == "ran_tty"
+
+    # 2. Desktop Window emulator priority when not in TTY
+    monkeypatch.setattr("duckpack.runner.is_interactive_tty", lambda: False)
+    monkeypatch.setattr("duckpack.terminal.launch_terminal_window", lambda *args, **kwargs: True)
+    res = InteractionRunner.dispatch(
+        mode="apply",
+        target="test.duckdb",
+        open_window=True,
+        on_window_applied=lambda: "window_applied",
+        on_headless=lambda: "ran_headless",
+    )
+    assert res == "window_applied"
+
+    # 3. Notebook fallback when window launcher returns False
+    monkeypatch.setattr("duckpack.terminal.launch_terminal_window", lambda *args, **kwargs: False)
+    monkeypatch.setattr("duckpack.notebook.is_notebook_environment", lambda: True)
+    monkeypatch.setattr("duckpack.notebook.render_notebook_card", lambda *args, **kwargs: True)
+
+    apply_card_res = InteractionRunner.dispatch(
+        mode="apply",
+        target="test.duckdb",
+        open_window=True,
+    )
+    assert apply_card_res.success is True
+    assert apply_card_res.applied_count == 0
+
+    explore_card_res = InteractionRunner.dispatch(
+        mode="explore",
+        target="test.duckdb",
+        open_window=True,
+    )
+    assert explore_card_res is None
+
+    # 4. Headless fallback when not in notebook and window disabled
+    monkeypatch.setattr("duckpack.notebook.is_notebook_environment", lambda: False)
+    res = InteractionRunner.dispatch(
+        mode="explore",
+        target="test.duckdb",
+        open_window=False,
+        on_headless=lambda: "ran_headless_fallback",
+    )
+    assert res == "ran_headless_fallback"
+
+
+
