@@ -624,6 +624,79 @@ pub fn resolve_project_catalog(project_dir: &std::path::Path, env_profile: Optio
     resolve_project_catalogs(project_dir, env_profile).into_iter().next()
 }
 
+/// Fully resolved, validated target specification ready to connect.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TargetSpec {
+    pub db: String,
+    pub token: Option<String>,
+    pub disable_ssl: bool,
+    pub catalogs: Vec<String>,
+    pub is_quack: bool,
+    pub is_motherduck: bool,
+}
+
+impl TargetSpec {
+    pub fn is_remote(&self) -> bool {
+        self.is_quack || self.is_motherduck
+    }
+
+    pub fn connect(&self) -> Result<Connection> {
+        connect_target_db(&self.db, self.token.as_deref(), self.disable_ssl)
+    }
+}
+
+/// Unified target resolver combining CLI flags, project configuration, environment profile,
+/// and environment variables into a validated TargetSpec.
+pub struct TargetResolver;
+
+impl TargetResolver {
+    pub fn resolve(
+        project_dir: &std::path::Path,
+        env_profile: Option<&str>,
+        explicit_db: Option<&str>,
+        explicit_token: Option<&str>,
+        explicit_insecure: Option<bool>,
+        explicit_catalogs: Option<Vec<String>>,
+    ) -> TargetSpec {
+        load_env_files(project_dir, env_profile);
+        let config = resolve_target_config(project_dir, env_profile);
+
+        // 1. Resolve database path/URI:
+        let db = match explicit_db {
+            Some(d) if env_profile.is_none() && d != "local.duckdb" && !d.is_empty() => d.to_string(),
+            Some(d) if env_profile.is_some() => config.db.clone().unwrap_or_else(|| d.to_string()),
+            Some(d) if d == "local.duckdb" => config.db.clone().unwrap_or_else(|| "local.duckdb".to_string()),
+            Some(d) if !d.is_empty() => d.to_string(),
+            _ => config.db.clone().unwrap_or_else(|| "local.duckdb".to_string()),
+        };
+
+        // 2. Resolve token
+        let token = resolve_quack_token(explicit_token, config.token_env.as_deref());
+
+        // 3. Resolve SSL / insecure
+        let disable_ssl = explicit_insecure.unwrap_or(false) || config.insecure.unwrap_or(false);
+
+        // 4. Resolve catalogs
+        let catalogs = match explicit_catalogs {
+            Some(cats) if !cats.is_empty() => cats,
+            _ => config.catalogs,
+        };
+
+        let is_quack = db.starts_with("quack:");
+        let is_motherduck = is_remote(&db);
+
+        TargetSpec {
+            db,
+            token,
+            disable_ssl,
+            catalogs,
+            is_quack,
+            is_motherduck,
+        }
+    }
+}
+
+
 /// Scaffolds a new declarative database project by generating the standard directory structure,
 /// configuration files (`duckpack.toml`), environment templates, and documentation.
 pub fn init_project(project_dir: &Path) -> Result<()> {
@@ -1041,4 +1114,66 @@ token_env = "PROD_TOKEN"
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_target_resolver_hierarchy_and_spec() {
+        let temp_dir = std::env::temp_dir().join(format!("duckpack_test_resolver_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Default with no config
+        let spec_default = TargetResolver::resolve(&temp_dir, None, None, None, None, None);
+        assert_eq!(spec_default.db, "local.duckdb");
+        assert_eq!(spec_default.token, None);
+        assert!(!spec_default.disable_ssl);
+        assert!(!spec_default.is_remote());
+        assert!(!spec_default.is_quack);
+        assert!(!spec_default.is_motherduck);
+        assert!(spec_default.catalogs.is_empty());
+
+        // 2. duckpack.toml with target defaults and env.prod
+        let toml_content = r#"
+[target]
+db = "warehouse.duckdb"
+catalog = "main_warehouse"
+
+[env.prod]
+db = "quack:prod.internal:9494"
+database = ["prod_analytics", "prod_events"]
+insecure = true
+token_env = "TEST_RESOLVER_PROD_TOKEN"
+"#;
+        std::fs::write(temp_dir.join("duckpack.toml"), toml_content).unwrap();
+
+        unsafe {
+            std::env::set_var("TEST_RESOLVER_PROD_TOKEN", "super_secret_prod_token");
+        }
+
+        // Resolving prod environment profile
+        let spec_prod = TargetResolver::resolve(&temp_dir, Some("prod"), None, None, None, None);
+        assert_eq!(spec_prod.db, "quack:prod.internal:9494");
+        assert_eq!(spec_prod.token.as_deref(), Some("super_secret_prod_token"));
+        assert!(spec_prod.disable_ssl);
+        assert!(spec_prod.is_remote());
+        assert!(spec_prod.is_quack);
+        assert!(!spec_prod.is_motherduck);
+        assert_eq!(spec_prod.catalogs, vec!["prod_analytics".to_string(), "prod_events".to_string()]);
+
+        // 3. Explicit overrides take precedence
+        let spec_override = TargetResolver::resolve(
+            &temp_dir,
+            Some("prod"),
+            Some("override.duckdb"),
+            Some("explicit_cli_token"),
+            Some(false),
+            Some(vec!["custom_cat".to_string()]),
+        );
+        assert_eq!(spec_override.token.as_deref(), Some("explicit_cli_token"));
+        assert_eq!(spec_override.catalogs, vec!["custom_cat".to_string()]);
+
+        unsafe {
+            std::env::remove_var("TEST_RESOLVER_PROD_TOKEN");
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
+

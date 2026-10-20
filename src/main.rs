@@ -178,65 +178,52 @@ fn main() -> Result<()> {
     let mut cli = Cli::from_arg_matches(&matches)?;
 
     let default_dir = PathBuf::from(".");
-    let project_dir = match &cli.command {
-        Commands::Init { project_dir } => project_dir,
-        Commands::Build { project_dir } => project_dir,
-        Commands::Apply { project_dir, .. } => project_dir,
-        Commands::Diff { project_dir, .. } => project_dir,
-        Commands::Compile { project_dir, .. } => project_dir,
-        Commands::Deploy { project_dir, .. } => project_dir,
-        Commands::Explore { project_dir, .. } => project_dir,
-        Commands::Python { .. } => &default_dir,
+    let project_dir: PathBuf = match &cli.command {
+        Commands::Init { project_dir } => project_dir.clone(),
+        Commands::Build { project_dir } => project_dir.clone(),
+        Commands::Apply { project_dir, .. } => project_dir.clone(),
+        Commands::Diff { project_dir, .. } => project_dir.clone(),
+        Commands::Compile { project_dir, .. } => project_dir.clone(),
+        Commands::Deploy { project_dir, .. } => project_dir.clone(),
+        Commands::Explore { project_dir, .. } => project_dir.clone(),
+        Commands::Python { .. } => default_dir,
     };
+    let project_dir = &project_dir;
 
-    // Load .env and .env.<profile> into process environment
-    duckpack::engine::load_env_files(project_dir, cli.env.as_deref());
-
-    let target_cfg = resolve_target_config(project_dir, cli.env.as_deref());
-
-    // Apply target/env configuration overrides, defaults, and token resolution
+    // Apply target/env configuration overrides, defaults, and token resolution via unified TargetResolver
     match &mut cli.command {
         Commands::Apply { db, quack_token, quack_disable_ssl, .. } |
         Commands::Diff { db, quack_token, quack_disable_ssl, .. } |
         Commands::Explore { db, quack_token, quack_disable_ssl, .. } => {
-            // Override db if profile given, or fallback if db is still default "local.duckdb"
-            if cli.env.is_some() {
-                if let Some(cfg_db) = &target_cfg.db {
-                    *db = cfg_db.clone();
-                }
-            } else if db == "local.duckdb" {
-                if let Some(cfg_db) = &target_cfg.db {
-                    *db = cfg_db.clone();
-                }
-            }
-
-            // Fallback insecure / quack_disable_ssl
-            if !*quack_disable_ssl {
-                if let Some(ins) = target_cfg.insecure {
-                    *quack_disable_ssl = ins;
-                }
-            }
-
-            // Resolve Quack token with CLI security guardrail
             if quack_token.is_some() {
                 eprintln!("Tip: Passing authentication tokens via CLI flags can expose credentials in shell history. Consider storing your token in .env (QUACK_TOKEN) or duckpack.toml.");
-            } else {
-                *quack_token = resolve_quack_token(None, target_cfg.token_env.as_deref());
             }
+            let spec = TargetResolver::resolve(
+                project_dir,
+                cli.env.as_deref(),
+                Some(db.as_str()),
+                quack_token.as_deref(),
+                Some(*quack_disable_ssl),
+                None,
+            );
+            *db = spec.db;
+            *quack_token = spec.token;
+            *quack_disable_ssl = spec.disable_ssl;
         }
         Commands::Deploy { db, .. } => {
-            if cli.env.is_some() {
-                if let Some(cfg_db) = &target_cfg.db {
-                    *db = cfg_db.clone();
-                }
-            } else if db == "local.duckdb" {
-                if let Some(cfg_db) = &target_cfg.db {
-                    *db = cfg_db.clone();
-                }
-            }
+            let spec = TargetResolver::resolve(
+                project_dir,
+                cli.env.as_deref(),
+                Some(db.as_str()),
+                None,
+                None,
+                None,
+            );
+            *db = spec.db;
         }
         _ => {}
     }
+
 
     match &cli.command {
         Commands::Init { project_dir } => {
