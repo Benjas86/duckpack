@@ -18,3 +18,4 @@ debug_query.txt
 *.jpg
 /decisions/
 .env*
+/sandbox/
