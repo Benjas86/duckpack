@@ -265,6 +265,50 @@ def test_terminal_staging_and_sync_back_temp_objects():
     assert len(remaining) == 0
 
 
+def test_session_bridge_lifecycle_and_temp_detection():
+    from duckpack import SessionBridge
+    con = duckdb.connect()
+
+    # When no temp tables/views, has_temp_objects is False
+    assert SessionBridge.has_temp_objects(con) is False
+
+    # Create temp table
+    con.execute("CREATE TEMP TABLE t_test (id INT, name VARCHAR);")
+    con.execute("INSERT INTO t_test VALUES (101, 'alpha');")
+    assert SessionBridge.has_temp_objects(con) is True
+
+    # Start SessionBridge
+    bridge = SessionBridge(con, token="test_token")
+    assert bridge.is_active is False
+    assert bridge.token == "test_token"
+    assert bridge.port > 0
+
+    uri = bridge.start()
+    assert uri.startswith("quack:127.0.0.1:")
+    assert bridge.is_active is True
+    assert bridge.db_uri == uri
+
+    # Verify bridge tables staged
+    staged = [r[0] for r in con.execute("SELECT table_name FROM duckdb_tables() WHERE database_name = 'memory' AND table_name LIKE '__duckpack_temp_bridge_%';").fetchall()]
+    assert "__duckpack_temp_bridge_t_test" in staged
+
+    # Stop bridge
+    stopped = bridge.stop()
+    assert stopped is True
+    assert bridge.is_active is False
+
+    # Stopping again is a safe no-op
+    assert bridge.stop() is False
+
+    # Bridge tables cleaned up
+    remaining = [r[0] for r in con.execute("SELECT table_name FROM duckdb_tables() WHERE database_name = 'memory' AND table_name LIKE '__duckpack_temp_bridge_%';").fetchall()]
+    assert len(remaining) == 0
+
+    # Original temp table intact
+    rows = con.execute("SELECT id, name FROM t_test;").fetchall()
+    assert rows == [(101, 'alpha')]
+
+
 def test_quack_env_and_config_resolution(tmp_path):
     import subprocess
     proj_dir = str(tmp_path / "env_quack_proj")
