@@ -265,11 +265,9 @@ pub fn restore_quack_temp_bridge(conn: &Connection) {
                     safe_orig, safe_bt
                 );
                 let _ = conn.execute(&restore_sql, []);
-                let drop_sql = format!(
-                    "CALL target_db.query('DROP TABLE IF EXISTS memory.\"{}\";');",
-                    safe_bt.replace('\'', "''")
-                );
-                let _ = conn.execute(&drop_sql, []);
+                let _ = conn.execute(&format!("DROP TABLE IF EXISTS target_db.\"{}\";", safe_bt), []);
+                let _ = conn.execute(&format!("CALL target_db.query('DROP TABLE IF EXISTS \"{}\";');", safe_bt.replace('\'', "''")), []);
+                let _ = conn.execute(&format!("CALL target_db.query('DROP TABLE IF EXISTS memory.\"{}\";');", safe_bt.replace('\'', "''")), []);
             }
         }
     }
@@ -289,6 +287,27 @@ pub fn restore_quack_temp_bridge(conn: &Connection) {
             let _ = conn.execute(&vsql, []);
         }
         let _ = conn.execute("CALL target_db.query('DROP TABLE IF EXISTS memory.__duckpack_temp_views_registry;');", []);
+    }
+}
+
+/// Cleans up any orphaned __duckpack_temp_bridge_% or __duckpack_temp_views_% tables left on target_db.
+pub fn cleanup_orphaned_quack_bridges(conn: &Connection) {
+    let tbl_sql = "SELECT * FROM target_db.query('SELECT table_name FROM duckdb_tables() WHERE table_name LIKE ''__duckpack_%'' AND internal = false;')";
+    if let Ok(mut stmt) = conn.prepare(tbl_sql) {
+        let mut bridges = Vec::new();
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(tname) = row.get::<_, String>(0) {
+                    bridges.push(tname);
+                }
+            }
+        }
+        for bt in bridges {
+            let safe_bt = bt.replace('\"', "\"\"");
+            let _ = conn.execute(&format!("DROP TABLE IF EXISTS target_db.\"{}\";", safe_bt), []);
+            let _ = conn.execute(&format!("CALL target_db.query('DROP TABLE IF EXISTS \"{}\";');", safe_bt.replace('\'', "''")), []);
+            let _ = conn.execute(&format!("CALL target_db.query('DROP TABLE IF EXISTS memory.\"{}\";');", safe_bt.replace('\'', "''")), []);
+        }
     }
 }
 

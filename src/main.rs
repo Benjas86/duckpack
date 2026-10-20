@@ -761,14 +761,10 @@ fn main() -> Result<()> {
             }
 
             if db.starts_with("quack:") {
-                restore_quack_temp_bridge(&target_conn);
+                cleanup_orphaned_quack_bridges(&target_conn);
             }
 
             let ide_res = ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db, *quack_disable_ssl);
-
-            if db.starts_with("quack:") {
-                sync_back_quack_temp_bridge(&target_conn);
-            }
 
             ratatui::crossterm::terminal::disable_raw_mode()?;
             ratatui::crossterm::execute!(
