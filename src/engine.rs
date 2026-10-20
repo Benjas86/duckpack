@@ -914,10 +914,12 @@ pub fn execute_sqls_with_retry(conn: &Connection, pending_sqls: Vec<String>) -> 
     execute_sqls_with_retry_custom(pending_sqls, |sql| conn.execute_batch(sql).map_err(|e| anyhow::anyhow!(e)))
 }
 
-/// Loads ignore patterns from `.duckdbignore` (or legacy `.duckignore`).
+/// Loads ignore patterns from `.duckpackignore`, `.duckdbignore`, or legacy `.duckignore`.
 /// Lines beginning with '#' and empty lines are skipped.
 pub fn load_ignore_rules(project_dir: &Path) -> Vec<String> {
-    let ignore_path = if project_dir.join(".duckdbignore").exists() {
+    let ignore_path = if project_dir.join(".duckpackignore").exists() {
+        Some(project_dir.join(".duckpackignore"))
+    } else if project_dir.join(".duckdbignore").exists() {
         Some(project_dir.join(".duckdbignore"))
     } else if project_dir.join(".duckignore").exists() {
         Some(project_dir.join(".duckignore"))
@@ -1192,6 +1194,24 @@ token_env = "TEST_RESOLVER_PROD_TOKEN"
         unsafe {
             std::env::remove_var("TEST_RESOLVER_PROD_TOKEN");
         }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_load_ignore_rules() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_ignore_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // When no file exists, returns empty
+        assert!(load_ignore_rules(&temp_dir).is_empty());
+
+        // Create .duckpackignore with comments, blank lines, and patterns
+        let content = "\n# Comments are ignored\nscratch_*\ntemp_*\n\nraw_data\n";
+        std::fs::write(temp_dir.join(".duckpackignore"), content).unwrap();
+
+        let rules = load_ignore_rules(&temp_dir);
+        assert_eq!(rules, vec!["scratch_*".to_string(), "temp_*".to_string(), "raw_data".to_string()]);
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
