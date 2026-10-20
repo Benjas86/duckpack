@@ -42,10 +42,15 @@ def _auto_attach_toml_target_if_needed(target, project_dir=".", env=None):
 
     catalogs = cfg.get("catalogs") or []
     catalog_alias = catalogs[0] if catalogs else None
+
+    # If no explicit warehouse catalog is specified and db_target is just the local default database file,
+    # do NOT auto-attach it to an explicit in-memory connection session.
+    is_remote = any(db_target.startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:"))
+    if not catalog_alias and not is_remote and env is None:
+        return
+
     if not catalog_alias:
-        if db_target.startswith("quack:") or db_target.startswith("quack://"):
-            catalog_alias = "remote_db"
-        elif db_target.startswith("md:") or db_target.startswith("motherduck:"):
+        if is_remote:
             catalog_alias = "remote_db"
         else:
             catalog_alias = Path(db_target).stem or "remote_db"

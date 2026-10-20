@@ -572,4 +572,25 @@ def test_interaction_runner_dispatch_hierarchy(monkeypatch):
     assert res == "ran_headless_fallback"
 
 
+def test_in_memory_connection_preserves_clean_session_without_local_duckdb(tmp_path):
+    proj_dir = str(tmp_path)
+    # Configure duckpack.toml with only default_db (standard local project setting)
+    with open(os.path.join(proj_dir, "duckpack.toml"), "w") as f:
+        f.write('[project]\nname = "test_clean_proj"\n\n[target]\ndefault_db = "local.duckdb"\n')
 
+    # Create dummy local.duckdb file
+    local_db = duckdb.connect(os.path.join(proj_dir, "local.duckdb"))
+    local_db.execute("CREATE TABLE secret_local_table (x INT);")
+    local_db.close()
+
+    # User starts their own in-memory connection
+    con = duckdb.connect()
+    con.execute("CREATE TABLE user_session_tbl AS SELECT 1 AS id;")
+
+    # explore against user connection should NOT auto-attach local.duckdb
+    duckpack.explore(con, project_dir=proj_dir, open_window=False)
+
+    attached = [r[0] for r in con.execute("SELECT database_name FROM duckdb_databases();").fetchall()]
+    assert "local" not in attached
+    assert "local.duckdb" not in attached
+    assert "memory" in attached
