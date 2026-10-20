@@ -714,7 +714,7 @@ fn run_apply_tui(
                 continue;
             }
             crate::tui::TuiAction::Explore => {
-                let _ = crate::ide::run_ide_loop(&mut terminal, conn, project_dir, db_target);
+                let _ = crate::ide::run_ide_loop(&mut terminal, conn, project_dir, db_target, false);
                 terminal.clear().ok();
                 continue;
             }
@@ -1603,7 +1603,7 @@ pub fn explore(
             engine::restore_quack_temp_bridge(&conn);
         }
 
-        let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &spec.db);
+        let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &spec.db, spec.disable_ssl);
 
         if spec.is_quack {
             engine::sync_back_quack_temp_bridge(&conn);
@@ -1687,7 +1687,7 @@ pub fn explore(
             let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
         }
 
-        let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &active_db_target);
+        let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &active_db_target, active_bridge.is_some());
         if let Some(mut bridge) = active_bridge {
             engine::sync_back_quack_temp_bridge(&conn);
             let _ = bridge.stop(py);

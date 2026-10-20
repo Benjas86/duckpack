@@ -544,6 +544,7 @@ pub fn run_ide_loop(
     conn: &Connection,
     project_dir: &PathBuf,
     db_path: &str,
+    quack_disable_ssl: bool,
 ) -> Result<()> {
     let mut tabs: Vec<EditorTab> = vec![EditorTab::new()];
     let mut active_tab_index: usize = 0;
@@ -1464,7 +1465,9 @@ pub fn run_ide_loop(
                         } else if key.code == KeyCode::Enter || key.code == KeyCode::Char(' ') {
                             trigger_explorer_action = true;
                         } else if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
+                            refresh_attached_catalog(conn, db_path, quack_disable_ssl);
                             trigger_explorer_refresh = true;
+                            status_msg = "Explorer refreshed.".to_string();
                         } else if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('s') {
                             if let Some(selected) = explorer_state.selected() {
                                 if selected < explorer_items.len() {
@@ -1868,7 +1871,7 @@ pub fn run_ide_loop(
 
                                 if is_explicit_remote {
                                     if is_catalog_mutation {
-                                        refresh_attached_catalog(conn, db_path);
+                                        refresh_attached_catalog(conn, db_path, quack_disable_ssl);
                                         trigger_explorer_refresh = true;
                                     }
                                     if count > 0 {
@@ -1959,7 +1962,7 @@ pub fn run_ide_loop(
                                                 || lower.contains("alter ")
                                                 || lower.contains("use ");
                                             if is_catalog_mutation {
-                                                refresh_attached_catalog(conn, db_path);
+                                                refresh_attached_catalog(conn, db_path, quack_disable_ssl);
                                                 trigger_explorer_refresh = true;
                                             }
                                             if count > 0 {
@@ -2014,7 +2017,6 @@ pub fn run_ide_loop(
         }
 
         if trigger_explorer_refresh {
-            refresh_attached_catalog(conn, db_path);
             let prev_selected = explorer_state.selected();
             meta = load_explorer_metadata(conn, project_dir, is_quack);
             dictionary = meta.dictionary.clone();
@@ -2028,7 +2030,6 @@ pub fn run_ide_loop(
             } else if !explorer_items.is_empty() {
                 explorer_state.select(Some(0));
             }
-            status_msg = "Explorer refreshed.".to_string();
         }
 
         if trigger_explorer_action {

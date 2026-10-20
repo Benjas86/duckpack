@@ -514,7 +514,7 @@ fn main() -> Result<()> {
                     }
                     tui::TuiAction::Explore => {
                         if let Some(term) = &mut terminal {
-                            ide::run_ide_loop(term, &target_conn, &project_dir, &db)?;
+                            ide::run_ide_loop(term, &target_conn, &project_dir, &db, *quack_disable_ssl)?;
                             term.clear()?;
                         }
                         continue;
@@ -764,7 +764,7 @@ fn main() -> Result<()> {
                 restore_quack_temp_bridge(&target_conn);
             }
 
-            let ide_res = ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db);
+            let ide_res = ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db, *quack_disable_ssl);
 
             if db.starts_with("quack:") {
                 sync_back_quack_temp_bridge(&target_conn);
