@@ -1328,8 +1328,8 @@ pub fn stage_host_temp_tables(target: &Bound<'_, PyAny>) -> (Vec<String>, Vec<(S
         .and_then(|rows| rows.extract::<Vec<(String, String)>>().ok())
         .unwrap_or_default();
 
+    let _ = target.call_method1("execute", ("CREATE TABLE IF NOT EXISTS memory.__duckpack_temp_views_registry (view_name VARCHAR, view_sql VARCHAR);",));
     if !temp_views.is_empty() {
-        let _ = target.call_method1("execute", ("CREATE OR REPLACE TABLE memory.__duckpack_temp_views_registry (view_name VARCHAR, view_sql VARCHAR);",));
         for (vname, vsql) in &temp_views {
             let safe_vname = vname.replace('\'', "''");
             let safe_vsql = vsql.replace('\'', "''");
@@ -1422,14 +1422,6 @@ fn connection_has_temp_objects(target: &Bound<'_, PyAny>) -> bool {
             .unwrap_or(false)
 }
 
-fn restore_client_temp_tables(
-    conn: &duckdb::Connection,
-    _target: &Bound<'_, PyAny>,
-    _temp_tables: &[String],
-    _temp_views: &[(String, String)],
-) {
-    engine::restore_quack_temp_bridge(conn);
-}
 
 
 /// Manages a local Quack network bridge for in-memory DuckDB connections or sessions with temporary objects.
@@ -1580,10 +1572,9 @@ pub fn explore(
     let req_catalog = spec.catalogs.first().cloned();
 
     if target.is_none() || explicit_db.is_some() {
-        let conn = spec.connect()
-            .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
-
         if !is_interactive_terminal() {
+            let conn = spec.connect()
+                .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
             return print_non_terminal_db(&conn, &spec.db, req_catalog.as_deref());
         }
 
@@ -1595,15 +1586,18 @@ pub fn explore(
         let mut terminal = ratatui::Terminal::new(backend)
             .map_err(|e| ExecutionError::new_err(format!("Terminal backend error: {}", e)))?;
 
-        if let Some(cat) = &req_catalog {
-            let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
-        }
+        let ide_res = py.allow_threads(|| -> anyhow::Result<()> {
+            let conn = spec.connect()?;
+            if let Some(cat) = &req_catalog {
+                let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
+            }
 
-        if spec.is_quack {
-            engine::cleanup_orphaned_quack_bridges(&conn);
-        }
+            if spec.is_quack {
+                engine::cleanup_orphaned_quack_bridges(&conn);
+            }
 
-        let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &spec.db, spec.disable_ssl);
+            crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &spec.db, spec.disable_ssl)
+        });
 
         ide_res.map_err(|e| ExecutionError::new_err(format!("IDE error: {}", e)))?;
 
@@ -1649,9 +1643,9 @@ pub fn explore(
         let mut active_bridge: Option<SessionBridge> = None;
         let has_temp = connection_has_temp_objects(target);
 
-        let (conn, active_db_target) = if !db_name.is_empty() && db_name != ":memory:" && !has_temp {
+        let active_db_target = if !db_name.is_empty() && db_name != ":memory:" && !has_temp {
             match engine::connect_target_db(&db_name, None, false) {
-                Ok(c) => (c, db_name),
+                Ok(_) => db_name,
                 Err(e) => {
                     // Fall back to serving via Python's active connection using SessionBridge
                     eprintln!("💡 Notice: Direct connection to target database file '{}' failed: {}.", db_name, e);
@@ -1659,33 +1653,44 @@ pub fn explore(
 
                     let mut bridge = SessionBridge::new(target.clone(), Some("duckpack_py"), None);
                     let server_uri = bridge.start(py)?;
-                    let c = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
-                        .map_err(|attach_err| ExecutionError::new_err(format!("Failed to attach to Python Quack bridge: {}", attach_err)))?;
                     active_bridge = Some(bridge);
-                    (c, server_uri)
+                    server_uri
                 }
             }
         } else {
             // For in-memory connection, start quack_serve on an available port using SessionBridge
             let mut bridge = SessionBridge::new(target.clone(), Some("duckpack_py"), None);
             let server_uri = bridge.start(py)?;
-            let c = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
-                .map_err(|e| ExecutionError::new_err(format!("Failed to attach to Python in-memory DuckDB: {}", e)))?;
             active_bridge = Some(bridge);
-            (c, server_uri)
+            server_uri
         };
 
-        if active_bridge.is_some() {
-            restore_client_temp_tables(&conn, target, &[], &[]);
-        }
+        let is_bridge = active_bridge.is_some();
+        let ide_res = py.allow_threads(|| -> anyhow::Result<()> {
+            let conn = if is_bridge {
+                engine::connect_target_db(&active_db_target, Some("duckpack_py"), false)?
+            } else {
+                engine::connect_target_db(&active_db_target, None, false)?
+            };
 
-        if let Some(cat) = &req_catalog {
-            let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
-        }
+            if is_bridge {
+                engine::restore_quack_temp_bridge(&conn);
+            }
 
-        let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &active_db_target, active_bridge.is_some());
+            if let Some(cat) = &req_catalog {
+                let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
+            }
+
+            let loop_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &active_db_target, is_bridge);
+
+            if is_bridge {
+                engine::sync_back_quack_temp_bridge(&conn);
+            }
+
+            loop_res
+        });
+
         if let Some(mut bridge) = active_bridge {
-            engine::sync_back_quack_temp_bridge(&conn);
             let _ = bridge.stop(py);
         }
         ide_res.map_err(|e| ExecutionError::new_err(format!("IDE error: {}", e)))?;

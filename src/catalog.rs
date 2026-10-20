@@ -312,16 +312,19 @@ pub fn load_explorer_metadata(
     }
 
     let mut all_tables: Vec<TableEntry> = Vec::new();
-    if is_remote_multi_db {
+    if is_quack {
         let quack_tbl_sql = "SELECT database_name, schema_name, table_name, estimated_size, temporary FROM target_db.query('SELECT database_name, schema_name, table_name, estimated_size, temporary FROM duckdb_tables() WHERE internal = false')";
         if let Ok(mut stmt) = conn.prepare(quack_tbl_sql) {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(db), Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                        if table.starts_with("__duckpack_") {
+                            continue;
+                        }
                         let est: Option<i64> = row.get(3).ok();
                         let is_temp: bool = row.get(4).unwrap_or(false) || db == "temp";
                         all_tables.push(TableEntry {
-                            database: if is_temp { active_database.clone() } else { db },
+                            database: if is_temp { active_database.clone() } else if !is_remote_multi_db { "target_db".to_string() } else { db },
                             schema,
                             name: table,
                             row_count: est,
@@ -436,7 +439,7 @@ pub fn load_explorer_metadata(
     }
 
     let mut all_views: Vec<ViewEntry> = Vec::new();
-    if is_remote_multi_db {
+    if is_quack {
         let quack_view_sql = "SELECT database_name, schema_name, view_name, temporary FROM target_db.query('SELECT database_name, schema_name, view_name, temporary FROM duckdb_views() WHERE internal = false')";
         if let Ok(mut stmt) = conn.prepare(quack_view_sql) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -447,7 +450,7 @@ pub fn load_explorer_metadata(
                         }
                         let is_temp: bool = row.get(3).unwrap_or(false) || db == "temp";
                         all_views.push(ViewEntry {
-                            database: if is_temp { active_database.clone() } else { db },
+                            database: if is_temp { active_database.clone() } else if !is_remote_multi_db { "target_db".to_string() } else { db },
                             schema,
                             name,
                             is_temporary: is_temp,
