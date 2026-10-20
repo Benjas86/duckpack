@@ -337,6 +337,9 @@ pub fn load_explorer_metadata(
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(db), Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                        if table.starts_with("__duckpack_") {
+                            continue;
+                        }
                         let est: Option<i64> = row.get(3).ok();
                         let is_temp: bool = row.get(4).unwrap_or(false) || db == "temp";
                         all_tables.push(TableEntry {
@@ -371,6 +374,9 @@ pub fn load_explorer_metadata(
                 if let Ok(mut rows) = stmt.query([]) {
                     while let Ok(Some(row)) = rows.next() {
                         if let (Ok(db), Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                            if table.starts_with("__duckpack_") {
+                                continue;
+                            }
                             let est: Option<i64> = row.get(3).ok();
                             let is_temp: bool = row.get(4).unwrap_or(false) || db == "temp";
                             all_tables.push(TableEntry {
@@ -392,6 +398,9 @@ pub fn load_explorer_metadata(
         if let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
                 if let (Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                    if table.starts_with("__duckpack_") {
+                        continue;
+                    }
                     let est: Option<i64> = row.get(2).ok();
                     if !all_tables.iter().any(|t| t.is_temporary && t.name.eq_ignore_ascii_case(&table) && t.schema.eq_ignore_ascii_case(&schema)) {
                         all_tables.push(TableEntry {
@@ -433,6 +442,9 @@ pub fn load_explorer_metadata(
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(db), Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                        if name.starts_with("__duckpack_") {
+                            continue;
+                        }
                         let is_temp: bool = row.get(3).unwrap_or(false) || db == "temp";
                         all_views.push(ViewEntry {
                             database: if is_temp { active_database.clone() } else { db },
@@ -449,6 +461,9 @@ pub fn load_explorer_metadata(
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(db), Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                        if name.starts_with("__duckpack_") {
+                            continue;
+                        }
                         let is_temp: bool = row.get(3).unwrap_or(false) || db == "temp";
                         all_views.push(ViewEntry {
                             database: if is_temp { active_database.clone() } else { db },
@@ -481,6 +496,9 @@ pub fn load_explorer_metadata(
                 if let Ok(mut rows) = stmt.query([]) {
                     while let Ok(Some(row)) = rows.next() {
                         if let (Ok(db), Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
+                            if name.starts_with("__duckpack_") {
+                                continue;
+                            }
                             let is_temp: bool = row.get(3).unwrap_or(false) || db == "temp";
                             all_views.push(ViewEntry {
                                 database: if is_temp { active_database.clone() } else { db },
@@ -500,6 +518,9 @@ pub fn load_explorer_metadata(
         if let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
                 if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                    if name.starts_with("__duckpack_") {
+                        continue;
+                    }
                     if !all_views.iter().any(|v| v.is_temporary && v.name.eq_ignore_ascii_case(&name) && v.schema.eq_ignore_ascii_case(&schema)) {
                         all_views.push(ViewEntry {
                             database: active_database.clone(),
@@ -519,6 +540,9 @@ pub fn load_explorer_metadata(
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        if name.starts_with("__duckpack_") {
+                            continue;
+                        }
                         all_views.push(ViewEntry {
                             database: active_database.clone(),
                             schema,
@@ -607,6 +631,9 @@ pub fn load_explorer_metadata(
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let Ok(name) = row.get::<_, String>(0) {
+                        if name.starts_with("__duckpack_") {
+                            continue;
+                        }
                         if !macros.contains(&name) { macros.push(name); }
                     }
                 }
@@ -618,6 +645,9 @@ pub fn load_explorer_metadata(
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let Ok(name) = row.get::<_, String>(0) {
+                        if name.starts_with("__duckpack_") {
+                            continue;
+                        }
                         macros.push(name);
                     }
                 }
@@ -899,5 +929,23 @@ mod tests {
 
         let current_db: String = conn.query_row("SELECT current_database();", [], |r| r.get(0)).unwrap();
         assert_eq!(current_db, "target_db");
+    }
+
+    #[test]
+    fn test_internal_duckpack_bridge_tables_are_excluded_from_catalog() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_internal_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE users (id INT);", []).unwrap();
+        conn.execute("CREATE TABLE __duckpack_temp_bridge_foo (id INT);", []).unwrap();
+        conn.execute("CREATE VIEW __duckpack_temp_views_registry AS SELECT 1;", []).unwrap();
+
+        let meta = load_explorer_metadata(&conn, &temp_dir, false);
+        assert!(meta.tables.contains(&"users".to_string()));
+        assert!(!meta.tables.iter().any(|t| t.starts_with("__duckpack_")));
+        assert!(!meta.views.iter().any(|v| v.starts_with("__duckpack_")));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -1600,14 +1600,10 @@ pub fn explore(
         }
 
         if spec.is_quack {
-            engine::restore_quack_temp_bridge(&conn);
+            engine::cleanup_orphaned_quack_bridges(&conn);
         }
 
         let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &spec.db, spec.disable_ssl);
-
-        if spec.is_quack {
-            engine::sync_back_quack_temp_bridge(&conn);
-        }
 
         ide_res.map_err(|e| ExecutionError::new_err(format!("IDE error: {}", e)))?;
 
