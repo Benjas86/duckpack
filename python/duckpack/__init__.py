@@ -17,6 +17,7 @@ from ._duckpack import (
     build as _native_build,
     init as _native_init,
     get_target_config as _native_get_target_config,
+    SessionBridge,
     __duckdb_version__,
 )
 
@@ -406,6 +407,7 @@ __all__ = [
     "init",
     "get_target_config",
     "stop_server",
+    "SessionBridge",
     "__version__",
     "__duckdb_version__",
 ]

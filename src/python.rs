@@ -1317,7 +1317,8 @@ fn introspect_py_catalog(
     Ok((schemas, table_map, view_map, macro_map))
 }
 
-fn stage_host_temp_tables(target: &Bound<'_, PyAny>) -> (Vec<String>, Vec<(String, String)>) {
+#[pyfunction]
+pub fn stage_host_temp_tables(target: &Bound<'_, PyAny>) -> (Vec<String>, Vec<(String, String)>) {
     let _ = target.call_method1("execute", ("ATTACH IF NOT EXISTS ':memory:' AS memory;",));
 
     let temp_tables: Vec<String> = target
@@ -1356,21 +1357,8 @@ fn stage_host_temp_tables(target: &Bound<'_, PyAny>) -> (Vec<String>, Vec<(Strin
     (temp_tables, temp_views)
 }
 
-fn restore_client_temp_tables(
-    conn: &duckdb::Connection,
-    _target: &Bound<'_, PyAny>,
-    _temp_tables: &[String],
-    _temp_views: &[(String, String)],
-) {
-    engine::restore_quack_temp_bridge(conn);
-}
-
-fn sync_back_client_temp_tables(
-    conn: &duckdb::Connection,
-    target: &Bound<'_, PyAny>,
-) {
-    engine::sync_back_quack_temp_bridge(conn);
-
+#[pyfunction]
+pub fn sync_back_host_temp_objects(target: &Bound<'_, PyAny>) {
     let _ = target.call_method1("execute", ("ATTACH IF NOT EXISTS ':memory:' AS memory;",));
 
     // 1. Restore tables from server default db
@@ -1433,12 +1421,152 @@ fn sync_back_client_temp_tables(
     let _ = target.call_method1("execute", ("DROP TABLE IF EXISTS memory.__duckpack_temp_views_sync_back;",));
 }
 
+fn connection_has_temp_objects(target: &Bound<'_, PyAny>) -> bool {
+    target
+        .call_method1("execute", ("SELECT count(*) FROM duckdb_tables() WHERE temporary = true AND internal = false;",))
+        .ok()
+        .and_then(|res| res.call_method0("fetchone").ok())
+        .and_then(|row| row.extract::<(i64,)>().ok())
+        .map(|(c,)| c > 0)
+        .unwrap_or(false)
+        || target
+            .call_method1("execute", ("SELECT count(*) FROM duckdb_views() WHERE temporary = true AND internal = false;",))
+            .ok()
+            .and_then(|res| res.call_method0("fetchone").ok())
+            .and_then(|row| row.extract::<(i64,)>().ok())
+            .map(|(c,)| c > 0)
+            .unwrap_or(false)
+}
+
+fn restore_client_temp_tables(
+    conn: &duckdb::Connection,
+    _target: &Bound<'_, PyAny>,
+    _temp_tables: &[String],
+    _temp_views: &[(String, String)],
+) {
+    engine::restore_quack_temp_bridge(conn);
+}
+
+
+/// Manages a local Quack network bridge for in-memory DuckDB connections or sessions with temporary objects.
+/// Handles two-way table/view staging, port allocation, server startup, and clean teardown.
+#[pyclass]
+pub struct SessionBridge {
+    target: Py<PyAny>,
+    port: u16,
+    db_uri: String,
+    token: String,
+    is_active: bool,
+}
+
+#[pymethods]
+impl SessionBridge {
+    #[new]
+    #[pyo3(signature = (target, token = None, port = None))]
+    pub fn new(
+        target: Bound<'_, PyAny>,
+        token: Option<&str>,
+        port: Option<u16>,
+    ) -> Self {
+        let resolved_port = port.unwrap_or_else(find_available_port);
+        let resolved_token = token.unwrap_or("duckpack_py").to_string();
+        let db_uri = format!("quack:127.0.0.1:{}", resolved_port);
+        Self {
+            target: target.unbind(),
+            port: resolved_port,
+            db_uri,
+            token: resolved_token,
+            is_active: false,
+        }
+    }
+
+    /// Stages temporary tables and views into memory, loads Quack, and begins serving.
+    /// Returns the database URI (e.g. 'quack:127.0.0.1:9494').
+    pub fn start(&mut self, py: Python<'_>) -> PyResult<String> {
+        let target = self.target.bind(py);
+        stage_host_temp_tables(target);
+
+        let serve_sql = format!(
+            "INSTALL quack; LOAD quack; CALL quack_serve('{}', token := '{}');",
+            self.db_uri, self.token
+        );
+        if let Err(e) = target.call_method1("execute", (serve_sql,)) {
+            return Err(ExecutionError::new_err(format!(
+                "Unable to start local quack bridge server for in-memory connection: {}. \
+                Tip: Ensure the 'quack' extension is installed and can be loaded in DuckDB.",
+                e
+            )));
+        }
+
+        self.is_active = true;
+        Ok(self.db_uri.clone())
+    }
+
+    /// Syncs back any modified temporary tables and views, then stops the background Quack server.
+    pub fn stop(&mut self, py: Python<'_>) -> PyResult<bool> {
+        if !self.is_active {
+            return Ok(false);
+        }
+
+        let target = self.target.bind(py);
+        sync_back_host_temp_objects(target);
+
+        let stop_sql = format!("CALL quack_stop('{}');", self.db_uri);
+        let _ = target.call_method1("execute", (stop_sql,));
+
+        self.is_active = false;
+        Ok(true)
+    }
+
+    #[getter]
+    pub fn db_uri(&self) -> String {
+        self.db_uri.clone()
+    }
+
+    #[getter]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    #[getter]
+    pub fn token(&self) -> String {
+        self.token.clone()
+    }
+
+    #[getter]
+    pub fn is_active(&self) -> bool {
+        self.is_active
+    }
+
+    /// Returns True if the connection contains temporary tables or views that require bridging.
+    #[staticmethod]
+    pub fn has_temp_objects(target: &Bound<'_, PyAny>) -> bool {
+        connection_has_temp_objects(target)
+    }
+
+    pub fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        Ok(slf)
+    }
+
+    pub fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_val: Option<&Bound<'_, PyAny>>,
+        _exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.stop(py)?;
+        Ok(false)
+    }
+}
+
+
 /// Launch the interactive DuckPack IDE terminal UI against a target database.
 /// In non-terminal environments (such as Jupyter notebooks), prints a formatted database overview.
 #[pyfunction]
 #[pyo3(signature = (target = None, project_dir = ".", database = None, catalog = None, quack_token = None, insecure = false, env = None))]
 pub fn explore(
-    _py: Python<'_>,
+    py: Python<'_>,
     target: Option<&Bound<'_, PyAny>>,
     project_dir: &str,
     database: Option<&str>,
@@ -1542,72 +1670,37 @@ pub fn explore(
             })
             .unwrap_or_else(|| ":memory:".to_string());
 
-        let mut staged_state: Option<(Vec<String>, Vec<(String, String)>)> = None;
-
-        let has_temp = target
-            .call_method1("execute", ("SELECT count(*) FROM duckdb_tables() WHERE temporary = true AND internal = false;",))
-            .ok()
-            .and_then(|res| res.call_method0("fetchone").ok())
-            .and_then(|row| row.extract::<(i64,)>().ok())
-            .map(|(c,)| c > 0)
-            .unwrap_or(false);
+        let mut active_bridge: Option<SessionBridge> = None;
+        let has_temp = connection_has_temp_objects(target);
 
         let (conn, active_db_target) = if !db_name.is_empty() && db_name != ":memory:" && !has_temp {
             match engine::connect_target_db(&db_name, None, false) {
                 Ok(c) => (c, db_name),
                 Err(e) => {
-                    // Fall back to serving via Python's active connection using the Quack bridge
+                    // Fall back to serving via Python's active connection using SessionBridge
                     eprintln!("💡 Notice: Direct connection to target database file '{}' failed: {}.", db_name, e);
                     eprintln!("   Seamlessly falling back to live Python Quack bridge...");
 
-                    let staged = stage_host_temp_tables(target);
-                    staged_state = Some(staged);
-
-                    let port = find_available_port();
-                    let start_server_sql = format!(
-                        "INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:{}', token := 'duckpack_py');",
-                        port
-                    );
-                    if let Err(serve_err) = target.call_method1("execute", (start_server_sql,)) {
-                        return Err(ExecutionError::new_err(format!(
-                            "Direct attach to '{}' failed ({}) and unable to start local quack bridge: {}. \
-                            Tip: Ensure the 'quack' extension can be loaded in your Python DuckDB environment.",
-                            db_name, e, serve_err
-                        )));
-                    }
-
-                    let server_uri = format!("quack:localhost:{}", port);
+                    let mut bridge = SessionBridge::new(target.clone(), Some("duckpack_py"), None);
+                    let server_uri = bridge.start(py)?;
                     let c = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
                         .map_err(|attach_err| ExecutionError::new_err(format!("Failed to attach to Python Quack bridge: {}", attach_err)))?;
+                    active_bridge = Some(bridge);
                     (c, server_uri)
                 }
             }
         } else {
-            // For in-memory connection, start quack_serve on an available port
-            let staged = stage_host_temp_tables(target);
-            staged_state = Some(staged);
-
-            let port = find_available_port();
-            let start_server_sql = format!(
-                "INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:{}', token := 'duckpack_py');",
-                port
-            );
-            if let Err(e) = target.call_method1("execute", (start_server_sql,)) {
-                return Err(ExecutionError::new_err(format!(
-                    "Unable to start local quack bridge for in-memory DuckDB connection: {}. \
-                    Tip: Ensure the 'quack' extension can be loaded, or explore a persistent database file via duckpack.explore('path.duckdb').",
-                    e
-                )));
-            }
-
-            let server_uri = format!("quack:localhost:{}", port);
+            // For in-memory connection, start quack_serve on an available port using SessionBridge
+            let mut bridge = SessionBridge::new(target.clone(), Some("duckpack_py"), None);
+            let server_uri = bridge.start(py)?;
             let c = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
                 .map_err(|e| ExecutionError::new_err(format!("Failed to attach to Python in-memory DuckDB: {}", e)))?;
+            active_bridge = Some(bridge);
             (c, server_uri)
         };
 
-        if let Some((staged_tables, staged_views)) = staged_state {
-            restore_client_temp_tables(&conn, target, &staged_tables, &staged_views);
+        if active_bridge.is_some() {
+            restore_client_temp_tables(&conn, target, &[], &[]);
         }
 
         if let Some(cat) = &req_catalog {
@@ -1615,9 +1708,9 @@ pub fn explore(
         }
 
         let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &active_db_target);
-        if active_db_target.starts_with("quack:") {
-            sync_back_client_temp_tables(&conn, target);
-            let _ = target.call_method1("execute", (format!("CALL quack_stop('{}');", active_db_target),));
+        if let Some(mut bridge) = active_bridge {
+            engine::sync_back_quack_temp_bridge(&conn);
+            let _ = bridge.stop(py);
         }
         ide_res.map_err(|e| ExecutionError::new_err(format!("IDE error: {}", e)))?;
 
@@ -1663,6 +1756,7 @@ pub fn _duckpack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ExecutionError", m.py().get_type::<ExecutionError>())?;
     m.add_class::<ApplyResult>()?;
     m.add_class::<DiffSummary>()?;
+    m.add_class::<SessionBridge>()?;
     m.add_function(wrap_pyfunction!(explore, m)?)?;
     m.add_function(wrap_pyfunction!(apply, m)?)?;
     m.add_function(wrap_pyfunction!(diff, m)?)?;
@@ -1670,6 +1764,8 @@ pub fn _duckpack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(get_target_config, m)?)?;
+    m.add_function(wrap_pyfunction!(stage_host_temp_tables, m)?)?;
+    m.add_function(wrap_pyfunction!(sync_back_host_temp_objects, m)?)?;
     m.add("__duckdb_version__", crate::engine::embedded_duckdb_version())?;
     Ok(())
 }

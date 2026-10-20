@@ -28,10 +28,7 @@ def is_notebook_environment() -> bool:
     return False
 
 
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from ._duckpack import SessionBridge
 
 
 def stop_server() -> bool:
@@ -41,21 +38,22 @@ def stop_server() -> bool:
     """
     global _ACTIVE_NOTEBOOK_BRIDGE
     if _ACTIVE_NOTEBOOK_BRIDGE is not None:
-        target = _ACTIVE_NOTEBOOK_BRIDGE.get("target")
-        db_uri = _ACTIVE_NOTEBOOK_BRIDGE.get("db_uri")
-        if target is not None and db_uri:
-            try:
-                from .terminal import sync_back_connection_temp_objects
-
-                sync_back_connection_temp_objects(target)
-            except Exception:
-                pass
-            try:
-                target.execute(f"CALL quack_stop('{db_uri}');")
-            except Exception:
-                pass
+        bridge = _ACTIVE_NOTEBOOK_BRIDGE
         _ACTIVE_NOTEBOOK_BRIDGE = None
-        return True
+        try:
+            if hasattr(bridge, "stop"):
+                return bridge.stop()
+            elif isinstance(bridge, dict):
+                target = bridge.get("target")
+                db_uri = bridge.get("db_uri")
+                if target is not None and db_uri:
+                    from ._duckpack import sync_back_host_temp_objects
+                    sync_back_host_temp_objects(target)
+                    target.execute(f"CALL quack_stop('{db_uri}');")
+            return True
+        except Exception as e:
+            print(f"[DuckPack] Warning: Failed to stop background Quack server cleanly: {e}")
+            return False
     return False
 
 
@@ -138,29 +136,20 @@ def render_notebook_card(
 
         has_temp = False
         try:
-            cnt = target.execute("SELECT count(*) FROM duckdb_tables() WHERE temporary = true AND internal = false;").fetchone()
-            if cnt and cnt[0] > 0:
-                has_temp = True
+            has_temp = SessionBridge.has_temp_objects(target)
         except Exception:
             pass
 
         if db_path and db_path != ":memory:" and os.path.exists(db_path) and not has_temp:
             db_arg = db_path
         else:
-            # In-memory session or temporary tables present -> start Quack bridge
+            # In-memory session or temporary tables present -> start Quack bridge via SessionBridge
             stop_server()  # Clean up any existing bridge first
-            from .terminal import stage_connection_temp_objects
-
-            stage_connection_temp_objects(target)
-            port = find_free_port()
-            db_uri = f"quack:127.0.0.1:{port}"
-            token = "duckpack_py"
+            bridge = SessionBridge(target)
             try:
-                target.execute("INSTALL quack; LOAD quack;")
-                target.execute(f"CALL quack_serve('{db_uri}', token := '{token}');")
-                _ACTIVE_NOTEBOOK_BRIDGE = {"port": port, "target": target, "db_uri": db_uri}
-                db_arg = db_uri
-                token_arg = token
+                db_arg = bridge.start()
+                token_arg = bridge.token
+                _ACTIVE_NOTEBOOK_BRIDGE = bridge
                 is_in_memory_bridge = True
             except Exception as e:
                 print(f"[DuckPack] Warning: Could not start local Quack bridge: {e}")

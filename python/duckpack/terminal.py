@@ -12,103 +12,21 @@ import subprocess
 import sys
 
 
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from ._duckpack import SessionBridge, stage_host_temp_tables, sync_back_host_temp_objects
 
 
 def stage_connection_temp_objects(target):
+    """Backward-compatible helper: delegates to deep Rust staging module."""
     try:
-        target.execute("ATTACH IF NOT EXISTS ':memory:' AS memory;")
-    except Exception:
-        pass
-
-    try:
-        temp_tables = [
-            r[0]
-            for r in target.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE temporary = true AND internal = false;"
-            ).fetchall()
-        ]
-        for t in temp_tables:
-            safe_t = t.replace('"', '""')
-            target.execute(
-                f'CREATE OR REPLACE TABLE memory."__duckpack_temp_bridge_{safe_t}" AS SELECT * FROM "{safe_t}";'
-            )
-    except Exception:
-        pass
-
-    try:
-        temp_views = target.execute(
-            "SELECT view_name, sql FROM duckdb_views() WHERE temporary = true AND internal = false;"
-        ).fetchall()
-        if temp_views:
-            target.execute(
-                'CREATE OR REPLACE TABLE memory."__duckpack_temp_views_registry" (view_name VARCHAR, view_sql VARCHAR);'
-            )
-            for vname, vsql in temp_views:
-                safe_vname = vname.replace("'", "''")
-                safe_vsql = vsql.replace("'", "''")
-                target.execute(
-                    f"INSERT INTO memory.__duckpack_temp_views_registry VALUES ('{safe_vname}', '{safe_vsql}');"
-                )
+        stage_host_temp_tables(target)
     except Exception:
         pass
 
 
 def sync_back_connection_temp_objects(target):
+    """Backward-compatible helper: delegates to deep Rust staging module."""
     try:
-        target.execute("ATTACH IF NOT EXISTS ':memory:' AS memory;")
-    except Exception:
-        pass
-
-    # 1. Sync back tables from server default db
-    try:
-        bridge_tables = [
-            r[0]
-            for r in target.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE table_name LIKE '__duckpack_temp_bridge_%' AND internal = false;"
-            ).fetchall()
-        ]
-        for bt in bridge_tables:
-            orig = bt[len("__duckpack_temp_bridge_") :]
-            safe_orig = orig.replace('"', '""')
-            safe_bt = bt.replace('"', '""')
-            target.execute(
-                f'CREATE OR REPLACE TEMP TABLE "{safe_orig}" AS SELECT * FROM "{safe_bt}";'
-            )
-            target.execute(f'DROP TABLE IF EXISTS "{safe_bt}";')
-    except Exception:
-        pass
-
-    # 2. Sync back tables from memory
-    try:
-        mem_bridges = [
-            r[0]
-            for r in target.execute(
-                "SELECT table_name FROM duckdb_tables() WHERE database_name = 'memory' AND table_name LIKE '__duckpack_temp_bridge_%' AND internal = false;"
-            ).fetchall()
-        ]
-        for bt in mem_bridges:
-            orig = bt[len("__duckpack_temp_bridge_") :]
-            safe_orig = orig.replace('"', '""')
-            safe_bt = bt.replace('"', '""')
-            target.execute(
-                f'CREATE OR REPLACE TEMP TABLE "{safe_orig}" AS SELECT * FROM memory."{safe_bt}";'
-            )
-            target.execute(f'DROP TABLE IF EXISTS memory."{safe_bt}";')
-    except Exception:
-        pass
-
-    # 3. Sync back views
-    try:
-        views_to_restore = target.execute(
-            "SELECT view_name, view_sql FROM memory.__duckpack_temp_views_sync_back;"
-        ).fetchall()
-        for _vname, vsql in views_to_restore:
-            target.execute(vsql)
-        target.execute("DROP TABLE IF EXISTS memory.__duckpack_temp_views_sync_back;")
+        sync_back_host_temp_objects(target)
     except Exception:
         pass
 
@@ -196,17 +114,7 @@ def launch_terminal_window(
 
         has_temp = False
         try:
-            cnt = target.execute(
-                "SELECT count(*) FROM duckdb_tables() WHERE temporary = true AND internal = false;"
-            ).fetchone()
-            if cnt and cnt[0] > 0:
-                has_temp = True
-            if not has_temp:
-                cnt_v = target.execute(
-                    "SELECT count(*) FROM duckdb_views() WHERE temporary = true AND internal = false;"
-                ).fetchone()
-                if cnt_v and cnt_v[0] > 0:
-                    has_temp = True
+            has_temp = SessionBridge.has_temp_objects(target)
         except Exception:
             pass
 
@@ -215,29 +123,20 @@ def launch_terminal_window(
             token_arg = None
             insecure_arg = False
         else:
-            # Live in-memory DuckDB connection or connection with temporary tables! Spin up local Quack bridge:
-            stage_connection_temp_objects(target)
-            port = find_free_port()
+            # Live in-memory DuckDB connection or connection with temporary tables! Spin up local Quack bridge via SessionBridge:
+            bridge = SessionBridge(target)
             try:
-                target.execute("INSTALL quack; LOAD quack;")
-                target.execute(
-                    f"CALL quack_serve('quack:localhost:{port}', token := 'duckpack_py');"
-                )
+                db_arg = bridge.start()
             except Exception as e:
                 print(f"Warning: Could not start local quack bridge for in-memory DB: {e}")
                 return False
 
-            db_arg = f"quack:localhost:{port}"
-            token_arg = "duckpack_py"
+            token_arg = bridge.token
             insecure_arg = False
 
             def cleanup():
                 try:
-                    sync_back_connection_temp_objects(target)
-                except Exception:
-                    pass
-                try:
-                    target.execute(f"CALL quack_stop('{db_arg}');")
+                    bridge.stop()
                 except Exception:
                     pass
 
