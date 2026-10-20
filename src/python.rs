@@ -487,25 +487,21 @@ pub fn diff(
     let shadow_macros = schema_diff::get_macros(&shadow_conn, None)
         .map_err(|e| SchemaError::new_err(format!("Error extracting shadow macros: {}", e)))?;
 
-    engine::load_env_files(&p_dir, env);
-
-    let target_cfg = engine::resolve_target_config(&p_dir, env);
-    let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
-    let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
-
-    let req_catalog = database
-        .or(catalog)
-        .map(|s| s.to_string())
-        .or_else(|| target_cfg.catalogs.first().cloned());
-
-    let target_str: Option<String> = match target {
-        None => Some(target_cfg.db.clone().unwrap_or_else(|| "local.duckdb".to_string())),
-        Some(t) => t.extract::<String>().ok(),
-    };
+    let explicit_db = target.and_then(|t| t.extract::<String>().ok());
+    let explicit_catalog = database.or(catalog).map(|s| vec![s.to_string()]);
+    let spec = engine::TargetResolver::resolve(
+        &p_dir,
+        env,
+        explicit_db.as_deref(),
+        quack_token,
+        Some(insecure),
+        explicit_catalog,
+    );
+    let req_catalog = spec.catalogs.first().cloned();
 
     // Determine target connection
-    let (target_schemas, target_schema, target_views, target_macros) = if let Some(db_str) = target_str {
-        let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
+    let (target_schemas, target_schema, target_views, target_macros) = if target.is_none() || explicit_db.is_some() {
+        let conn = spec.connect()
             .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
         let active_cat = schema_diff::validate_target_catalog(&conn, req_catalog.as_deref(), false)
             .map_err(|e| ExecutionError::new_err(e.to_string()))?;
@@ -839,38 +835,26 @@ pub fn apply(
         return Err(SchemaError::new_err(format!("Project directory {} does not exist", p_dir.display())));
     }
 
-    engine::load_env_files(&p_dir, env);
-
-    let target_cfg = engine::resolve_target_config(&p_dir, env);
-    let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
-    let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
-
-    let req_catalogs = if let Some(cat) = database.or(catalog) {
-        vec![cat.to_string()]
-    } else if !target_cfg.catalogs.is_empty() {
-        target_cfg.catalogs.clone()
-    } else {
-        let cats = engine::resolve_project_catalogs(&p_dir, env);
-        if cats.is_empty() {
-            vec![]
-        } else {
-            cats
-        }
-    };
+    let explicit_db = target.and_then(|t| t.extract::<String>().ok());
+    let explicit_catalogs = database.or(catalog).map(|cat| vec![cat.to_string()]);
+    let spec = engine::TargetResolver::resolve(
+        &p_dir,
+        env,
+        explicit_db.as_deref(),
+        quack_token,
+        Some(insecure),
+        explicit_catalogs,
+    );
+    let req_catalogs = spec.catalogs.clone();
     let ignore_list = engine::load_ignore_rules(&p_dir);
 
-    let target_str: Option<String> = match target {
-        None => Some(target_cfg.db.clone().unwrap_or_else(|| "local.duckdb".to_string())),
-        Some(t) => t.extract::<String>().ok(),
-    };
-
-    if let Some(db_str) = target_str {
-        let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
+    if target.is_none() || explicit_db.is_some() {
+        let conn = spec.connect()
             .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
 
         if (!auto_approve || interactive) && is_interactive_terminal() {
             let start_cat = req_catalogs.first().map(|s| s.as_str());
-            return run_apply_tui(&conn, &p_dir, &db_str, force_drop, start_cat);
+            return run_apply_tui(&conn, &p_dir, &spec.db, force_drop, start_cat);
         } else if !auto_approve {
             return Err(ExecutionError::new_err(
                 "Cannot apply schema changes: auto_approve is False in a non-interactive environment. \
@@ -886,7 +870,7 @@ pub fn apply(
             req_catalogs
         };
 
-        let remote = engine::is_remote(&db_str);
+        let remote = engine::is_remote(&spec.db);
         let mut total_applied_items = Vec::new();
 
         for target_cat in &catalogs_to_apply {
@@ -1583,28 +1567,24 @@ pub fn explore(
         }
     }
 
-    engine::load_env_files(&p_dir, env);
+    let explicit_db = target.and_then(|t| t.extract::<String>().ok());
+    let explicit_catalogs = database.or(catalog).map(|cat| vec![cat.to_string()]);
+    let spec = engine::TargetResolver::resolve(
+        &p_dir,
+        env,
+        explicit_db.as_deref(),
+        quack_token,
+        Some(insecure),
+        explicit_catalogs,
+    );
+    let req_catalog = spec.catalogs.first().cloned();
 
-    let target_cfg = engine::resolve_target_config(&p_dir, env);
-    let resolved_token = engine::resolve_quack_token(quack_token, target_cfg.token_env.as_deref());
-    let effective_insecure = insecure || target_cfg.insecure.unwrap_or(false);
-
-    let req_catalog = database
-        .or(catalog)
-        .map(|s| s.to_string())
-        .or_else(|| target_cfg.catalogs.first().cloned());
-
-    let target_str: Option<String> = match target {
-        None => Some(target_cfg.db.clone().unwrap_or_else(|| "local.duckdb".to_string())),
-        Some(t) => t.extract::<String>().ok(),
-    };
-
-    if let Some(db_str) = target_str {
-        let conn = engine::connect_target_db(&db_str, resolved_token.as_deref(), effective_insecure)
+    if target.is_none() || explicit_db.is_some() {
+        let conn = spec.connect()
             .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
 
         if !is_interactive_terminal() {
-            return print_non_terminal_db(&conn, &db_str, req_catalog.as_deref());
+            return print_non_terminal_db(&conn, &spec.db, req_catalog.as_deref());
         }
 
         let _guard = TerminalGuard::enter()
@@ -1619,13 +1599,13 @@ pub fn explore(
             let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
         }
 
-        if db_str.starts_with("quack:") {
+        if spec.is_quack {
             engine::restore_quack_temp_bridge(&conn);
         }
 
-        let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &db_str);
+        let ide_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &spec.db);
 
-        if db_str.starts_with("quack:") {
+        if spec.is_quack {
             engine::sync_back_quack_temp_bridge(&conn);
         }
 
