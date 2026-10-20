@@ -728,22 +728,26 @@ pub fn load_explorer_metadata(
 
 /// Refreshes the attached remote database catalog so that the client's internal planner and
 /// explorer immediately see any new tables, views, or schema changes created on the server.
-pub fn refresh_attached_catalog(conn: &Connection, db_path: &str) {
+pub fn refresh_attached_catalog(conn: &Connection, db_path: &str, quack_disable_ssl: bool) {
     if db_path.starts_with("quack:") {
-        let disable_ssl = crate::engine::should_disable_quack_ssl(db_path, false);
-        let attach_sql = crate::engine::build_quack_attach_sql(db_path, disable_ssl);
-        let _ = conn.execute("USE memory;", []);
-        let _ = conn.execute("DETACH target_db;", []);
-        let _ = conn.execute(&attach_sql, []);
-        let _ = conn.execute("USE target_db;", []);
+        let disable_ssl = crate::engine::should_disable_quack_ssl(db_path, quack_disable_ssl);
+        // Safety probe: Before detaching target_db, test ATTACH under a temporary probe alias.
+        // If probing fails (e.g. network timeout, TLS mismatch, server busy), we NEVER detach or drop target_db!
+        let probe_sql = format!(
+            "ATTACH '{}' AS __duckpack_quack_probe{};",
+            db_path.replace('\'', "''"),
+            if disable_ssl { " (DISABLE_SSL true)" } else { "" }
+        );
+        if conn.execute(&probe_sql, []).is_ok() {
+            let _ = conn.execute("DETACH __duckpack_quack_probe;", []);
+            let attach_sql = crate::engine::build_quack_attach_sql(db_path, disable_ssl);
+            let _ = conn.execute("USE memory;", []);
+            let _ = conn.execute("DETACH target_db;", []);
+            let _ = conn.execute(&attach_sql, []);
+            let _ = conn.execute("USE target_db;", []);
+        }
     } else if db_path.starts_with("md:") || db_path.starts_with("motherduck:") {
         let _ = conn.execute("REFRESH DATABASES;", []);
-    } else {
-        let safe_db = db_path.replace('\'', "''");
-        let _ = conn.execute("USE memory;", []);
-        let _ = conn.execute("DETACH target_db;", []);
-        let _ = conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), []);
-        let _ = conn.execute("USE target_db;", []);
     }
 }
 
@@ -847,5 +851,53 @@ mod tests {
         assert_eq!(view_cols[1].0, "label");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_temp_table_creation_on_attached_target_db_preserves_target_db() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_temp_target_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("ATTACH ':memory:' AS target_db;", []).unwrap();
+        conn.execute("USE target_db;", []).unwrap();
+        conn.execute("CREATE TABLE target_db.permanent_tbl (id INT, val VARCHAR);", []).unwrap();
+        conn.execute("INSERT INTO target_db.permanent_tbl VALUES (1, 'val1'), (2, 'val2');", []).unwrap();
+
+        // Simulate user running: CREATE TEMP TABLE t_tbl AS FROM permanent_tbl LIMIT 10;
+        conn.execute("CREATE TEMP TABLE t_tbl AS FROM target_db.permanent_tbl LIMIT 10;", []).unwrap();
+
+        let meta = load_explorer_metadata(&conn, &temp_dir, false);
+
+        // target_db must remain the active database!
+        assert_eq!(meta.active_database, "target_db");
+        assert!(meta.databases.iter().any(|d| d.name == "target_db" && d.is_active));
+        assert!(meta.temp_tables.contains("t_tbl"));
+
+        // Both permanent_tbl and t_tbl should be listed
+        let target_info = meta.databases.iter().find(|d| d.name == "target_db").unwrap();
+        assert!(target_info.tables.iter().any(|t| t.name == "permanent_tbl" && !t.is_temporary));
+        assert!(target_info.tables.iter().any(|t| t.name == "t_tbl" && t.is_temporary));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_refresh_attached_catalog_probing_safety_never_drops_target_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("ATTACH ':memory:' AS target_db;", []).unwrap();
+        conn.execute("USE target_db;", []).unwrap();
+        conn.execute("CREATE TABLE target_db.orders (order_id INT);", []).unwrap();
+
+        // Call refresh_attached_catalog with an unreachable Quack server address.
+        // Probing should fail and target_db must NOT be detached or dropped!
+        refresh_attached_catalog(&conn, "quack:nonexistent.internal.host.xyz:9494", false);
+
+        // Verify target_db is still attached and usable
+        let res: i64 = conn.query_row("SELECT count(*) FROM target_db.orders;", [], |r| r.get(0)).unwrap();
+        assert_eq!(res, 0);
+
+        let current_db: String = conn.query_row("SELECT current_database();", [], |r| r.get(0)).unwrap();
+        assert_eq!(current_db, "target_db");
     }
 }
