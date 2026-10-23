@@ -1255,28 +1255,27 @@ fn introspect_py_catalog(
         false
     };
 
-    if is_quack && table_map.is_empty() {
+    if is_quack {
         let tbl_sql = format!(
-            "SELECT '{}.' || (CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END), COALESCE(sql, '') FROM {}.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false')",
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, COALESCE(sql, '') FROM {}.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
             safe_cat, safe_cat
         );
         if let Ok((_, q_tbls)) = executor.query_rows(&tbl_sql) {
             for row in q_tbls {
                 if row.len() >= 2 {
-                    table_map.insert(
-                        row[0].clone(),
+                    table_map.entry(row[0].clone()).or_insert_with(|| {
                         schema_diff::TableSchema {
                             create_sql: row[1].clone(),
                             columns: HashMap::new(),
                             constraints: Vec::new(),
-                        },
-                    );
+                        }
+                    });
                 }
             }
         }
 
         let col_sql = format!(
-            "SELECT '{}.' || (CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END), column_name, data_type FROM {}.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false')",
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type FROM {}.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
             safe_cat, safe_cat
         );
         if let Ok((_, q_cols)) = executor.query_rows(&col_sql) {
@@ -1331,11 +1330,11 @@ fn introspect_py_catalog(
 
     if is_quack {
         let q_constr_sql = format!(
-            "SELECT '{}.' || (CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END), \
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
              constraint_type, constraint_name, COALESCE(constraint_column_names, ''), \
              expression, referenced_table, COALESCE(referenced_column_names, '') \
              FROM {}.query('SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, '','') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (database_name = ''{}'' OR database_name = current_database())')",
-            safe_cat, safe_cat, safe_cat
+            safe_cat, safe_cat
         );
         if let Ok((_, q_constrs)) = executor.query_rows(&q_constr_sql) {
             for row in q_constrs {
