@@ -32,10 +32,13 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
   - [DuckPack as "SSDT for DuckDB"](#duckpack-as-ssdt-for-duckdb)
   - [Engine Scope: DuckDB DDL vs External Query Federation](#engine-scope-duckdb-ddl-vs-external-query-federation)
   - [Multi-Database Catalog Targeting](#multi-database-catalog-targeting)
+  - [Table Constraint Diffing & Copy-and-Swap Migrations](#table-constraint-diffing--copy-and-swap-migrations)
   - [Interactive Apply & Notebook Parity](#interactive-apply--notebook-parity)
   - [Embedded DuckDB Version Transparency & Diagnostics](#embedded-duckdb-version-transparency--diagnostics)
 - [🧑‍💻 DuckPack Terminal IDE](#-duckpack-terminal-ide)
   - [Keyboard Shortcuts Cheat Sheet](#keyboard-shortcuts-cheat-sheet)
+  - [Primary Key & Foreign Key Visual Identifiers](#primary-key--foreign-key-visual-identifiers)
+  - [Dynamic Explorer Width Resizing & Snappy Scrolling](#dynamic-explorer-width-resizing--snappy-scrolling)
   - [Catalog-Aware Multi-Database Exploration & Cross-DB Joins](#catalog-aware-multi-database-exploration--cross-db-joins)
   - [Live Database Attachment & Detach (`Ctrl+A` / `d`)](#live-database-attachment--detach-ctrla--d)
   - [Multi-Tab Query System & Isolated Results](#multi-tab-query-system--isolated-results)
@@ -66,12 +69,15 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
 ## ✨ Features
 
 - **Declarative Schema Management ("SSDT for DuckDB"):** Define your schemas, tables, views, and macros as raw `.sql` files. No migration timestamps, sequence numbers, or rollback scripts to maintain.
+- **Table Constraint Diffing & Copy-and-Swap Migrations:** Automatically introspects `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`, and `CHECK` constraints. Generates in-place `ALTER TABLE` statements for safe additions and transactional copy-and-swap (`__duckpack_swap`) staging tables for complex constraint modifications.
 - **Catalog-Aware Multi-Database Targeting:** Seamlessly target specific attached databases (via `--database <name>`, `duckpack.toml [target] database = "..."`, or Python `duckpack.apply(con, database="analytics")`) with strict catalog isolation.
 - **Clear Engine Boundary (SSDT vs Federation):** Full declarative DDL lifecycle management specifically engineered for DuckDB, Quack, and MotherDuck. External attached engines (MSSQL, PostgreSQL, MySQL, SQLite) are first-class citizens in Explore for ad-hoc querying, cross-DB joins, and DML (`INSERT INTO`, `UPDATE`), with schema DDL safely managed by external native tools.
 - **Interactive Apply Parity (CLI & Notebook):** Review visual colored diffs and apply migrations interactively with live confirmation prompts in terminal, Python scripts, or Jupyter notebooks (with automated external terminal pop-out).
 - **Schema Drift Detection (`duckpack diff`):** Instant dry-run inspection to detect divergence between your declarative codebase and live databases without mutating state.
 - **Git-Style Smart Renames:** Uses Jaro-Winkler similarity matching (>80%) to detect renamed tables or columns, issuing non-destructive `ALTER TABLE RENAME` statements instead of dropping and recreating data.
 - **Built-in Interactive Terminal IDE:** Explore live databases, write queries with syntax highlighting and autocompletion (`Ctrl+Space`), and manage independent query tabs.
+- **Visual Primary Key & Foreign Key Indicators:** Inspect table structures in the Explorer tree with visual icons (`🔑` for Primary Keys, `🔗` for Foreign Keys with reference targets `[FK -> table.col]`, and composite `🔑🔗` badges).
+- **Dynamic Explorer Width Resizing & Snappy Scrolling:** Adjust sidebar width on the fly via `W` (cycling 25%/35%/50% presets) or `+`/`-` and `[`/`]` (5% increments from 15% to 60%). Navigate wide schemas quickly with 4-char arrow scrolling, `Shift+Arrow` 10-char jumps, and `Home` margin snap.
 - **Catalog-Aware Multi-Database Exploration:** Inspect multiple attached catalogs (local DuckDB, in-memory `memory` scratchpad, attached SQLite/Postgres/MySQL/MSSQL, and remote Quack `target_db` instances) in a unified hierarchical tree with catalog-qualified query generation and cross-database joins.
 - **Live Catalog Attach & Detach (`Ctrl+A` / `d` / `b`):** Dynamically attach third-party databases, DuckDB files, or remote Quack instances directly inside the IDE without restarting; cycle target catalogs on the fly.
 - **Temporary Table Discovery & Python Two-Way Sync:** Temporary tables and views (`CREATE TEMP TABLE ...`) appear seamlessly in the active database's Explorer tree with a distinct `[temp]` badge. Instant DDL auto-refresh updates the sidebar on `CREATE`/`DROP`/`ALTER`, and interactive Python exploration (`duckpack.explore(con)`) performs safe two-way session synchronization across the Quack bridge.
@@ -230,6 +236,37 @@ When a specific catalog is targeted:
 - Migrations are executed within the target database context using safe `USE "<database>"` switching, ensuring unqualified DDL statements deploy cleanly without touching default or scratchpad databases.
 - In the TUI Explorer, press **`b`** to cycle between attached writable DuckDB catalogs for diff and apply operations.
 
+### Table Constraint Diffing & Copy-and-Swap Migrations
+
+DuckDB's internal `duckdb_columns()` view maps column names to data types, but does not capture relational constraints (`PRIMARY KEY`, `FOREIGN KEY`, `UNIQUE`, or `CHECK`). DuckPack bridges this by querying `duckdb_constraints()` across both your declarative models (in the in-memory shadow database) and the target database:
+
+#### 1. In-Place Constraint Alterations (`[ADD CONSTRAINT]`)
+When a new `PRIMARY KEY` or `UNIQUE` constraint is added to a table that previously lacked one, DuckPack applies an in-place DDL mutation without recreating the table:
+```sql
+ALTER TABLE users ADD PRIMARY KEY (user_id);
+ALTER TABLE users ADD UNIQUE (email_address);
+```
+These changes are classified as non-destructive additions and are enabled by default during interactive apply.
+
+#### 2. Atomic Copy-and-Swap Migrations (`[RECREATE TABLE]`)
+DuckDB does not natively support in-place `ALTER TABLE ... ADD FOREIGN KEY`, `ADD CHECK`, or constraint drops. For these modifications, DuckPack generates an atomic, transactional copy-and-swap migration using a staging table:
+```sql
+BEGIN TRANSACTION;
+CREATE TABLE orders__duckpack_swap (
+    order_id INTEGER PRIMARY KEY,
+    user_id INTEGER,
+    amount DECIMAL(18,2),
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+INSERT INTO orders__duckpack_swap (order_id, user_id, amount)
+    SELECT order_id, user_id, amount FROM orders;
+DROP TABLE orders;
+ALTER TABLE orders__duckpack_swap RENAME TO orders;
+COMMIT;
+```
+- **Data Protection:** Because table recreation replaces the existing table structure, DuckPack classifies `[RECREATE TABLE]` as a protected operation. In interactive mode, it is deselected by default, and in automated pipelines (`duckpack apply --auto-approve`), it requires the `--force-drop` flag to proceed.
+- **Rollback Safety:** If data in the existing table violates the new constraint, DuckDB automatically aborts and rolls back the transaction, keeping your existing table and data intact.
+
 ### Interactive Apply & Notebook Parity
 
 DuckPack bridges the gap between terminal CLI power users, CI/CD pipelines, and Python data scientists:
@@ -274,15 +311,17 @@ duckpack explore --db quack:0.0.0.0:9494 --quack-token <TOKEN>
 Or transition instantly from `duckpack apply` by pressing **`e`**.
 
 ```
-┌ Explorer [R: Refresh | Ctrl+A: Attach | q: Query] ──┬─ [Tab 1: cross_join.sql] ── [+ New] ── [❌ Close] ────┐
+┌ Explorer (25%) [W: Width | +/-: Resize | R: Refresh | q: Query] ──┬─ [Tab 1: cross_join.sql] ── [+ New] ── [❌ Close] ────┐
 │ ▼ 📁 target_db [Active] (quack)                     │ SELECT                                                │
 │   ▼ 📦 Tables (2)                                   │   ro.order_id,                                        │
 │     ├─ customers (1,450 rows)                       │   ro.amount,                                          │
-│     │  ├─ customer_id (BIGINT)                      │   lu.user_email                                       │
+│     │  ├─ 🔑 customer_id (BIGINT) [PK]              │   lu.user_email                                       │
 │     │  └─ email (VARCHAR)                           │ FROM target_db.orders ro                              │
 │     └─ orders (8,920 rows)                          │ JOIN memory.local_users lu                            │
-│   ▼ 👁️ Views (1)                                    │   ON ro.customer_id = lu.id                           │
-│     └─ active_orders                                │ LIMIT 100;                                            │
+│        ├─ 🔑 order_id (BIGINT) [PK]                 │   ON ro.customer_id = lu.id                           │
+│        └─ 🔗 customer_id (BIGINT) [FK -> cust...]   │ LIMIT 100;                                            │
+│   ▼ 👁️ Views (1)                                    │                                                       │
+│     └─ active_orders                                │                                                       │
 │ ▼ 📁 memory (duckdb)                                │                                                       │
 │   ▼ 📦 Tables (1)                                   │                                                       │
 │     └─ local_users (50 rows)                        │                                                       │
@@ -300,6 +339,8 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | :--- | :--- | :--- |
 | **Global / Navigation** | `Tab` | Cycle focus between **Explorer**, **Editor**, and **Results** panes |
 | | `?` | Toggle the Help Modal |
+| | `Alt+W` | Cycle Explorer width presets (`25%` $\rightarrow$ `35%` $\rightarrow$ `50%`) |
+| | `Alt+]` / `Alt+[` | Widen / narrow Explorer pane by 5% |
 | | `Ctrl+C` / `Esc` | Cancel operation / exit modal / quit IDE |
 | **Editor** | `Ctrl+E` / `F5` | **Execute query** in active tab (or execute highlighted selection) |
 | | `Shift + Arrows` | Highlight text to isolate and execute *only* the selection on `Ctrl+E` |
@@ -314,6 +355,12 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | | `Ctrl+N` / `Ctrl+P` | Switch to the **Next** / **Previous** tab |
 | **Explorer** | `Up` / `Down` | Navigate through databases, table groups, tables, and columns |
 | | `Enter` / `Space` | Expand or collapse database/group/table column tree / open SQL file |
+| | `W` / `w` | **Cycle width presets:** `25%` $\rightarrow$ `35%` $\rightarrow$ `50%` $\rightarrow$ `25%` |
+| | `+` / `=` / `]` | **Widen Explorer** by +5% (up to 60%) |
+| | `-` / `[` | **Narrow Explorer** by -5% (down to 15%) |
+| | `Left` / `Right` / `h` / `l` | **Scroll horizontally** by 4 characters |
+| | `Shift + Left` / `Right` | **Fast horizontal scroll** by 10 characters |
+| | `Home` | **Snap horizontal scroll** back to left margin |
 | | `q` / `s` | **Query table/view** (generates catalog-qualified SQL into editor) |
 | | `Ctrl+A` | **Attach Database** dialog (DuckDB, SQLite, Postgres, MySQL, MSSQL, Quack) |
 | | `d` | **Detach Database** from current session |
@@ -328,8 +375,41 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | | `PgUp` / `PgDn` | Fast scroll vertically |
 | | `n` / `p` | Navigate to **Next** / **Previous** page (500-row pagination chunks) |
 | | `Ctrl+O` | Export active query results to a CSV file in `queries/` |
-| **Mouse Support** | Mouse Wheel | Seamless vertical & horizontal scrolling in any focused pane |
+| **Mouse Support** | Mouse Wheel | Vertical & horizontal (tilt or `Shift+Wheel`) scrolling in focused pane |
 | | Click Tabs | Click on tab headers to switch or click `[+ New]` / `[❌ Close]` buttons |
+
+### Primary Key & Foreign Key Visual Identifiers
+
+The Explorer sidebar introspects constraints from `duckdb_constraints()` for both local DuckDB databases and remote Quack instances, rendering relational relationships directly beside column names:
+
+- **Primary Key (`🔑`)**:
+  ```text
+  🔑 customer_id (BIGINT) [PK]
+  ```
+- **Foreign Key (`🔗`)**: Explicitly indicates the referenced table and column target:
+  ```text
+  🔗 user_id (INTEGER) [FK -> users.user_id]
+  ```
+- **Composite Primary Key + Foreign Key (`🔑🔗`)**: When a column serves as both a primary key and a foreign key:
+  ```text
+  🔑🔗 tenant_id (BIGINT) [PK, FK -> tenants.id]
+  ```
+
+### Dynamic Explorer Width Resizing & Snappy Scrolling
+
+When inspecting tables with long column names, complex data types (`MAP(VARCHAR, JSON)`), or nested catalog schemas, standard sidebar widths can feel cramped:
+
+- **Width Presets (`W` or `Alt+W`):** Instantly cycle the Explorer width between **`25%`**, **`35%`**, and **`50%`** without leaving the keyboard.
+- **Fine Adjustment (`+` / `-` or `[` / `]`):** Fine-tune sidebar width in 5% increments between 15% and 60% (e.g. `Alt+]` or `Alt+[` from any pane).
+- **Responsive Header:** The Explorer title updates dynamically with the active percentage and shortcut hints:
+  ```text
+  Explorer (35%) [W: Width | +/-: Resize | R: Refresh | q: Query]
+  ```
+- **Snappy Horizontal Scrolling:**
+  - `Left` / `Right` (or `h` / `l`): Shifts by 4 characters.
+  - `Shift + Left` / `Shift + Right`: Jumps by 10 characters.
+  - `Home`: Instantly snaps back to column 0.
+  - Mouse wheel tilt or `Shift + Wheel`: Smooth horizontal scrolling across long metadata strings.
 
 ### Catalog-Aware Multi-Database Exploration & Cross-DB Joins
 
