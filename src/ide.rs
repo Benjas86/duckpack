@@ -2684,6 +2684,7 @@ mod tests {
             let temp_dir = std::env::temp_dir().join(format!("dp_live_quack_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             let _ = std::fs::create_dir_all(&temp_dir);
 
+            conn.execute("CREATE TEMP TABLE t_test AS SELECT 1;", []).unwrap();
             let meta = load_explorer_metadata(&conn, &temp_dir, true);
             println!("Databases found: {:?}", meta.databases.iter().map(|d| (&d.name, &d.db_type, d.is_active, d.tables.len())).collect::<Vec<_>>());
             assert_eq!(meta.databases.len(), 2, "Expected target_db and memory");
