@@ -388,6 +388,9 @@ pub fn load_explorer_metadata(
     // Query tables from attached quack databases
     for (name, typ, _, _) in &raw_dbs {
         if typ.eq_ignore_ascii_case("quack") {
+            if is_quack && name == "target_db" {
+                continue;
+            }
             let safe_name = name.replace('\'', "''");
             let sql = if is_remote_multi_db {
                 format!(
@@ -409,13 +412,16 @@ pub fn load_explorer_metadata(
                             }
                             let est: Option<i64> = row.get(3).ok();
                             let is_temp: bool = row.get(4).unwrap_or(false) || db == "temp";
-                            all_tables.push(TableEntry {
-                                database: if is_temp { active_database.clone() } else { db },
-                                schema,
-                                name: table,
-                                row_count: est,
-                                is_temporary: is_temp,
-                            });
+                            let target_database = if is_temp { active_database.clone() } else { db };
+                            if !all_tables.iter().any(|t| t.database.eq_ignore_ascii_case(&target_database) && t.schema.eq_ignore_ascii_case(&schema) && t.name.eq_ignore_ascii_case(&table)) {
+                                all_tables.push(TableEntry {
+                                    database: target_database,
+                                    schema,
+                                    name: table,
+                                    row_count: est,
+                                    is_temporary: is_temp,
+                                });
+                            }
                         }
                     }
                 }
@@ -510,6 +516,9 @@ pub fn load_explorer_metadata(
     // Query views from attached quack databases
     for (name, typ, _, _) in &raw_dbs {
         if typ.eq_ignore_ascii_case("quack") {
+            if is_quack && name == "target_db" {
+                continue;
+            }
             let safe_name = name.replace('\'', "''");
             let sql = if is_remote_multi_db {
                 format!(
@@ -530,12 +539,15 @@ pub fn load_explorer_metadata(
                                 continue;
                             }
                             let is_temp: bool = row.get(3).unwrap_or(false) || db == "temp";
-                            all_views.push(ViewEntry {
-                                database: if is_temp { active_database.clone() } else { db },
-                                schema,
-                                name,
-                                is_temporary: is_temp,
-                            });
+                            let target_database = if is_temp { active_database.clone() } else { db };
+                            if !all_views.iter().any(|v| v.database.eq_ignore_ascii_case(&target_database) && v.schema.eq_ignore_ascii_case(&schema) && v.name.eq_ignore_ascii_case(&name)) {
+                                all_views.push(ViewEntry {
+                                    database: target_database,
+                                    schema,
+                                    name,
+                                    is_temporary: is_temp,
+                                });
+                            }
                         }
                     }
                 }
@@ -853,6 +865,7 @@ pub fn refresh_attached_catalog(conn: &Connection, db_path: &str, quack_disable_
             // In DuckDB v2, keep 'memory' as the default session catalog so that
             // local prepared statements register correctly, while target_db is attached
             // and accessible via 'target_db' qualifier or target_db.query().
+            let _ = conn.execute("SET search_path = 'target_db.main,main';", []);
         }
     } else if db_path.starts_with("md:") || db_path.starts_with("motherduck:") {
         let _ = conn.execute("REFRESH DATABASES;", []);

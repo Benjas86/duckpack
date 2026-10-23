@@ -298,6 +298,9 @@ pub fn connect_target_db(
         // For Quack connections in DuckDB v2, keep 'memory' as the default session catalog
         // so that local prepared statements register correctly, while target_db is attached
         // and accessible via 'target_db' qualifier or target_db.query().
+        // Configure search_path so unqualified queries resolve to target_db.main first,
+        // while local temporary tables and session tables created in main/memory resolve seamlessly.
+        let _ = conn.execute("SET search_path = 'target_db.main,main';", []);
         Ok(conn)
     } else if is_remote(db) {
         let conn = open_duckdb_connection()

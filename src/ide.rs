@@ -1968,7 +1968,12 @@ pub fn run_ide_loop(
                         let mut executed_remote_fallback = false;
                         let local_err_str = e.to_string();
                         let is_syntax_error = local_err_str.contains("syntax error at or near");
-                        if is_quack && !is_explicit_remote && !is_syntax_error {
+                        let lower_q = query_to_execute.to_lowercase();
+                        let is_temp_mutation = lower_q.contains("temp table")
+                            || lower_q.contains("temporary table")
+                            || lower_q.contains("temp view")
+                            || lower_q.contains("temporary view");
+                        if is_quack && !is_explicit_remote && !is_syntax_error && !is_temp_mutation {
                             let clean_query = query_to_execute.trim().strip_suffix(';').unwrap_or(query_to_execute.trim());
                             let remote_sql = if is_paginatable {
                                 format!("SELECT * FROM target_db.query('{}') LIMIT {} OFFSET {}", clean_query.replace("'", "''"), active_tab.pagination_limit, active_tab.pagination_offset)
@@ -2067,6 +2072,16 @@ pub fn run_ide_loop(
             autocomplete_matches.clear();
             if !meta.queries.is_empty() {
                 expanded_groups.insert("Queries".to_string());
+            }
+            if meta.databases.len() > 1 {
+                for db in &meta.databases {
+                    if db.is_active {
+                        expanded_groups.insert(format!("db:{}", db.name));
+                        expanded_groups.insert(format!("{}:Tables", db.name));
+                    }
+                }
+            } else {
+                expanded_groups.insert("Tables".to_string());
             }
             explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
             if let Some(sel) = prev_selected {
