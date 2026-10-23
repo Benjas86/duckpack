@@ -850,7 +850,9 @@ pub fn refresh_attached_catalog(conn: &Connection, db_path: &str, quack_disable_
             let _ = conn.execute("USE memory;", []);
             let _ = conn.execute("DETACH target_db;", []);
             let _ = conn.execute(&attach_sql, []);
-            let _ = conn.execute("CONNECT target_db;", []).or_else(|_| conn.execute("USE target_db;", []));
+            // In DuckDB v2, keep 'memory' as the default session catalog so that
+            // local prepared statements register correctly, while target_db is attached
+            // and accessible via 'target_db' qualifier or target_db.query().
         }
     } else if db_path.starts_with("md:") || db_path.starts_with("motherduck:") {
         let _ = conn.execute("REFRESH DATABASES;", []);
@@ -1005,6 +1007,33 @@ mod tests {
 
         let current_db: String = conn.query_row("SELECT current_database();", [], |r| r.get(0)).unwrap();
         assert_eq!(current_db, "target_db");
+    }
+
+    #[test]
+    fn test_live_refresh_attached_catalog() {
+        let db_uri = "quack:0.0.0.0:9494";
+        let token = "your_quack_token_here";
+        if let Ok(conn) = crate::engine::connect_target_db(db_uri, Some(token), true) {
+            let temp_dir = std::env::temp_dir().join("dp_test_refresh_live");
+            let _ = std::fs::create_dir_all(&temp_dir);
+
+            println!("Calling refresh_attached_catalog...");
+            refresh_attached_catalog(&conn, db_uri, true);
+
+            let meta = load_explorer_metadata(&conn, &temp_dir, true);
+            println!("After refresh, databases found: {:?}", meta.databases.iter().map(|d| (&d.name, d.tables.len())).collect::<Vec<_>>());
+            assert_eq!(meta.databases.len(), 2);
+
+            // Test temp table creation after refresh
+            conn.execute("CREATE TEMP TABLE t_temp_live AS SELECT 1;", []).unwrap();
+            let meta2 = load_explorer_metadata(&conn, &temp_dir, true);
+            assert_eq!(meta2.databases.len(), 2);
+            assert!(meta2.temp_tables.contains("t_temp_live"));
+            let target_db = meta2.databases.iter().find(|d| d.name == "target_db").unwrap();
+            assert!(target_db.tables.iter().any(|t| t.name == "t_temp_live" && t.is_temporary));
+
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
     }
 
     #[test]
