@@ -778,7 +778,7 @@ fn run_diff_review_tui(
             if let Some(out_file) = out {
                 let mut script = String::new();
                 for item in &diff_result.items {
-                    let is_drop = matches!(item.item_type, diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro | diff::DiffItemType::DropTrigger);
+                    let is_drop = matches!(item.item_type, diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro | diff::DiffItemType::DropTrigger | diff::DiffItemType::RecreateTable);
                     if is_drop && !current_force_drop {
                         continue;
                     }

@@ -519,8 +519,13 @@ pub fn apply_diff(
         for item in &diff.items {
             if !item.selected || item.ignored { continue; }
             match item.item_type {
-                diff::DiffItemType::CreateTable | diff::DiffItemType::AlterTable | diff::DiffItemType::CreateMacro | diff::DiffItemType::RenameTable | diff::DiffItemType::RenameColumn => {
+                diff::DiffItemType::CreateTable | diff::DiffItemType::AlterTable | diff::DiffItemType::CreateMacro | diff::DiffItemType::RenameTable | diff::DiffItemType::RenameColumn | diff::DiffItemType::AddConstraint => {
                     structure_to_apply.push(item.sql.clone());
+                }
+                diff::DiffItemType::RecreateTable => {
+                    if force_drop {
+                        structure_to_apply.push(item.sql.clone());
+                    }
                 }
                 diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro | diff::DiffItemType::DropTrigger => {
                     if force_drop {

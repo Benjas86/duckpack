@@ -1082,6 +1082,7 @@ pub fn apply(
                         | schema_diff::DiffItemType::DropView
                         | schema_diff::DiffItemType::DropMacro
                         | schema_diff::DiffItemType::DropSchema
+                        | schema_diff::DiffItemType::RecreateTable
                 );
                 if is_drop && !force_drop {
                     continue;
@@ -1225,6 +1226,7 @@ fn introspect_py_catalog(
                 schema_diff::TableSchema {
                     create_sql: row[1].clone(),
                     columns: HashMap::new(),
+                    constraints: Vec::new(),
                 },
             );
         }
@@ -1266,6 +1268,7 @@ fn introspect_py_catalog(
                         schema_diff::TableSchema {
                             create_sql: row[1].clone(),
                             columns: HashMap::new(),
+                            constraints: Vec::new(),
                         },
                     );
                 }
@@ -1281,6 +1284,87 @@ fn introspect_py_catalog(
                 if row.len() >= 3 {
                     if let Some(t) = table_map.get_mut(&row[0]) {
                         t.columns.insert(row[1].clone(), row[2].clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // 3b. Constraints
+    let constr_query = format!(
+        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+         constraint_type, constraint_name, COALESCE(array_to_string(constraint_column_names, ','), ''), \
+         expression, referenced_table, COALESCE(array_to_string(referenced_column_names, ','), '') \
+         FROM duckdb_constraints() \
+         WHERE database_name = '{}' AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
+        safe_cat
+    );
+    if let Ok((_, constr_rows)) = executor.query_rows(&constr_query) {
+        for row in constr_rows {
+            if row.len() >= 7 {
+                let table_name = &row[0];
+                if let Some(t) = table_map.get_mut(table_name) {
+                    let cols_str = &row[3];
+                    let ref_cols_str = &row[6];
+                    let cols: Vec<String> = if cols_str.is_empty() {
+                        Vec::new()
+                    } else {
+                        cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                    };
+                    let ref_cols: Vec<String> = if ref_cols_str.is_empty() {
+                        Vec::new()
+                    } else {
+                        ref_cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                    };
+                    t.constraints.push(schema_diff::ConstraintSchema {
+                        constraint_type: row[1].clone(),
+                        constraint_name: if row[2].is_empty() { None } else { Some(row[2].clone()) },
+                        columns: cols,
+                        expression: if row[4].is_empty() { None } else { Some(row[4].clone()) },
+                        referenced_table: if row[5].is_empty() { None } else { Some(row[5].clone()) },
+                        referenced_columns: ref_cols,
+                    });
+                }
+            }
+        }
+    }
+
+    if is_quack {
+        let q_constr_sql = format!(
+            "SELECT '{}.' || (CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END), \
+             constraint_type, constraint_name, COALESCE(array_to_string(constraint_column_names, ','), ''), \
+             expression, referenced_table, COALESCE(array_to_string(referenced_column_names, ','), '') \
+             FROM {}.query('SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, '','') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (database_name = ''{}'' OR database_name = current_database())')",
+            safe_cat, safe_cat, safe_cat
+        );
+        if let Ok((_, q_constrs)) = executor.query_rows(&q_constr_sql) {
+            for row in q_constrs {
+                if row.len() >= 7 {
+                    let table_name = &row[0];
+                    if let Some(t) = table_map.get_mut(table_name) {
+                        let cols_str = &row[3];
+                        let ref_cols_str = &row[6];
+                        let cols: Vec<String> = if cols_str.is_empty() {
+                            Vec::new()
+                        } else {
+                            cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                        };
+                        let ref_cols: Vec<String> = if ref_cols_str.is_empty() {
+                            Vec::new()
+                        } else {
+                            ref_cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                        };
+                        let new_c = schema_diff::ConstraintSchema {
+                            constraint_type: row[1].clone(),
+                            constraint_name: if row[2].is_empty() { None } else { Some(row[2].clone()) },
+                            columns: cols,
+                            expression: if row[4].is_empty() { None } else { Some(row[4].clone()) },
+                            referenced_table: if row[5].is_empty() { None } else { Some(row[5].clone()) },
+                            referenced_columns: ref_cols,
+                        };
+                        if !t.constraints.iter().any(|c| c.matches(&new_c)) {
+                            t.constraints.push(new_c);
+                        }
                     }
                 }
             }

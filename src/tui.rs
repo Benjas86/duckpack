@@ -171,8 +171,8 @@ fn sort_diff_items(items: &mut Vec<DiffItem>) {
     items.sort_by_key(|item| {
         match item.item_type {
             DiffItemType::CreateSchema | DiffItemType::CreateTable | DiffItemType::CreateView | DiffItemType::CreateMacro | DiffItemType::CreateTrigger => 1,
-            DiffItemType::AlterTable | DiffItemType::RenameTable | DiffItemType::RenameColumn => 2,
-            DiffItemType::DropSchema | DiffItemType::DropTable | DiffItemType::DropView | DiffItemType::DropMacro | DiffItemType::DropColumn | DiffItemType::DropTrigger => 3,
+            DiffItemType::AlterTable | DiffItemType::RenameTable | DiffItemType::RenameColumn | DiffItemType::AddConstraint => 2,
+            DiffItemType::DropSchema | DiffItemType::DropTable | DiffItemType::DropView | DiffItemType::DropMacro | DiffItemType::DropColumn | DiffItemType::DropTrigger | DiffItemType::RecreateTable => 3,
         }
     });
 }
@@ -283,6 +283,8 @@ pub fn draw_and_handle_events(
                             if force_drop { ("[DROP TRG] ", Style::default().fg(Color::Red)) } 
                             else { ("[IGNORED DROP] ", Style::default().fg(Color::DarkGray)) }
                         },
+                        DiffItemType::AddConstraint => ("[ADD CONSTRAINT] ", Style::default().fg(Color::Yellow)),
+                        DiffItemType::RecreateTable => if force_drop { ("[RECREATE TABLE] ", Style::default().fg(Color::Red)) } else { ("[IGNORED RECREATE] ", Style::default().fg(Color::DarkGray)) },
                     };
 
                     if item.locked {
