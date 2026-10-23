@@ -675,31 +675,36 @@ def test_live_quack_pk_diff_and_apply_idempotency(tmp_path):
     except Exception as e:
         pytest.skip(f"Live Quack container not reachable: {e}")
 
-    proj_dir = str(tmp_path / "quack_pk_proj")
-    duckpack.init(proj_dir)
+    test_tbl = "__duckpack_pk_isolated_test"
+    try:
+        # Pre-create table on Quack without PK
+        con.execute(f"CALL target_db.query('CREATE OR REPLACE TABLE {test_tbl} (id INT, val VARCHAR);');")
 
-    # Ignore other tables on Quack so test focuses cleanly on users
-    with open(os.path.join(proj_dir, "duckpack.toml"), "w") as f:
-        f.write('[project]\nname = "quack_pk_proj"\n\n[ignore]\nrules = ["products", "test_tbl", "wide_pipeline_test", "*view*", "target_table"]\n')
+        proj_dir = str(tmp_path / "quack_pk_proj")
+        duckpack.init(proj_dir)
 
-    with open(os.path.join(proj_dir, "tables", "users.sql"), "w") as f:
-        f.write("""CREATE TABLE users (
-            user_id INTEGER PRIMARY KEY,
-            first_name VARCHAR,
-            last_name VARCHAR,
-            dob DATE,
-            email_Address VARCHAR,
-            created_date_time DATE,
-            last_login_date_time DATE,
-            live BOOLEAN
-        );""")
+        # Ignore all user tables on Quack so test focuses cleanly on isolated test table
+        with open(os.path.join(proj_dir, "duckpack.toml"), "w") as f:
+            f.write(f'[project]\nname = "quack_pk_proj"\n\n[ignore]\nrules = ["users", "products", "test_tbl", "wide_pipeline_test", "*view*", "target_table"]\n')
 
-    # Apply to live Quack
-    apply_res = duckpack.apply(con, proj_dir, catalog="target_db")
-    assert apply_res.success is True
+        with open(os.path.join(proj_dir, "tables", f"{test_tbl}.sql"), "w") as f:
+            f.write(f"CREATE TABLE {test_tbl} (id INT PRIMARY KEY, val VARCHAR);")
 
-    # Verify zero diff after apply on live Quack
-    diff_after = duckpack.diff(con, proj_dir, catalog="target_db")
-    users_items = [i for i in diff_after.items if "users" in i]
-    assert len(users_items) == 0, f"Expected 0 diff items for users, got {users_items}"
+        # Verify diff detects constraint
+        diff_before = duckpack.diff(con, proj_dir, catalog="target_db")
+        assert any(test_tbl in i for i in diff_before.items), f"Expected diff to detect PK change for {test_tbl}"
+
+        # Apply to live Quack
+        apply_res = duckpack.apply(con, proj_dir, catalog="target_db")
+        assert apply_res.success is True
+
+        # Verify zero diff after apply on live Quack
+        diff_after = duckpack.diff(con, proj_dir, catalog="target_db")
+        tbl_items = [i for i in diff_after.items if test_tbl in i]
+        assert len(tbl_items) == 0, f"Expected 0 diff items for {test_tbl}, got {tbl_items}"
+    finally:
+        try:
+            con.execute(f"CALL target_db.query('DROP TABLE IF EXISTS {test_tbl};');")
+        except Exception:
+            pass
 

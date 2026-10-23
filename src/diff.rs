@@ -281,19 +281,27 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
         });
     }
 
-    if tables.is_empty() {
+    let is_quack = conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) > 0;
+
+    if is_quack || tables.is_empty() {
         let q_sql = format!(
             "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
              COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
-             FROM target_db.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND database_name = ''{}''')",
+             FROM target_db.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
             safe_cat
         );
         if let Ok(mut q_stmt) = conn.prepare(&q_sql) {
             if let Ok(rows) = q_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
                 for row in rows.flatten() {
                     let (table_name, sql) = row;
-                    tables.insert(table_name, TableSchema {
-                        create_sql: sql,
+                    tables.entry(table_name).or_insert_with(|| TableSchema {
+                        create_sql: sql.clone(),
                         columns: HashMap::new(),
                         constraints: Vec::new(),
                     });
@@ -321,11 +329,11 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
     }
 
     let any_col_empty = tables.values().any(|t| t.columns.is_empty());
-    if any_col_empty {
+    if is_quack || any_col_empty {
         let q_col_sql = format!(
             "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
              column_name, data_type \
-             FROM target_db.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false AND database_name = ''{}''')",
+             FROM target_db.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
             safe_cat
         );
         if let Ok(mut q_col_stmt) = conn.prepare(&q_col_sql) {
@@ -339,6 +347,7 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
             }
         }
     }
+
 
     // Introspect table constraints (PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK)
     let constr_sql = format!(
