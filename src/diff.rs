@@ -48,6 +48,17 @@ pub enum DiffItemType {
     DropView,
     CreateMacro,
     DropMacro,
+    CreateTrigger,
+    DropTrigger,
+}
+
+/// Represents an individual trigger in a DuckDB catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerSchema {
+    pub schema_name: String,
+    pub trigger_name: String,
+    pub table_name: String,
+    pub sql: String,
 }
 
 /// A discrete change to the database schema computed by the engine.
@@ -386,16 +397,86 @@ pub fn get_schemas(conn: &Connection, catalog: Option<&str>) -> Result<std::coll
     Ok(schemas)
 }
 
+/// Extracts all trigger definitions from a DuckDB connection for a specific catalog.
+pub fn get_triggers(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<String, TriggerSchema>> {
+    let target_cat = match catalog {
+        Some(c) => c.to_string(),
+        None => conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_else(|_| "memory".to_string()),
+    };
+    let safe_cat = target_cat.replace('\'', "''");
+    let mut triggers = HashMap::new();
+
+    let sql = format!(
+        "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') \
+         FROM duckdb_triggers() WHERE database_name = '{}'",
+        safe_cat
+    );
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let (schema, trg_name, table, trg_sql) = row;
+                let key = if schema == "main" {
+                    trg_name.clone()
+                } else {
+                    format!("{}.{}", schema, trg_name)
+                };
+                triggers.insert(key, TriggerSchema {
+                    schema_name: schema,
+                    trigger_name: trg_name,
+                    table_name: table,
+                    sql: trg_sql,
+                });
+            }
+        }
+    }
+
+    if triggers.is_empty() {
+        let q_sql = format!(
+            "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') \
+             FROM target_db.query('SELECT schema_name, trigger_name, table_name, sql FROM duckdb_triggers() WHERE database_name = ''{}''')",
+            safe_cat
+        );
+        if let Ok(mut q_stmt) = conn.prepare(&q_sql) {
+            if let Ok(rows) = q_stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            }) {
+                for row in rows.flatten() {
+                    let (schema, trg_name, table, trg_sql) = row;
+                    let key = if schema == "main" {
+                        trg_name.clone()
+                    } else {
+                        format!("{}.{}", schema, trg_name)
+                    };
+                    triggers.insert(key, TriggerSchema {
+                        schema_name: schema,
+                        trigger_name: trg_name,
+                        table_name: table,
+                        sql: trg_sql,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(triggers)
+}
+
 /// The core diffing engine. 
 /// Compares the `shadow` database (desired state) against the `target` database (current state)
-/// and calculates the exact delta (adding tables, renaming columns, altering types, etc.).
+/// and calculates the exact delta (adding tables, renaming columns, altering types, triggers, etc.).
 /// It uses Jaro-Winkler string similarity to heuristically detect renames instead of destructive drops.
-/// The core Diff Engine. Compares two database schemas (target vs shadow) 
-/// and computes the exact SQL statements required to migrate the target to match the shadow.
-///
-/// # Educational Note:
-/// This function uses Git-style similarity matching (Jaccard Index) to detect if a table or column
-/// was renamed, rather than simply dropped and recreated, allowing for non-destructive migrations!
 pub fn compute_diff(
     shadow_schemas: &std::collections::HashSet<String>,
     target_schemas: &std::collections::HashSet<String>,
@@ -405,6 +486,8 @@ pub fn compute_diff(
     target_views: &HashMap<String, String>,
     shadow_macros: &HashMap<String, String>,
     target_macros: &HashMap<String, String>,
+    shadow_triggers: &HashMap<String, TriggerSchema>,
+    target_triggers: &HashMap<String, TriggerSchema>,
     _project_dir: &std::path::PathBuf,
     ignore_list: &[String]
 ) -> DiffResult {
@@ -690,6 +773,72 @@ pub fn compute_diff(
         }
     }
 
+    // 5. Triggers
+    for (name, shadow_trg) in shadow_triggers {
+        let is_trg_ignored = is_ignored(name) || is_ignored(&shadow_trg.table_name);
+        if let Some(target_trg) = target_triggers.get(name) {
+            if shadow_trg.sql.trim() != target_trg.sql.trim() {
+                let target_table = if target_trg.schema_name == "main" {
+                    target_trg.table_name.clone()
+                } else {
+                    format!("{}.{}", target_trg.schema_name, target_trg.table_name)
+                };
+                diff.items.push(DiffItem {
+                    item_type: DiffItemType::DropTrigger,
+                    obj_name: name.clone(),
+                    sql: format!("DROP TRIGGER {} ON {};", target_trg.trigger_name, target_table),
+                    old_def: Some(target_trg.sql.clone()),
+                    new_def: None,
+                    selected: !is_trg_ignored,
+                    locked: false,
+                    ignored: is_trg_ignored,
+                });
+                diff.items.push(DiffItem {
+                    item_type: DiffItemType::CreateTrigger,
+                    obj_name: name.clone(),
+                    sql: shadow_trg.sql.clone(),
+                    old_def: None,
+                    new_def: Some(shadow_trg.sql.clone()),
+                    selected: !is_trg_ignored,
+                    locked: false,
+                    ignored: is_trg_ignored,
+                });
+            }
+        } else {
+            diff.items.push(DiffItem {
+                item_type: DiffItemType::CreateTrigger,
+                obj_name: name.clone(),
+                sql: shadow_trg.sql.clone(),
+                old_def: None,
+                new_def: Some(shadow_trg.sql.clone()),
+                selected: !is_trg_ignored,
+                locked: false,
+                ignored: is_trg_ignored,
+            });
+        }
+    }
+
+    for (name, target_trg) in target_triggers {
+        if !shadow_triggers.contains_key(name) {
+            let is_trg_ignored = is_ignored(name) || is_ignored(&target_trg.table_name);
+            let target_table = if target_trg.schema_name == "main" {
+                target_trg.table_name.clone()
+            } else {
+                format!("{}.{}", target_trg.schema_name, target_trg.table_name)
+            };
+            diff.items.push(DiffItem {
+                item_type: DiffItemType::DropTrigger,
+                obj_name: name.clone(),
+                sql: format!("DROP TRIGGER {} ON {};", target_trg.trigger_name, target_table),
+                old_def: Some(target_trg.sql.clone()),
+                new_def: None,
+                selected: !is_trg_ignored,
+                locked: false,
+                ignored: is_trg_ignored,
+            });
+        }
+    }
+
     diff
 }
 
@@ -719,12 +868,60 @@ mod tests {
             &shadow, &target,
             &HashMap::new(), &HashMap::new(),
             &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
             &std::path::PathBuf::new(),
             &[]
         );
         
         assert_eq!(diff.items.len(), 1);
         assert_eq!(diff.items[0].item_type, DiffItemType::CreateTable);
+    }
+
+    #[test]
+    fn test_compute_diff_triggers() {
+        let mut shadow_triggers = HashMap::new();
+        let mut target_triggers = HashMap::new();
+
+        shadow_triggers.insert("trg_audit".to_string(), TriggerSchema {
+            schema_name: "main".to_string(),
+            trigger_name: "trg_audit".to_string(),
+            table_name: "users".to_string(),
+            sql: "CREATE TRIGGER trg_audit AFTER INSERT ON users FOR EACH ROW INSERT INTO audit_log VALUES (NEW.id);".to_string(),
+        });
+
+        // 1. New trigger creation
+        let diff1 = compute_diff(
+            &HashSet::new(), &HashSet::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &shadow_triggers, &target_triggers,
+            &std::path::PathBuf::new(),
+            &[]
+        );
+        assert_eq!(diff1.items.len(), 1);
+        assert_eq!(diff1.items[0].item_type, DiffItemType::CreateTrigger);
+        assert_eq!(diff1.items[0].obj_name, "trg_audit");
+
+        // 2. Dropped trigger generates DROP TRIGGER trg ON tbl;
+        target_triggers.insert("trg_old".to_string(), TriggerSchema {
+            schema_name: "main".to_string(),
+            trigger_name: "trg_old".to_string(),
+            table_name: "orders".to_string(),
+            sql: "CREATE TRIGGER trg_old AFTER DELETE ON orders FOR EACH ROW INSERT INTO audit_log VALUES (OLD.id);".to_string(),
+        });
+        let diff2 = compute_diff(
+            &HashSet::new(), &HashSet::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &target_triggers,
+            &std::path::PathBuf::new(),
+            &[]
+        );
+        assert_eq!(diff2.items.len(), 1);
+        assert_eq!(diff2.items[0].item_type, DiffItemType::DropTrigger);
+        assert_eq!(diff2.items[0].sql, "DROP TRIGGER trg_old ON orders;");
     }
 
     #[test]
@@ -762,6 +959,59 @@ mod tests {
         // Explicit target_db request
         let target_res = validate_target_catalog(&conn, Some("target_db"), true).unwrap();
         assert_eq!(target_res, "target_db");
+    }
+
+    #[test]
+    fn test_duckdb_v2_triggers_catalog() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE test_users (id INT, name VARCHAR);").unwrap();
+        // Test DuckDB native trigger syntax: statement follows FOR EACH ROW / STATEMENT directly
+        conn.execute_batch("CREATE TABLE audit_log (id INT);").unwrap();
+        let res = conn.execute_batch("CREATE TRIGGER trg1 AFTER INSERT ON test_users FOR EACH ROW INSERT INTO audit_log VALUES (NEW.id);");
+        println!("Native DuckDB trigger result: {:?}", res);
+        assert!(res.is_ok());
+
+        // Check duckdb_triggers contents
+        let mut stmt = conn.prepare("SELECT schema_name, trigger_name, table_name, sql FROM duckdb_triggers()").unwrap();
+        let rows: Vec<_> = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))).unwrap().flatten().collect();
+        println!("Active triggers: {:?}", rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "trg1");
+        assert_eq!(rows[0].2, "test_users");
+
+        // Test DROP TRIGGER trg ON table;
+        let drop_res = conn.execute_batch("DROP TRIGGER trg1 ON test_users;");
+        println!("DROP TRIGGER result: {:?}", drop_res);
+        assert!(drop_res.is_ok());
+
+        // Check duckdb_triggers columns
+        if let Ok(mut stmt) = conn.prepare("DESCRIBE SELECT * FROM duckdb_triggers()") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+                let cols: Vec<_> = rows.flatten().collect();
+                println!("duckdb_triggers() schema: {:?}", cols);
+            }
+        }
+
+        // Test Nested Schemas: create parent schema first, then child
+        let res_schema = conn.execute_batch("CREATE SCHEMA finance; CREATE SCHEMA finance.reports; CREATE TABLE finance.reports.quarterly_kpis (id INT);");
+        println!("Nested schema result: {:?}", res_schema);
+        assert!(res_schema.is_ok());
+
+        // Describe duckdb_schemas()
+        if let Ok(mut stmt) = conn.prepare("DESCRIBE SELECT * FROM duckdb_schemas()") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+                let cols: Vec<_> = rows.flatten().collect();
+                println!("duckdb_schemas() schema: {:?}", cols);
+            }
+        }
+        let schema_pairs: Vec<(String, Option<String>)> = conn.prepare("SELECT schema_name, parent_schema FROM duckdb_schemas() WHERE internal = false")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1).ok()))).unwrap().flatten().collect();
+        println!("Schema / Parent pairs: {:?}", schema_pairs);
+
+        let query_res = conn.execute_batch("SELECT * FROM finance.reports.quarterly_kpis;");
+        println!("Querying finance.reports.quarterly_kpis: {:?}", query_res);
+        assert!(query_res.is_ok());
     }
 }
 

@@ -11,7 +11,7 @@ use ratatui::{
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tui_textarea::TextArea;
+use tui_textarea::{CursorMove, TextArea};
 
 pub use crate::catalog::*;
 pub use crate::query::*;
@@ -32,6 +32,7 @@ pub(crate) enum NodeType {
     Group,
     Table { database: Option<String>, schema: Option<String>, is_temporary: bool },
     View { database: Option<String>, schema: Option<String>, is_temporary: bool },
+    Trigger { database: Option<String>, schema: Option<String>, table: Option<String> },
     Query,
     Macro,
     Column { data_type: String },
@@ -106,7 +107,7 @@ struct EditorTab<'a> {
 impl<'a> EditorTab<'a> {
     fn new() -> Self {
         let mut textarea = TextArea::default();
-        textarea.set_search_pattern("(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b").unwrap_or(());
+        textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
         textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
         textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
         Self {
@@ -255,6 +256,36 @@ pub(crate) fn rebuild_explorer_nodes(
                         }
                     }
                 }
+
+                if !db.triggers.is_empty() {
+                    let trg_group_key = format!("{}:Triggers", db.name);
+                    let is_trg_group_expanded = expanded_groups.contains(&trg_group_key);
+                    items.push(ExplorerNode {
+                        name: trg_group_key.clone(),
+                        display: format!("  ⚡ Triggers ({})", db.triggers.len()),
+                        level: 1,
+                        is_expandable: true,
+                        is_expanded: is_trg_group_expanded,
+                        node_type: NodeType::Group,
+                    });
+
+                    if is_trg_group_expanded {
+                        for trg in &db.triggers {
+                            items.push(ExplorerNode {
+                                name: trg.name.clone(),
+                                display: format!("    ├─ {} (on {})", trg.display_name(), trg.table_name),
+                                level: 2,
+                                is_expandable: false,
+                                is_expanded: false,
+                                node_type: NodeType::Trigger {
+                                    database: Some(db.name.clone()),
+                                    schema: Some(trg.schema.clone()),
+                                    table: Some(trg.table_name.clone()),
+                                },
+                            });
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -344,6 +375,34 @@ pub(crate) fn rebuild_explorer_nodes(
                             });
                         }
                     }
+                }
+            }
+        }
+
+        if !meta.triggers.is_empty() {
+            let is_expanded = expanded_groups.contains("Triggers");
+            items.push(ExplorerNode {
+                name: "Triggers".to_string(),
+                display: format!("⚡ Triggers ({})", meta.triggers.len()),
+                level: 0,
+                is_expandable: true,
+                is_expanded,
+                node_type: NodeType::Group,
+            });
+            if is_expanded {
+                for trg in &meta.triggers {
+                    items.push(ExplorerNode {
+                        name: trg.clone(),
+                        display: format!("  ├─ {}", trg),
+                        level: 1,
+                        is_expandable: false,
+                        is_expanded: false,
+                        node_type: NodeType::Trigger {
+                            database: Some(meta.active_database.clone()),
+                            schema: Some("main".to_string()),
+                            table: None,
+                        },
+                    });
                 }
             }
         }
@@ -724,7 +783,7 @@ pub fn run_ide_loop(
                 " Editor [New Query] ".to_string()
             };
 
-            let sql_keywords = "(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b";
+            let sql_keywords = SQL_KEYWORD_PATTERN;
             if active_tab.textarea.is_selecting() {
                 active_tab.textarea.set_search_pattern("a^").unwrap_or(());
             } else {
@@ -1506,7 +1565,7 @@ pub fn run_ide_loop(
                                             }
 
                                             tabs[active_tab_index].textarea = TextArea::from(vec![qualified_sql]);
-                                            tabs[active_tab_index].textarea.set_search_pattern("(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b").unwrap_or(());
+                                            tabs[active_tab_index].textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
                                             tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
                                             tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
                                             focus = FocusPane::Editor;
@@ -1679,7 +1738,7 @@ pub fn run_ide_loop(
             let query = tabs[active_tab_index].textarea.lines().join("\n");
             let formatted = sqlformat::format(&query, &sqlformat::QueryParams::None, &sqlformat::FormatOptions::default());
             tabs[active_tab_index].textarea = TextArea::from(formatted.lines().map(|s| s.to_string()).collect::<Vec<_>>());
-            tabs[active_tab_index].textarea.set_search_pattern("(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b").unwrap_or(());
+            tabs[active_tab_index].textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
             tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
             tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
             status_msg = "Formatted SQL".to_string();
@@ -1790,7 +1849,7 @@ pub fn run_ide_loop(
                 active_tab.horizontal_scroll = 0;
                 
                 // Reset syntax highlighting
-                active_tab.textarea.set_search_pattern("(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b").unwrap_or(());
+                active_tab.textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
                 active_tab.textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
                 let is_explicit_remote = is_remote_directive_query(&query_to_execute);
@@ -1874,10 +1933,11 @@ pub fn run_ide_loop(
                                         refresh_attached_catalog(conn, db_path, quack_disable_ssl);
                                         trigger_explorer_refresh = true;
                                     }
+                                    let hint = " (Hint: '-- @remote' is deprecated in DuckDB v2.0; queries now execute natively via CONNECT target_db.)";
                                     if count > 0 {
-                                        status_msg = format!("Remote statement executed successfully. Returned {} rows in {:.2?}.", count, elapsed);
+                                        status_msg = format!("Remote statement executed successfully. Returned {} rows in {:.2?}.{}", count, elapsed, hint);
                                     } else {
-                                        status_msg = format!("Remote statement executed successfully in {:.2?}.", elapsed);
+                                        status_msg = format!("Remote statement executed successfully in {:.2?}.{}", elapsed, hint);
                                     }
                                 } else if is_remote_db && is_unadorned_secret_or_setting(&query_to_execute) {
                                     status_msg = "⚠️ Applied LOCALLY on DuckPack! Use '-- @remote' at top of query to apply to remote Quack.".to_string();
@@ -1898,15 +1958,7 @@ pub fn run_ide_loop(
                             }
                             Err(e) => {
                                 let err_str = e.to_string();
-                                if err_str.contains("syntax error at or near") {
-                                    if let Some(pos) = err_str.find("\"") {
-                                        if let Some(end_pos) = err_str[pos+1..].find("\"") {
-                                            let broken_word = &err_str[pos+1..pos+1+end_pos];
-                                            tabs[active_tab_index].textarea.set_search_pattern(&format!("(?i)\\b{}\\b", regex::escape(&broken_word))).unwrap_or(());
-                                            tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
-                                        }
-                                    }
-                                }
+                                handle_sql_error_position(&mut tabs[active_tab_index].textarea, &err_str);
                                 let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
                                 status_msg = format!("Execution Error: {}{}", e, diag);
                             }
@@ -1999,15 +2051,7 @@ pub fn run_ide_loop(
 
                         if !executed_remote_fallback {
                             let err_str = e.to_string();
-                            if err_str.contains("syntax error at or near") {
-                                if let Some(pos) = err_str.find("\"") {
-                                    if let Some(end_pos) = err_str[pos+1..].find("\"") {
-                                        let broken_word = &err_str[pos+1..pos+1+end_pos];
-                                        tabs[active_tab_index].textarea.set_search_pattern(&format!("(?i)\\b{}\\b", regex::escape(&broken_word))).unwrap_or(());
-                                        tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
-                                    }
-                                }
-                            }
+                            handle_sql_error_position(&mut tabs[active_tab_index].textarea, &err_str);
                             let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
                             status_msg = format!("Prepare Error: {}{}", e, diag);
                         }
@@ -2094,7 +2138,7 @@ pub fn run_ide_loop(
                                 }
                                 
                                 tabs[active_tab_index].textarea = TextArea::from(content.lines().map(|s| s.to_string()).collect::<Vec<_>>());
-                                tabs[active_tab_index].textarea.set_search_pattern("(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO)\\b").unwrap_or(());
+                                tabs[active_tab_index].textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
                                 tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
                                 tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
                                 tabs[active_tab_index].active_file = Some(path);
@@ -2104,6 +2148,7 @@ pub fn run_ide_loop(
                         }
                         NodeType::Column { .. } => {}
                         NodeType::Macro => {}
+                        NodeType::Trigger { .. } => {}
                     }
                 }
             }
@@ -2111,6 +2156,70 @@ pub fn run_ide_loop(
     }
 
     Ok(())
+}
+
+/// Extracts error location (line, column) and token from DuckDB v2.0 PEG parser errors
+/// or legacy Postgres parser errors, jumping the cursor and styling the error token in bold red.
+pub fn handle_sql_error_position(textarea: &mut TextArea, err_str: &str) {
+    let lower = err_str.to_lowercase();
+    let mut found_pos: Option<(usize, usize)> = None;
+
+    // Pattern 1: DuckDB PEG parser "line (\d+), column (\d+)" or "syntax error at line (\d+), column (\d+)"
+    if let Some(line_idx) = lower.find("line ") {
+        let rest = &lower[line_idx + 5..];
+        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(line_num) = num_str.parse::<usize>() {
+            let after_line = &rest[num_str.len()..];
+            let mut col_num = 1;
+            if let Some(col_idx) = after_line.find("col") {
+                let col_rest = &after_line[col_idx + 3..];
+                let col_digits = col_rest.trim_start_matches("umn").trim_start_matches(|c: char| c.is_whitespace() || c == ':');
+                let col_num_str: String = col_digits.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(parsed_col) = col_num_str.parse::<usize>() {
+                    col_num = parsed_col;
+                }
+            }
+            found_pos = Some((line_num, col_num));
+        }
+    }
+
+    // Jump cursor if position was parsed
+    if let Some((line, col)) = found_pos {
+        let row_idx = (line.saturating_sub(1)) as u16;
+        let col_idx = (col.saturating_sub(1)) as u16;
+        textarea.move_cursor(CursorMove::Jump(row_idx, col_idx));
+    }
+
+    // Highlight error token:
+    // Case A: legacy DuckDB 1.x "syntax error at or near \"<word>\""
+    if err_str.contains("syntax error at or near") {
+        if let Some(pos) = err_str.find('"') {
+            if let Some(end_pos) = err_str[pos + 1..].find('"') {
+                let broken_word = &err_str[pos + 1..pos + 1 + end_pos];
+                textarea.set_search_pattern(&format!("(?i)\\b{}\\b", regex::escape(broken_word))).unwrap_or(());
+                textarea.set_search_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+                return;
+            }
+        }
+    }
+
+    // Case B: token under cursor if line and col found
+    if let Some((line, col)) = found_pos {
+        let lines = textarea.lines();
+        let row_idx = line.saturating_sub(1);
+        if row_idx < lines.len() {
+            let line_text = &lines[row_idx];
+            let col_idx = col.saturating_sub(1);
+            if col_idx < line_text.len() {
+                let tail = &line_text[col_idx..];
+                let token: String = tail.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if !token.is_empty() {
+                    textarea.set_search_pattern(&format!("(?i)\\b{}\\b", regex::escape(&token))).unwrap_or(());
+                    textarea.set_search_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+                }
+            }
+        }
+    }
 }
 
 /// Translates native DuckDB data types into readable strings for the IDE Results pane.
@@ -2651,6 +2760,58 @@ mod tests {
         assert_eq!(view_cols.len(), 2);
         assert_eq!(view_cols[0].0, "id");
         assert_eq!(view_cols[1].0, "label");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_handle_sql_error_position_peg() {
+        let mut textarea = TextArea::from(vec![
+            "SELECT *".to_string(),
+            "FROM non_existent".to_string(),
+            "WHEREE x = 1".to_string(),
+        ]);
+        let err = "Parser Error: syntax error at line 3, column 1";
+        handle_sql_error_position(&mut textarea, err);
+        let (row, col) = textarea.cursor();
+        assert_eq!(row, 2);
+        assert_eq!(col, 0);
+    }
+
+    #[test]
+    fn test_handle_sql_error_position_legacy() {
+        let mut textarea = TextArea::from(vec![
+            "SELCT 1;".to_string(),
+        ]);
+        let err = "Parser Error: syntax error at or near \"SELCT\"";
+        handle_sql_error_position(&mut textarea, err);
+    }
+
+    #[test]
+    fn test_triggers_in_explorer() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_trg_exp_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE orders (id INT, total DOUBLE);", []).unwrap();
+        conn.execute("CREATE TABLE order_audit (id INT);", []).unwrap();
+        conn.execute("CREATE TRIGGER trg_audit AFTER INSERT ON orders FOR EACH ROW INSERT INTO order_audit VALUES (NEW.id);", []).unwrap();
+
+        let meta = load_explorer_metadata(&conn, &temp_dir, false);
+        assert_eq!(meta.triggers.len(), 1);
+        assert!(meta.triggers[0].contains("trg_audit"));
+
+        let mut expanded_groups = HashSet::new();
+        expanded_groups.insert("Triggers".to_string());
+        let expanded_tables = HashSet::new();
+
+        let nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
+        let trg_node = nodes.iter().find(|n| n.name.contains("trg_audit")).expect("trg_audit node not found");
+        assert!(trg_node.display.contains("trg_audit"));
+        match &trg_node.node_type {
+            NodeType::Trigger { .. } => {},
+            _ => panic!("Expected NodeType::Trigger"),
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

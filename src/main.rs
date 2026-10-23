@@ -275,6 +275,8 @@ fn main() -> Result<()> {
             let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
             let shadow_macros = diff::get_macros(&shadow_conn, None)?;
             let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
+            let shadow_triggers = diff::get_triggers(&shadow_conn, None)?;
+            let target_triggers = diff::get_triggers(&target_conn, Some(&active_catalog))?;
             let ignore_list = load_ignore_rules(project_dir);
 
             let diff_result = diff::compute_diff(
@@ -286,6 +288,8 @@ fn main() -> Result<()> {
                 &target_views, 
                 &shadow_macros, 
                 &target_macros, 
+                &shadow_triggers,
+                &target_triggers,
                 project_dir,
                 &ignore_list
             );
@@ -334,6 +338,8 @@ fn main() -> Result<()> {
                     let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
                     let shadow_macros = diff::get_macros(&shadow_conn, None)?;
                     let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
+                    let shadow_triggers = diff::get_triggers(&shadow_conn, None)?;
+                    let target_triggers = diff::get_triggers(&target_conn, Some(&active_catalog))?;
                     let ignore_list = load_ignore_rules(project_dir);
 
                     let diff_result = diff::compute_diff(
@@ -345,6 +351,8 @@ fn main() -> Result<()> {
                         &target_views, 
                         &shadow_macros, 
                         &target_macros, 
+                        &shadow_triggers,
+                        &target_triggers,
                         project_dir,
                         &ignore_list
                     );
@@ -748,6 +756,8 @@ fn run_diff_review_tui(
             let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
             let shadow_macros = diff::get_macros(&shadow_conn, None)?;
             let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
+            let shadow_triggers = diff::get_triggers(&shadow_conn, None)?;
+            let target_triggers = diff::get_triggers(&target_conn, Some(&active_catalog))?;
             let ignore_list = load_ignore_rules(project_dir);
 
             let mut diff_result = diff::compute_diff(
@@ -759,6 +769,8 @@ fn run_diff_review_tui(
                 &target_views, 
                 &shadow_macros, 
                 &target_macros, 
+                &shadow_triggers,
+                &target_triggers,
                 project_dir,
                 &ignore_list
             );
@@ -766,7 +778,7 @@ fn run_diff_review_tui(
             if let Some(out_file) = out {
                 let mut script = String::new();
                 for item in &diff_result.items {
-                    let is_drop = matches!(item.item_type, diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro);
+                    let is_drop = matches!(item.item_type, diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro | diff::DiffItemType::DropTrigger);
                     if is_drop && !current_force_drop {
                         continue;
                     }
@@ -949,6 +961,7 @@ fn run_diff_review_tui(
                             }
                             diff::DiffItemType::DropView => target_views.get(&obj_name).cloned(),
                             diff::DiffItemType::DropMacro => target_macros.get(&obj_name).cloned(),
+                            diff::DiffItemType::DropTrigger => target_triggers.get(&obj_name).map(|t| t.sql.clone()),
                             _ => None,
                         };
 
@@ -958,6 +971,7 @@ fn run_diff_review_tui(
                                 diff::DiffItemType::DropTable => path.push("tables"),
                                 diff::DiffItemType::DropView => path.push("views"),
                                 diff::DiffItemType::DropMacro => path.push("macros"),
+                                diff::DiffItemType::DropTrigger => path.push("triggers"),
                                 _ => {}
                             }
                             path.push(format!("{}.sql", obj_name));
