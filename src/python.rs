@@ -134,7 +134,7 @@ fn find_available_port() -> u16 {
 }
 
 fn print_non_terminal_explorer(executor: &mut PyDbExecutor, catalog: Option<&str>) -> PyResult<()> {
-    let (_schemas, table_map, view_map, macro_map) = introspect_py_catalog(executor, catalog)?;
+    let (_schemas, table_map, view_map, macro_map, _trigger_map) = introspect_py_catalog(executor, catalog)?;
 
     // Discover temporary tables
     let mut temp_tables: Vec<(String, Vec<(String, String)>)> = Vec::new();
@@ -486,6 +486,8 @@ pub fn diff(
         .map_err(|e| SchemaError::new_err(format!("Error extracting shadow views: {}", e)))?;
     let shadow_macros = schema_diff::get_macros(&shadow_conn, None)
         .map_err(|e| SchemaError::new_err(format!("Error extracting shadow macros: {}", e)))?;
+    let shadow_triggers = schema_diff::get_triggers(&shadow_conn, None)
+        .map_err(|e| SchemaError::new_err(format!("Error extracting shadow triggers: {}", e)))?;
 
     let explicit_db = target.and_then(|t| t.extract::<String>().ok());
     let explicit_catalog = database.or(catalog).map(|s| vec![s.to_string()]);
@@ -500,7 +502,7 @@ pub fn diff(
     let req_catalog = spec.catalogs.first().cloned();
 
     // Determine target connection
-    let (target_schemas, target_schema, target_views, target_macros) = if target.is_none() || explicit_db.is_some() {
+    let (target_schemas, target_schema, target_views, target_macros, target_triggers) = if target.is_none() || explicit_db.is_some() {
         let conn = spec.connect()
             .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
         let active_cat = schema_diff::validate_target_catalog(&conn, req_catalog.as_deref(), false)
@@ -510,6 +512,7 @@ pub fn diff(
             schema_diff::get_schema(&conn, Some(&active_cat)).map_err(|e| ExecutionError::new_err(e.to_string()))?,
             schema_diff::get_views(&conn, Some(&active_cat)).map_err(|e| ExecutionError::new_err(e.to_string()))?,
             schema_diff::get_macros(&conn, Some(&active_cat)).map_err(|e| ExecutionError::new_err(e.to_string()))?,
+            schema_diff::get_triggers(&conn, Some(&active_cat)).map_err(|e| ExecutionError::new_err(e.to_string()))?,
         )
     } else {
         // Live Python connection: introspect catalog directly
@@ -530,6 +533,8 @@ pub fn diff(
         &target_views,
         &shadow_macros,
         &target_macros,
+        &shadow_triggers,
+        &target_triggers,
         &p_dir,
         &ignore_list,
     );
@@ -593,6 +598,10 @@ fn run_apply_tui(
             .map_err(|e| SchemaError::new_err(e.to_string()))?;
         let target_macros = schema_diff::get_macros(conn, Some(&active_catalog))
             .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+        let shadow_triggers = schema_diff::get_triggers(&shadow_conn, None)
+            .map_err(|e| SchemaError::new_err(e.to_string()))?;
+        let target_triggers = schema_diff::get_triggers(conn, Some(&active_catalog))
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
         let ignore_list = engine::load_ignore_rules(project_dir);
 
         let mut diff_result = schema_diff::compute_diff(
@@ -604,6 +613,8 @@ fn run_apply_tui(
             &target_views,
             &shadow_macros,
             &target_macros,
+            &shadow_triggers,
+            &target_triggers,
             project_dir,
             &ignore_list,
         );
@@ -725,6 +736,7 @@ fn run_apply_tui(
                     }
                     crate::diff::DiffItemType::DropView => target_views.get(&obj_name).cloned(),
                     crate::diff::DiffItemType::DropMacro => target_macros.get(&obj_name).cloned(),
+                    crate::diff::DiffItemType::DropTrigger => target_triggers.get(&obj_name).map(|t| t.sql.clone()),
                     _ => None,
                 };
                 if let Some(sql) = sql {
@@ -733,6 +745,7 @@ fn run_apply_tui(
                         crate::diff::DiffItemType::DropTable => path.push("tables"),
                         crate::diff::DiffItemType::DropView => path.push("views"),
                         crate::diff::DiffItemType::DropMacro => path.push("macros"),
+                        crate::diff::DiffItemType::DropTrigger => path.push("triggers"),
                         _ => {}
                     }
                     path.push(format!("{}.sql", obj_name));
@@ -888,6 +901,8 @@ pub fn apply(
             let target_views = schema_diff::get_views(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
             let shadow_macros = schema_diff::get_macros(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
             let target_macros = schema_diff::get_macros(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
+            let shadow_triggers = schema_diff::get_triggers(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
+            let target_triggers = schema_diff::get_triggers(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
 
             let diff_result = schema_diff::compute_diff(
                 &shadow_schemas,
@@ -898,6 +913,8 @@ pub fn apply(
                 &target_views,
                 &shadow_macros,
                 &target_macros,
+                &shadow_triggers,
+                &target_triggers,
                 &p_dir,
                 &ignore_list,
             );
@@ -1016,8 +1033,9 @@ pub fn apply(
             let shadow_schema = schema_diff::get_schema(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
             let shadow_views = schema_diff::get_views(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
             let shadow_macros = schema_diff::get_macros(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
+            let shadow_triggers = schema_diff::get_triggers(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
 
-            let (target_schemas, target_schema, target_views, target_macros) = introspect_py_catalog(&mut executor, Some(&active_catalog))?;
+            let (target_schemas, target_schema, target_views, target_macros, target_triggers) = introspect_py_catalog(&mut executor, Some(&active_catalog))?;
 
             let diff_result = schema_diff::compute_diff(
                 &shadow_schemas,
@@ -1028,6 +1046,8 @@ pub fn apply(
                 &target_views,
                 &shadow_macros,
                 &target_macros,
+                &shadow_triggers,
+                &target_triggers,
                 &p_dir,
                 &ignore_list,
             );
@@ -1164,6 +1184,7 @@ fn introspect_py_catalog(
     std::collections::HashMap<String, schema_diff::TableSchema>,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, schema_diff::TriggerSchema>,
 )> {
     use std::collections::HashMap;
 
@@ -1298,7 +1319,39 @@ fn introspect_py_catalog(
         }
     }
 
-    Ok((schemas, table_map, view_map, macro_map))
+    // 6. Triggers
+    let trigger_query = format!(
+        "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') \
+         FROM duckdb_triggers() WHERE database_name = '{}'",
+        safe_cat
+    );
+    let mut trigger_map = HashMap::new();
+    if let Ok((_, trigger_rows)) = executor.query_rows(&trigger_query) {
+        for row in trigger_rows {
+            if row.len() >= 4 {
+                let schema = row[0].clone();
+                let trg_name = row[1].clone();
+                let table = row[2].clone();
+                let sql = row[3].clone();
+                let key = if schema == "main" {
+                    trg_name.clone()
+                } else {
+                    format!("{}.{}", schema, trg_name)
+                };
+                trigger_map.insert(
+                    key,
+                    schema_diff::TriggerSchema {
+                        schema_name: schema,
+                        trigger_name: trg_name,
+                        table_name: table,
+                        sql,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok((schemas, table_map, view_map, macro_map, trigger_map))
 }
 
 #[pyfunction]

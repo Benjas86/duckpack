@@ -49,6 +49,29 @@ impl ViewEntry {
     }
 }
 
+/// Represents an individual trigger across any attached DuckDB database/catalog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TriggerEntry {
+    pub database: String,
+    pub schema: String,
+    pub name: String,
+    pub table_name: String,
+}
+
+impl TriggerEntry {
+    pub fn display_name(&self) -> String {
+        if self.schema == "main" {
+            self.name.clone()
+        } else {
+            format!("{}.{}", self.schema, self.name)
+        }
+    }
+
+    pub fn qualified_name(&self) -> String {
+        format!("{}.{}.{}", self.database, self.schema, self.name)
+    }
+}
+
 /// Metadata holding info on an attached database catalog.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DatabaseInfo {
@@ -59,6 +82,7 @@ pub struct DatabaseInfo {
     pub readonly: bool,
     pub tables: Vec<TableEntry>,
     pub views: Vec<ViewEntry>,
+    pub triggers: Vec<TriggerEntry>,
 }
 
 /// Metadata holding all discoverable entities in the database and project.
@@ -72,6 +96,7 @@ pub struct ExplorerMetadata {
     pub temp_tables: HashSet<String>,
     pub temp_views: HashSet<String>,
     pub macros: Vec<String>,
+    pub triggers: Vec<String>,
     pub queries: Vec<String>,
     pub dictionary: Vec<String>,
 }
@@ -558,16 +583,50 @@ pub fn load_explorer_metadata(
         }
     }
 
+    let mut all_triggers: Vec<TriggerEntry> = Vec::new();
+    if is_quack {
+        let quack_trg_sql = "SELECT database_name, schema_name, trigger_name, table_name FROM target_db.query('SELECT database_name, schema_name, trigger_name, table_name FROM duckdb_triggers()')";
+        if let Ok(mut stmt) = conn.prepare(quack_trg_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(db), Ok(schema), Ok(trg), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, String>(3)) {
+                        all_triggers.push(TriggerEntry {
+                            database: if !is_remote_multi_db { "target_db".to_string() } else { db },
+                            schema,
+                            name: trg,
+                            table_name: table,
+                        });
+                    }
+                }
+            }
+        }
+    } else if let Ok(mut stmt) = conn.prepare("SELECT database_name, schema_name, trigger_name, table_name FROM duckdb_triggers()") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(db), Ok(schema), Ok(trg), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, String>(3)) {
+                    all_triggers.push(TriggerEntry {
+                        database: db,
+                        schema,
+                        name: trg,
+                        table_name: table,
+                    });
+                }
+            }
+        }
+    }
+
     let mut databases: Vec<DatabaseInfo> = Vec::new();
     let is_remote_quack = is_quack || raw_dbs.iter().any(|d| d.0 == "target_db" || d.1.eq_ignore_ascii_case("quack"));
     for (name, db_type, path, readonly) in &raw_dbs {
         let mut db_tables: Vec<TableEntry> = all_tables.iter().filter(|t| &t.database == name).cloned().collect();
         let mut db_views: Vec<ViewEntry> = all_views.iter().filter(|v| &v.database == name).cloned().collect();
+        let mut db_triggers: Vec<TriggerEntry> = all_triggers.iter().filter(|t| &t.database == name).cloned().collect();
         db_tables.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         db_views.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        db_triggers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
         // If 'memory' is empty and not the active database, skip it only in classic single local DB mode
-        if !is_remote_quack && raw_dbs.len() <= 1 && name == "memory" && active_database != "memory" && db_tables.is_empty() && db_views.is_empty() {
+        if !is_remote_quack && raw_dbs.len() <= 1 && name == "memory" && active_database != "memory" && db_tables.is_empty() && db_views.is_empty() && db_triggers.is_empty() {
             continue;
         }
 
@@ -580,6 +639,7 @@ pub fn load_explorer_metadata(
             readonly: *readonly,
             tables: db_tables,
             views: db_views,
+            triggers: db_triggers,
         });
     }
 
@@ -598,6 +658,7 @@ pub fn load_explorer_metadata(
     let mut tables: Vec<String> = Vec::new();
     let mut table_counts: HashMap<String, i64> = HashMap::new();
     let mut views: Vec<String> = Vec::new();
+    let mut triggers: Vec<String> = Vec::new();
     let mut temp_tables: HashSet<String> = HashSet::new();
     let mut temp_views: HashSet<String> = HashSet::new();
 
@@ -624,6 +685,9 @@ pub fn load_explorer_metadata(
         }
         for v in &active_info.views {
             views.push(v.display_name());
+        }
+        for trg in &active_info.triggers {
+            triggers.push(format!("{} (on {})", trg.display_name(), trg.table_name));
         }
     }
 
@@ -672,6 +736,12 @@ pub fn load_explorer_metadata(
             dictionary.push(v.display_name());
             dictionary.push(format!("{}.{}", db.name, v.name));
             dictionary.push(v.qualified_name());
+        }
+        for trg in &db.triggers {
+            dictionary.push(trg.name.clone());
+            dictionary.push(trg.display_name());
+            dictionary.push(format!("{}.{}", db.name, trg.name));
+            dictionary.push(trg.qualified_name());
         }
     }
 
@@ -754,6 +824,7 @@ pub fn load_explorer_metadata(
         temp_tables,
         temp_views,
         macros,
+        triggers,
         queries,
         dictionary,
     }
@@ -777,7 +848,7 @@ pub fn refresh_attached_catalog(conn: &Connection, db_path: &str, quack_disable_
             let _ = conn.execute("USE memory;", []);
             let _ = conn.execute("DETACH target_db;", []);
             let _ = conn.execute(&attach_sql, []);
-            let _ = conn.execute("USE target_db;", []);
+            let _ = conn.execute("CONNECT target_db;", []).or_else(|_| conn.execute("USE target_db;", []));
         }
     } else if db_path.starts_with("md:") || db_path.starts_with("motherduck:") {
         let _ = conn.execute("REFRESH DATABASES;", []);

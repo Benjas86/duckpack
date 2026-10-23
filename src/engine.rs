@@ -151,15 +151,20 @@ pub fn diagnose_storage_version_error(err_str: &str, db_path: &str) -> Option<St
         || lower.contains("serialization error")
         || lower.contains("different version of duckdb")
         || lower.contains("created by a newer version")
+        || lower.contains("version number 69")
+        || lower.contains("versions between")
+        || (lower.contains("version number") && lower.contains("database file"))
         || (lower.contains("cannot open database") && lower.contains("version"))
     {
         Some(format!(
             "DuckDB Storage Version Mismatch: The database file '{}' appears to have been created or modified by a newer or different version of DuckDB than DuckPack's embedded engine ({}).\n\n\
             Remediation Options:\n\
               1. Upgrade DuckPack: Run `duckpack python install --upgrade` or download the latest CLI release.\n\
-              2. Python One-Liner (Auto-Bridged): Run using your active Python environment's DuckDB:\n\
+              2. Compatibility Setting: In your DuckDB client, configure storage compatibility before writing:\n\
+                 SET storage_compatibility_version = 'v1.2.0';\n\
+              3. Python One-Liner (Auto-Bridged): Run using your active Python environment's DuckDB:\n\
                  $ python -c \"import duckdb, duckpack; con = duckdb.connect('{}'); duckpack.explore(con)\"\n\
-              3. Serve via your local DuckDB CLI:\n\
+              4. Serve via your local DuckDB CLI:\n\
                  $ duckdb {} -c \"INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:9494');\"\n\
                  $ duckpack explore --db quack:localhost:9494",
             db_path,
@@ -181,8 +186,8 @@ pub fn connect_target_db(
     if db.starts_with("quack:") {
         let conn = Connection::open_in_memory()
             .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
-        conn.execute_batch("INSTALL quack; LOAD quack;")
-            .with_context(|| "Failed to install/load quack extension")?;
+        conn.execute_batch("LOAD quack;").or_else(|_| conn.execute_batch("INSTALL quack; LOAD quack;"))
+            .with_context(|| format!("Failed to install/load quack extension for target '{}'", db))?;
 
         let token = resolve_quack_token(quack_token, None);
 
@@ -211,8 +216,10 @@ pub fn connect_target_db(
             }
             return Err(anyhow::anyhow!("Failed to attach remote database '{}': {}", db, err_msg));
         }
-        conn.execute("USE target_db;", [])
-            .with_context(|| "Failed to switch to target database")?;
+        if conn.execute("CONNECT target_db;", []).is_err() {
+            conn.execute("USE target_db;", [])
+                .with_context(|| "Failed to switch to target database")?;
+        }
         Ok(conn)
     } else if is_remote(db) {
         let conn = Connection::open_in_memory()
@@ -222,8 +229,10 @@ pub fn connect_target_db(
         if let Err(e) = attach_res {
             return Err(anyhow::anyhow!("Failed to attach remote database '{}': {}", db, e));
         }
-        conn.execute("USE target_db;", [])
-            .with_context(|| "Failed to switch to target database")?;
+        if conn.execute("CONNECT target_db;", []).is_err() {
+            conn.execute("USE target_db;", [])
+                .with_context(|| "Failed to switch to target database")?;
+        }
         Ok(conn)
     } else {
         let conn = Connection::open_in_memory()
@@ -237,8 +246,10 @@ pub fn connect_target_db(
             }
             return Err(anyhow::anyhow!("Failed to attach local database '{}': {}", db, err_msg));
         }
-        conn.execute("USE target_db;", [])
-            .with_context(|| "Failed to switch to target database")?;
+        if conn.execute("CONNECT target_db;", []).is_err() {
+            conn.execute("USE target_db;", [])
+                .with_context(|| "Failed to switch to target database")?;
+        }
         Ok(conn)
     }
 }
@@ -411,6 +422,7 @@ pub fn apply_diff(
         }
 
         let mut views_to_apply = Vec::new();
+        let mut triggers_to_apply = Vec::new();
         let mut drops_to_apply = Vec::new();
         let mut drop_schemas = Vec::new();
 
@@ -429,7 +441,7 @@ pub fn apply_diff(
                 diff::DiffItemType::CreateTable | diff::DiffItemType::AlterTable | diff::DiffItemType::CreateMacro | diff::DiffItemType::RenameTable | diff::DiffItemType::RenameColumn => {
                     structure_to_apply.push(item.sql.clone());
                 }
-                diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro => {
+                diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro | diff::DiffItemType::DropTrigger => {
                     if force_drop {
                         drops_to_apply.push(item.sql.clone());
                     }
@@ -441,6 +453,9 @@ pub fn apply_diff(
                 }
                 diff::DiffItemType::CreateView => {
                     views_to_apply.push(item.sql.clone());
+                }
+                diff::DiffItemType::CreateTrigger => {
+                    triggers_to_apply.push(item.sql.clone());
                 }
                 diff::DiffItemType::CreateSchema => {} // handled above
             }
@@ -455,7 +470,12 @@ pub fn apply_diff(
             execute_sqls_with_retry_custom(views_to_apply, &execute_sql)?;
         }
 
-        // 4. Drops
+        // 4. Triggers
+        if !triggers_to_apply.is_empty() {
+            execute_sqls_with_retry_custom(triggers_to_apply, &execute_sql)?;
+        }
+
+        // 5. Drops
         for drop_sql in drops_to_apply {
             let _ = execute_sql(&drop_sql); // Ignore errors if already dropped by cascade
         }
@@ -719,7 +739,7 @@ impl TargetResolver {
 /// Scaffolds a new declarative database project by generating the standard directory structure,
 /// configuration files (`duckpack.toml`), environment templates, and documentation.
 pub fn init_project(project_dir: &Path) -> Result<()> {
-    let dirs = ["schemas", "tables", "views", "macros", "queries", "seeds", "scripts/pre-deploy", "scripts/post-deploy"];
+    let dirs = ["schemas", "tables", "views", "macros", "triggers", "queries", "seeds", "scripts/pre-deploy", "scripts/post-deploy"];
     for dir in dirs.iter() {
         let path = project_dir.join(dir);
         if !path.exists() {
@@ -769,15 +789,16 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
 ## Project Structure
 
 - `schemas/`: Contains `CREATE SCHEMA` statements. Schemas deleted from this folder will be dropped **CASCADE** on the target DB!
-- `tables/`: Contains `CREATE TABLE` statements (one per file).
+- `tables/`: Contains `CREATE TABLE` statements (one per file). Subdirectories supported for nested schemas.
 - `views/`: Contains `CREATE VIEW` statements (engine auto-forces `OR REPLACE`).
 - `macros/`: Contains `CREATE MACRO` statements.
+- `triggers/`: Contains `CREATE TRIGGER` statements (table-scoped triggers).
 - `queries/`: Save your ad-hoc `.sql` queries and scratchpad files here.
 - `seeds/`: Contains static CSVs or seed scripts.
 - `scripts/`: Contains `pre-deploy` and `post-deploy` scripts.
 - `duckpack.toml`: Project configuration and targets.
 - `.env`: Environment variables for template interpolation. Write `${VAR_NAME}` in your SQL, and the engine will dynamically replace it!
-- `.duckdbignore`: Specifies tables or views to ignore during diffing (wildcards supported).
+- `.duckpackignore`: Specifies tables or views to ignore during diffing (wildcards supported).
 "#;
         fs::write(&readme_path, readme_content).with_context(|| "Failed to write README.md")?;
         println!("Created documentation file: {}", readme_path.display());
@@ -796,14 +817,15 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
         println!("Created environment file: {}", env_path.display());
     }
 
-    let ignore_path = project_dir.join(".duckdbignore");
+    let ignore_path = project_dir.join(".duckpackignore");
     if !ignore_path.exists() {
-        let ignore_content = r#"# Specify tables or views to ignore during diffing (wildcards supported).
+        let ignore_content = r#"# Specify tables, views, or triggers to ignore during diffing (wildcards supported).
 # Example:
 # temp_*
 # *_backup
+# scratch_*
 "#;
-        fs::write(&ignore_path, ignore_content).with_context(|| "Failed to write .duckdbignore")?;
+        fs::write(&ignore_path, ignore_content).with_context(|| "Failed to write .duckpackignore")?;
         println!("Created ignore file: {}", ignore_path.display());
     }
 
@@ -846,25 +868,44 @@ pub fn build_shadow_db(project_dir: &Path) -> Result<Connection> {
         execute_directory(&conn, &views_dir)?;
     }
 
+    let triggers_dir = project_dir.join("triggers");
+    if triggers_dir.exists() {
+        execute_directory(&conn, &triggers_dir)?;
+    }
+
     Ok(conn)
 }
 
+fn collect_sql_files_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.path());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_sql_files_recursive(&path, out)?;
+        } else if path.is_file() && path.extension().unwrap_or_default() == "sql" {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 /// A helper utility to iterate over a directory of `.sql` files and execute them using a custom executor function.
+/// Recursively scans subdirectories to support nested schemas and modular structures.
 pub fn execute_directory_custom<F>(dir: &Path, exec_fn: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<()>,
 {
+    let mut files = Vec::new();
+    collect_sql_files_recursive(dir, &mut files)?;
     let mut pending_sqls = Vec::new();
-    let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
-    entries.sort_by_key(|e| e.path());
-    
-    for entry in entries {
-        let path = entry.path();
-        if path.is_file() && path.extension().unwrap_or_default() == "sql" {
-            pending_sqls.push(diff::read_sql_with_env(&path)?);
-        }
+    for path in files {
+        pending_sqls.push(diff::read_sql_with_env(&path)?);
     }
-    
+
     execute_sqls_with_retry_custom(pending_sqls, exec_fn)
         .context(format!("Failed to compile SQL files in {}", dir.display()))
 }
@@ -917,23 +958,19 @@ pub fn execute_sqls_with_retry(conn: &Connection, pending_sqls: Vec<String>) -> 
 /// Loads ignore patterns from `.duckpackignore`, `.duckdbignore`, or legacy `.duckignore`.
 /// Lines beginning with '#' and empty lines are skipped.
 pub fn load_ignore_rules(project_dir: &Path) -> Vec<String> {
-    let ignore_path = if project_dir.join(".duckpackignore").exists() {
-        Some(project_dir.join(".duckpackignore"))
-    } else if project_dir.join(".duckdbignore").exists() {
-        Some(project_dir.join(".duckdbignore"))
-    } else if project_dir.join(".duckignore").exists() {
-        Some(project_dir.join(".duckignore"))
-    } else {
-        None
-    };
-
     let mut rules = Vec::new();
-    if let Some(path) = ignore_path {
-        if let Ok(content) = fs::read_to_string(path) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                    rules.push(trimmed.to_string());
+    let candidates = [".duckpackignore", ".duckdbignore", ".duckignore"];
+    for name in candidates {
+        let path = project_dir.join(name);
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        if !rules.contains(&trimmed.to_string()) {
+                            rules.push(trimmed.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -1024,6 +1061,29 @@ mod tests {
         let err2 = "IO Error: File not found";
         let diag2 = diagnose_storage_version_error(err2, "prod.duckdb");
         assert!(diag2.is_none());
+
+        let err3 = "IO Error: Trying to read a database file with version number 69, but we can only read versions between 64 and 68.";
+        let diag3 = diagnose_storage_version_error(err3, "prod.duckdb");
+        assert!(diag3.is_some());
+        let msg3 = diag3.unwrap();
+        assert!(msg3.contains("DuckDB Storage Version Mismatch"));
+        assert!(msg3.contains("storage_compatibility_version"));
+    }
+
+    #[test]
+    fn test_execute_directory_recursive() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_rec_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let nested = temp_dir.join("finance").join("reports");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("kpis.sql"), "CREATE TABLE kpis (id INT);").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        execute_directory(&conn, &temp_dir).unwrap();
+
+        let count: i64 = conn.query_row("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'kpis'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

@@ -1,5 +1,12 @@
 use std::path::Path;
 
+/// Unified regex pattern for highlighting standard DuckDB SQL keywords in the IDE editor.
+pub const SQL_KEYWORD_PATTERN: &str = 
+    "(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|\
+    CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|\
+    SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO|TRIGGER|CONNECT|DISCONNECT|VARIANT|\
+    RETURNING|APPROX|MATERIALIZED)\\b";
+
 /// Checks if a SQL query includes a `-- @remote` or `-- [remote]` directive.
 pub fn is_remote_directive_query(query: &str) -> bool {
     query.lines().any(|line| {
@@ -201,5 +208,21 @@ mod tests {
         assert!(!queries.contains(&"notes.txt".to_string()));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sql_keyword_pattern() {
+        let re = regex::Regex::new(SQL_KEYWORD_PATTERN).unwrap();
+        assert!(re.is_match("TRIGGER"));
+        assert!(re.is_match("trigger"));
+        assert!(re.is_match("CONNECT"));
+        assert!(re.is_match("connect"));
+        assert!(re.is_match("DISCONNECT"));
+        assert!(re.is_match("VARIANT"));
+        assert!(re.is_match("RETURNING"));
+        assert!(re.is_match("APPROX"));
+        assert!(re.is_match("MATERIALIZED"));
+        assert!(re.is_match("SELECT"));
+        assert!(!re.is_match("random_identifier"));
     }
 }

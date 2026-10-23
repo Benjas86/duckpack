@@ -170,9 +170,9 @@ fn get_side_by_side_diff(old_def: &str, new_def: &str) -> (Vec<Line<'static>>, V
 fn sort_diff_items(items: &mut Vec<DiffItem>) {
     items.sort_by_key(|item| {
         match item.item_type {
-            DiffItemType::CreateSchema | DiffItemType::CreateTable | DiffItemType::CreateView | DiffItemType::CreateMacro => 1,
+            DiffItemType::CreateSchema | DiffItemType::CreateTable | DiffItemType::CreateView | DiffItemType::CreateMacro | DiffItemType::CreateTrigger => 1,
             DiffItemType::AlterTable | DiffItemType::RenameTable | DiffItemType::RenameColumn => 2,
-            DiffItemType::DropSchema | DiffItemType::DropTable | DiffItemType::DropView | DiffItemType::DropMacro | DiffItemType::DropColumn => 3,
+            DiffItemType::DropSchema | DiffItemType::DropTable | DiffItemType::DropView | DiffItemType::DropMacro | DiffItemType::DropColumn | DiffItemType::DropTrigger => 3,
         }
     });
 }
@@ -276,6 +276,11 @@ pub fn draw_and_handle_events(
                         DiffItemType::CreateMacro => ("[MACRO] ", Style::default().fg(Color::Magenta)),
                         DiffItemType::DropMacro => {
                             if force_drop { ("[DROP MACRO] ", Style::default().fg(Color::Red)) } 
+                            else { ("[IGNORED DROP] ", Style::default().fg(Color::DarkGray)) }
+                        },
+                        DiffItemType::CreateTrigger => ("[TRIGGER] ", Style::default().fg(Color::LightMagenta)),
+                        DiffItemType::DropTrigger => {
+                            if force_drop { ("[DROP TRG] ", Style::default().fg(Color::Red)) } 
                             else { ("[IGNORED DROP] ", Style::default().fg(Color::DarkGray)) }
                         },
                     };
