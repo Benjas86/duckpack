@@ -119,14 +119,22 @@ pub fn format_row_count(count: i64) -> String {
     }
 }
 
-/// Loads column names and types for a specific database, schema, and table/view.
+/// Represents a column in the database explorer, including its name, data type, and primary key status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableColumnInfo {
+    pub name: String,
+    pub data_type: String,
+    pub is_pk: bool,
+}
+
+/// Loads column names, types, and primary key status for a specific database, schema, and table/view.
 pub fn load_table_columns_for(
     db: &str,
     schema: &str,
     table: &str,
     conn: &Connection,
     is_quack: bool,
-) -> Vec<(String, String)> {
+) -> Vec<TableColumnInfo> {
     let mut cols = Vec::new();
 
     // 1. Direct query on db if it is target_db
@@ -277,7 +285,55 @@ pub fn load_table_columns_for(
         }
     }
 
-    cols
+    // Determine primary key columns for this table
+    let mut pk_set = HashSet::new();
+    let safe_table = table.replace('\'', "''");
+    let safe_schema = schema.replace('\'', "''");
+    let safe_db = db.replace('\'', "''");
+
+    let pk_query = format!(
+        "SELECT unnest(constraint_column_names) \
+         FROM duckdb_constraints() \
+         WHERE constraint_type = 'PRIMARY KEY' \
+           AND (database_name = '{}' OR database_name = 'target_db' OR database_name = current_database()) \
+           AND (schema_name = '{}' OR schema_name = 'main') \
+           AND table_name = '{}'",
+        safe_db, safe_schema, safe_table
+    );
+    if let Ok(mut stmt) = conn.prepare(&pk_query) {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(col) = row.get::<_, String>(0) {
+                    pk_set.insert(col.to_lowercase());
+                }
+            }
+        }
+    }
+
+    if pk_set.is_empty() && is_quack {
+        let q_pk_query = format!(
+            "SELECT * FROM target_db.query('SELECT unnest(constraint_column_names) FROM duckdb_constraints() WHERE constraint_type = ''PRIMARY KEY'' AND (schema_name = ''{}'' OR schema_name = ''main'') AND table_name = ''{}''')",
+            safe_schema, safe_table
+        );
+        if let Ok(mut stmt) = conn.prepare(&q_pk_query) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(col) = row.get::<_, String>(0) {
+                        pk_set.insert(col.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+
+    cols.into_iter().map(|(name, typ)| {
+        let is_pk = pk_set.contains(&name.to_lowercase());
+        TableColumnInfo {
+            name,
+            data_type: typ,
+            is_pk,
+        }
+    }).collect()
 }
 
 /// Discovers all databases, tables, views, macros, and queries in the DuckDB environment.
@@ -979,15 +1035,29 @@ mod tests {
 
         let cols = load_table_columns_for(&meta.active_database, "main", "staging_tbl", &conn, false);
         assert_eq!(cols.len(), 2);
-        assert_eq!(cols[0].0, "id");
-        assert_eq!(cols[1].0, "label");
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[1].name, "label");
 
         let view_cols = load_table_columns_for(&meta.active_database, "main", "staging_view", &conn, false);
         assert_eq!(view_cols.len(), 2);
-        assert_eq!(view_cols[0].0, "id");
-        assert_eq!(view_cols[1].0, "label");
+        assert_eq!(view_cols[0].name, "id");
+        assert_eq!(view_cols[1].name, "label");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_load_table_columns_pk_detection() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE users (user_id INT PRIMARY KEY, email VARCHAR, active BOOLEAN);", []).unwrap();
+        let cols = load_table_columns_for("memory", "main", "users", &conn, false);
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "user_id");
+        assert!(cols[0].is_pk, "user_id should be identified as primary key");
+        assert_eq!(cols[1].name, "email");
+        assert!(!cols[1].is_pk, "email should not be identified as primary key");
+        assert_eq!(cols[2].name, "active");
+        assert!(!cols[2].is_pk, "active should not be identified as primary key");
     }
 
     #[test]
