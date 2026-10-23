@@ -350,7 +350,7 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
          referenced_table, \
          COALESCE(array_to_string(referenced_column_names, ','), '') \
          FROM duckdb_constraints() \
-         WHERE database_name = '{}' AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
+         WHERE (database_name = '{}' OR database_name = 'target_db') AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
         safe_cat
     );
     if let Ok(mut constr_stmt) = conn.prepare(&constr_sql) {
@@ -404,10 +404,10 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
             "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
              constraint_type, \
              constraint_name, \
-             COALESCE(array_to_string(constraint_column_names, ','), ''), \
+             COALESCE(constraint_column_names, ''), \
              expression, \
              referenced_table, \
-             COALESCE(array_to_string(referenced_column_names, ','), '') \
+             COALESCE(referenced_column_names, '') \
              FROM target_db.query('SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, '','') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (database_name = ''{}'' OR database_name = current_database())')",
             safe_cat
         );

@@ -35,7 +35,7 @@ pub(crate) enum NodeType {
     Trigger { database: Option<String>, schema: Option<String>, table: Option<String> },
     Query,
     Macro,
-    Column { data_type: String },
+    Column { data_type: String, is_pk: bool },
 }
 
 /// State for the Attach Database modal dialog (Ctrl+A).
@@ -195,14 +195,19 @@ pub(crate) fn rebuild_explorer_nodes(
 
                             if is_tbl_expanded {
                                 let cols = load_table_columns_for(&db.name, &t.schema, &t.name, conn, is_quack);
-                                for (col_name, data_type) in cols {
+                                for col in cols {
+                                    let display = if col.is_pk {
+                                        format!("      └─ 🔑 {} ({}) [PK]", col.name, col.data_type)
+                                    } else {
+                                        format!("      └─ {} ({})", col.name, col.data_type)
+                                    };
                                     items.push(ExplorerNode {
-                                        name: col_name.clone(),
-                                        display: format!("      └─ {} ({})", col_name, data_type),
+                                        name: col.name.clone(),
+                                        display,
                                         level: 3,
                                         is_expandable: false,
                                         is_expanded: false,
-                                        node_type: NodeType::Column { data_type },
+                                        node_type: NodeType::Column { data_type: col.data_type, is_pk: col.is_pk },
                                     });
                                 }
                             }
@@ -242,14 +247,14 @@ pub(crate) fn rebuild_explorer_nodes(
 
                             if is_view_expanded {
                                 let cols = load_table_columns_for(&db.name, &v.schema, &v.name, conn, is_quack);
-                                for (col_name, data_type) in cols {
+                                for col in cols {
                                     items.push(ExplorerNode {
-                                        name: col_name.clone(),
-                                        display: format!("      └─ {} ({})", col_name, data_type),
+                                        name: col.name.clone(),
+                                        display: format!("      └─ {} ({})", col.name, col.data_type),
                                         level: 3,
                                         is_expandable: false,
                                         is_expanded: false,
-                                        node_type: NodeType::Column { data_type },
+                                        node_type: NodeType::Column { data_type: col.data_type, is_pk: false },
                                     });
                                 }
                             }
@@ -320,14 +325,19 @@ pub(crate) fn rebuild_explorer_nodes(
                     });
                     if is_tbl_expanded {
                         let cols = load_table_columns_for(&meta.active_database, "main", t, conn, is_quack);
-                        for (col_name, data_type) in cols {
+                        for col in cols {
+                            let display = if col.is_pk {
+                                format!("    └─ 🔑 {} ({}) [PK]", col.name, col.data_type)
+                            } else {
+                                format!("    └─ {} ({})", col.name, col.data_type)
+                            };
                             items.push(ExplorerNode {
-                                name: col_name.clone(),
-                                display: format!("    └─ {} ({})", col_name, data_type),
+                                name: col.name.clone(),
+                                display,
                                 level: 2,
                                 is_expandable: false,
                                 is_expanded: false,
-                                node_type: NodeType::Column { data_type },
+                                node_type: NodeType::Column { data_type: col.data_type, is_pk: col.is_pk },
                             });
                         }
                     }
@@ -364,14 +374,14 @@ pub(crate) fn rebuild_explorer_nodes(
                     });
                     if is_view_expanded {
                         let cols = load_table_columns_for(&meta.active_database, "main", v, conn, is_quack);
-                        for (col_name, data_type) in cols {
+                        for col in cols {
                             items.push(ExplorerNode {
-                                name: col_name.clone(),
-                                display: format!("    └─ {} ({})", col_name, data_type),
+                                name: col.name.clone(),
+                                display: format!("    └─ {} ({})", col.name, col.data_type),
                                 level: 2,
                                 is_expandable: false,
                                 is_expanded: false,
-                                node_type: NodeType::Column { data_type },
+                                node_type: NodeType::Column { data_type: col.data_type, is_pk: false },
                             });
                         }
                     }
@@ -2770,7 +2780,19 @@ mod tests {
 
             let cols = load_table_columns_for("target_db", "main", "test_tbl", &conn, true);
             println!("Columns for test_tbl: {:?}", cols);
-            assert!(cols.iter().any(|c| c.0 == "column_a"));
+            assert!(cols.iter().any(|c| c.name == "column_a"));
+
+            // Verify PK detection on live Quack for products table
+            let prod_cols = load_table_columns_for("target_db", "main", "products", &conn, true);
+            let pk_col = prod_cols.iter().find(|c| c.name == "product_id").expect("product_id not found in products");
+            assert!(pk_col.is_pk, "product_id should be identified as primary key");
+
+            let mut expanded_tables = std::collections::HashSet::new();
+            expanded_tables.insert("products".to_string());
+            let nodes_with_cols = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, true);
+            let pk_node = nodes_with_cols.iter().find(|n| n.name == "product_id").expect("product_id node not found");
+            assert!(pk_node.display.contains("🔑 product_id") && pk_node.display.contains("[PK]"), "Expected key icon and [PK] tag, got: {}", pk_node.display);
+            println!("Verified live Quack Explorer PK rendering: {}", pk_node.display);
 
             let _ = std::fs::remove_dir_all(&temp_dir);
         }
@@ -2846,13 +2868,13 @@ mod tests {
 
         let cols = load_table_columns_for(&meta.active_database, "main", "staging_tbl", &conn, false);
         assert_eq!(cols.len(), 2);
-        assert_eq!(cols[0].0, "id");
-        assert_eq!(cols[1].0, "label");
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[1].name, "label");
 
         let view_cols = load_table_columns_for(&meta.active_database, "main", "staging_view", &conn, false);
         assert_eq!(view_cols.len(), 2);
-        assert_eq!(view_cols[0].0, "id");
-        assert_eq!(view_cols[1].0, "label");
+        assert_eq!(view_cols[0].name, "id");
+        assert_eq!(view_cols[1].name, "label");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

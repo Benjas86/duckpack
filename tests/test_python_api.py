@@ -594,3 +594,112 @@ def test_in_memory_connection_preserves_clean_session_without_local_duckdb(tmp_p
     assert "local" not in attached
     assert "local.duckdb" not in attached
     assert "memory" in attached
+
+
+def test_pk_diff_and_apply_idempotency_in_memory(tmp_path):
+    proj_dir = str(tmp_path / "pk_proj")
+    duckpack.init(proj_dir)
+
+    # 1. Target table initially without a primary key
+    con = duckdb.connect()
+    con.execute("CREATE TABLE users (id INT, name VARCHAR);")
+    con.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');")
+
+    # 2. Project model adds PRIMARY KEY (id)
+    with open(os.path.join(proj_dir, "tables", "users.sql"), "w") as f:
+        f.write("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR);")
+
+    # 3. Diff should detect AddConstraint
+    diff_res = duckpack.diff(con, proj_dir)
+    assert diff_res.has_changes is True
+    assert diff_res.change_count == 1
+    assert any("users" in item for item in diff_res.items)
+
+    # 4. Apply in-place
+    apply_res = duckpack.apply(con, proj_dir)
+    assert apply_res.success is True
+    assert apply_res.applied_count == 1
+
+    # 5. Verify constraint applied in live database
+    constrs = con.execute("SELECT constraint_type, constraint_column_names FROM duckdb_constraints() WHERE table_name = 'users';").fetchall()
+    assert any(c[0] == "PRIMARY KEY" and c[1] == ["id"] for c in constrs)
+
+    # 6. Re-diff MUST report zero changes (idempotency check)
+    post_diff = duckpack.diff(con, proj_dir)
+    assert post_diff.has_changes is False
+    assert post_diff.change_count == 0
+
+
+def test_constraint_copy_and_swap_migration_in_memory(tmp_path):
+    proj_dir = str(tmp_path / "swap_proj")
+    duckpack.init(proj_dir)
+
+    # 1. Target table initially without CHECK constraint
+    con = duckdb.connect()
+    con.execute("CREATE TABLE orders (order_id INT PRIMARY KEY, amount DOUBLE);")
+    con.execute("INSERT INTO orders VALUES (101, 49.99), (102, 99.50);")
+
+    # 2. Project model adds CHECK (amount > 0)
+    with open(os.path.join(proj_dir, "tables", "orders.sql"), "w") as f:
+        f.write("CREATE TABLE orders (order_id INT PRIMARY KEY, amount DOUBLE, CHECK (amount > 0));")
+
+    # 3. Diff should detect RecreateTable
+    diff_res = duckpack.diff(con, proj_dir)
+    assert diff_res.has_changes is True
+    assert any("orders" in item for item in diff_res.items)
+
+    # 4. Apply with force_drop=True to execute copy-and-swap
+    apply_res = duckpack.apply(con, proj_dir, force_drop=True)
+    assert apply_res.success is True
+
+    # 5. Verify data is preserved after recreation
+    rows = con.execute("SELECT order_id, amount FROM orders ORDER BY order_id;").fetchall()
+    assert rows == [(101, 49.99), (102, 99.50)]
+
+    # 6. Verify CHECK constraint exists
+    constrs = con.execute("SELECT constraint_type FROM duckdb_constraints() WHERE table_name = 'orders';").fetchall()
+    assert any(c[0] == "CHECK" for c in constrs)
+
+    # 7. Re-diff MUST report zero changes
+    post_diff = duckpack.diff(con, proj_dir)
+    assert post_diff.has_changes is False
+
+
+def test_live_quack_pk_diff_and_apply_idempotency(tmp_path):
+    # Connect to live Quack container
+    con = duckdb.connect()
+    try:
+        con.execute("LOAD quack;")
+        con.execute("CREATE SECRET (TYPE QUACK, TOKEN 'your_quack_token_here');")
+        con.execute("ATTACH 'quack:0.0.0.0:9494' AS target_db (DISABLE_SSL true);")
+    except Exception as e:
+        pytest.skip(f"Live Quack container not reachable: {e}")
+
+    proj_dir = str(tmp_path / "quack_pk_proj")
+    duckpack.init(proj_dir)
+
+    # Ignore other tables on Quack so test focuses cleanly on users
+    with open(os.path.join(proj_dir, "duckpack.toml"), "w") as f:
+        f.write('[project]\nname = "quack_pk_proj"\n\n[ignore]\nrules = ["products", "test_tbl", "wide_pipeline_test", "*view*", "target_table"]\n')
+
+    with open(os.path.join(proj_dir, "tables", "users.sql"), "w") as f:
+        f.write("""CREATE TABLE users (
+            user_id INTEGER PRIMARY KEY,
+            first_name VARCHAR,
+            last_name VARCHAR,
+            dob DATE,
+            email_Address VARCHAR,
+            created_date_time DATE,
+            last_login_date_time DATE,
+            live BOOLEAN
+        );""")
+
+    # Apply to live Quack
+    apply_res = duckpack.apply(con, proj_dir, catalog="target_db")
+    assert apply_res.success is True
+
+    # Verify zero diff after apply on live Quack
+    diff_after = duckpack.diff(con, proj_dir, catalog="target_db")
+    users_items = [i for i in diff_after.items if "users" in i]
+    assert len(users_items) == 0, f"Expected 0 diff items for users, got {users_items}"
+
