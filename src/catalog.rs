@@ -471,6 +471,22 @@ pub fn load_explorer_metadata(
         }
     }
 
+    // Query exact live row count for all tables (avoiding stale optimizer estimated_size)
+    for t in &mut all_tables {
+        let count_sql = if t.is_temporary {
+            format!("SELECT count(*) FROM \"{}\"", t.name.replace('"', "\"\""))
+        } else if is_quack && !is_remote_multi_db {
+            format!("SELECT count(*) FROM target_db.{}.\"{}\"", t.schema, t.name.replace('"', "\"\""))
+        } else if is_quack && t.database != "memory" {
+            format!("SELECT * FROM target_db.query('SELECT count(*) FROM {}.{}.\"{}\"')", t.database, t.schema, t.name.replace('"', "\"\""))
+        } else {
+            format!("SELECT count(*) FROM {}.{}.\"{}\"", t.database, t.schema, t.name.replace('"', "\"\""))
+        };
+        if let Ok(count) = conn.query_row(&count_sql, [], |r| r.get::<_, i64>(0)) {
+            t.row_count = Some(count);
+        }
+    }
+
     let mut all_views: Vec<ViewEntry> = Vec::new();
     if is_quack {
         let quack_view_sql = "SELECT database_name, schema_name, view_name, temporary FROM target_db.query('SELECT database_name, schema_name, view_name, temporary FROM duckdb_views() WHERE internal = false')";

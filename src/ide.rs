@@ -1903,16 +1903,7 @@ pub fn run_ide_loop(
                             active_tab.column_names.clear();
                             let elapsed = start_time.elapsed();
 
-                            let lower = query_to_execute.to_lowercase();
-                            let is_catalog_mutation = lower.contains("attach ")
-                                || lower.contains("detach ")
-                                || lower.contains("create ")
-                                || lower.contains("drop ")
-                                || lower.contains("alter ")
-                                || lower.contains("use ");
-                            if is_catalog_mutation {
-                                trigger_explorer_refresh = true;
-                            }
+                            trigger_explorer_refresh = true;
                             status_msg = format!("Statement executed successfully in {:.2?}.", elapsed);
 
                             let history_path = queries_dir.join(".history.sql");
@@ -2790,6 +2781,9 @@ mod tests {
         let db_uri = "quack:0.0.0.0:9494";
         let token = "your_quack_token_here";
         if let Ok(conn) = crate::engine::connect_target_db(db_uri, Some(token), true) {
+            let temp_dir = std::env::temp_dir().join(format!("dp_live_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            let _ = std::fs::create_dir_all(&temp_dir);
+
             let _ = conn.execute_batch("DELETE FROM target_db.users WHERE user_id = 9999;");
             let q = "insert into users values (9999, 'Test', 'User', '1900-01-01', 'test_user@example.com', now(), now(), True);";
             
@@ -2801,7 +2795,16 @@ mod tests {
             assert_eq!(count, 1, "Expected exactly 1 row inserted, got {}", count);
             println!("Verified: Exactly 1 row inserted via execute_batch for users!");
 
+            // Verify load_explorer_metadata returns the EXACT live count for users
+            let meta = load_explorer_metadata(&conn, &temp_dir, true);
+            let target_db = meta.databases.iter().find(|d| d.name == "target_db").unwrap();
+            let users_table = target_db.tables.iter().find(|t| t.name == "users").unwrap();
+            let actual_db_count: i64 = conn.query_row("SELECT count(*) FROM target_db.users;", [], |r| r.get(0)).unwrap();
+            assert_eq!(users_table.row_count, Some(actual_db_count), "Explorer metadata row_count must match actual count(*)");
+            println!("Verified: Explorer metadata row count {} matches actual DB count {}", users_table.row_count.unwrap(), actual_db_count);
+
             let _ = conn.execute_batch("DELETE FROM target_db.users WHERE user_id = 9999;");
+            let _ = std::fs::remove_dir_all(&temp_dir);
         }
     }
 
