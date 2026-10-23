@@ -24,12 +24,57 @@ pub fn read_sql_with_env<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
     Ok(replaced.into_owned())
 }
 
+/// Represents a constraint on a table (PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintSchema {
+    pub constraint_type: String, // "PRIMARY KEY", "UNIQUE", "FOREIGN KEY", "CHECK"
+    pub constraint_name: Option<String>,
+    pub columns: Vec<String>,
+    pub expression: Option<String>,
+    pub referenced_table: Option<String>,
+    pub referenced_columns: Vec<String>,
+}
+
+impl ConstraintSchema {
+    pub fn matches(&self, other: &Self) -> bool {
+        if !self.constraint_type.eq_ignore_ascii_case(&other.constraint_type) {
+            return false;
+        }
+        let self_cols: Vec<String> = self.columns.iter().map(|c| c.to_lowercase()).collect();
+        let other_cols: Vec<String> = other.columns.iter().map(|c| c.to_lowercase()).collect();
+        if self_cols != other_cols {
+            return false;
+        }
+        match self.constraint_type.to_uppercase().as_str() {
+            "CHECK" => {
+                let self_expr = self.expression.as_deref().unwrap_or("").trim().trim_matches(|c| c == '(' || c == ')').trim();
+                let other_expr = other.expression.as_deref().unwrap_or("").trim().trim_matches(|c| c == '(' || c == ')').trim();
+                self_expr.eq_ignore_ascii_case(other_expr)
+            }
+            "FOREIGN KEY" => {
+                let self_tbl = self.referenced_table.as_deref().unwrap_or("").to_lowercase();
+                let other_tbl = other.referenced_table.as_deref().unwrap_or("").to_lowercase();
+                let self_simple = self_tbl.split('.').last().unwrap_or(&self_tbl);
+                let other_simple = other_tbl.split('.').last().unwrap_or(&other_tbl);
+                if self_simple != other_simple {
+                    return false;
+                }
+                let self_ref_cols: Vec<String> = self.referenced_columns.iter().map(|c| c.to_lowercase()).collect();
+                let other_ref_cols: Vec<String> = other.referenced_columns.iter().map(|c| c.to_lowercase()).collect();
+                self_ref_cols == other_ref_cols
+            }
+            _ => true,
+        }
+    }
+}
+
 /// Represents the resolved structure of a DuckDB table.
-/// Contains the raw creation SQL and a map of column names to their data types.
+/// Contains the raw creation SQL, a map of column names to their data types, and parsed constraints.
 #[derive(Debug, Clone)]
 pub struct TableSchema {
     pub create_sql: String,
     pub columns: HashMap<String, String>,
+    pub constraints: Vec<ConstraintSchema>,
 }
 
 /// Enumerates all the possible schema modifications that can occur.
@@ -44,6 +89,8 @@ pub enum DiffItemType {
     RenameTable,
     DropColumn,
     RenameColumn,
+    AddConstraint,
+    RecreateTable,
     CreateView,
     DropView,
     CreateMacro,
@@ -230,6 +277,7 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
         tables.insert(table_name.clone(), TableSchema {
             create_sql: sql,
             columns: HashMap::new(),
+            constraints: Vec::new(),
         });
     }
 
@@ -247,6 +295,7 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
                     tables.insert(table_name, TableSchema {
                         create_sql: sql,
                         columns: HashMap::new(),
+                        constraints: Vec::new(),
                     });
                 }
             }
@@ -285,6 +334,119 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
                     let (table_name, column_name, data_type) = row;
                     if let Some(table) = tables.get_mut(&table_name) {
                         table.columns.insert(column_name, data_type);
+                    }
+                }
+            }
+        }
+    }
+
+    // Introspect table constraints (PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK)
+    let constr_sql = format!(
+        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+         constraint_type, \
+         constraint_name, \
+         COALESCE(array_to_string(constraint_column_names, ','), ''), \
+         expression, \
+         referenced_table, \
+         COALESCE(array_to_string(referenced_column_names, ','), '') \
+         FROM duckdb_constraints() \
+         WHERE database_name = '{}' AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
+        safe_cat
+    );
+    if let Ok(mut constr_stmt) = conn.prepare(&constr_sql) {
+        if let Ok(constr_rows) = constr_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        }) {
+            for row in constr_rows.flatten() {
+                let (table_name, c_type, c_name, cols_str, expr, ref_tbl, ref_cols_str) = row;
+                if let Some(table) = tables.get_mut(&table_name) {
+                    let cols: Vec<String> = if cols_str.is_empty() {
+                        Vec::new()
+                    } else {
+                        cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                    };
+                    let ref_cols: Vec<String> = if ref_cols_str.is_empty() {
+                        Vec::new()
+                    } else {
+                        ref_cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                    };
+                    table.constraints.push(ConstraintSchema {
+                        constraint_type: c_type,
+                        constraint_name: c_name,
+                        columns: cols,
+                        expression: expr,
+                        referenced_table: ref_tbl,
+                        referenced_columns: ref_cols,
+                    });
+                }
+            }
+        }
+    }
+
+    let is_quack = conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) > 0;
+
+    if is_quack {
+        let q_constr_sql = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+             constraint_type, \
+             constraint_name, \
+             COALESCE(array_to_string(constraint_column_names, ','), ''), \
+             expression, \
+             referenced_table, \
+             COALESCE(array_to_string(referenced_column_names, ','), '') \
+             FROM target_db.query('SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, '','') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (database_name = ''{}'' OR database_name = current_database())')",
+            safe_cat
+        );
+        if let Ok(mut q_stmt) = conn.prepare(&q_constr_sql) {
+            if let Ok(q_rows) = q_stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            }) {
+                for row in q_rows.flatten() {
+                    let (table_name, c_type, c_name, cols_str, expr, ref_tbl, ref_cols_str) = row;
+                    if let Some(table) = tables.get_mut(&table_name) {
+                        let cols: Vec<String> = if cols_str.is_empty() {
+                            Vec::new()
+                        } else {
+                            cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                        };
+                        let ref_cols: Vec<String> = if ref_cols_str.is_empty() {
+                            Vec::new()
+                        } else {
+                            ref_cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                        };
+                        let new_c = ConstraintSchema {
+                            constraint_type: c_type,
+                            constraint_name: c_name,
+                            columns: cols,
+                            expression: expr,
+                            referenced_table: ref_tbl,
+                            referenced_columns: ref_cols,
+                        };
+                        if !table.constraints.iter().any(|c| c.matches(&new_c)) {
+                            table.constraints.push(new_c);
+                        }
                     }
                 }
             }
@@ -599,33 +761,136 @@ pub fn compute_diff(
                 }
             }
 
-            if !safe_sqls.is_empty() {
-                let has_rename = safe_sqls.iter().any(|s| s.contains("RENAME COLUMN"));
-                let ignored = is_ignored(table_name);
-                diff.items.push(DiffItem {
-                    item_type: if has_rename { DiffItemType::RenameColumn } else { DiffItemType::AlterTable },
-                    obj_name: table_name.clone(),
-                    sql: safe_sqls.join("\n"),
-                    old_def: Some(target_table.create_sql.clone()),
-                    new_def: Some(shadow_table.create_sql.clone()),
-                    selected: !ignored,
-                    locked: false,
-                    ignored,
-                });
+            let mut added_constraints = Vec::new();
+            for sc in &shadow_table.constraints {
+                if !target_table.constraints.iter().any(|tc| tc.matches(sc)) {
+                    added_constraints.push(sc);
+                }
             }
 
-            if !destructive_sqls.is_empty() {
+            let mut dropped_constraints = Vec::new();
+            for tc in &target_table.constraints {
+                if !shadow_table.constraints.iter().any(|sc| sc.matches(tc)) {
+                    dropped_constraints.push(tc);
+                }
+            }
+
+            let mut needs_recreate = false;
+            let mut in_place_constraints = Vec::new();
+
+            if !dropped_constraints.is_empty() {
+                needs_recreate = true;
+            }
+
+            for ac in &added_constraints {
+                match ac.constraint_type.to_uppercase().as_str() {
+                    "PRIMARY KEY" => {
+                        let target_has_pk = target_table.constraints.iter().any(|c| c.constraint_type.eq_ignore_ascii_case("PRIMARY KEY"));
+                        if target_has_pk {
+                            needs_recreate = true;
+                        } else {
+                            in_place_constraints.push(format!("ALTER TABLE {} ADD PRIMARY KEY ({});", table_name, ac.columns.join(", ")));
+                        }
+                    }
+                    "UNIQUE" => {
+                        in_place_constraints.push(format!("ALTER TABLE {} ADD UNIQUE ({});", table_name, ac.columns.join(", ")));
+                    }
+                    "FOREIGN KEY" | "CHECK" => {
+                        needs_recreate = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            if needs_recreate {
+                let (schema_prefix, simple_name) = match table_name.split_once('.') {
+                    Some((s, t)) => (format!("{}.", s), t),
+                    None => (String::new(), table_name.as_str()),
+                };
+                let swap_table_name = format!("{}{}__duckpack_swap", schema_prefix, simple_name);
+
+                let create_table_re = Regex::new(r"(?i)^\s*CREATE\s+TABLE\s+[^\s(]+").unwrap();
+                let swap_create_sql = create_table_re.replace(&shadow_table.create_sql, format!("CREATE TABLE {}", swap_table_name));
+
+                let mut common_cols: Vec<String> = shadow_table.columns.keys()
+                    .filter(|col| target_table.columns.contains_key(*col))
+                    .cloned()
+                    .collect();
+                common_cols.sort();
+
+                let mut swap_script = String::new();
+                swap_script.push_str("BEGIN TRANSACTION;\n");
+                let swap_create = swap_create_sql.trim().trim_end_matches(';');
+                swap_script.push_str(swap_create);
+                swap_script.push_str(";\n");
+
+                if !common_cols.is_empty() {
+                    let quoted_cols: Vec<String> = common_cols.iter().map(|c| format!("\"{}\"", c)).collect();
+                    let cols_str = quoted_cols.join(", ");
+                    swap_script.push_str(&format!(
+                        "INSERT INTO {} ({}) SELECT {} FROM {};\n",
+                        swap_table_name, cols_str, cols_str, table_name
+                    ));
+                }
+
+                swap_script.push_str(&format!("DROP TABLE {};\n", table_name));
+                swap_script.push_str(&format!("ALTER TABLE {} RENAME TO {};\n", swap_table_name, simple_name));
+                swap_script.push_str("COMMIT;");
+
                 let ignored = is_ignored(table_name);
                 diff.items.push(DiffItem {
-                    item_type: DiffItemType::DropColumn,
+                    item_type: DiffItemType::RecreateTable,
                     obj_name: table_name.clone(),
-                    sql: destructive_sqls.join("\n"),
+                    sql: swap_script,
                     old_def: Some(target_table.create_sql.clone()),
                     new_def: Some(shadow_table.create_sql.clone()),
                     selected: !ignored,
                     locked: false,
                     ignored,
                 });
+            } else {
+                if !safe_sqls.is_empty() {
+                    let has_rename = safe_sqls.iter().any(|s| s.contains("RENAME COLUMN"));
+                    let ignored = is_ignored(table_name);
+                    diff.items.push(DiffItem {
+                        item_type: if has_rename { DiffItemType::RenameColumn } else { DiffItemType::AlterTable },
+                        obj_name: table_name.clone(),
+                        sql: safe_sqls.join("\n"),
+                        old_def: Some(target_table.create_sql.clone()),
+                        new_def: Some(shadow_table.create_sql.clone()),
+                        selected: !ignored,
+                        locked: false,
+                        ignored,
+                    });
+                }
+
+                if !in_place_constraints.is_empty() {
+                    let ignored = is_ignored(table_name);
+                    diff.items.push(DiffItem {
+                        item_type: DiffItemType::AddConstraint,
+                        obj_name: table_name.clone(),
+                        sql: in_place_constraints.join("\n"),
+                        old_def: Some(target_table.create_sql.clone()),
+                        new_def: Some(shadow_table.create_sql.clone()),
+                        selected: !ignored,
+                        locked: false,
+                        ignored,
+                    });
+                }
+
+                if !destructive_sqls.is_empty() {
+                    let ignored = is_ignored(table_name);
+                    diff.items.push(DiffItem {
+                        item_type: DiffItemType::DropColumn,
+                        obj_name: table_name.clone(),
+                        sql: destructive_sqls.join("\n"),
+                        old_def: Some(target_table.create_sql.clone()),
+                        new_def: Some(shadow_table.create_sql.clone()),
+                        selected: !ignored,
+                        locked: false,
+                        ignored,
+                    });
+                }
             }
         } else {
             created_tables.push(table_name.clone());
@@ -861,6 +1126,7 @@ mod tests {
         shadow.insert("users".to_string(), TableSchema {
             create_sql: "CREATE TABLE users (id INTEGER);".to_string(),
             columns,
+            constraints: Vec::new(),
         });
         
         let diff = compute_diff(
@@ -1012,6 +1278,232 @@ mod tests {
         let query_res = conn.execute_batch("SELECT * FROM finance.reports.quarterly_kpis;");
         println!("Querying finance.reports.quarterly_kpis: {:?}", query_res);
         assert!(query_res.is_ok());
+    }
+
+    #[test]
+    fn test_compute_diff_add_primary_key_in_place() {
+        let mut shadow = HashMap::new();
+        let mut target = HashMap::new();
+
+        let mut cols = HashMap::new();
+        cols.insert("id".to_string(), "INTEGER".to_string());
+        cols.insert("name".to_string(), "VARCHAR".to_string());
+
+        target.insert("users".to_string(), TableSchema {
+            create_sql: "CREATE TABLE users (id INTEGER, name VARCHAR);".to_string(),
+            columns: cols.clone(),
+            constraints: Vec::new(),
+        });
+
+        shadow.insert("users".to_string(), TableSchema {
+            create_sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR);".to_string(),
+            columns: cols,
+            constraints: vec![ConstraintSchema {
+                constraint_type: "PRIMARY KEY".to_string(),
+                constraint_name: Some("users_id_pkey".to_string()),
+                columns: vec!["id".to_string()],
+                expression: None,
+                referenced_table: None,
+                referenced_columns: Vec::new(),
+            }],
+        });
+
+        let diff = compute_diff(
+            &HashSet::new(), &HashSet::new(),
+            &shadow, &target,
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[]
+        );
+
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::AddConstraint);
+        assert_eq!(diff.items[0].sql, "ALTER TABLE users ADD PRIMARY KEY (id);");
+        assert!(diff.items[0].selected);
+    }
+
+    #[test]
+    fn test_compute_diff_add_unique_in_place() {
+        let mut shadow = HashMap::new();
+        let mut target = HashMap::new();
+
+        let mut cols = HashMap::new();
+        cols.insert("id".to_string(), "INTEGER".to_string());
+        cols.insert("email".to_string(), "VARCHAR".to_string());
+
+        let pk = ConstraintSchema {
+            constraint_type: "PRIMARY KEY".to_string(),
+            constraint_name: Some("users_id_pkey".to_string()),
+            columns: vec!["id".to_string()],
+            expression: None,
+            referenced_table: None,
+            referenced_columns: Vec::new(),
+        };
+
+        target.insert("users".to_string(), TableSchema {
+            create_sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR);".to_string(),
+            columns: cols.clone(),
+            constraints: vec![pk.clone()],
+        });
+
+        shadow.insert("users".to_string(), TableSchema {
+            create_sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR UNIQUE);".to_string(),
+            columns: cols,
+            constraints: vec![
+                pk,
+                ConstraintSchema {
+                    constraint_type: "UNIQUE".to_string(),
+                    constraint_name: Some("users_email_key".to_string()),
+                    columns: vec!["email".to_string()],
+                    expression: None,
+                    referenced_table: None,
+                    referenced_columns: Vec::new(),
+                },
+            ],
+        });
+
+        let diff = compute_diff(
+            &HashSet::new(), &HashSet::new(),
+            &shadow, &target,
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[]
+        );
+
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::AddConstraint);
+        assert_eq!(diff.items[0].sql, "ALTER TABLE users ADD UNIQUE (email);");
+        assert!(diff.items[0].selected);
+    }
+
+    #[test]
+    fn test_compute_diff_add_foreign_key_recreates_table() {
+        let mut shadow = HashMap::new();
+        let mut target = HashMap::new();
+
+        let mut cols = HashMap::new();
+        cols.insert("id".to_string(), "INTEGER".to_string());
+        cols.insert("user_id".to_string(), "INTEGER".to_string());
+
+        let pk = ConstraintSchema {
+            constraint_type: "PRIMARY KEY".to_string(),
+            constraint_name: Some("orders_id_pkey".to_string()),
+            columns: vec!["id".to_string()],
+            expression: None,
+            referenced_table: None,
+            referenced_columns: Vec::new(),
+        };
+
+        target.insert("orders".to_string(), TableSchema {
+            create_sql: "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER);".to_string(),
+            columns: cols.clone(),
+            constraints: vec![pk.clone()],
+        });
+
+        shadow.insert("orders".to_string(), TableSchema {
+            create_sql: "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));".to_string(),
+            columns: cols,
+            constraints: vec![
+                pk,
+                ConstraintSchema {
+                    constraint_type: "FOREIGN KEY".to_string(),
+                    constraint_name: Some("orders_user_id_fkey".to_string()),
+                    columns: vec!["user_id".to_string()],
+                    expression: None,
+                    referenced_table: Some("users".to_string()),
+                    referenced_columns: vec!["id".to_string()],
+                },
+            ],
+        });
+
+        let diff = compute_diff(
+            &HashSet::new(), &HashSet::new(),
+            &shadow, &target,
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[]
+        );
+
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::RecreateTable);
+        assert!(diff.items[0].sql.contains("BEGIN TRANSACTION;"));
+        assert!(diff.items[0].sql.contains("CREATE TABLE orders__duckpack_swap"));
+        assert!(diff.items[0].sql.contains("INSERT INTO orders__duckpack_swap"));
+        assert!(diff.items[0].sql.contains("DROP TABLE orders;"));
+        assert!(diff.items[0].sql.contains("ALTER TABLE orders__duckpack_swap RENAME TO orders;"));
+        assert!(diff.items[0].sql.contains("COMMIT;"));
+    }
+
+    #[test]
+    fn test_compute_diff_drop_constraint_recreates_table() {
+        let mut shadow = HashMap::new();
+        let mut target = HashMap::new();
+
+        let mut cols = HashMap::new();
+        cols.insert("id".to_string(), "INTEGER".to_string());
+        cols.insert("email".to_string(), "VARCHAR".to_string());
+
+        let pk = ConstraintSchema {
+            constraint_type: "PRIMARY KEY".to_string(),
+            constraint_name: Some("users_id_pkey".to_string()),
+            columns: vec!["id".to_string()],
+            expression: None,
+            referenced_table: None,
+            referenced_columns: Vec::new(),
+        };
+        let uq = ConstraintSchema {
+            constraint_type: "UNIQUE".to_string(),
+            constraint_name: Some("users_email_key".to_string()),
+            columns: vec!["email".to_string()],
+            expression: None,
+            referenced_table: None,
+            referenced_columns: Vec::new(),
+        };
+
+        target.insert("users".to_string(), TableSchema {
+            create_sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR UNIQUE);".to_string(),
+            columns: cols.clone(),
+            constraints: vec![pk.clone(), uq],
+        });
+
+        // Shadow removed the UNIQUE constraint
+        shadow.insert("users".to_string(), TableSchema {
+            create_sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR);".to_string(),
+            columns: cols,
+            constraints: vec![pk],
+        });
+
+        let diff = compute_diff(
+            &HashSet::new(), &HashSet::new(),
+            &shadow, &target,
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[]
+        );
+
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::RecreateTable);
+    }
+
+    #[test]
+    fn test_get_schema_duckdb_constraints() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR UNIQUE);").unwrap();
+        let schema = get_schema(&conn, Some("memory")).unwrap();
+        assert!(schema.contains_key("users"));
+        let users_tbl = &schema["users"];
+        assert_eq!(users_tbl.columns.len(), 2);
+        assert_eq!(users_tbl.constraints.len(), 2);
+        assert!(users_tbl.constraints.iter().any(|c| c.constraint_type == "PRIMARY KEY" && c.columns == vec!["id"]));
+        assert!(users_tbl.constraints.iter().any(|c| c.constraint_type == "UNIQUE" && c.columns == vec!["email"]));
     }
 }
 
