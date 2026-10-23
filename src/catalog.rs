@@ -119,12 +119,14 @@ pub fn format_row_count(count: i64) -> String {
     }
 }
 
-/// Represents a column in the database explorer, including its name, data type, and primary key status.
+/// Represents a column in the database explorer, including its name, data type, and primary/foreign key status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableColumnInfo {
     pub name: String,
     pub data_type: String,
     pub is_pk: bool,
+    pub is_fk: bool,
+    pub fk_target: Option<String>,
 }
 
 /// Loads column names, types, and primary key status for a specific database, schema, and table/view.
@@ -285,7 +287,7 @@ pub fn load_table_columns_for(
         }
     }
 
-    // Determine primary key columns for this table
+// Determine primary key columns for this table
     let mut pk_set = HashSet::new();
     let safe_table = table.replace('\'', "''");
     let safe_schema = schema.replace('\'', "''");
@@ -326,12 +328,99 @@ pub fn load_table_columns_for(
         }
     }
 
+    // Determine foreign key columns for this table: col_name -> "target_table.target_col"
+    let mut fk_map: HashMap<String, String> = HashMap::new();
+    let fk_query = format!(
+        "SELECT \
+            COALESCE(array_to_string(constraint_column_names, ','), ''), \
+            COALESCE(referenced_table, ''), \
+            COALESCE(array_to_string(referenced_column_names, ','), '') \
+         FROM duckdb_constraints() \
+         WHERE constraint_type = 'FOREIGN KEY' \
+           AND (database_name = '{}' OR database_name = 'target_db' OR database_name = current_database()) \
+           AND (schema_name = '{}' OR schema_name = 'main') \
+           AND table_name = '{}'",
+        safe_db, safe_schema, safe_table
+    );
+    if let Ok(mut stmt) = conn.prepare(&fk_query) {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(cols_str), Ok(ref_tbl), Ok(ref_cols_str)) = (
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                ) {
+                    let cols: Vec<&str> = cols_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                    let ref_cols: Vec<&str> = ref_cols_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                    for (i, c) in cols.iter().enumerate() {
+                        let target = if let Some(rc) = ref_cols.get(i) {
+                            if ref_tbl.is_empty() {
+                                rc.to_string()
+                            } else {
+                                format!("{}.{}", ref_tbl, rc)
+                            }
+                        } else if !ref_tbl.is_empty() {
+                            ref_tbl.clone()
+                        } else {
+                            "unknown".to_string()
+                        };
+                        fk_map.insert(c.to_lowercase(), target);
+                    }
+                }
+            }
+        }
+    }
+
+    if fk_map.is_empty() && is_quack {
+        let q_fk_query = format!(
+            "SELECT \
+                COALESCE(constraint_column_names, ''), \
+                COALESCE(referenced_table, ''), \
+                COALESCE(referenced_column_names, '') \
+             FROM target_db.query('SELECT array_to_string(constraint_column_names, '','') as constraint_column_names, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type = ''FOREIGN KEY'' AND (schema_name = ''{}'' OR schema_name = ''main'') AND table_name = ''{}''')",
+            safe_schema, safe_table
+        );
+        if let Ok(mut stmt) = conn.prepare(&q_fk_query) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(cols_str), Ok(ref_tbl), Ok(ref_cols_str)) = (
+                        row.get::<_, String>(0),
+                        row.get::<_, String>(1),
+                        row.get::<_, String>(2),
+                    ) {
+                        let cols: Vec<&str> = cols_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                        let ref_cols: Vec<&str> = ref_cols_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                        for (i, c) in cols.iter().enumerate() {
+                            let target = if let Some(rc) = ref_cols.get(i) {
+                                if ref_tbl.is_empty() {
+                                    rc.to_string()
+                                } else {
+                                    format!("{}.{}", ref_tbl, rc)
+                                }
+                            } else if !ref_tbl.is_empty() {
+                                ref_tbl.clone()
+                            } else {
+                                "unknown".to_string()
+                            };
+                            fk_map.insert(c.to_lowercase(), target);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     cols.into_iter().map(|(name, typ)| {
-        let is_pk = pk_set.contains(&name.to_lowercase());
+        let lower = name.to_lowercase();
+        let is_pk = pk_set.contains(&lower);
+        let fk_target = fk_map.get(&lower).cloned();
+        let is_fk = fk_target.is_some();
         TableColumnInfo {
             name,
             data_type: typ,
             is_pk,
+            is_fk,
+            fk_target,
         }
     }).collect()
 }
@@ -1049,15 +1138,26 @@ mod tests {
     #[test]
     fn test_load_table_columns_pk_detection() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE users (user_id INT PRIMARY KEY, email VARCHAR, active BOOLEAN);", []).unwrap();
+        conn.execute("CREATE TABLE roles (role_id INT PRIMARY KEY, title VARCHAR);", []).unwrap();
+        conn.execute("CREATE TABLE users (user_id INT PRIMARY KEY, role_id INT REFERENCES roles(role_id), email VARCHAR, active BOOLEAN);", []).unwrap();
         let cols = load_table_columns_for("memory", "main", "users", &conn, false);
-        assert_eq!(cols.len(), 3);
+        assert_eq!(cols.len(), 4);
         assert_eq!(cols[0].name, "user_id");
         assert!(cols[0].is_pk, "user_id should be identified as primary key");
-        assert_eq!(cols[1].name, "email");
-        assert!(!cols[1].is_pk, "email should not be identified as primary key");
-        assert_eq!(cols[2].name, "active");
-        assert!(!cols[2].is_pk, "active should not be identified as primary key");
+        assert!(!cols[0].is_fk, "user_id should not be foreign key");
+
+        assert_eq!(cols[1].name, "role_id");
+        assert!(!cols[1].is_pk, "role_id should not be primary key");
+        assert!(cols[1].is_fk, "role_id should be identified as foreign key");
+        assert_eq!(cols[1].fk_target.as_deref(), Some("roles.role_id"));
+
+        assert_eq!(cols[2].name, "email");
+        assert!(!cols[2].is_pk, "email should not be identified as primary key");
+        assert!(!cols[2].is_fk, "email should not be foreign key");
+
+        assert_eq!(cols[3].name, "active");
+        assert!(!cols[3].is_pk, "active should not be identified as primary key");
+        assert!(!cols[3].is_fk, "active should not be foreign key");
     }
 
     #[test]

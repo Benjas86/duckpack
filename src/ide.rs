@@ -35,7 +35,29 @@ pub(crate) enum NodeType {
     Trigger { database: Option<String>, schema: Option<String>, table: Option<String> },
     Query,
     Macro,
-    Column { data_type: String, is_pk: bool },
+    Column { data_type: String, is_pk: bool, is_fk: bool, fk_target: Option<String> },
+}
+
+/// Formats the display line for a column in the database explorer tree.
+fn format_column_display(
+    indent: &str,
+    name: &str,
+    data_type: &str,
+    is_pk: bool,
+    is_fk: bool,
+    fk_target: Option<&str>,
+) -> String {
+    if is_pk && is_fk {
+        let target = fk_target.unwrap_or("unknown");
+        format!("{}└─ 🔑🔗 {} ({}) [PK, FK -> {}]", indent, name, data_type, target)
+    } else if is_pk {
+        format!("{}└─ 🔑 {} ({}) [PK]", indent, name, data_type)
+    } else if is_fk {
+        let target = fk_target.unwrap_or("unknown");
+        format!("{}└─ 🔗 {} ({}) [FK -> {}]", indent, name, data_type, target)
+    } else {
+        format!("{}└─ {} ({})", indent, name, data_type)
+    }
 }
 
 /// State for the Attach Database modal dialog (Ctrl+A).
@@ -196,18 +218,19 @@ pub(crate) fn rebuild_explorer_nodes(
                             if is_tbl_expanded {
                                 let cols = load_table_columns_for(&db.name, &t.schema, &t.name, conn, is_quack);
                                 for col in cols {
-                                    let display = if col.is_pk {
-                                        format!("      └─ 🔑 {} ({}) [PK]", col.name, col.data_type)
-                                    } else {
-                                        format!("      └─ {} ({})", col.name, col.data_type)
-                                    };
+                                    let display = format_column_display("      ", &col.name, &col.data_type, col.is_pk, col.is_fk, col.fk_target.as_deref());
                                     items.push(ExplorerNode {
                                         name: col.name.clone(),
                                         display,
                                         level: 3,
                                         is_expandable: false,
                                         is_expanded: false,
-                                        node_type: NodeType::Column { data_type: col.data_type, is_pk: col.is_pk },
+                                        node_type: NodeType::Column {
+                                            data_type: col.data_type,
+                                            is_pk: col.is_pk,
+                                            is_fk: col.is_fk,
+                                            fk_target: col.fk_target,
+                                        },
                                     });
                                 }
                             }
@@ -254,7 +277,12 @@ pub(crate) fn rebuild_explorer_nodes(
                                         level: 3,
                                         is_expandable: false,
                                         is_expanded: false,
-                                        node_type: NodeType::Column { data_type: col.data_type, is_pk: false },
+                                        node_type: NodeType::Column {
+                                            data_type: col.data_type,
+                                            is_pk: false,
+                                            is_fk: false,
+                                            fk_target: None,
+                                        },
                                     });
                                 }
                             }
@@ -326,18 +354,19 @@ pub(crate) fn rebuild_explorer_nodes(
                     if is_tbl_expanded {
                         let cols = load_table_columns_for(&meta.active_database, "main", t, conn, is_quack);
                         for col in cols {
-                            let display = if col.is_pk {
-                                format!("    └─ 🔑 {} ({}) [PK]", col.name, col.data_type)
-                            } else {
-                                format!("    └─ {} ({})", col.name, col.data_type)
-                            };
+                            let display = format_column_display("    ", &col.name, &col.data_type, col.is_pk, col.is_fk, col.fk_target.as_deref());
                             items.push(ExplorerNode {
                                 name: col.name.clone(),
                                 display,
                                 level: 2,
                                 is_expandable: false,
                                 is_expanded: false,
-                                node_type: NodeType::Column { data_type: col.data_type, is_pk: col.is_pk },
+                                node_type: NodeType::Column {
+                                    data_type: col.data_type,
+                                    is_pk: col.is_pk,
+                                    is_fk: col.is_fk,
+                                    fk_target: col.fk_target,
+                                },
                             });
                         }
                     }
@@ -381,7 +410,12 @@ pub(crate) fn rebuild_explorer_nodes(
                                 level: 2,
                                 is_expandable: false,
                                 is_expanded: false,
-                                node_type: NodeType::Column { data_type: col.data_type, is_pk: false },
+                                node_type: NodeType::Column {
+                                    data_type: col.data_type,
+                                    is_pk: false,
+                                    is_fk: false,
+                                    fk_target: None,
+                                },
                             });
                         }
                     }
@@ -665,6 +699,7 @@ pub fn run_ide_loop(
 
     let mut explorer_state = ListState::default();
     let mut explorer_horizontal_scroll: usize = 0;
+    let mut explorer_width_percent: u16 = 25;
     let mut explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
 
     if !explorer_items.is_empty() {
@@ -704,9 +739,11 @@ pub fn run_ide_loop(
                 );
             f.render_widget(top_header, main_chunks[0]);
 
+            let exp_pct = explorer_width_percent.clamp(15, 60);
+            let right_pct = 100 - exp_pct;
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
+                .constraints([Constraint::Percentage(exp_pct), Constraint::Percentage(right_pct)].as_ref())
                 .split(main_chunks[1]);
 
             let is_error_status = status_msg.contains("Error") || status_msg.contains("⚠️") || status_msg.contains("Failed");
@@ -752,9 +789,9 @@ pub fn run_ide_loop(
             };
 
             let explorer_title = if focus == FocusPane::Explorer {
-                " Explorer [R: Refresh | Ctrl+A: Attach | q: Query] "
+                format!(" Explorer ({}%) [W: Width | +/-: Resize | R: Refresh | q: Query] ", exp_pct)
             } else {
-                " Explorer [Ctrl+A: Attach] "
+                format!(" Explorer ({}%) [Ctrl+A: Attach] ", exp_pct)
             };
 
             let explorer_list = List::new(list_items)
@@ -944,9 +981,12 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" Ctrl+Space", Style::default().fg(Color::Cyan)), Span::raw("Autocomplete")]),
                     Line::from(vec![Span::styled(" n / p     ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Page (in Results pane)")]),
                     Line::from(vec![Span::styled(" r / R     ", Style::default().fg(Color::Cyan)), Span::raw("Refresh Explorer (when in Explorer pane)")]),
+                    Line::from(vec![Span::styled(" W / Alt+W ", Style::default().fg(Color::Cyan)), Span::raw("Cycle Explorer Width (25% -> 35% -> 50%)")]),
+                    Line::from(vec![Span::styled(" +/- or [/]", Style::default().fg(Color::Cyan)), Span::raw("Resize Explorer Width (in 5% increments)")]),
+                    Line::from(vec![Span::styled(" ◄ / ► / h/l", Style::default().fg(Color::Cyan)), Span::raw("Scroll Explorer horizontally (Shift: 10 chars, Home: reset)")]),
                     Line::from(vec![Span::styled(" q / s     ", Style::default().fg(Color::Cyan)), Span::raw("Query Table (in Explorer pane)")]),
                     Line::from(vec![Span::styled(" d         ", Style::default().fg(Color::Cyan)), Span::raw("Detach Database (in Explorer pane)")]),
-                    Line::from(vec![Span::styled(" ◄ / ►     ", Style::default().fg(Color::Cyan)), Span::raw("Scroll Columns (Shift+◄/► fast)")]),
+                    Line::from(vec![Span::styled(" ◄ / ►     ", Style::default().fg(Color::Cyan)), Span::raw("Scroll Columns (in Results pane, Shift+◄/► fast)")]),
                     Line::from(vec![Span::styled(" Home/End  ", Style::default().fg(Color::Cyan)), Span::raw("First/Last Column (in Results pane)")]),
                     Line::from(""),
                     Line::from(vec![Span::styled(" -- @remote", Style::default().fg(Color::Yellow)), Span::raw("Add at top of query to execute on remote Quack server (e.g. CREATE SECRET)")]),
@@ -1190,7 +1230,7 @@ pub fn run_ide_loop(
                 } else if mouse.kind == MouseEventKind::ScrollDown {
                     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                         if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
-                            explorer_horizontal_scroll += 1;
+                            explorer_horizontal_scroll += 4;
                         } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
                             let max_col = tabs[active_tab_index].column_names.len().saturating_sub(1);
                             if tabs[active_tab_index].horizontal_scroll < max_col {
@@ -1224,7 +1264,7 @@ pub fn run_ide_loop(
                 } else if mouse.kind == MouseEventKind::ScrollUp {
                     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                         if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
-                            if explorer_horizontal_scroll > 0 { explorer_horizontal_scroll -= 1; }
+                            explorer_horizontal_scroll = explorer_horizontal_scroll.saturating_sub(4);
                         } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
                             let active_tab = &mut tabs[active_tab_index];
                             if active_tab.horizontal_scroll > 0 { active_tab.horizontal_scroll -= 1; }
@@ -1251,9 +1291,7 @@ pub fn run_ide_loop(
                     }
                 } else if mouse.kind == MouseEventKind::ScrollLeft {
                     if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
-                        if explorer_horizontal_scroll > 0 {
-                            explorer_horizontal_scroll -= 1;
-                        }
+                        explorer_horizontal_scroll = explorer_horizontal_scroll.saturating_sub(4);
                     } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
                         let active_tab = &mut tabs[active_tab_index];
                         if active_tab.horizontal_scroll > 0 {
@@ -1265,7 +1303,7 @@ pub fn run_ide_loop(
                     }
                 } else if mouse.kind == MouseEventKind::ScrollRight {
                     if mouse.row >= current_explorer_rect.top() && mouse.row <= current_explorer_rect.bottom() && mouse.column >= current_explorer_rect.left() && mouse.column <= current_explorer_rect.right() {
-                        explorer_horizontal_scroll += 1;
+                        explorer_horizontal_scroll += 4;
                     } else if mouse.row >= current_results_rect.top() && mouse.row <= current_results_rect.bottom() && mouse.column >= current_results_rect.left() && mouse.column <= current_results_rect.right() {
                         let max_col = tabs[active_tab_index].column_names.len().saturating_sub(1);
                         if tabs[active_tab_index].horizontal_scroll < max_col {
@@ -1405,6 +1443,27 @@ pub fn run_ide_loop(
                     execute_query = true;
                 }
 
+                // Global Alt shortcuts for explorer resizing
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    if key.code == KeyCode::Char('w') || key.code == KeyCode::Char('W') {
+                        explorer_width_percent = match explorer_width_percent {
+                            p if p < 30 => 35,
+                            p if p < 45 => 50,
+                            _ => 25,
+                        };
+                        status_msg = format!("Explorer width preset: {}%", explorer_width_percent);
+                        continue;
+                    } else if key.code == KeyCode::Char(']') || key.code == KeyCode::Char('+') || key.code == KeyCode::Char('=') {
+                        explorer_width_percent = (explorer_width_percent + 5).min(60);
+                        status_msg = format!("Explorer width: {}%", explorer_width_percent);
+                        continue;
+                    } else if key.code == KeyCode::Char('[') || key.code == KeyCode::Char('-') {
+                        explorer_width_percent = explorer_width_percent.saturating_sub(5).max(15);
+                        status_msg = format!("Explorer width: {}%", explorer_width_percent);
+                        continue;
+                    }
+                }
+
                 // Global quit
                 if key.code == KeyCode::Esc {
                     break;
@@ -1525,12 +1584,33 @@ pub fn run_ide_loop(
                                     explorer_state.select(Some(selected + 1));
                                 }
                             }
-                        } else if key.code == KeyCode::Left {
-                            if explorer_horizontal_scroll > 0 {
-                                explorer_horizontal_scroll -= 1;
+                        } else if key.code == KeyCode::Left || key.code == KeyCode::Char('h') {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                explorer_horizontal_scroll = explorer_horizontal_scroll.saturating_sub(10);
+                            } else {
+                                explorer_horizontal_scroll = explorer_horizontal_scroll.saturating_sub(4);
                             }
-                        } else if key.code == KeyCode::Right {
-                            explorer_horizontal_scroll += 1;
+                        } else if key.code == KeyCode::Right || key.code == KeyCode::Char('l') {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                explorer_horizontal_scroll += 10;
+                            } else {
+                                explorer_horizontal_scroll += 4;
+                            }
+                        } else if key.code == KeyCode::Home {
+                            explorer_horizontal_scroll = 0;
+                        } else if key.code == KeyCode::Char('w') || key.code == KeyCode::Char('W') {
+                            explorer_width_percent = match explorer_width_percent {
+                                p if p < 30 => 35,
+                                p if p < 45 => 50,
+                                _ => 25,
+                            };
+                            status_msg = format!("Explorer width preset: {}%", explorer_width_percent);
+                        } else if key.code == KeyCode::Char('+') || key.code == KeyCode::Char('=') || key.code == KeyCode::Char(']') {
+                            explorer_width_percent = (explorer_width_percent + 5).min(60);
+                            status_msg = format!("Explorer width: {}%", explorer_width_percent);
+                        } else if key.code == KeyCode::Char('-') || key.code == KeyCode::Char('[') {
+                            explorer_width_percent = explorer_width_percent.saturating_sub(5).max(15);
+                            status_msg = format!("Explorer width: {}%", explorer_width_percent);
                         } else if key.code == KeyCode::Enter || key.code == KeyCode::Char(' ') {
                             trigger_explorer_action = true;
                         } else if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
@@ -2794,6 +2874,18 @@ mod tests {
             assert!(pk_node.display.contains("🔑 product_id") && pk_node.display.contains("[PK]"), "Expected key icon and [PK] tag, got: {}", pk_node.display);
             println!("Verified live Quack Explorer PK rendering: {}", pk_node.display);
 
+            // Verify FK detection and rendering on live Quack for orders table
+            let order_cols = load_table_columns_for("target_db", "main", "orders", &conn, true);
+            let user_id_col = order_cols.iter().find(|c| c.name == "user_id").expect("user_id not found in orders");
+            assert!(user_id_col.is_fk, "user_id should be identified as foreign key");
+            assert_eq!(user_id_col.fk_target.as_deref(), Some("users.user_id"));
+
+            expanded_tables.insert("orders".to_string());
+            let nodes_with_orders = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, true);
+            let fk_node = nodes_with_orders.iter().find(|n| n.name == "user_id" && n.display.contains("[FK")).expect("user_id FK node not found");
+            assert!(fk_node.display.contains("🔗 user_id") && fk_node.display.contains("[FK -> users.user_id]"), "Expected FK icon and target, got: {}", fk_node.display);
+            println!("Verified live Quack Explorer FK rendering: {}", fk_node.display);
+
             let _ = std::fs::remove_dir_all(&temp_dir);
         }
     }
@@ -2930,4 +3022,65 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_explorer_fk_and_pk_column_rendering() {
+        // Direct test of format_column_display helper
+        assert_eq!(
+            format_column_display("  ", "id", "INTEGER", true, false, None),
+            "  └─ 🔑 id (INTEGER) [PK]"
+        );
+        assert_eq!(
+            format_column_display("  ", "parent_id", "INTEGER", false, true, Some("parent.id")),
+            "  └─ 🔗 parent_id (INTEGER) [FK -> parent.id]"
+        );
+        assert_eq!(
+            format_column_display("  ", "parent_id", "INTEGER", true, true, Some("parent.id")),
+            "  └─ 🔑🔗 parent_id (INTEGER) [PK, FK -> parent.id]"
+        );
+        assert_eq!(
+            format_column_display("  ", "name", "VARCHAR", false, false, None),
+            "  └─ name (VARCHAR)"
+        );
+
+        // Integration test with database catalog and rebuild_explorer_nodes
+        let temp_dir = std::env::temp_dir().join(format!("dp_fk_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE parent (id INT PRIMARY KEY, name VARCHAR);", []).unwrap();
+        conn.execute("CREATE TABLE child (child_id INT PRIMARY KEY, parent_id INT REFERENCES parent(id), data VARCHAR);", []).unwrap();
+        conn.execute("CREATE TABLE composite_child (parent_id INT REFERENCES parent(id), sub_id INT, PRIMARY KEY (parent_id, sub_id));", []).unwrap();
+
+        let meta = load_explorer_metadata(&conn, &temp_dir, false);
+        let mut expanded_groups = HashSet::new();
+        expanded_groups.insert("Tables".to_string());
+        let mut expanded_tables = HashSet::new();
+        expanded_tables.insert("child".to_string());
+        expanded_tables.insert("composite_child".to_string());
+
+        let nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
+
+        // Check child table columns
+        let child_pk = nodes.iter().find(|n| n.name == "child_id").expect("child_id not found");
+        assert!(child_pk.display.contains("🔑 child_id"), "Expected 🔑 for child_id: {}", child_pk.display);
+        assert!(child_pk.display.contains("[PK]"), "Expected [PK] for child_id: {}", child_pk.display);
+        assert!(!child_pk.display.contains("🔗"), "child_id should not have FK icon");
+
+        let parent_id_nodes: Vec<_> = nodes.iter().filter(|n| n.name == "parent_id").collect();
+        assert_eq!(parent_id_nodes.len(), 2, "Expected 2 parent_id columns (child and composite_child)");
+
+        let child_fk = parent_id_nodes[0];
+        assert!(child_fk.display.contains("🔗 parent_id"), "Expected 🔗 for parent_id in child: {}", child_fk.display);
+        assert!(child_fk.display.contains("[FK -> parent.id]"), "Expected [FK -> parent.id]: {}", child_fk.display);
+        assert!(!child_fk.display.contains("🔑"), "parent_id in child should not have PK icon");
+
+        // Check composite PK+FK table
+        let composite_fk = parent_id_nodes[1];
+        assert!(composite_fk.display.contains("🔑🔗 parent_id"), "Expected 🔑🔗 for composite parent_id: {}", composite_fk.display);
+        assert!(composite_fk.display.contains("[PK, FK -> parent.id]"), "Expected [PK, FK -> parent.id]: {}", composite_fk.display);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
+
