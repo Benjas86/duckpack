@@ -1853,8 +1853,9 @@ pub fn run_ide_loop(
                 active_tab.textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
                 let is_explicit_remote = is_remote_directive_query(&query_to_execute);
-                let (exec_query, is_paginatable) = if is_explicit_remote {
-                    wrap_remote_query(&query_to_execute)
+                let (exec_query, is_paginatable, is_mutation) = if is_explicit_remote {
+                    let (eq, is_pag) = wrap_remote_query(&query_to_execute);
+                    (eq, is_pag, false)
                 } else {
                     let mut clean_lower = query_to_execute.trim().to_lowercase();
                     loop {
@@ -1875,19 +1876,71 @@ pub fn run_ide_loop(
                         }
                     }
                     let is_pag = clean_lower.starts_with("select") || clean_lower.starts_with("with") || clean_lower.starts_with("values") || clean_lower.starts_with("from");
-                    (query_to_execute.clone(), is_pag)
-                };
-                
-                let final_query = if is_paginatable {
-                    active_tab.is_paginated = true;
-                    let clean_query = exec_query.trim().strip_suffix(';').unwrap_or(exec_query.trim());
-                    format!("SELECT * FROM ({}) LIMIT {} OFFSET {}", clean_query, active_tab.pagination_limit, active_tab.pagination_offset)
-                } else {
-                    active_tab.is_paginated = false;
-                    exec_query.clone()
+                    let is_mut = clean_lower.starts_with("insert")
+                        || clean_lower.starts_with("update")
+                        || clean_lower.starts_with("delete")
+                        || clean_lower.starts_with("create")
+                        || clean_lower.starts_with("drop")
+                        || clean_lower.starts_with("alter")
+                        || clean_lower.starts_with("truncate")
+                        || clean_lower.starts_with("attach")
+                        || clean_lower.starts_with("detach")
+                        || clean_lower.starts_with("use")
+                        || clean_lower.starts_with("set")
+                        || clean_lower.starts_with("reset")
+                        || clean_lower.starts_with("copy")
+                        || clean_lower.starts_with("checkpoint")
+                        || clean_lower.starts_with("vacuum");
+                    (query_to_execute.clone(), is_pag, is_mut)
                 };
 
-                match conn.prepare(&final_query) {
+                if is_mutation {
+                    active_tab.is_paginated = false;
+                    let start_time = std::time::Instant::now();
+                    match conn.execute_batch(&exec_query) {
+                        Ok(()) => {
+                            active_tab.query_results.clear();
+                            active_tab.column_names.clear();
+                            let elapsed = start_time.elapsed();
+
+                            let lower = query_to_execute.to_lowercase();
+                            let is_catalog_mutation = lower.contains("attach ")
+                                || lower.contains("detach ")
+                                || lower.contains("create ")
+                                || lower.contains("drop ")
+                                || lower.contains("alter ")
+                                || lower.contains("use ");
+                            if is_catalog_mutation {
+                                trigger_explorer_refresh = true;
+                            }
+                            status_msg = format!("Statement executed successfully in {:.2?}.", elapsed);
+
+                            let history_path = queries_dir.join(".history.sql");
+                            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            let history_entry = format!("-- Executed at {} (Took {:.2?})\n{};\n\n", timestamp, elapsed, query_to_execute.trim());
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(history_path) {
+                                let _ = f.write_all(history_entry.as_bytes());
+                            }
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            handle_sql_error_position(&mut tabs[active_tab_index].textarea, &err_str);
+                            let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
+                            status_msg = format!("Execution Error: {}{}", e, diag);
+                        }
+                    }
+                } else {
+                    let final_query = if is_paginatable {
+                        active_tab.is_paginated = true;
+                        let clean_query = exec_query.trim().strip_suffix(';').unwrap_or(exec_query.trim());
+                        format!("SELECT * FROM ({}) LIMIT {} OFFSET {}", clean_query, active_tab.pagination_limit, active_tab.pagination_offset)
+                    } else {
+                        active_tab.is_paginated = false;
+                        exec_query.clone()
+                    };
+
+                    match conn.prepare(&final_query) {
                     Ok(mut stmt) => {
                         let mut exec_rows = Vec::new();
                         let mut count = 0;
@@ -2061,6 +2114,7 @@ pub fn run_ide_loop(
                             status_msg = format!("Prepare Error: {}{}", e, diag);
                         }
                     }
+                }
                 }
             }
         }
@@ -2728,6 +2782,26 @@ mod tests {
             assert!(cols.iter().any(|c| c.0 == "column_a"));
 
             let _ = std::fs::remove_dir_all(&temp_dir);
+        }
+    }
+
+    #[test]
+    fn test_live_insert_users() {
+        let db_uri = "quack:0.0.0.0:9494";
+        let token = "your_quack_token_here";
+        if let Ok(conn) = crate::engine::connect_target_db(db_uri, Some(token), true) {
+            let _ = conn.execute_batch("DELETE FROM target_db.users WHERE user_id = 9999;");
+            let q = "insert into users values (9999, 'Test', 'User', '1900-01-01', 'test_user@example.com', now(), now(), True);";
+            
+            // Execute mutation via execute_batch
+            let res = conn.execute_batch(q);
+            assert!(res.is_ok(), "execute_batch failed: {:?}", res);
+
+            let count: i64 = conn.query_row("SELECT count(*) FROM target_db.users WHERE user_id = 9999;", [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1, "Expected exactly 1 row inserted, got {}", count);
+            println!("Verified: Exactly 1 row inserted via execute_batch for users!");
+
+            let _ = conn.execute_batch("DELETE FROM target_db.users WHERE user_id = 9999;");
         }
     }
 
