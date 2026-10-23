@@ -311,9 +311,11 @@ pub fn load_explorer_metadata(
             |r| r.get(0),
         )
         .unwrap_or_else(|_| "memory".to_string())
+    } else if is_quack {
+        "target_db".to_string()
     } else {
         conn.query_row("SELECT current_database();", [], |r| r.get(0))
-            .unwrap_or_else(|_| if is_quack { "target_db".to_string() } else { "memory".to_string() })
+            .unwrap_or_else(|_| "memory".to_string())
     };
 
     let mut raw_dbs: Vec<(String, String, Option<String>, bool)> = Vec::new();

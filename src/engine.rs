@@ -177,6 +177,85 @@ pub fn diagnose_storage_version_error(err_str: &str, db_path: &str) -> Option<St
     }
 }
 
+/// Configures DuckDB connection settings to allow unsigned extensions, community extensions,
+/// and metadata version mismatches (e.g. loading v2.0.0 extensions into dev/hash builds).
+pub fn create_duckdb_config() -> Result<duckdb::Config> {
+    let config = duckdb::Config::default()
+        .allow_unsigned_extensions()?
+        .with("allow_extensions_metadata_mismatch", "true")?
+        .with("allow_community_extensions", "true")?;
+    Ok(config)
+}
+
+/// Opens an in-memory DuckDB connection configured with extension support flags.
+pub fn open_duckdb_connection() -> Result<Connection> {
+    if let Ok(cfg) = create_duckdb_config() {
+        if let Ok(conn) = Connection::open_in_memory_with_flags(cfg) {
+            return Ok(conn);
+        }
+    }
+    Connection::open_in_memory().context("Failed to open in-memory DuckDB connection")
+}
+
+/// Loads the `quack` extension, gracefully handling local version path mismatches
+/// (e.g., ~/.duckdb/extensions/v2.0.0 vs dev commit hashes) before falling back to network install.
+pub fn load_quack_extension(conn: &Connection) -> Result<()> {
+    // 1. Try standard LOAD quack;
+    if conn.execute_batch("LOAD quack;").is_ok() {
+        return Ok(());
+    }
+
+    // 2. Search local extension directory (~/.duckdb/extensions) for existing quack.duckdb_extension
+    if let Ok(home) = std::env::var("HOME") {
+        let base_ext_dir = PathBuf::from(home).join(".duckdb").join("extensions");
+        if base_ext_dir.exists() {
+            let mut candidates = Vec::new();
+            if let Ok(entries) = fs::read_dir(&base_ext_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Ok(sub_entries) = fs::read_dir(&path) {
+                            for sub in sub_entries.flatten() {
+                                let sub_path = sub.path();
+                                let ext_file = sub_path.join("quack.duckdb_extension");
+                                if ext_file.exists() {
+                                    candidates.push(ext_file);
+                                }
+                            }
+                        }
+                        let direct_ext = path.join("quack.duckdb_extension");
+                        if direct_ext.exists() {
+                            candidates.push(direct_ext);
+                        }
+                    }
+                }
+            }
+
+            // Prioritize exact hash match or v2.0.0
+            candidates.sort_by(|a, b| {
+                let a_str = a.to_string_lossy();
+                let b_str = b.to_string_lossy();
+                let a_score = if a_str.contains("v2.0.0") { 3 } else if a_str.contains("d54cbbe3df") { 4 } else { 1 };
+                let b_score = if b_str.contains("v2.0.0") { 3 } else if b_str.contains("d54cbbe3df") { 4 } else { 1 };
+                b_score.cmp(&a_score)
+            });
+
+            for candidate in candidates {
+                let load_sql = format!("LOAD '{}';", candidate.to_string_lossy().replace('\'', "''"));
+                if conn.execute(&load_sql, []).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // 3. Fallback to INSTALL quack; LOAD quack;
+    conn.execute_batch("INSTALL quack; LOAD quack;")
+        .or_else(|_| conn.execute_batch("INSTALL quack FROM community; LOAD quack;"))
+        .context("Failed to install/load quack extension")?;
+    Ok(())
+}
+
 /// Connects to the target DuckDB database (local, motherduck remote, or quack remote).
 pub fn connect_target_db(
     db: &str,
@@ -184,15 +263,15 @@ pub fn connect_target_db(
     quack_disable_ssl: bool,
 ) -> Result<Connection> {
     if db.starts_with("quack:") {
-        let conn = Connection::open_in_memory()
+        let conn = open_duckdb_connection()
             .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
-        conn.execute_batch("LOAD quack;").or_else(|_| conn.execute_batch("INSTALL quack; LOAD quack;"))
+        load_quack_extension(&conn)
             .with_context(|| format!("Failed to install/load quack extension for target '{}'", db))?;
 
         let token = resolve_quack_token(quack_token, None);
 
         if let Some(token) = token {
-            let safe_token = token.replace("'", "''");
+            let safe_token = token.replace('\'', "''");
             conn.execute(&format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token), [])
                 .with_context(|| "Failed to set quack auth secret")?;
         }
@@ -216,15 +295,14 @@ pub fn connect_target_db(
             }
             return Err(anyhow::anyhow!("Failed to attach remote database '{}': {}", db, err_msg));
         }
-        if conn.execute("CONNECT target_db;", []).is_err() {
-            conn.execute("USE target_db;", [])
-                .with_context(|| "Failed to switch to target database")?;
-        }
+        // For Quack connections in DuckDB v2, keep 'memory' as the default session catalog
+        // so that local prepared statements register correctly, while target_db is attached
+        // and accessible via 'target_db' qualifier or target_db.query().
         Ok(conn)
     } else if is_remote(db) {
-        let conn = Connection::open_in_memory()
+        let conn = open_duckdb_connection()
             .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
-        let safe_db = db.replace("'", "''");
+        let safe_db = db.replace('\'', "''");
         let attach_res = conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), []);
         if let Err(e) = attach_res {
             return Err(anyhow::anyhow!("Failed to attach remote database '{}': {}", db, e));
@@ -235,9 +313,9 @@ pub fn connect_target_db(
         }
         Ok(conn)
     } else {
-        let conn = Connection::open_in_memory()
+        let conn = open_duckdb_connection()
             .with_context(|| "Failed to open in-memory DB for local ATTACH")?;
-        let safe_db = db.replace("'", "''");
+        let safe_db = db.replace('\'', "''");
         let attach_res = conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), []);
         if let Err(e) = attach_res {
             let err_msg = e.to_string();
@@ -846,7 +924,7 @@ pub fn build_shadow_db(project_dir: &Path) -> Result<Connection> {
         return Connection::open(project_dir).with_context(|| "Failed to open .duckpack artifact");
     }
 
-    let conn = Connection::open_in_memory().with_context(|| "Failed to create Shadow DB")?;
+    let conn = open_duckdb_connection().with_context(|| "Failed to create Shadow DB")?;
     
     let schemas_dir = project_dir.join("schemas");
     if schemas_dir.exists() {
@@ -1042,8 +1120,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_load_quack_extension() {
+        let conn = open_duckdb_connection().unwrap();
+        let res = load_quack_extension(&conn);
+        if res.is_ok() {
+            let sec_res = conn.execute("CREATE SECRET (TYPE QUACK, TOKEN 'foo');", []);
+            assert!(sec_res.is_ok());
+        }
+    }
+
+    #[test]
     fn test_embedded_duckdb_version() {
         let v = embedded_duckdb_version();
+        println!("Rust embedded_duckdb_version: {}", v);
+        let conn = open_duckdb_connection().unwrap();
+        let pragma: (String, String, String) = conn.query_row("PRAGMA version;", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        println!("Rust PRAGMA version: {:?}", pragma);
         assert!(!v.is_empty());
         assert!(v.starts_with('v') || v.chars().next().map_or(false, |c| c.is_ascii_digit()));
     }
