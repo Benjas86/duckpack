@@ -1,11 +1,7 @@
 use std::path::Path;
 
 /// Unified regex pattern for highlighting standard DuckDB SQL keywords in the IDE editor.
-pub const SQL_KEYWORD_PATTERN: &str = 
-    "(?i)\\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|JOIN|ON|GROUP BY|ORDER BY|LIMIT|\
-    CREATE|TABLE|DROP|ALTER|VALUES|AND|OR|NOT|AS|IN|IS|NULL|SET|INTO|VIEW|INDEX|\
-    SHOW|PRAGMA|DESCRIBE|ATTACH|USE|MACRO|TRIGGER|CONNECT|DISCONNECT|VARIANT|\
-    RETURNING|APPROX|MATERIALIZED)\\b";
+pub use crate::syntax::SQL_KEYWORD_PATTERN;
 
 /// Checks if a SQL query includes a `-- @remote` or `-- [remote]` directive.
 pub fn is_remote_directive_query(query: &str) -> bool {
