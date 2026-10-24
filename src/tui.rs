@@ -30,7 +30,7 @@ pub enum TuiAction {
 /// Recalculates the locked state of all diff items based on their dependencies.
 /// If a parent item (like a CREATE TABLE) is deselected, dependent items (like ALTER TABLE or INSERT)
 /// are automatically locked and deselected to prevent invalid SQL execution.
-fn recompute_locks(items: &mut Vec<DiffItem>) {
+pub(crate) fn recompute_locks(items: &mut Vec<DiffItem>) {
     for item in items.iter_mut() {
         item.locked = false;
     }

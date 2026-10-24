@@ -39,6 +39,7 @@ pub(crate) enum ProjectCategory {
     Table,
     View,
     Macro,
+    Trigger,
     Query,
     Seed,
     Config,
@@ -84,7 +85,7 @@ fn format_column_display(
 #[derive(Clone, Debug)]
 pub(crate) struct NewAssetModalState {
     pub(crate) is_open: bool,
-    pub(crate) category_index: usize, // 0: Table, 1: View, 2: Macro, 3: Schema, 4: Query
+    pub(crate) category_index: usize, // 0: Table, 1: View, 2: Macro, 3: Trigger, 4: Schema, 5: Query, 6: Seed
     pub(crate) name: String,
     pub(crate) active_field: usize, // 0: category, 1: name, 2: create, 3: cancel
     pub(crate) error_msg: Option<String>,
@@ -114,8 +115,10 @@ impl NewAssetModalState {
             0 => ProjectCategory::Table,
             1 => ProjectCategory::View,
             2 => ProjectCategory::Macro,
-            3 => ProjectCategory::Schema,
-            _ => ProjectCategory::Query,
+            3 => ProjectCategory::Trigger,
+            4 => ProjectCategory::Schema,
+            5 => ProjectCategory::Query,
+            _ => ProjectCategory::Seed,
         }
     }
 
@@ -124,8 +127,10 @@ impl NewAssetModalState {
             0 => "Table",
             1 => "View",
             2 => "Macro",
-            3 => "Schema",
-            _ => "Query",
+            3 => "Trigger",
+            4 => "Schema",
+            5 => "Query",
+            _ => "Seed",
         }
     }
 }
@@ -159,7 +164,7 @@ impl InIdeDiffModalState {
 
 /// Generates starting DDL boilerplate for newly scaffolded project assets.
 pub(crate) fn generate_asset_boilerplate(category: ProjectCategory, name: &str) -> String {
-    let clean = name.trim().trim_end_matches(".sql");
+    let clean = name.trim().trim_end_matches(".sql").trim_end_matches(".csv");
     match category {
         ProjectCategory::Table => format!(
             "-- Table: {}\nCREATE TABLE {} (\n    id INTEGER PRIMARY KEY,\n    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n);\n",
@@ -173,6 +178,10 @@ pub(crate) fn generate_asset_boilerplate(category: ProjectCategory, name: &str) 
             "-- Macro: {}\nCREATE MACRO {}(val) AS val;\n",
             clean, clean
         ),
+        ProjectCategory::Trigger => format!(
+            "-- Trigger: {}\nCREATE OR REPLACE TRIGGER {}\nAFTER INSERT ON <target_table>\nFOR EACH ROW\nEXECUTE FUNCTION <func_name>();\n",
+            clean, clean
+        ),
         ProjectCategory::Schema => format!(
             "-- Schema: {}\nCREATE SCHEMA IF NOT EXISTS {};\n",
             clean, clean
@@ -181,6 +190,9 @@ pub(crate) fn generate_asset_boilerplate(category: ProjectCategory, name: &str) 
             "-- Query: {}\nSELECT 1;\n",
             clean
         ),
+        ProjectCategory::Seed => format!(
+            "id,name,value\n1,sample,100\n"
+        ),
         _ => String::new(),
     }
 }
@@ -188,7 +200,11 @@ pub(crate) fn generate_asset_boilerplate(category: ProjectCategory, name: &str) 
 /// Computes the disk file path for a project asset category and name.
 pub(crate) fn get_asset_file_path(project_dir: &Path, category: ProjectCategory, name: &str) -> PathBuf {
     let mut clean_name = name.trim().to_string();
-    if !clean_name.ends_with(".sql") {
+    if category == ProjectCategory::Seed {
+        if !clean_name.contains('.') {
+            clean_name.push_str(".csv");
+        }
+    } else if !clean_name.ends_with(".sql") {
         clean_name.push_str(".sql");
     }
     let sub = match category {
@@ -196,6 +212,7 @@ pub(crate) fn get_asset_file_path(project_dir: &Path, category: ProjectCategory,
         ProjectCategory::Table => "tables",
         ProjectCategory::View => "views",
         ProjectCategory::Macro => "macros",
+        ProjectCategory::Trigger => "triggers",
         ProjectCategory::Query => "queries",
         ProjectCategory::Seed => "seeds",
         ProjectCategory::Config => "",
@@ -361,17 +378,28 @@ pub(crate) fn rebuild_project_nodes(
         node_type: NodeType::Group,
     });
     if is_schemas_expanded {
-        for p in &schemas {
-            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+        if schemas.is_empty() {
             items.push(ExplorerNode {
-                name: fname.clone(),
-                display: format!("  ├─ {}{}", fname, badge),
+                name: "proj:schemas:empty".to_string(),
+                display: "  └─ (empty - press 'a' to add)".to_string(),
                 level: 1,
                 is_expandable: false,
                 is_expanded: false,
-                node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Schema },
+                node_type: NodeType::Group,
             });
+        } else {
+            for p in &schemas {
+                let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+                items.push(ExplorerNode {
+                    name: fname.clone(),
+                    display: format!("  ├─ {}{}", fname, badge),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Schema },
+                });
+            }
         }
     }
 
@@ -387,17 +415,28 @@ pub(crate) fn rebuild_project_nodes(
         node_type: NodeType::Group,
     });
     if is_tables_expanded {
-        for p in &tables {
-            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+        if tables.is_empty() {
             items.push(ExplorerNode {
-                name: fname.clone(),
-                display: format!("  ├─ {}{}", fname, badge),
+                name: "proj:tables:empty".to_string(),
+                display: "  └─ (empty - press 'a' to add)".to_string(),
                 level: 1,
                 is_expandable: false,
                 is_expanded: false,
-                node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Table },
+                node_type: NodeType::Group,
             });
+        } else {
+            for p in &tables {
+                let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+                items.push(ExplorerNode {
+                    name: fname.clone(),
+                    display: format!("  ├─ {}{}", fname, badge),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Table },
+                });
+            }
         }
     }
 
@@ -413,17 +452,28 @@ pub(crate) fn rebuild_project_nodes(
         node_type: NodeType::Group,
     });
     if is_views_expanded {
-        for p in &views {
-            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+        if views.is_empty() {
             items.push(ExplorerNode {
-                name: fname.clone(),
-                display: format!("  ├─ {}{}", fname, badge),
+                name: "proj:views:empty".to_string(),
+                display: "  └─ (empty - press 'a' to add)".to_string(),
                 level: 1,
                 is_expandable: false,
                 is_expanded: false,
-                node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::View },
+                node_type: NodeType::Group,
             });
+        } else {
+            for p in &views {
+                let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+                items.push(ExplorerNode {
+                    name: fname.clone(),
+                    display: format!("  ├─ {}{}", fname, badge),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::View },
+                });
+            }
         }
     }
 
@@ -439,21 +489,69 @@ pub(crate) fn rebuild_project_nodes(
         node_type: NodeType::Group,
     });
     if is_macros_expanded {
-        for p in &macros {
-            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+        if macros.is_empty() {
             items.push(ExplorerNode {
-                name: fname.clone(),
-                display: format!("  ├─ {}{}", fname, badge),
+                name: "proj:macros:empty".to_string(),
+                display: "  └─ (empty - press 'a' to add)".to_string(),
                 level: 1,
                 is_expandable: false,
                 is_expanded: false,
-                node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Macro },
+                node_type: NodeType::Group,
             });
+        } else {
+            for p in &macros {
+                let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+                items.push(ExplorerNode {
+                    name: fname.clone(),
+                    display: format!("  ├─ {}{}", fname, badge),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Macro },
+                });
+            }
         }
     }
 
-    // 5. Queries
+    // 5. Triggers
+    let triggers = scan_dir("triggers", Some("sql"));
+    let is_triggers_expanded = expanded_groups.contains("proj:triggers");
+    items.push(ExplorerNode {
+        name: "proj:triggers".to_string(),
+        display: format!("⚡ Triggers ({})", triggers.len()),
+        level: 0,
+        is_expandable: true,
+        is_expanded: is_triggers_expanded,
+        node_type: NodeType::Group,
+    });
+    if is_triggers_expanded {
+        if triggers.is_empty() {
+            items.push(ExplorerNode {
+                name: "proj:triggers:empty".to_string(),
+                display: "  └─ (empty - press 'a' to add)".to_string(),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::Group,
+            });
+        } else {
+            for p in &triggers {
+                let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+                items.push(ExplorerNode {
+                    name: fname.clone(),
+                    display: format!("  ├─ {}{}", fname, badge),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Trigger },
+                });
+            }
+        }
+    }
+
+    // 6. Queries
     let queries = scan_dir("queries", Some("sql"));
     let is_queries_expanded = expanded_groups.contains("proj:queries");
     items.push(ExplorerNode {
@@ -465,33 +563,53 @@ pub(crate) fn rebuild_project_nodes(
         node_type: NodeType::Group,
     });
     if is_queries_expanded {
-        for p in &queries {
-            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+        if queries.is_empty() {
             items.push(ExplorerNode {
-                name: fname.clone(),
-                display: format!("  ├─ {}{}", fname, badge),
+                name: "proj:queries:empty".to_string(),
+                display: "  └─ (empty - press 'a' to add)".to_string(),
                 level: 1,
                 is_expandable: false,
                 is_expanded: false,
-                node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Query },
+                node_type: NodeType::Group,
             });
+        } else {
+            for p in &queries {
+                let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+                items.push(ExplorerNode {
+                    name: fname.clone(),
+                    display: format!("  ├─ {}{}", fname, badge),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Query },
+                });
+            }
         }
     }
 
-    // 6. Seeds
+    // 7. Seeds
     let seeds = scan_dir("seeds", None);
-    if !seeds.is_empty() {
-        let is_seeds_expanded = expanded_groups.contains("proj:seeds");
-        items.push(ExplorerNode {
-            name: "proj:seeds".to_string(),
-            display: format!("🌱 Seeds ({})", seeds.len()),
-            level: 0,
-            is_expandable: true,
-            is_expanded: is_seeds_expanded,
-            node_type: NodeType::Group,
-        });
-        if is_seeds_expanded {
+    let is_seeds_expanded = expanded_groups.contains("proj:seeds");
+    items.push(ExplorerNode {
+        name: "proj:seeds".to_string(),
+        display: format!("🌱 Seeds ({})", seeds.len()),
+        level: 0,
+        is_expandable: true,
+        is_expanded: is_seeds_expanded,
+        node_type: NodeType::Group,
+    });
+    if is_seeds_expanded {
+        if seeds.is_empty() {
+            items.push(ExplorerNode {
+                name: "proj:seeds:empty".to_string(),
+                display: "  └─ (empty - press 'a' to add)".to_string(),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::Group,
+            });
+        } else {
             for p in &seeds {
                 let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
                 let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
@@ -1176,7 +1294,7 @@ pub fn run_ide_loop(
     let mut explorer_mode = ExplorerMode::Database;
     let (mut git_branch, mut git_status) = get_git_branch_and_status(project_dir);
     let mut expanded_project_groups: HashSet<String> = vec![
-        "proj:schemas", "proj:tables", "proj:views", "proj:macros", "proj:queries", "proj:seeds"
+        "proj:schemas", "proj:tables", "proj:views", "proj:macros", "proj:triggers", "proj:queries", "proj:seeds"
     ].into_iter().map(|s| s.to_string()).collect();
 
     let mut new_asset_modal = NewAssetModalState::new();
@@ -1716,8 +1834,8 @@ pub fn run_ide_loop(
                     .split(inner_area);
 
                 if let Some(ref diff) = in_ide_diff_modal.diff_result {
-                    let active_items: Vec<_> = diff.items.iter().filter(|i| !i.ignored).collect();
-                    if active_items.is_empty() {
+                    let active_indices: Vec<usize> = diff.items.iter().enumerate().filter(|(_, i)| !i.ignored).map(|(idx, _)| idx).collect();
+                    if active_indices.is_empty() {
                         let msg = Paragraph::new("\n  ✨ Target database catalog is completely up to date with project files!\n\n  No pending migrations or schema changes detected.")
                             .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
                         f.render_widget(msg, diff_layout[1]);
@@ -1725,11 +1843,13 @@ pub fn run_ide_loop(
                         let close_btn = Line::from(Span::styled(" [ Close (Esc) ] ", Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)));
                         f.render_widget(Paragraph::new(close_btn).alignment(Alignment::Center), diff_layout[3]);
                     } else {
-                        let summary_text = format!(" Found {} pending declarative change(s) between project files and database:", active_items.len());
+                        let selected_count = active_indices.iter().filter(|&&idx| diff.items[idx].selected && !diff.items[idx].locked).count();
+                        let summary_text = format!(" Found {} pending declarative change(s) ({} selected):", active_indices.len(), selected_count);
                         f.render_widget(Paragraph::new(summary_text).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)), diff_layout[0]);
 
-                        let list_lines: Vec<Line> = active_items.iter().enumerate().map(|(idx, item)| {
-                            let (badge, style) = match item.item_type {
+                        let list_lines: Vec<Line> = active_indices.iter().enumerate().map(|(pos, &real_idx)| {
+                            let item = &diff.items[real_idx];
+                            let (badge, badge_style) = match item.item_type {
                                 crate::diff::DiffItemType::CreateTable | crate::diff::DiffItemType::CreateSchema | crate::diff::DiffItemType::CreateView | crate::diff::DiffItemType::CreateMacro | crate::diff::DiffItemType::CreateTrigger => {
                                     ("[+]", Style::default().fg(Color::Green))
                                 }
@@ -1743,28 +1863,67 @@ pub fn run_ide_loop(
                                     ("[-]", Style::default().fg(Color::Red))
                                 }
                             };
-                            let cursor = if idx == in_ide_diff_modal.selected_index { "▶ " } else { "  " };
+                            let cursor = if pos == in_ide_diff_modal.selected_index { "▶ " } else { "  " };
+                            let (checkbox, item_style) = if item.locked {
+                                (
+                                    Span::styled("[L] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                                    Style::default().fg(Color::Red).add_modifier(Modifier::CROSSED_OUT),
+                                )
+                            } else if item.selected {
+                                (
+                                    Span::styled("[x] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                                    badge_style,
+                                )
+                            } else {
+                                (
+                                    Span::styled("[ ] ", Style::default().fg(Color::DarkGray)),
+                                    Style::default().fg(Color::DarkGray),
+                                )
+                            };
+
                             Line::from(vec![
                                 Span::styled(cursor, Style::default().fg(Color::Yellow)),
-                                Span::styled(format!("{} ", badge), style.add_modifier(Modifier::BOLD)),
-                                Span::raw(format!("{:?}: {}", item.item_type, item.obj_name)),
+                                checkbox,
+                                Span::styled(format!("{} ", badge), item_style.add_modifier(Modifier::BOLD)),
+                                Span::styled(
+                                    format!("{:?}: {}", item.item_type, item.obj_name),
+                                    if item.locked {
+                                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT)
+                                    } else if !item.selected {
+                                        Style::default().fg(Color::DarkGray)
+                                    } else {
+                                        Style::default()
+                                    },
+                                ),
                             ])
                         }).collect();
 
+                        let visible_height = diff_layout[1].height.saturating_sub(2) as usize;
+                        let scroll_top = if in_ide_diff_modal.selected_index >= visible_height {
+                            (in_ide_diff_modal.selected_index + 1).saturating_sub(visible_height)
+                        } else {
+                            0
+                        };
+
                         let changes_list = Paragraph::new(list_lines)
+                            .scroll((scroll_top as u16, 0))
                             .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Pending Changes "));
                         f.render_widget(changes_list, diff_layout[1]);
 
                         if let Some(ref err) = in_ide_diff_modal.error_msg {
                             f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), diff_layout[2]);
                         } else {
-                            f.render_widget(Paragraph::new("  Enter: Apply All Changes | Esc: Close without Applying").style(Style::default().fg(Color::DarkGray)), diff_layout[2]);
+                            f.render_widget(Paragraph::new("  Space: Toggle Selection | a: Toggle All | Enter: Apply Selected | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), diff_layout[2]);
                         }
 
-                        let apply_btn_style = Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD);
+                        let apply_btn_style = if selected_count > 0 {
+                            Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().bg(Color::DarkGray).fg(Color::Gray)
+                        };
                         let close_btn_style = Style::default().fg(Color::DarkGray);
                         let buttons = Line::from(vec![
-                            Span::styled(format!(" [ Apply All {} Change(s) (Enter) ] ", active_items.len()), apply_btn_style),
+                            Span::styled(format!(" [ Apply {} Selected Change(s) (Enter) ] ", selected_count), apply_btn_style),
                             Span::raw("    "),
                             Span::styled(" [ Cancel (Esc) ] ", close_btn_style),
                         ]);
@@ -2025,11 +2184,11 @@ pub fn run_ide_loop(
                         new_asset_modal.active_field = if new_asset_modal.active_field == 0 { 3 } else { new_asset_modal.active_field - 1 };
                     } else if key.code == KeyCode::Left || key.code == KeyCode::Char('h') {
                         if new_asset_modal.active_field == 0 {
-                            new_asset_modal.category_index = if new_asset_modal.category_index == 0 { 4 } else { new_asset_modal.category_index - 1 };
+                            new_asset_modal.category_index = if new_asset_modal.category_index == 0 { 6 } else { new_asset_modal.category_index - 1 };
                         }
                     } else if key.code == KeyCode::Right || key.code == KeyCode::Char('l') {
                         if new_asset_modal.active_field == 0 {
-                            new_asset_modal.category_index = (new_asset_modal.category_index + 1) % 5;
+                            new_asset_modal.category_index = (new_asset_modal.category_index + 1) % 7;
                         }
                     } else if key.code == KeyCode::Backspace {
                         if new_asset_modal.active_field == 1 {
@@ -2091,22 +2250,55 @@ pub fn run_ide_loop(
                 } else if in_ide_diff_modal.is_open {
                     if key.code == KeyCode::Esc {
                         in_ide_diff_modal.is_open = false;
+                    } else if key.code == KeyCode::Char(' ') {
+                        if let Some(ref mut diff) = in_ide_diff_modal.diff_result {
+                            let active_indices: Vec<usize> = diff.items.iter().enumerate().filter(|(_, i)| !i.ignored).map(|(idx, _)| idx).collect();
+                            if in_ide_diff_modal.selected_index < active_indices.len() {
+                                let real_idx = active_indices[in_ide_diff_modal.selected_index];
+                                if !diff.items[real_idx].locked && !diff.items[real_idx].ignored {
+                                    diff.items[real_idx].selected = !diff.items[real_idx].selected;
+                                    crate::tui::recompute_locks(&mut diff.items);
+                                    in_ide_diff_modal.error_msg = None;
+                                } else if diff.items[real_idx].locked {
+                                    in_ide_diff_modal.error_msg = Some(format!(
+                                        "Cannot select '{}': dependent on a deselected item.",
+                                        diff.items[real_idx].obj_name
+                                    ));
+                                }
+                            }
+                        }
+                    } else if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
+                        if let Some(ref mut diff) = in_ide_diff_modal.diff_result {
+                            let any_unselected = diff.items.iter().any(|i| !i.ignored && !i.locked && !i.selected);
+                            for item in diff.items.iter_mut() {
+                                if !item.ignored {
+                                    item.selected = any_unselected;
+                                }
+                            }
+                            crate::tui::recompute_locks(&mut diff.items);
+                            in_ide_diff_modal.error_msg = None;
+                        }
                     } else if key.code == KeyCode::Enter {
                         if let Some(ref diff) = in_ide_diff_modal.diff_result {
-                            let unignored_count = diff.items.iter().filter(|i| !i.ignored).count();
-                            if unignored_count > 0 {
-                                match apply_ide_diff(project_dir, conn, diff) {
-                                    Ok(_) => {
-                                        status_msg = format!("✓ Applied {} declarative change(s) to target catalog successfully!", unignored_count);
-                                        in_ide_diff_modal.is_open = false;
-                                        trigger_explorer_refresh = true;
-                                    }
-                                    Err(e) => {
-                                        in_ide_diff_modal.error_msg = Some(format!("Apply Error: {}", e));
-                                    }
-                                }
-                            } else {
+                            let active_indices: Vec<usize> = diff.items.iter().enumerate().filter(|(_, i)| !i.ignored).map(|(idx, _)| idx).collect();
+                            if active_indices.is_empty() {
                                 in_ide_diff_modal.is_open = false;
+                            } else {
+                                let selected_count = active_indices.iter().filter(|&&idx| diff.items[idx].selected && !diff.items[idx].locked).count();
+                                if selected_count > 0 {
+                                    match apply_ide_diff(project_dir, conn, diff) {
+                                        Ok(_) => {
+                                            status_msg = format!("✓ Applied {} selected change(s) to target catalog successfully!", selected_count);
+                                            in_ide_diff_modal.is_open = false;
+                                            trigger_explorer_refresh = true;
+                                        }
+                                        Err(e) => {
+                                            in_ide_diff_modal.error_msg = Some(format!("Apply Error: {}", e));
+                                        }
+                                    }
+                                } else {
+                                    in_ide_diff_modal.error_msg = Some("No changes selected to apply. Press Space to select changes or Esc to cancel.".to_string());
+                                }
                             }
                         } else {
                             in_ide_diff_modal.is_open = false;
@@ -2485,16 +2677,20 @@ pub fn run_ide_loop(
                                                 if name.contains("tables") { new_asset_modal.category_index = 0; }
                                                 else if name.contains("views") { new_asset_modal.category_index = 1; }
                                                 else if name.contains("macros") { new_asset_modal.category_index = 2; }
-                                                else if name.contains("schemas") { new_asset_modal.category_index = 3; }
-                                                else if name.contains("queries") { new_asset_modal.category_index = 4; }
+                                                else if name.contains("triggers") { new_asset_modal.category_index = 3; }
+                                                else if name.contains("schemas") { new_asset_modal.category_index = 4; }
+                                                else if name.contains("queries") { new_asset_modal.category_index = 5; }
+                                                else if name.contains("seeds") { new_asset_modal.category_index = 6; }
                                             }
                                             NodeType::ProjectFile { category, .. } => {
                                                 match category {
                                                     ProjectCategory::Table => new_asset_modal.category_index = 0,
                                                     ProjectCategory::View => new_asset_modal.category_index = 1,
                                                     ProjectCategory::Macro => new_asset_modal.category_index = 2,
-                                                    ProjectCategory::Schema => new_asset_modal.category_index = 3,
-                                                    ProjectCategory::Query => new_asset_modal.category_index = 4,
+                                                    ProjectCategory::Trigger => new_asset_modal.category_index = 3,
+                                                    ProjectCategory::Schema => new_asset_modal.category_index = 4,
+                                                    ProjectCategory::Query => new_asset_modal.category_index = 5,
+                                                    ProjectCategory::Seed => new_asset_modal.category_index = 6,
                                                     _ => {}
                                                 }
                                             }
@@ -3162,13 +3358,24 @@ pub fn run_ide_loop(
                         }
                         NodeType::Group => {
                             if explorer_mode == ExplorerMode::Project {
-                                if expanded_project_groups.contains(&item_name) {
-                                    expanded_project_groups.remove(&item_name);
+                                if item_name.ends_with(":empty") {
+                                    new_asset_modal.reset();
+                                    if item_name.contains("tables") { new_asset_modal.category_index = 0; }
+                                    else if item_name.contains("views") { new_asset_modal.category_index = 1; }
+                                    else if item_name.contains("macros") { new_asset_modal.category_index = 2; }
+                                    else if item_name.contains("triggers") { new_asset_modal.category_index = 3; }
+                                    else if item_name.contains("schemas") { new_asset_modal.category_index = 4; }
+                                    else if item_name.contains("queries") { new_asset_modal.category_index = 5; }
+                                    else if item_name.contains("seeds") { new_asset_modal.category_index = 6; }
                                 } else {
-                                    expanded_project_groups.insert(item_name);
+                                    if expanded_project_groups.contains(&item_name) {
+                                        expanded_project_groups.remove(&item_name);
+                                    } else {
+                                        expanded_project_groups.insert(item_name);
+                                    }
+                                    explorer_items = rebuild_project_nodes(project_dir, &expanded_project_groups, &git_status);
+                                    explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                                 }
-                                explorer_items = rebuild_project_nodes(project_dir, &expanded_project_groups, &git_status);
-                                explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                             } else {
                                 if expanded_groups.contains(&item_name) {
                                     expanded_groups.remove(&item_name);
@@ -4063,12 +4270,20 @@ mod tests {
         assert_eq!(modal.category_label(), "Macro");
 
         modal.category_index = 3;
+        assert_eq!(modal.current_category(), ProjectCategory::Trigger);
+        assert_eq!(modal.category_label(), "Trigger");
+
+        modal.category_index = 4;
         assert_eq!(modal.current_category(), ProjectCategory::Schema);
         assert_eq!(modal.category_label(), "Schema");
 
-        modal.category_index = 4;
+        modal.category_index = 5;
         assert_eq!(modal.current_category(), ProjectCategory::Query);
         assert_eq!(modal.category_label(), "Query");
+
+        modal.category_index = 6;
+        assert_eq!(modal.current_category(), ProjectCategory::Seed);
+        assert_eq!(modal.category_label(), "Seed");
     }
 
     #[test]
@@ -4083,11 +4298,18 @@ mod tests {
         let macro_sql = generate_asset_boilerplate(ProjectCategory::Macro, "to_cents");
         assert!(macro_sql.contains("CREATE MACRO to_cents(val)"));
 
+        let trigger_sql = generate_asset_boilerplate(ProjectCategory::Trigger, "trg_audit");
+        assert!(trigger_sql.contains("CREATE OR REPLACE TRIGGER trg_audit"));
+        assert!(trigger_sql.contains("FOR EACH ROW"));
+
         let schema_sql = generate_asset_boilerplate(ProjectCategory::Schema, "analytics");
         assert!(schema_sql.contains("CREATE SCHEMA IF NOT EXISTS analytics"));
 
         let query_sql = generate_asset_boilerplate(ProjectCategory::Query, "adhoc_report");
         assert!(query_sql.contains("SELECT 1;"));
+
+        let seed_data = generate_asset_boilerplate(ProjectCategory::Seed, "sample_data");
+        assert!(seed_data.contains("id,name,value"));
     }
 
     #[test]
@@ -4110,12 +4332,16 @@ mod tests {
             root.join("macros").join("my_macro.sql")
         );
         assert_eq!(
+            get_asset_file_path(&root, ProjectCategory::Trigger, "orders_audit"),
+            root.join("triggers").join("orders_audit.sql")
+        );
+        assert_eq!(
             get_asset_file_path(&root, ProjectCategory::Query, "analysis"),
             root.join("queries").join("analysis.sql")
         );
         assert_eq!(
             get_asset_file_path(&root, ProjectCategory::Seed, "countries"),
-            root.join("seeds").join("countries.sql")
+            root.join("seeds").join("countries.csv")
         );
     }
 
@@ -4141,6 +4367,7 @@ mod tests {
         let mut expanded = HashSet::new();
         expanded.insert("proj:tables".to_string());
         expanded.insert("proj:views".to_string());
+        expanded.insert("proj:triggers".to_string()); // triggers directory doesn't exist on disk
 
         let nodes = rebuild_project_nodes(&temp_dir, &expanded, &git_status);
 
@@ -4159,6 +4386,14 @@ mod tests {
         // Verify v_users.sql with [+] badge
         let view_node = nodes.iter().find(|n| n.name == "v_users.sql").expect("v_users.sql node not found");
         assert!(view_node.display.contains("[+]"));
+
+        // Verify triggers group is present even though triggers/ dir did not exist
+        let trigger_group = nodes.iter().find(|n| n.name == "proj:triggers").expect("proj:triggers group not found");
+        assert!(trigger_group.display.contains("Triggers (0)"));
+
+        // Verify triggers empty placeholder node is present
+        let empty_trigger_node = nodes.iter().find(|n| n.name == "proj:triggers:empty").expect("proj:triggers:empty placeholder not found");
+        assert!(empty_trigger_node.display.contains("empty - press 'a' to add"));
 
         // Verify duckpack.toml config node
         let config_node = nodes.iter().find(|n| n.name == "duckpack.toml").expect("duckpack.toml node not found");
@@ -4191,6 +4426,58 @@ mod tests {
         assert_eq!(diff_after.items.len(), 0);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_diff_space_toggle_and_lock_recomputation() {
+        let mut diff = crate::diff::DiffResult {
+            items: vec![
+                crate::diff::DiffItem {
+                    item_type: crate::diff::DiffItemType::CreateTable,
+                    obj_name: "customers".to_string(),
+                    sql: "CREATE TABLE customers (id INT PRIMARY KEY);".to_string(),
+                    old_def: None,
+                    new_def: None,
+                    selected: true,
+                    locked: false,
+                    ignored: false,
+                },
+                crate::diff::DiffItem {
+                    item_type: crate::diff::DiffItemType::CreateView,
+                    obj_name: "v_customers".to_string(),
+                    sql: "CREATE VIEW v_customers AS SELECT * FROM customers;".to_string(),
+                    old_def: None,
+                    new_def: None,
+                    selected: true,
+                    locked: false,
+                    ignored: false,
+                },
+            ],
+        };
+
+        // Initially both are selected and unlocked
+        assert!(diff.items[0].selected);
+        assert!(!diff.items[0].locked);
+        assert!(diff.items[1].selected);
+        assert!(!diff.items[1].locked);
+
+        // Toggle customers off with Space
+        diff.items[0].selected = false;
+        crate::tui::recompute_locks(&mut diff.items);
+
+        // customers is unselected
+        assert!(!diff.items[0].selected);
+        assert!(!diff.items[0].locked);
+
+        // Dependent view v_customers is automatically locked and deselected
+        assert!(!diff.items[1].selected);
+        assert!(diff.items[1].locked);
+
+        // Re-selecting customers unlocks the view
+        diff.items[0].selected = true;
+        crate::tui::recompute_locks(&mut diff.items);
+        assert!(diff.items[0].selected);
+        assert!(!diff.items[1].locked);
     }
 }
 
