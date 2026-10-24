@@ -341,8 +341,8 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | **Global / Navigation** | `Tab` | Cycle focus between **Explorer**, **Editor**, and **Results** panes |
 | | `?` | Toggle the Help Modal |
 | | `F3` / `1` | Switch Explorer to **Database Catalog** view (`target_db`, `memory`, attached DBs) |
-| | `F4` / `2` | Switch Explorer to **Project Files** view (`schemas/`, `tables/`, `views/`, `macros/`, `queries/`, `seeds/`, `duckpack.toml`) |
-| | `F6` / `Ctrl+D` | **In-IDE Declarative Diff & Apply:** Compute diff and migrate target database directly |
+| | `F4` / `2` | Switch Explorer to **Project Files** view (`schemas/`, `tables/`, `views/`, `macros/`, `triggers/`, `queries/`, `seeds/`, `duckpack.toml`) |
+| | `F6` / `Ctrl+D` | **In-IDE Declarative Diff & Apply:** Review diff modal with `Space` toggling, dependency locks, and migration apply |
 | | `Ctrl+B` / `v` | **Validate Project:** Verify SQL syntax and cross-asset dependencies against Shadow DB |
 | | `Alt+W` | Cycle Explorer width presets (`25%` $\rightarrow$ `35%` $\rightarrow$ `50%`) |
 | | `Alt+]` / `Alt+[` | Widen / narrow Explorer pane by 5% |
@@ -360,7 +360,7 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | | `Ctrl+N` / `Ctrl+P` | Switch to the **Next** / **Previous** tab |
 | **Explorer** | `Up` / `Down` | Navigate through databases/categories, table groups, tables, and columns |
 | | `Enter` / `Space` | Expand or collapse tree folder / open SQL file in editor tab |
-| | `a` / `n` | **Quick Add Asset Modal** (in Project mode: scaffold Table, View, Macro, Schema, Query) |
+| | `a` / `n` | **Quick Add Asset Modal** (in Project mode: Table, View, Macro, Trigger, Schema, Query, Seed) |
 | | `v` | **Validate Project** syntax and dependencies against Shadow DB (in Project mode) |
 | | `W` / `w` | **Cycle width presets:** `25%` $\rightarrow$ `35%` $\rightarrow$ `50%` $\rightarrow$ `25%` |
 | | `+` / `=` / `]` | **Widen Explorer** by +5% (up to 60%) |
@@ -373,6 +373,10 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | | `d` | **Detach Database** from current session |
 | | `b` | **Cycle Target Catalog** for diff/apply operations |
 | | `r` / `R` | **Refresh Explorer:** re-scans live database (in DB mode) or disk & git status (in Project mode) |
+| **In-IDE Diff & Apply** | `Space` | **Toggle selection** `[x]` / `[ ]` of highlighted migration with dependency locking `[L]` |
+| | `a` | **Toggle All:** select or deselect all eligible migrations |
+| | `Enter` | **Apply selected changes** directly to target database catalog |
+| | `Esc` | **Close** diff review dialog without applying changes |
 | **Apply Review Screen** | `y` | **Confirm and apply** all pending declarative migrations |
 | | `n` / `Esc` | **Abort and cancel** migrations without modifying database |
 | | `e` | **Explore IDE:** launch full terminal query IDE on target database |
@@ -392,12 +396,13 @@ DuckPack Explore features a dual-mode sidebar that brings the complete declarati
 
 - **Mode Switching (`F3` / `1` vs `F4` / `2`):**
   - **`[F3: Database Catalog]`**: Inspect live target and attached database catalogs, schemas, tables, views, triggers, columns, and constraints (`🔑`, `🔗`).
-  - **`[F4: Project Files]`**: Browse declarative asset files organized categorically (`📁 Schemas`, `📦 Tables`, `👁️ Views`, `🔧 Macros`, `📄 Queries`, `🌱 Seeds`, `⚙️ Config`).
+  - **`[F4: Project Files]`**: Browse declarative asset files organized categorically (`📁 Schemas`, `📦 Tables`, `👁️ Views`, `🔧 Macros`, `⚡ Triggers`, `📄 Queries`, `🌱 Seeds`, `⚙️ Config`).
+- **Complete Scaffolding & Zero-Exit Authoring:** All canonical project categories (`schemas/`, `tables/`, `views/`, `macros/`, `triggers/`, `queries/`, `seeds/`) are always rendered in the project sidebar tree—even if the underlying folder does not exist on disk yet. Empty categories show an interactive `(empty - press 'a' to add)` placeholder so developers never need to leave DuckPack to scaffold new directories or assets.
 - **Passive Git Awareness:** The Explorer header dynamically shows the current branch (e.g. `Project (main*) (25%)`), and files display status badges (`[M]` modified, `[+]` untracked, `[D]` deleted). DuckPack never commits or pushes, preserving index safety and SSH autonomy.
-- **Guided Asset Scaffolding (`a` or `n`):** Quick Add modal to scaffold a new Table, View, Macro, Schema, or Query with clean boilerplate SQL. It automatically detects the selected folder category and opens the file in a new editor tab.
+- **Guided Asset Scaffolding (`a` or `n`):** Quick Add modal to scaffold a new Table, View, Macro, Trigger, Schema, Query, or Seed with clean boilerplate SQL/CSV. It automatically detects the selected folder category, creates the directory on disk if needed, writes the boilerplate, and opens the file in a new editor tab.
 - **Direct File Editing & Dirty Tab Tracking:** Opened files bind directly to disk. Tabs show `*` when dirty (`users.sql *`). Pressing `Ctrl+S` writes changes to disk, clears the dirty indicator, and refreshes project file badges.
 - **In-IDE Syntax Validation (`Ctrl+B` or `v`):** Compiles the entire project against an in-memory Shadow DB to verify SQL syntax, macros, and cross-asset dependencies with error line jumps.
-- **In-IDE Diff & Apply (`F6` or `Ctrl+D`):** Computes declarative diffs against the active target database and presents an interactive apply screen directly in the IDE to migrate changes without quitting.
+- **In-IDE Diff & Selective Apply (`F6` or `Ctrl+D`):** Computes declarative diffs against the active target database and presents an interactive diff modal directly inside the IDE. Supports `Space` to select/deselect individual changes with automatic dependency locking (`[L]`) and applies only the selected migrations on `Enter`.
 
 ### Primary Key & Foreign Key Visual Identifiers
 
