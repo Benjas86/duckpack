@@ -1202,22 +1202,39 @@ fn introspect_py_catalog(
 
     // 1. Schemas
     let schema_query = format!(
-        "SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND database_name = '{}' AND schema_name NOT IN ('information_schema', 'pg_catalog', 'main')",
-        safe_cat
+        "{} SELECT full_schema_name FROM full_schemas WHERE database_name = '{}' AND full_schema_name NOT IN ('information_schema', 'pg_catalog', 'main') ORDER BY depth ASC",
+        schema_diff::FULL_SCHEMAS_CTE, safe_cat
     );
-    let (_, schema_rows) = executor
-        .query_rows(&schema_query)
-        .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-    let schemas: HashSet<String> = schema_rows.into_iter().filter_map(|r| r.into_iter().next()).collect();
+    let schema_res = executor.query_rows(&schema_query);
+    let schemas: HashSet<String> = if let Ok((_, schema_rows)) = schema_res {
+        schema_rows.into_iter().filter_map(|r| r.into_iter().next()).collect()
+    } else {
+        let fallback_schema_query = format!(
+            "SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND database_name = '{}' AND schema_name NOT IN ('information_schema', 'pg_catalog', 'main')",
+            safe_cat
+        );
+        let (_, schema_rows) = executor
+            .query_rows(&fallback_schema_query)
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+        schema_rows.into_iter().filter_map(|r| r.into_iter().next()).collect()
+    };
 
     // 2. Tables
     let table_query = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, COALESCE(sql, '') FROM duckdb_tables() WHERE internal = false AND database_name = '{}'",
-        safe_cat
+        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN t.table_name ELSE fs.full_schema_name || '.' || t.table_name END, COALESCE(t.sql, '') FROM duckdb_tables() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE t.internal = false AND t.database_name = '{}'",
+        schema_diff::FULL_SCHEMAS_CTE, safe_cat
     );
-    let (_, table_rows) = executor
-        .query_rows(&table_query)
-        .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+    let table_rows = if let Ok((_, rows)) = executor.query_rows(&table_query) {
+        rows
+    } else {
+        let fallback_table_query = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, COALESCE(sql, '') FROM duckdb_tables() WHERE internal = false AND database_name = '{}'",
+            safe_cat
+        );
+        executor
+            .query_rows(&fallback_table_query)
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?.1
+    };
     let mut table_map = HashMap::new();
     for row in table_rows {
         if row.len() >= 2 {
@@ -1235,12 +1252,20 @@ fn introspect_py_catalog(
 
     // 3. Columns
     let col_query = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND database_name = '{}'",
-        safe_cat
+        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, c.column_name, c.data_type, c.column_default FROM duckdb_columns() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.internal = false AND c.database_name = '{}'",
+        schema_diff::FULL_SCHEMAS_CTE, safe_cat
     );
-    let (_, col_rows) = executor
-        .query_rows(&col_query)
-        .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+    let col_rows = if let Ok((_, rows)) = executor.query_rows(&col_query) {
+        rows
+    } else {
+        let fallback_col_query = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND database_name = '{}'",
+            safe_cat
+        );
+        executor
+            .query_rows(&fallback_col_query)
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?.1
+    };
     for row in col_rows {
         if row.len() >= 3 {
             if let Some(t) = table_map.get_mut(&row[0]) {
@@ -1388,12 +1413,20 @@ fn introspect_py_catalog(
 
     // 4. Views
     let view_query = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, COALESCE(sql, '') FROM duckdb_views() WHERE internal = false AND database_name = '{}'",
-        safe_cat
+        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN v.view_name ELSE fs.full_schema_name || '.' || v.view_name END, COALESCE(v.sql, '') FROM duckdb_views() v JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name WHERE v.internal = false AND v.database_name = '{}'",
+        schema_diff::FULL_SCHEMAS_CTE, safe_cat
     );
-    let (_, view_rows) = executor
-        .query_rows(&view_query)
-        .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+    let view_rows = if let Ok((_, rows)) = executor.query_rows(&view_query) {
+        rows
+    } else {
+        let fallback_view_query = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, COALESCE(sql, '') FROM duckdb_views() WHERE internal = false AND database_name = '{}'",
+            safe_cat
+        );
+        executor
+            .query_rows(&fallback_view_query)
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?.1
+    };
     let mut view_map = HashMap::new();
     for row in view_rows {
         if row.len() >= 2 {
@@ -1420,9 +1453,11 @@ fn introspect_py_catalog(
 
     // 6. Triggers
     let trigger_query = format!(
-        "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') \
-         FROM duckdb_triggers() WHERE database_name = '{}'",
-        safe_cat
+        "{} SELECT fs.full_schema_name, t.trigger_name, t.table_name, COALESCE(t.sql, '') \
+         FROM duckdb_triggers() t \
+         JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name \
+         WHERE t.database_name = '{}'",
+        schema_diff::FULL_SCHEMAS_CTE, safe_cat
     );
     let mut trigger_map = HashMap::new();
     if let Ok((_, trigger_rows)) = executor.query_rows(&trigger_query) {

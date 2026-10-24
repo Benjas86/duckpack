@@ -250,6 +250,26 @@ pub fn validate_target_catalog(conn: &Connection, catalog: Option<&str>, for_app
     }
 }
 
+/// Common Table Expression for DuckDB 2.0 to resolve fully qualified nested schemas hierarchically.
+pub const FULL_SCHEMAS_CTE: &str = "\
+WITH RECURSIVE full_schemas AS ( \
+    SELECT oid, database_name, schema_name, parent_schema_oid, schema_name AS full_schema_name, 0 AS depth \
+    FROM duckdb_schemas() \
+    WHERE parent_schema_oid IS NULL \
+    UNION ALL \
+    SELECT s.oid, s.database_name, s.schema_name, s.parent_schema_oid, f.full_schema_name || '.' || s.schema_name, f.depth + 1 \
+    FROM duckdb_schemas() s \
+    JOIN full_schemas f ON s.database_name = f.database_name AND s.parent_schema_oid = f.oid \
+)";
+
+/// Double-quotes each component of a dot-qualified identifier (e.g. `finance.reports` -> `"finance"."reports"`).
+pub fn quote_qualified_identifier(name: &str) -> String {
+    name.split('.')
+        .map(|part| format!("\"{}\"", part.replace('\"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// Extracts the entire table schema from a DuckDB connection for a specific catalog.
 /// It queries `duckdb_tables()` for table definitions and `duckdb_columns()` for specific datatypes.
 /// Returns a HashMap mapping `schema.table` -> `TableSchema`.
@@ -261,12 +281,22 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
     let safe_cat = target_cat.replace('\'', "''");
 
     let sql = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
-         COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
-         FROM duckdb_tables() WHERE internal = false AND database_name = '{}'",
-        safe_cat
+        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN t.table_name ELSE fs.full_schema_name || '.' || t.table_name END, \
+         COALESCE(t.sql, '/* Remote table: ' || t.table_name || ' */') \
+         FROM duckdb_tables() t \
+         JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name \
+         WHERE t.internal = false AND t.database_name = '{}'",
+        FULL_SCHEMAS_CTE, safe_cat
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(&sql).or_else(|_| {
+        let fallback_sql = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+             COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
+             FROM duckdb_tables() WHERE internal = false AND database_name = '{}'",
+            safe_cat
+        );
+        conn.prepare(&fallback_sql)
+    })?;
     let mut tables: HashMap<String, TableSchema> = HashMap::new();
     
     let rows = stmt.query_map([], |row| {
@@ -293,12 +323,14 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
 
     if is_quack || tables.is_empty() {
         let q_sql = format!(
-            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
-             COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
-             FROM target_db.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
+            "SELECT CASE WHEN fs.full_schema_name = 'main' THEN t.table_name ELSE fs.full_schema_name || '.' || t.table_name END, \
+             COALESCE(t.sql, '/* Remote table: ' || t.table_name || ' */') \
+             FROM target_db.query('{} SELECT fs.full_schema_name, t.table_name, t.sql FROM duckdb_tables() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE t.internal = false AND (t.database_name = ''{}'' OR t.database_name = current_database())')",
+            FULL_SCHEMAS_CTE.replace('\'', "''"),
             safe_cat
         );
-        if let Ok(mut q_stmt) = conn.prepare(&q_sql) {
+        let q_res = conn.prepare(&q_sql);
+        if let Ok(mut q_stmt) = q_res {
             if let Ok(rows) = q_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
                 for row in rows.flatten() {
                     let (table_name, sql) = row;
@@ -310,16 +342,46 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
                     });
                 }
             }
+        } else {
+            let fallback_q_sql = format!(
+                "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+                 COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
+                 FROM target_db.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
+                safe_cat
+            );
+            if let Ok(mut q_stmt) = conn.prepare(&fallback_q_sql) {
+                if let Ok(rows) = q_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                    for row in rows.flatten() {
+                        let (table_name, sql) = row;
+                        tables.entry(table_name).or_insert_with(|| TableSchema {
+                            create_sql: sql.clone(),
+                            columns: HashMap::new(),
+                            column_defaults: HashMap::new(),
+                            constraints: Vec::new(),
+                        });
+                    }
+                }
+            }
         }
     }
 
     let col_sql = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
-         column_name, data_type, column_default \
-         FROM duckdb_columns() WHERE internal = false AND database_name = '{}'",
-        safe_cat
+        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, \
+         c.column_name, c.data_type, c.column_default \
+         FROM duckdb_columns() c \
+         JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name \
+         WHERE c.internal = false AND c.database_name = '{}'",
+        FULL_SCHEMAS_CTE, safe_cat
     );
-    let mut col_stmt = conn.prepare(&col_sql)?;
+    let mut col_stmt = conn.prepare(&col_sql).or_else(|_| {
+        let fallback_col_sql = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+             column_name, data_type, column_default \
+             FROM duckdb_columns() WHERE internal = false AND database_name = '{}'",
+            safe_cat
+        );
+        conn.prepare(&fallback_col_sql)
+    })?;
     let col_rows = col_stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -342,12 +404,14 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
     let any_col_empty = tables.values().any(|t| t.columns.is_empty());
     if is_quack || any_col_empty {
         let q_col_sql = format!(
-            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
-             column_name, data_type, column_default \
-             FROM target_db.query('SELECT schema_name, table_name, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
+            "SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, \
+             c.column_name, c.data_type, c.column_default \
+             FROM target_db.query('{} SELECT fs.full_schema_name, c.table_name, c.column_name, c.data_type, c.column_default FROM duckdb_columns() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.internal = false AND (c.database_name = ''{}'' OR c.database_name = current_database())')",
+            FULL_SCHEMAS_CTE.replace('\'', "''"),
             safe_cat
         );
-        if let Ok(mut q_col_stmt) = conn.prepare(&q_col_sql) {
+        let q_col_res = conn.prepare(&q_col_sql);
+        if let Ok(mut q_col_stmt) = q_col_res {
             if let Ok(q_col_rows) = q_col_stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -368,24 +432,68 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
                     }
                 }
             }
+        } else {
+            let fallback_q_col = format!(
+                "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+                 column_name, data_type, column_default \
+                 FROM target_db.query('SELECT schema_name, table_name, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
+                safe_cat
+            );
+            if let Ok(mut q_col_stmt) = conn.prepare(&fallback_q_col) {
+                if let Ok(q_col_rows) = q_col_stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                }) {
+                    for row in q_col_rows.flatten() {
+                        let (table_name, column_name, data_type, column_default) = row;
+                        if let Some(table) = tables.get_mut(&table_name) {
+                            table.columns.insert(column_name.clone(), data_type);
+                            if let Some(def) = column_default {
+                                table.column_defaults.insert(column_name, def);
+                            } else {
+                                table.column_defaults.remove(&column_name);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-
     // Introspect table constraints (PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK)
     let constr_sql = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
-         constraint_type, \
-         constraint_name, \
-         COALESCE(array_to_string(constraint_column_names, ','), ''), \
-         expression, \
-         referenced_table, \
-         COALESCE(array_to_string(referenced_column_names, ','), '') \
-         FROM duckdb_constraints() \
-         WHERE (database_name = '{}' OR database_name = 'target_db') AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
-        safe_cat
+        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, \
+         c.constraint_type, \
+         c.constraint_name, \
+         COALESCE(array_to_string(c.constraint_column_names, ','), ''), \
+         c.expression, \
+         c.referenced_table, \
+         COALESCE(array_to_string(c.referenced_column_names, ','), '') \
+         FROM duckdb_constraints() c \
+         JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name \
+         WHERE (c.database_name = '{}' OR c.database_name = 'target_db') AND c.constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
+        FULL_SCHEMAS_CTE, safe_cat
     );
-    if let Ok(mut constr_stmt) = conn.prepare(&constr_sql) {
+    let constr_res = conn.prepare(&constr_sql).or_else(|_| {
+        let fallback_constr_sql = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+             constraint_type, \
+             constraint_name, \
+             COALESCE(array_to_string(constraint_column_names, ','), ''), \
+             expression, \
+             referenced_table, \
+             COALESCE(array_to_string(referenced_column_names, ','), '') \
+             FROM duckdb_constraints() \
+             WHERE (database_name = '{}' OR database_name = 'target_db') AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
+            safe_cat
+        );
+        conn.prepare(&fallback_constr_sql)
+    });
+    if let Ok(mut constr_stmt) = constr_res {
         if let Ok(constr_rows) = constr_stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -433,17 +541,19 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
 
     if is_quack {
         let q_constr_sql = format!(
-            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+            "SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, \
              constraint_type, \
              constraint_name, \
              COALESCE(constraint_column_names, ''), \
              expression, \
              referenced_table, \
              COALESCE(referenced_column_names, '') \
-             FROM target_db.query('SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, '','') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (database_name = ''{}'' OR database_name = current_database())')",
+             FROM target_db.query('{} SELECT fs.full_schema_name, c.table_name, c.constraint_type, c.constraint_name, array_to_string(c.constraint_column_names, '','') as constraint_column_names, c.expression, c.referenced_table, array_to_string(c.referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (c.database_name = ''{}'' OR c.database_name = current_database())')",
+            FULL_SCHEMAS_CTE.replace('\'', "''"),
             safe_cat
         );
-        if let Ok(mut q_stmt) = conn.prepare(&q_constr_sql) {
+        let q_constr_res = conn.prepare(&q_constr_sql);
+        if let Ok(mut q_stmt) = q_constr_res {
             if let Ok(q_rows) = q_stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -482,6 +592,58 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
                     }
                 }
             }
+        } else {
+            let fallback_q_constr = format!(
+                "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
+                 constraint_type, \
+                 constraint_name, \
+                 COALESCE(constraint_column_names, ''), \
+                 expression, \
+                 referenced_table, \
+                 COALESCE(referenced_column_names, '') \
+                 FROM target_db.query('SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, '','') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (database_name = ''{}'' OR database_name = current_database())')",
+                safe_cat
+            );
+            if let Ok(mut q_stmt) = conn.prepare(&fallback_q_constr) {
+                if let Ok(q_rows) = q_stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                }) {
+                    for row in q_rows.flatten() {
+                        let (table_name, c_type, c_name, cols_str, expr, ref_tbl, ref_cols_str) = row;
+                        if let Some(table) = tables.get_mut(&table_name) {
+                            let cols: Vec<String> = if cols_str.is_empty() {
+                                Vec::new()
+                            } else {
+                                cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                            };
+                            let ref_cols: Vec<String> = if ref_cols_str.is_empty() {
+                                Vec::new()
+                            } else {
+                                ref_cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+                            };
+                            let new_c = ConstraintSchema {
+                                constraint_type: c_type,
+                                constraint_name: c_name,
+                                columns: cols,
+                                expression: expr,
+                                referenced_table: ref_tbl,
+                                referenced_columns: ref_cols,
+                            };
+                            if !table.constraints.iter().any(|c| c.matches(&new_c)) {
+                                table.constraints.push(new_c);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -497,33 +659,63 @@ pub fn get_views(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<Str
     let safe_cat = target_cat.replace('\'', "''");
 
     let sql = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, \
-         COALESCE(sql, '/* Remote view: ' || view_name || ' */') \
-         FROM duckdb_views() WHERE internal = false AND database_name = '{}'",
-        safe_cat
+        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN v.view_name ELSE fs.full_schema_name || '.' || v.view_name END, \
+         COALESCE(v.sql, '/* Remote view: ' || v.view_name || ' */') \
+         FROM duckdb_views() v \
+         JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name \
+         WHERE v.internal = false AND v.database_name = '{}'",
+        FULL_SCHEMAS_CTE, safe_cat
     );
-    let mut stmt = conn.prepare(&sql)?;
-    
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
     let mut views = HashMap::new();
-    for row in rows {
-        let (name, sql) = row?;
-        views.insert(name, sql);
-    }
-    if views.is_empty() {
-        let q_sql = format!(
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+            for row in rows.flatten() {
+                views.insert(row.0, row.1);
+            }
+        }
+    } else {
+        let fallback_sql = format!(
             "SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, \
              COALESCE(sql, '/* Remote view: ' || view_name || ' */') \
-             FROM target_db.query('SELECT schema_name, view_name, sql FROM duckdb_views() WHERE internal = false AND database_name = ''{}''')",
+             FROM duckdb_views() WHERE internal = false AND database_name = '{}'",
             safe_cat
+        );
+        if let Ok(mut stmt) = conn.prepare(&fallback_sql) {
+            if let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                for row in rows.flatten() {
+                    views.insert(row.0, row.1);
+                }
+            }
+        }
+    }
+
+    if views.is_empty() {
+        let q_sql = format!(
+            "SELECT CASE WHEN fs.full_schema_name = 'main' THEN v.view_name ELSE fs.full_schema_name || '.' || v.view_name END, \
+             COALESCE(v.sql, '/* Remote view: ' || v.view_name || ' */') \
+             FROM target_db.query('{} SELECT fs.full_schema_name, v.view_name, v.sql FROM duckdb_views() v JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name WHERE v.internal = false AND (v.database_name = ''{}'' OR v.database_name = current_database())')",
+            FULL_SCHEMAS_CTE.replace('\'', "''"), safe_cat
         );
         if let Ok(mut q_stmt) = conn.prepare(&q_sql) {
             if let Ok(rows) = q_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
                 for row in rows.flatten() {
                     let (name, sql) = row;
                     views.insert(name, sql);
+                }
+            }
+        } else {
+            let fallback_q_sql = format!(
+                "SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, \
+                 COALESCE(sql, '/* Remote view: ' || view_name || ' */') \
+                 FROM target_db.query('SELECT schema_name, view_name, sql FROM duckdb_views() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
+                safe_cat
+            );
+            if let Ok(mut q_stmt) = conn.prepare(&fallback_q_sql) {
+                if let Ok(rows) = q_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                    for row in rows.flatten() {
+                        let (name, sql) = row;
+                        views.insert(name, sql);
+                    }
                 }
             }
         }
@@ -558,6 +750,7 @@ pub fn get_macros(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
 }
 
 /// Extracts all schema names (excluding system schemas) from a DuckDB connection for a specific catalog.
+/// Returns fully-qualified nested schema names hierarchically sorted.
 pub fn get_schemas(conn: &Connection, catalog: Option<&str>) -> Result<std::collections::HashSet<String>> {
     let target_cat = match catalog {
         Some(c) => c.to_string(),
@@ -566,24 +759,51 @@ pub fn get_schemas(conn: &Connection, catalog: Option<&str>) -> Result<std::coll
     let safe_cat = target_cat.replace('\'', "''");
 
     let sql = format!(
-        "SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND database_name = '{}' AND schema_name NOT IN ('information_schema', 'pg_catalog', 'main')",
-        safe_cat
+        "{} SELECT full_schema_name FROM full_schemas WHERE database_name = '{}' AND full_schema_name NOT IN ('information_schema', 'pg_catalog', 'main') ORDER BY depth ASC",
+        FULL_SCHEMAS_CTE, safe_cat
     );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| Ok(row.get::<_, String>(0)?))?;
     let mut schemas = std::collections::HashSet::new();
-    for row in rows {
-        schemas.insert(row?);
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(rows) = stmt.query_map([], |row| Ok(row.get::<_, String>(0)?)) {
+            for row in rows.flatten() {
+                schemas.insert(row);
+            }
+        }
+    } else {
+        let fallback_sql = format!(
+            "SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND database_name = '{}' AND schema_name NOT IN ('information_schema', 'pg_catalog', 'main')",
+            safe_cat
+        );
+        if let Ok(mut stmt) = conn.prepare(&fallback_sql) {
+            if let Ok(rows) = stmt.query_map([], |row| Ok(row.get::<_, String>(0)?)) {
+                for row in rows.flatten() {
+                    schemas.insert(row);
+                }
+            }
+        }
     }
+
     if schemas.is_empty() {
         let q_sql = format!(
-            "SELECT schema_name FROM target_db.query('SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND database_name = ''{}'' AND schema_name NOT IN (''information_schema'', ''pg_catalog'', ''main'')')",
-            safe_cat
+            "SELECT full_schema_name FROM target_db.query('{} SELECT full_schema_name FROM full_schemas WHERE (database_name = ''{}'' OR database_name = current_database()) AND full_schema_name NOT IN (''information_schema'', ''pg_catalog'', ''main'') ORDER BY depth ASC')",
+            FULL_SCHEMAS_CTE.replace('\'', "''"), safe_cat
         );
         if let Ok(mut q_stmt) = conn.prepare(&q_sql) {
             if let Ok(rows) = q_stmt.query_map([], |row| Ok(row.get::<_, String>(0)?)) {
                 for row in rows.flatten() {
                     schemas.insert(row);
+                }
+            }
+        } else {
+            let fallback_q_sql = format!(
+                "SELECT schema_name FROM target_db.query('SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database()) AND schema_name NOT IN (''information_schema'', ''pg_catalog'', ''main'')')",
+                safe_cat
+            );
+            if let Ok(mut q_stmt) = conn.prepare(&fallback_q_sql) {
+                if let Ok(rows) = q_stmt.query_map([], |row| Ok(row.get::<_, String>(0)?)) {
+                    for row in rows.flatten() {
+                        schemas.insert(row);
+                    }
                 }
             }
         }
@@ -601,9 +821,11 @@ pub fn get_triggers(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<
     let mut triggers = HashMap::new();
 
     let sql = format!(
-        "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') \
-         FROM duckdb_triggers() WHERE database_name = '{}'",
-        safe_cat
+        "{} SELECT fs.full_schema_name, t.trigger_name, t.table_name, COALESCE(t.sql, '') \
+         FROM duckdb_triggers() t \
+         JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name \
+         WHERE t.database_name = '{}'",
+        FULL_SCHEMAS_CTE, safe_cat
     );
     if let Ok(mut stmt) = conn.prepare(&sql) {
         if let Ok(rows) = stmt.query_map([], |row| {
@@ -629,13 +851,44 @@ pub fn get_triggers(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<
                 });
             }
         }
+    } else {
+        let fallback_sql = format!(
+            "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') \
+             FROM duckdb_triggers() WHERE database_name = '{}'",
+            safe_cat
+        );
+        if let Ok(mut stmt) = conn.prepare(&fallback_sql) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            }) {
+                for row in rows.flatten() {
+                    let (schema, trg_name, table, trg_sql) = row;
+                    let key = if schema == "main" {
+                        trg_name.clone()
+                    } else {
+                        format!("{}.{}", schema, trg_name)
+                    };
+                    triggers.insert(key, TriggerSchema {
+                        schema_name: schema,
+                        trigger_name: trg_name,
+                        table_name: table,
+                        sql: trg_sql,
+                    });
+                }
+            }
+        }
     }
 
     if triggers.is_empty() {
         let q_sql = format!(
-            "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') \
-             FROM target_db.query('SELECT schema_name, trigger_name, table_name, sql FROM duckdb_triggers() WHERE database_name = ''{}''')",
-            safe_cat
+            "SELECT fs.full_schema_name, t.trigger_name, t.table_name, COALESCE(t.sql, '') \
+             FROM target_db.query('{} SELECT fs.full_schema_name, t.trigger_name, t.table_name, t.sql FROM duckdb_triggers() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE (t.database_name = ''{}'' OR t.database_name = current_database())')",
+            FULL_SCHEMAS_CTE.replace('\'', "''"), safe_cat
         );
         if let Ok(mut q_stmt) = conn.prepare(&q_sql) {
             if let Ok(rows) = q_stmt.query_map([], |row| {
@@ -659,6 +912,37 @@ pub fn get_triggers(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<
                         table_name: table,
                         sql: trg_sql,
                     });
+                }
+            }
+        } else {
+            let fallback_q_sql = format!(
+                "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') \
+                 FROM target_db.query('SELECT schema_name, trigger_name, table_name, sql FROM duckdb_triggers() WHERE database_name = ''{}''')",
+                safe_cat
+            );
+            if let Ok(mut q_stmt) = conn.prepare(&fallback_q_sql) {
+                if let Ok(rows) = q_stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                }) {
+                    for row in rows.flatten() {
+                        let (schema, trg_name, table, trg_sql) = row;
+                        let key = if schema == "main" {
+                            trg_name.clone()
+                        } else {
+                            format!("{}.{}", schema, trg_name)
+                        };
+                        triggers.insert(key, TriggerSchema {
+                            schema_name: schema,
+                            trigger_name: trg_name,
+                            table_name: table,
+                            sql: trg_sql,
+                        });
+                    }
                 }
             }
         }
@@ -705,36 +989,56 @@ pub fn compute_diff(
     let mut dropped_tables = Vec::new();
 
     // 1. Schemas
-    for schema_name in shadow_schemas {
-        if is_ignored(schema_name) { continue; }
-        if !target_schemas.contains(schema_name) {
-            diff.items.push(DiffItem {
-                item_type: DiffItemType::CreateSchema,
-                obj_name: schema_name.clone(),
-                sql: format!("CREATE SCHEMA \"{}\";", schema_name),
-                old_def: None,
-                new_def: None,
-                selected: true,
-                locked: false,
-                ignored: false,
-            });
-        }
+    let mut schemas_to_create: Vec<String> = shadow_schemas
+        .iter()
+        .filter(|s| !is_ignored(s) && !target_schemas.contains(*s))
+        .cloned()
+        .collect();
+    // Sort topologically: parent schemas (fewer dots) before nested child schemas (more dots)
+    schemas_to_create.sort_by(|a, b| {
+        let depth_a = a.matches('.').count();
+        let depth_b = b.matches('.').count();
+        depth_a.cmp(&depth_b).then_with(|| a.cmp(b))
+    });
+
+    for schema_name in schemas_to_create {
+        let quoted_name = quote_qualified_identifier(&schema_name);
+        diff.items.push(DiffItem {
+            item_type: DiffItemType::CreateSchema,
+            obj_name: schema_name.clone(),
+            sql: format!("CREATE SCHEMA {};", quoted_name),
+            old_def: None,
+            new_def: None,
+            selected: true,
+            locked: false,
+            ignored: false,
+        });
     }
     
-    for schema_name in target_schemas {
-        if is_ignored(schema_name) { continue; }
-        if !shadow_schemas.contains(schema_name) {
-            diff.items.push(DiffItem {
-                item_type: DiffItemType::DropSchema,
-                obj_name: schema_name.clone(),
-                sql: format!("DROP SCHEMA \"{}\" CASCADE;", schema_name),
-                old_def: None,
-                new_def: None,
-                selected: true,
-                locked: false,
-                ignored: false,
-            });
-        }
+    let mut schemas_to_drop: Vec<String> = target_schemas
+        .iter()
+        .filter(|s| !is_ignored(s) && !shadow_schemas.contains(*s))
+        .cloned()
+        .collect();
+    // For dropping, sort child schemas first (more dots first)
+    schemas_to_drop.sort_by(|a, b| {
+        let depth_a = a.matches('.').count();
+        let depth_b = b.matches('.').count();
+        depth_b.cmp(&depth_a).then_with(|| a.cmp(b))
+    });
+
+    for schema_name in schemas_to_drop {
+        let quoted_name = quote_qualified_identifier(&schema_name);
+        diff.items.push(DiffItem {
+            item_type: DiffItemType::DropSchema,
+            obj_name: schema_name.clone(),
+            sql: format!("DROP SCHEMA {} CASCADE;", quoted_name),
+            old_def: None,
+            new_def: None,
+            selected: true,
+            locked: false,
+            ignored: false,
+        });
     }
 
     for (table_name, shadow_table) in shadow.iter() {
@@ -1660,6 +1964,125 @@ mod tests {
         assert_eq!(diff.items.len(), 1);
         assert_eq!(diff.items[0].item_type, DiffItemType::AlterTable);
         assert_eq!(diff.items[0].sql, "ALTER TABLE orders ADD COLUMN processed BOOLEAN DEFAULT false;");
+    }
+
+    #[test]
+    fn test_nested_schemas_introspection_and_ordering() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE SCHEMA region; \
+             CREATE SCHEMA region.sales; \
+             CREATE SCHEMA region.sales.apac; \
+             CREATE TABLE region.sales.orders (revenue DECIMAL); \
+             CREATE TABLE region.sales.apac.targets (goal INT);"
+        ).unwrap();
+
+        let schemas = get_schemas(&conn, None).unwrap();
+        assert!(schemas.contains("region"));
+        assert!(schemas.contains("region.sales"));
+        assert!(schemas.contains("region.sales.apac"));
+
+        let tables = get_schema(&conn, None).unwrap();
+        assert!(tables.contains_key("region.sales.orders"));
+        assert!(tables.contains_key("region.sales.apac.targets"));
+
+        // Diff creation against empty target
+        let empty_target_schemas = HashSet::new();
+        let diff = compute_diff(
+            &schemas, &empty_target_schemas,
+            &tables, &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[]
+        );
+
+        let schema_items: Vec<_> = diff.items.iter()
+            .filter(|i| i.item_type == DiffItemType::CreateSchema)
+            .collect();
+        assert_eq!(schema_items.len(), 3);
+        // Assert topological order: root schema first, then level 1, then level 2
+        assert_eq!(schema_items[0].obj_name, "region");
+        assert_eq!(schema_items[0].sql, "CREATE SCHEMA \"region\";");
+        assert_eq!(schema_items[1].obj_name, "region.sales");
+        assert_eq!(schema_items[1].sql, "CREATE SCHEMA \"region\".\"sales\";");
+        assert_eq!(schema_items[2].obj_name, "region.sales.apac");
+        assert_eq!(schema_items[2].sql, "CREATE SCHEMA \"region\".\"sales\".\"apac\";");
+
+        // Diff dropping against empty shadow (target has all 3 schemas)
+        let empty_shadow_schemas = HashSet::new();
+        let drop_diff = compute_diff(
+            &empty_shadow_schemas, &schemas,
+            &HashMap::new(), &tables,
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[]
+        );
+
+        let drop_items: Vec<_> = drop_diff.items.iter()
+            .filter(|i| i.item_type == DiffItemType::DropSchema)
+            .collect();
+        assert_eq!(drop_items.len(), 3);
+        // Assert reverse topological order for drops: child schema dropped before parent
+        assert_eq!(drop_items[0].obj_name, "region.sales.apac");
+        assert_eq!(drop_items[0].sql, "DROP SCHEMA \"region\".\"sales\".\"apac\" CASCADE;");
+        assert_eq!(drop_items[1].obj_name, "region.sales");
+        assert_eq!(drop_items[1].sql, "DROP SCHEMA \"region\".\"sales\" CASCADE;");
+        assert_eq!(drop_items[2].obj_name, "region");
+        assert_eq!(drop_items[2].sql, "DROP SCHEMA \"region\" CASCADE;");
+    }
+
+    #[test]
+    fn test_nested_schemas_apply_diff() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Prepare diff containing nested schema and table
+        let mut diff = DiffResult { items: Vec::new() };
+        diff.items.push(DiffItem {
+            item_type: DiffItemType::CreateSchema,
+            obj_name: "region".to_string(),
+            sql: "CREATE SCHEMA \"region\";".to_string(),
+            old_def: None,
+            new_def: None,
+            selected: true,
+            locked: false,
+            ignored: false,
+        });
+        diff.items.push(DiffItem {
+            item_type: DiffItemType::CreateSchema,
+            obj_name: "region.sales".to_string(),
+            sql: "CREATE SCHEMA \"region\".\"sales\";".to_string(),
+            old_def: None,
+            new_def: None,
+            selected: true,
+            locked: false,
+            ignored: false,
+        });
+        diff.items.push(DiffItem {
+            item_type: DiffItemType::CreateTable,
+            obj_name: "region.sales.orders".to_string(),
+            sql: "CREATE TABLE region.sales.orders (revenue DECIMAL);".to_string(),
+            old_def: None,
+            new_def: None,
+            selected: true,
+            locked: false,
+            ignored: false,
+        });
+
+        let proj_dir = std::path::PathBuf::from("/tmp");
+        let apply_res = crate::engine::apply_diff(&conn, &diff, false, false, &proj_dir, None);
+        assert!(apply_res.is_ok(), "Apply failed: {:?}", apply_res.err());
+
+        // Verify schemas exist
+        let schemas = get_schemas(&conn, None).unwrap();
+        assert!(schemas.contains("region"));
+        assert!(schemas.contains("region.sales"));
+
+        // Verify table exists and can be queried
+        let query_res = conn.execute_batch("SELECT revenue FROM region.sales.orders;");
+        assert!(query_res.is_ok());
     }
 }
 
