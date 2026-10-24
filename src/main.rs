@@ -213,7 +213,11 @@ fn main() -> Result<()> {
                 Some(*quack_disable_ssl),
                 None,
             );
-            *db = spec.db;
+            let mut resolved_db = spec.db;
+            if !spec.is_quack && !spec.is_motherduck && !std::path::Path::new(&resolved_db).is_absolute() && project_dir != std::path::Path::new(".") {
+                resolved_db = project_dir.join(&resolved_db).to_string_lossy().to_string();
+            }
+            *db = resolved_db;
             *quack_token = spec.token;
             *quack_disable_ssl = spec.disable_ssl;
         }
@@ -226,7 +230,11 @@ fn main() -> Result<()> {
                 None,
                 None,
             );
-            *db = spec.db;
+            let mut resolved_db = spec.db;
+            if !spec.is_quack && !spec.is_motherduck && !std::path::Path::new(&resolved_db).is_absolute() && project_dir != std::path::Path::new(".") {
+                resolved_db = project_dir.join(&resolved_db).to_string_lossy().to_string();
+            }
+            *db = resolved_db;
         }
         _ => {}
     }
