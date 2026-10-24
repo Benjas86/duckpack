@@ -52,66 +52,8 @@ pub(crate) fn recompute_locks(items: &mut Vec<DiffItem>) {
     }
 }
 
-/// A rudimentary SQL syntax highlighter that tokenizes a SQL string and applies Ratatui `Span` styles.
-/// Keywords are highlighted in Cyan and strings in Yellow.
-fn highlight_sql(sql: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let keywords = ["SELECT", "FROM", "WHERE", "CREATE", "TABLE", "VIEW", "OR", "REPLACE", "MACRO", "AS", "DEFAULT", "TIMESTAMP", "INTEGER", "DATE", "DECIMAL", "VARCHAR", "ALTER", "ADD", "COLUMN", "DROP", "TYPE", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "AND", "NOT", "NULL", "PRIMARY", "KEY", "UUID", "BOOLEAN"];
-    
-    let mut current_word = String::new();
-    let mut is_string = false;
-    
-    for c in sql.chars() {
-        if c == '\'' {
-            if !current_word.is_empty() {
-                let upper = current_word.to_uppercase();
-                if keywords.contains(&upper.as_str()) {
-                    spans.push(Span::styled(current_word.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-                } else {
-                    spans.push(Span::raw(current_word.clone()));
-                }
-                current_word.clear();
-            }
-            is_string = !is_string;
-            current_word.push(c);
-            if !is_string {
-                spans.push(Span::styled(current_word.clone(), Style::default().fg(Color::Yellow)));
-                current_word.clear();
-            }
-        } else if c.is_whitespace() || c == '(' || c == ')' || c == ',' || c == ';' || c == '=' {
-            if !current_word.is_empty() {
-                if is_string {
-                    current_word.push(c);
-                    continue;
-                }
-                let upper = current_word.to_uppercase();
-                if keywords.contains(&upper.as_str()) {
-                    spans.push(Span::styled(current_word.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-                } else {
-                    spans.push(Span::raw(current_word.clone()));
-                }
-                current_word.clear();
-            }
-            if !is_string {
-                spans.push(Span::raw(c.to_string()));
-            } else {
-                current_word.push(c);
-            }
-        } else {
-            current_word.push(c);
-        }
-    }
-    
-    if !current_word.is_empty() {
-        let upper = current_word.to_uppercase();
-        if !is_string && keywords.contains(&upper.as_str()) {
-            spans.push(Span::styled(current_word, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-        } else {
-            spans.push(Span::styled(current_word, if is_string { Style::default().fg(Color::Yellow) } else { Style::default() }));
-        }
-    }
-    spans
-}
+use crate::syntax::highlight_sql;
+
 
 /// Wraps the `sqlformat` crate to standardize formatting for SQL diffing.
 /// We use this to ensure that whitespace or casing differences in `.sql` files 
