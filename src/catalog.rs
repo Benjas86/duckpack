@@ -1286,8 +1286,11 @@ mod tests {
     #[test]
     fn test_live_refresh_attached_catalog() {
         let db_uri = "quack:0.0.0.0:9494";
-        let token = "your_quack_token_here";
-        if let Ok(conn) = crate::engine::connect_target_db(db_uri, Some(token), true) {
+        let token_var = std::env::var("QUACK_TOKEN").unwrap_or_default();
+        if token_var.is_empty() {
+            return;
+        }
+        if let Ok(conn) = crate::engine::connect_target_db(db_uri, Some(&token_var), true) {
             let temp_dir = std::env::temp_dir().join("dp_test_refresh_live");
             let _ = std::fs::create_dir_all(&temp_dir);
 

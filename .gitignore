@@ -19,3 +19,5 @@ debug_query.txt
 /decisions/
 .env*
 /sandbox/
+/tests/fixtures/v2_0_compat/
+/tests/fixtures/

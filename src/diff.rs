@@ -262,13 +262,57 @@ WITH RECURSIVE full_schemas AS ( \
     JOIN full_schemas f ON s.database_name = f.database_name AND s.parent_schema_oid = f.oid \
 )";
 
+/// Represents a dot-qualified SQL object identifier with support for arbitrary nested schemas.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QualifiedIdentifier {
+    pub parts: Vec<String>,
+}
+
+impl QualifiedIdentifier {
+    pub fn parse(name: &str) -> Self {
+        let parts = name
+            .split('.')
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        Self { parts }
+    }
+
+    pub fn leaf_name(&self) -> &str {
+        self.parts.last().map(|s| s.as_str()).unwrap_or("")
+    }
+
+    pub fn schema_prefix(&self) -> String {
+        if self.parts.len() <= 1 {
+            String::new()
+        } else {
+            let schema_parts = &self.parts[..self.parts.len() - 1];
+            format!("{}.", schema_parts.join("."))
+        }
+    }
+
+    pub fn full_schema(&self) -> Option<String> {
+        if self.parts.len() <= 1 {
+            None
+        } else {
+            Some(self.parts[..self.parts.len() - 1].join("."))
+        }
+    }
+
+    pub fn quoted_qualified_name(&self) -> String {
+        self.parts
+            .iter()
+            .map(|part| format!("\"{}\"", part.replace('\"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+}
+
 /// Double-quotes each component of a dot-qualified identifier (e.g. `finance.reports` -> `"finance"."reports"`).
 pub fn quote_qualified_identifier(name: &str) -> String {
-    name.split('.')
-        .map(|part| format!("\"{}\"", part.replace('\"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(".")
+    QualifiedIdentifier::parse(name).quoted_qualified_name()
 }
+
 
 /// Extracts the entire table schema from a DuckDB connection for a specific catalog.
 /// It queries `duckdb_tables()` for table definitions and `duckdb_columns()` for specific datatypes.
@@ -732,12 +776,23 @@ pub fn get_macros(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
     let safe_cat = target_cat.replace('\'', "''");
 
     let sql = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END, \
-         macro_definition, CAST(parameters AS VARCHAR) \
-         FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false AND database_name = '{}'",
-        safe_cat
+        "{} SELECT CASE WHEN COALESCE(fs.full_schema_name, f.schema_name) = 'main' THEN f.function_name ELSE COALESCE(fs.full_schema_name, f.schema_name) || '.' || f.function_name END, \
+         f.macro_definition, CAST(f.parameters AS VARCHAR) \
+         FROM duckdb_functions() f \
+         LEFT JOIN full_schemas fs ON f.schema_name = fs.schema_name AND f.database_name = fs.database_name \
+         WHERE f.function_type = 'macro' AND f.internal = false AND f.database_name = '{}'",
+        FULL_SCHEMAS_CTE, safe_cat
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(&sql).or_else(|_| {
+        let fallback_sql = format!(
+            "SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END, \
+             macro_definition, CAST(parameters AS VARCHAR) \
+             FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false AND database_name = '{}'",
+            safe_cat
+        );
+        conn.prepare(&fallback_sql)
+    })?;
+
     let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
     let mut macros = HashMap::new();
     for row in rows {
@@ -1161,10 +1216,9 @@ pub fn compute_diff(
             }
 
             if needs_recreate {
-                let (schema_prefix, simple_name) = match table_name.split_once('.') {
-                    Some((s, t)) => (format!("{}.", s), t),
-                    None => (String::new(), table_name.as_str()),
-                };
+                let ident = QualifiedIdentifier::parse(table_name);
+                let schema_prefix = ident.schema_prefix();
+                let simple_name = ident.leaf_name();
                 let swap_table_name = format!("{}{}__duckpack_swap", schema_prefix, simple_name);
 
                 let create_table_re = Regex::new(r"(?i)^\s*CREATE\s+TABLE\s+[^\s(]+").unwrap();
@@ -1191,8 +1245,12 @@ pub fn compute_diff(
                     ));
                 }
 
-                swap_script.push_str(&format!("DROP TABLE {};\n", table_name));
-                swap_script.push_str(&format!("ALTER TABLE {} RENAME TO {};\n", swap_table_name, simple_name));
+                let quoted_table = quote_qualified_identifier(table_name);
+                let quoted_swap = quote_qualified_identifier(&swap_table_name);
+                let quoted_simple = format!("\"{}\"", simple_name.replace('\"', "\"\""));
+
+                swap_script.push_str(&format!("DROP TABLE {};\n", quoted_table));
+                swap_script.push_str(&format!("ALTER TABLE {} RENAME TO {};\n", quoted_swap, quoted_simple));
                 swap_script.push_str("COMMIT;");
 
                 let ignored = is_ignored(table_name);
@@ -1206,6 +1264,28 @@ pub fn compute_diff(
                     locked: false,
                     ignored,
                 });
+
+                // Auto-preserve triggers attached to this recreated table
+                for (trg_name, shadow_trg) in shadow_triggers {
+                    let trg_table_ident = QualifiedIdentifier::parse(&shadow_trg.table_name);
+                    if trg_table_ident.leaf_name() == ident.leaf_name()
+                        && (trg_table_ident.full_schema().is_none() || trg_table_ident.full_schema() == ident.full_schema())
+                    {
+                        if !diff.items.iter().any(|item| item.item_type == DiffItemType::CreateTrigger && item.obj_name == *trg_name) {
+                            let is_trg_ignored = is_ignored(trg_name) || is_ignored(table_name);
+                            diff.items.push(DiffItem {
+                                item_type: DiffItemType::CreateTrigger,
+                                obj_name: trg_name.clone(),
+                                sql: shadow_trg.sql.clone(),
+                                old_def: None,
+                                new_def: Some(shadow_trg.sql.clone()),
+                                selected: !is_trg_ignored,
+                                locked: false,
+                                ignored: is_trg_ignored,
+                            });
+                        }
+                    }
+                }
             } else {
                 if !safe_sqls.is_empty() {
                     let has_rename = safe_sqls.iter().any(|s| s.contains("RENAME COLUMN"));
@@ -1326,8 +1406,13 @@ pub fn compute_diff(
         let target_def = target_views.get(name);
         
         if target_def.is_none() || target_def != Some(shadow_def) {
-            let view_re = Regex::new(r"(?i)^(\s*CREATE\s+)VIEW\b").unwrap();
-            let safe_sql = view_re.replace(shadow_def, "${1}OR REPLACE VIEW").to_string();
+            let view_re = Regex::new(r"(?i)^(\s*CREATE\s+)(?:OR\s+REPLACE\s+)?(?:SECURE\s+)?VIEW\b").unwrap();
+            let is_secure = Regex::new(r"(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?SECURE\s+VIEW\b").unwrap().is_match(shadow_def);
+            let safe_sql = if is_secure {
+                view_re.replace(shadow_def, "${1}OR REPLACE SECURE VIEW").to_string()
+            } else {
+                view_re.replace(shadow_def, "${1}OR REPLACE VIEW").to_string()
+            };
             let ignored = is_ignored(name);
             
             diff.items.push(DiffItem {
@@ -1402,14 +1487,15 @@ pub fn compute_diff(
         if let Some(target_trg) = target_triggers.get(name) {
             if shadow_trg.sql.trim() != target_trg.sql.trim() {
                 let target_table = if target_trg.schema_name == "main" {
-                    target_trg.table_name.clone()
+                    quote_qualified_identifier(&target_trg.table_name)
                 } else {
-                    format!("{}.{}", target_trg.schema_name, target_trg.table_name)
+                    quote_qualified_identifier(&format!("{}.{}", target_trg.schema_name, target_trg.table_name))
                 };
+                let quoted_trg = format!("\"{}\"", target_trg.trigger_name.replace('\"', "\"\""));
                 diff.items.push(DiffItem {
                     item_type: DiffItemType::DropTrigger,
                     obj_name: name.clone(),
-                    sql: format!("DROP TRIGGER {} ON {};", target_trg.trigger_name, target_table),
+                    sql: format!("DROP TRIGGER {} ON {};", quoted_trg, target_table),
                     old_def: Some(target_trg.sql.clone()),
                     new_def: None,
                     selected: !is_trg_ignored,
@@ -1445,14 +1531,15 @@ pub fn compute_diff(
         if !shadow_triggers.contains_key(name) {
             let is_trg_ignored = is_ignored(name) || is_ignored(&target_trg.table_name);
             let target_table = if target_trg.schema_name == "main" {
-                target_trg.table_name.clone()
+                quote_qualified_identifier(&target_trg.table_name)
             } else {
-                format!("{}.{}", target_trg.schema_name, target_trg.table_name)
+                quote_qualified_identifier(&format!("{}.{}", target_trg.schema_name, target_trg.table_name))
             };
+            let quoted_trg = format!("\"{}\"", target_trg.trigger_name.replace('\"', "\"\""));
             diff.items.push(DiffItem {
                 item_type: DiffItemType::DropTrigger,
                 obj_name: name.clone(),
-                sql: format!("DROP TRIGGER {} ON {};", target_trg.trigger_name, target_table),
+                sql: format!("DROP TRIGGER {} ON {};", quoted_trg, target_table),
                 old_def: Some(target_trg.sql.clone()),
                 new_def: None,
                 selected: !is_trg_ignored,
@@ -1461,6 +1548,7 @@ pub fn compute_diff(
             });
         }
     }
+
 
     diff
 }
@@ -1546,8 +1634,9 @@ mod tests {
         );
         assert_eq!(diff2.items.len(), 1);
         assert_eq!(diff2.items[0].item_type, DiffItemType::DropTrigger);
-        assert_eq!(diff2.items[0].sql, "DROP TRIGGER trg_old ON orders;");
+        assert_eq!(diff2.items[0].sql, "DROP TRIGGER \"trg_old\" ON \"orders\";");
     }
+
 
     #[test]
     fn test_validate_target_catalog_and_isolation() {
@@ -1798,11 +1887,10 @@ mod tests {
         assert_eq!(diff.items.len(), 1);
         assert_eq!(diff.items[0].item_type, DiffItemType::RecreateTable);
         assert!(diff.items[0].sql.contains("BEGIN TRANSACTION;"));
-        assert!(diff.items[0].sql.contains("CREATE TABLE orders__duckpack_swap"));
-        assert!(diff.items[0].sql.contains("INSERT INTO orders__duckpack_swap"));
-        assert!(diff.items[0].sql.contains("DROP TABLE orders;"));
-        assert!(diff.items[0].sql.contains("ALTER TABLE orders__duckpack_swap RENAME TO orders;"));
+        assert!(diff.items[0].sql.contains("DROP TABLE \"orders\";"));
+        assert!(diff.items[0].sql.contains("ALTER TABLE \"orders__duckpack_swap\" RENAME TO \"orders\";"));
         assert!(diff.items[0].sql.contains("COMMIT;"));
+
     }
 
     #[test]
@@ -2084,5 +2172,118 @@ mod tests {
         let query_res = conn.execute_batch("SELECT revenue FROM region.sales.orders;");
         assert!(query_res.is_ok());
     }
+
+    #[test]
+    fn test_qualified_identifier_parsing_and_quoting() {
+        let q1 = QualifiedIdentifier::parse("users");
+        assert_eq!(q1.leaf_name(), "users");
+        assert_eq!(q1.schema_prefix(), "");
+        assert_eq!(q1.full_schema(), None);
+        assert_eq!(q1.quoted_qualified_name(), "\"users\"");
+
+        let q2 = QualifiedIdentifier::parse("finance.reports.q3");
+        assert_eq!(q2.leaf_name(), "q3");
+        assert_eq!(q2.schema_prefix(), "finance.reports.");
+        assert_eq!(q2.full_schema(), Some("finance.reports".to_string()));
+        assert_eq!(q2.quoted_qualified_name(), "\"finance\".\"reports\".\"q3\"");
+    }
+
+    #[test]
+    fn test_secure_view_diff_replacement() {
+        let shadow_schemas = HashSet::new();
+        let target_schemas = HashSet::new();
+        let mut shadow_views = HashMap::new();
+        let mut target_views = HashMap::new();
+
+        shadow_views.insert("v_sec".to_string(), "CREATE SECURE VIEW v_sec AS SELECT 1;".to_string());
+        target_views.insert("v_sec".to_string(), "CREATE SECURE VIEW v_sec AS SELECT 0;".to_string());
+
+        let diff = compute_diff(
+            &shadow_schemas, &target_schemas,
+            &HashMap::new(), &HashMap::new(),
+            &shadow_views, &target_views,
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[]
+        );
+
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::CreateView);
+        assert_eq!(diff.items[0].sql, "CREATE OR REPLACE SECURE VIEW v_sec AS SELECT 1;");
+    }
+
+    #[test]
+    fn test_recreate_table_trigger_preservation() {
+        let shadow_schemas = HashSet::new();
+        let target_schemas = HashSet::new();
+        let mut shadow = HashMap::new();
+        let mut target = HashMap::new();
+
+        let mut shadow_cols = HashMap::new();
+        shadow_cols.insert("id".to_string(), "INTEGER".to_string());
+        let mut target_cols = HashMap::new();
+        target_cols.insert("id".to_string(), "INTEGER".to_string());
+
+        // Target has no check constraint, shadow adds a check constraint requiring recreate
+        let shadow_constr = vec![ConstraintSchema {
+            constraint_type: "CHECK".to_string(),
+            constraint_name: Some("chk_id".to_string()),
+            columns: vec!["id".to_string()],
+            expression: Some("id > 0".to_string()),
+            referenced_table: None,
+            referenced_columns: vec![],
+        }];
+
+        shadow.insert("finance.reports.kpis".to_string(), TableSchema {
+            create_sql: "CREATE TABLE finance.reports.kpis (id INTEGER CHECK (id > 0));".to_string(),
+            columns: shadow_cols,
+            column_defaults: HashMap::new(),
+            constraints: shadow_constr,
+        });
+        target.insert("finance.reports.kpis".to_string(), TableSchema {
+            create_sql: "CREATE TABLE finance.reports.kpis (id INTEGER);".to_string(),
+            columns: target_cols,
+            column_defaults: HashMap::new(),
+            constraints: vec![],
+        });
+
+        let mut shadow_triggers = HashMap::new();
+        let mut target_triggers = HashMap::new();
+
+        shadow_triggers.insert("trg_kpi".to_string(), TriggerSchema {
+            schema_name: "finance.reports".to_string(),
+            trigger_name: "trg_kpi".to_string(),
+            table_name: "finance.reports.kpis".to_string(),
+            sql: "CREATE TRIGGER trg_kpi AFTER INSERT ON finance.reports.kpis FOR EACH ROW INSERT INTO audit VALUES (NEW.id);".to_string(),
+        });
+        target_triggers.insert("trg_kpi".to_string(), TriggerSchema {
+            schema_name: "finance.reports".to_string(),
+            trigger_name: "trg_kpi".to_string(),
+            table_name: "finance.reports.kpis".to_string(),
+            sql: "CREATE TRIGGER trg_kpi AFTER INSERT ON finance.reports.kpis FOR EACH ROW INSERT INTO audit VALUES (NEW.id);".to_string(),
+        });
+
+        let diff = compute_diff(
+            &shadow_schemas, &target_schemas,
+            &shadow, &target,
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &shadow_triggers, &target_triggers,
+            &std::path::PathBuf::new(),
+            &[]
+        );
+
+        // Expect RecreateTable AND CreateTrigger
+        let recreate_item = diff.items.iter().find(|i| i.item_type == DiffItemType::RecreateTable);
+        assert!(recreate_item.is_some(), "RecreateTable should be present");
+        let recreate_sql = &recreate_item.unwrap().sql;
+        // Verify 3-level table swap generates leaf rename TO "kpis"
+        assert!(recreate_sql.contains("ALTER TABLE \"finance\".\"reports\".\"kpis__duckpack_swap\" RENAME TO \"kpis\";"));
+
+        let trg_item = diff.items.iter().find(|i| i.item_type == DiffItemType::CreateTrigger);
+        assert!(trg_item.is_some(), "CreateTrigger should be auto-emitted for recreated table");
+    }
 }
+
 

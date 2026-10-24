@@ -665,15 +665,19 @@ def test_constraint_copy_and_swap_migration_in_memory(tmp_path):
     assert post_diff.has_changes is False
 
 
+@pytest.mark.integration
+@pytest.mark.skipif(not os.environ.get("QUACK_TOKEN"), reason="QUACK_TOKEN environment variable not set for live Quack test")
 def test_live_quack_pk_diff_and_apply_idempotency(tmp_path):
+    token = os.environ.get("QUACK_TOKEN")
     # Connect to live Quack container
     con = duckdb.connect()
     try:
         con.execute("LOAD quack;")
-        con.execute("CREATE SECRET (TYPE QUACK, TOKEN 'your_quack_token_here');")
+        con.execute(f"CREATE SECRET (TYPE QUACK, TOKEN '{token}');")
         con.execute("ATTACH 'quack:0.0.0.0:9494' AS target_db (DISABLE_SSL true);")
     except Exception as e:
         pytest.skip(f"Live Quack container not reachable: {e}")
+
 
     test_tbl = "__duckpack_pk_isolated_test"
     try:
