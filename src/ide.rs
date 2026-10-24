@@ -2209,14 +2209,12 @@ pub fn run_ide_loop(
                         new_asset_modal.active_field = (new_asset_modal.active_field + 1) % 4;
                     } else if key.code == KeyCode::BackTab || key.code == KeyCode::Up {
                         new_asset_modal.active_field = if new_asset_modal.active_field == 0 { 3 } else { new_asset_modal.active_field - 1 };
-                    } else if key.code == KeyCode::Left || key.code == KeyCode::Char('h') {
-                        if new_asset_modal.active_field == 0 {
-                            new_asset_modal.category_index = if new_asset_modal.category_index == 0 { 6 } else { new_asset_modal.category_index - 1 };
-                        }
-                    } else if key.code == KeyCode::Right || key.code == KeyCode::Char('l') {
-                        if new_asset_modal.active_field == 0 {
-                            new_asset_modal.category_index = (new_asset_modal.category_index + 1) % 7;
-                        }
+                    } else if new_asset_modal.active_field == 0 && (key.code == KeyCode::Left || key.code == KeyCode::Char('h')) {
+                        new_asset_modal.category_index = if new_asset_modal.category_index == 0 { 6 } else { new_asset_modal.category_index - 1 };
+                    } else if new_asset_modal.active_field == 0 && (key.code == KeyCode::Right || key.code == KeyCode::Char('l')) {
+                        new_asset_modal.category_index = (new_asset_modal.category_index + 1) % 7;
+                    } else if new_asset_modal.active_field >= 2 && (key.code == KeyCode::Left || key.code == KeyCode::Right) {
+                        new_asset_modal.active_field = if new_asset_modal.active_field == 2 { 3 } else { 2 };
                     } else if key.code == KeyCode::Backspace {
                         if new_asset_modal.active_field == 1 {
                             new_asset_modal.name.pop();
