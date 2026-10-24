@@ -521,11 +521,15 @@ pub fn apply_diff(
         let mut drop_schemas = Vec::new();
 
         // 1. Create schemas first
+        let mut schemas_to_apply = Vec::new();
         for item in &diff.items {
             if !item.selected || item.ignored { continue; }
             if item.item_type == diff::DiffItemType::CreateSchema {
-                execute_sql(&item.sql)?;
+                schemas_to_apply.push(item.sql.clone());
             }
+        }
+        if !schemas_to_apply.is_empty() {
+            execute_sqls_with_retry_custom(schemas_to_apply, &execute_sql)?;
         }
 
         let mut structure_to_apply = Vec::new();
