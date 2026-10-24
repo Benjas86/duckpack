@@ -2758,26 +2758,41 @@ pub fn run_ide_loop(
                                         NodeType::Table { database, schema, is_temporary } | NodeType::View { database, schema, is_temporary } => {
                                             let db_name = database.as_deref().unwrap_or(&meta.active_database);
                                             let schema_name = schema.as_deref().unwrap_or("main");
+
+                                            let quote_part = |s: &str| -> String {
+                                                if s.chars().any(|c| !c.is_alphanumeric() && c != '_') {
+                                                    format!("\"{}\"", s.replace('"', "\"\""))
+                                                } else {
+                                                    s.to_string()
+                                                }
+                                            };
+                                            let quote_schema_path = |s: &str| -> String {
+                                                s.split('.').map(quote_part).collect::<Vec<_>>().join(".")
+                                            };
+                                            let quoted_item = quote_part(item_name);
+                                            let quoted_schema = quote_schema_path(schema_name);
+                                            let quoted_db = quote_part(db_name);
+
                                             let qualified_sql = if *is_temporary {
-                                                format!("SELECT * FROM {} LIMIT 500;", item_name)
+                                                format!("SELECT * FROM {} LIMIT 500;", quoted_item)
                                             } else if is_quack && db_name != meta.active_database && db_name != "memory" && db_name != "target_db" {
                                                 if schema_name == "main" {
-                                                    format!("-- @remote\nSELECT * FROM {}.{} LIMIT 500;", db_name, item_name)
+                                                    format!("-- @remote\nSELECT * FROM {}.{} LIMIT 500;", quoted_db, quoted_item)
                                                 } else {
-                                                    format!("-- @remote\nSELECT * FROM {}.{}.{} LIMIT 500;", db_name, schema_name, item_name)
+                                                    format!("-- @remote\nSELECT * FROM {}.{}.{} LIMIT 500;", quoted_db, quoted_schema, quoted_item)
                                                 }
                                             } else if meta.databases.len() > 1 {
                                                 if schema_name == "main" {
-                                                    format!("SELECT * FROM {}.{} LIMIT 500;", db_name, item_name)
+                                                    format!("SELECT * FROM {}.{} LIMIT 500;", quoted_db, quoted_item)
                                                 } else {
-                                                    format!("SELECT * FROM {}.{}.{} LIMIT 500;", db_name, schema_name, item_name)
+                                                    format!("SELECT * FROM {}.{}.{} LIMIT 500;", quoted_db, quoted_schema, quoted_item)
                                                 }
                                             } else if db_name == meta.active_database && schema_name == "main" {
-                                                format!("SELECT * FROM {} LIMIT 500;", item_name)
+                                                format!("SELECT * FROM {} LIMIT 500;", quoted_item)
                                             } else if schema_name == "main" {
-                                                format!("SELECT * FROM {}.{} LIMIT 500;", db_name, item_name)
+                                                format!("SELECT * FROM {}.{} LIMIT 500;", quoted_db, quoted_item)
                                             } else {
-                                                format!("SELECT * FROM {}.{}.{} LIMIT 500;", db_name, schema_name, item_name)
+                                                format!("SELECT * FROM {}.{}.{} LIMIT 500;", quoted_db, quoted_schema, quoted_item)
                                             };
 
                                             let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
@@ -2792,7 +2807,8 @@ pub fn run_ide_loop(
                                             tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
                                             focus = FocusPane::Editor;
                                             execute_query = true;
-                                            status_msg = format!("Queried table '{}'", item_name);
+                                            let display_table = if schema_name == "main" { item_name.clone() } else { format!("{}.{}", schema_name, item_name) };
+                                            status_msg = format!("Queried table '{}'", display_table);
                                         }
                                         _ => {}
                                     }
@@ -4548,6 +4564,46 @@ mod tests {
         crate::tui::recompute_locks(&mut diff.items);
         assert!(diff.items[0].selected);
         assert!(!diff.items[1].locked);
+    }
+
+    #[test]
+    fn test_nested_schemas_in_ide_explorer() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_ide_nested_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("ATTACH ':memory:' AS target_db;", []).unwrap();
+        conn.execute("USE target_db;", []).unwrap();
+        conn.execute("CREATE SCHEMA target_db.region;", []).unwrap();
+        conn.execute("CREATE SCHEMA target_db.region.sales;", []).unwrap();
+        conn.execute("CREATE TABLE target_db.region.products (id INT PRIMARY KEY);", []).unwrap();
+        conn.execute("CREATE TABLE target_db.region.sales.orders (order_id INT PRIMARY KEY, qty INT);", []).unwrap();
+
+        let meta = load_explorer_metadata(&conn, &temp_dir, false);
+        let mut expanded_groups = HashSet::new();
+        expanded_groups.insert("db:target_db".to_string());
+        expanded_groups.insert("target_db:Tables".to_string());
+        let expanded_tables = HashSet::new();
+
+        let nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
+
+        // Verify products node display
+        let prod_node = nodes.iter().find(|n| n.name == "products").expect("products node");
+        assert!(prod_node.display.contains("region.products"));
+
+        // Verify orders node display with nested schema
+        let orders_node = nodes.iter().find(|n| n.name == "orders").expect("orders node");
+        assert!(orders_node.display.contains("region.sales.orders"));
+
+        match &orders_node.node_type {
+            NodeType::Table { database, schema, .. } => {
+                assert_eq!(database.as_deref(), Some("target_db"));
+                assert_eq!(schema.as_deref(), Some("region.sales"));
+            }
+            _ => panic!("Expected NodeType::Table"),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 
