@@ -719,29 +719,33 @@ JOIN memory.customer_categories mem ON rt.customer_id = mem.customer_id;
 ```
 Standard `SELECT` queries, aggregations, cross-database joins, and DML run natively across the connection without requiring any special annotations.
 
-### The `-- @remote` Query Directive
+### DuckDB v2.0 Native `CONNECT` Session Management
 
-In DuckDB's engine architecture, session-scoped entities like **Secrets** and **Settings** are kept in local client memory by default. Prepending `-- @remote` at the top of your query instructs DuckPack to automatically forward the statement directly to the remote server engine via `FROM query(...)`:
+In DuckDB v2.0, the Quack remote protocol graduates to first-class connection sessions via the native `CONNECT target_db;` statement. When DuckPack attaches to a remote Quack server, it immediately establishes session context on the remote server:
 
 ```sql
--- @remote
-CREATE SECRET (
-    TYPE S3,
-    KEY_ID 'AKIAIOSFODNN7EXAMPLE',
-    SECRET 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
-    REGION 'us-east-1'
-);
+ATTACH 'quack:analytics.company.com:443' AS target_db;
+CONNECT target_db;
 ```
 
-| Statement Type | Needs `-- @remote`? | Execution Target | Behavior |
-| :--- | :---: | :--- | :--- |
-| `CREATE TABLE` / `CREATE VIEW` | **No** | Remote Database | Standard SQL; persists directly on remote Quack DB. |
-| `SELECT * FROM table / view` | **No** | Remote Database | Standard SQL; queries remote data directly. |
-| `INSERT` / `UPDATE` / `DELETE` | **No** | Remote Database | Standard SQL; mutates remote data directly. |
-| **`CREATE SECRET (TYPE S3 ...)`** | **YES** | Remote Server Instance | Pushes S3/GCS/Azure credentials directly to the remote daemon. |
-| **`SHOW TABLES` / `DESCRIBE`** | **YES** | Remote Server Instance | Executes server-side cleanly to introspect remote catalog. |
-| **`SET variable = ...`** | **YES** | Remote Server Instance | Applies configuration variables directly to remote server session. |
-| **`INSTALL / LOAD extension`** | **YES** | Remote Server Instance | Installs or loads extensions directly on remote Quack engine. |
+With `CONNECT target_db;` active:
+- **Zero-Friction Execution:** All standard queries, DDL (`CREATE TABLE`, `CREATE SCHEMA`), DML (`INSERT`, `UPDATE`, `DELETE`), CTEs, and session configuration commands execute directly on the remote server without manual wrappers.
+- **Native Secrets & Settings:** `CREATE SECRET (TYPE S3 ...)` and `SET variable = ...` statements apply directly to the remote server session without needing special client-side redirection.
+
+### The `-- @remote` Query Directive (Sunset & Backwards Compatibility)
+
+In DuckDB 1.x, session-scoped entities (such as secrets and configuration settings) were held in local client memory unless wrapped via `-- @remote`. 
+
+With DuckDB v2.0's native `CONNECT` architecture, **`-- @remote` is sunsetted as a requirement**. DuckPack maintains backwards-compatible support: if an existing script or query contains `-- @remote`, DuckPack strips the directive and executes the statement natively without errors.
+
+| Statement Type | DuckDB v1.x (`-- @remote`) | DuckDB v2.0 (`CONNECT target_db`) |
+| :--- | :---: | :--- |
+| `CREATE TABLE` / `CREATE VIEW` / `CREATE SECURE VIEW` | Standard SQL | Native server-side execution. |
+| `SELECT` / CTEs / DML | Standard SQL | Native server-side execution (including CTE DML). |
+| `CREATE SECRET (TYPE S3 ...)` | Required `-- @remote` | Native server-side execution via `CONNECT`. |
+| `SET variable = ...` | Required `-- @remote` | Native server-side execution via `CONNECT`. |
+| `INSTALL` / `LOAD` | Required `-- @remote` | Native server-side execution via `CONNECT`. |
+
 
 ### SSL & Non-TLS Options
 
@@ -764,10 +768,11 @@ Running `duckpack init --project-dir my_project` generates the standard declarat
 
 ```
 my_project/
-├── schemas/               # CREATE SCHEMA statements
-├── tables/                # CREATE TABLE statements (one table per .sql file)
-├── views/                 # CREATE VIEW statements (engine auto-forces OR REPLACE)
-├── macros/                # CREATE MACRO statements
+├── schemas/               # CREATE SCHEMA statements (supports nested schemas e.g. finance/reports.sql)
+├── tables/                # CREATE TABLE statements (one table per .sql file; VARIANT types supported)
+├── views/                 # CREATE VIEW & CREATE SECURE VIEW statements (engine auto-forces OR REPLACE)
+├── macros/                # CREATE MACRO statements (supports DuckDB 2.0 lambda x: ... syntax)
+├── triggers/              # CREATE TRIGGER statements (auto-preserved during table copy-and-swap)
 ├── queries/               # Scratchpad queries, exports, and query history
 ├── seeds/                 # Static CSVs or data seed files
 ├── scripts/
@@ -777,6 +782,18 @@ my_project/
 ├── .env                   # Environment variables for ${VAR} template substitution
 └── .duckdbignore          # Ignore patterns for tables/views
 ```
+
+### DuckDB v2.0 Authoring Guidelines
+
+- **Arbitrary Nested Schemas:** Schemas can be nested to any depth (`CREATE SCHEMA finance.reports;`). Table files can live in nested subdirectories (`tables/finance/reports/q3.sql`) or dot-named files (`tables/finance.reports.q3.sql`). DuckPack automatically resolves topological creation order (parents before children) and teardown order (children before parents).
+- **First-Class `VARIANT` Columns:** Tables and views support native `VARIANT` types and `variant_*` functions alongside JSON casts (`::JSON::VARIANT`). In-place type alterations (`ALTER TABLE t ALTER c TYPE VARIANT`) are applied without requiring table recreation.
+- **`CREATE SECURE VIEW`:** Secure views are fully supported in `views/`. When views are modified, DuckPack automatically emits `CREATE OR REPLACE SECURE VIEW` to preserve view protection.
+- **Double-Arrow / `lambda` Macro Syntax:** In DuckDB 2.0, single-arrow lambdas (`x -> x + 1`) are deprecated. Write macros using `lambda x: x + 1` or double-arrow syntax:
+  ```sql
+  CREATE MACRO core.double_all(arr) AS list_transform(arr, lambda x: x * 2);
+  ```
+- **Automatic Trigger Preservation:** DuckDB 2.0 cascades table drops to all attached triggers. DuckPack's declarative diff engine detects when a table requires a copy-and-swap migration and automatically re-emits `CREATE TRIGGER` statements immediately after the table swap, preventing trigger loss.
+
 
 ### Configuration (`duckpack.toml`)
 

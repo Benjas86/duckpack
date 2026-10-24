@@ -32,3 +32,9 @@ features = ["python"]
 bindings = "pyo3"
 module-name = "duckpack._duckpack"
 python-source = "python"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: live service integration tests (requires external daemon)",
+]
+

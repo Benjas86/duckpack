@@ -32,10 +32,17 @@ pub fn wrap_remote_query(query: &str) -> (String, bool) {
     let trimmed = stripped.trim();
     let clean_stripped = trimmed.strip_suffix(';').unwrap_or(trimmed);
     let lower = clean_stripped.to_lowercase();
-    let is_select = lower.starts_with("select")
+    let is_mutating_cte = lower.starts_with("with")
+        && (lower.contains(") insert into")
+            || lower.contains(") delete from")
+            || lower.contains(") update ")
+            || (lower.contains("insert into") && !lower.starts_with("with") == false && !lower.contains("select ")));
+
+    let is_select = (lower.starts_with("select")
         || lower.starts_with("with")
         || lower.starts_with("values")
-        || lower.starts_with("from");
+        || lower.starts_with("from"))
+        && !is_mutating_cte;
 
     let escaped = clean_stripped.replace('\'', "''");
     let wrapped = if is_select {
@@ -81,12 +88,13 @@ pub fn is_unadorned_secret_or_setting(query: &str) -> bool {
 
 /// Generates a diagnostic hint if an error message on a remote database indicates cloud storage, credential, or Quack streaming scan limitations.
 pub fn diagnose_remote_credential_error(err_str: &str, is_remote: bool) -> &'static str {
-    if !is_remote {
-        return "";
-    }
     let lower = err_str.to_lowercase();
-    if lower.contains("multiple streaming scans") || lower.contains("streaming scans + ctas") {
-        " [Hint: Quack protocol limitation. Add '-- @remote' above query to execute server-side!]"
+    if lower.contains("deprecated lambda arrow") || lower.contains("lambda_syntax") {
+        " [Hint: DuckDB 2.0 deprecated '->' lambdas. Use 'lambda x: ...' or SET lambda_syntax='ENABLE_SINGLE_ARROW']"
+    } else if !is_remote {
+        ""
+    } else if lower.contains("multiple streaming scans") || lower.contains("streaming scans + ctas") {
+        " [Hint: Quack protocol limitation. With DuckDB 2.0 native CONNECT target_db, queries run server-side natively!]"
     } else if lower.contains("s3")
         || lower.contains("403")
         || lower.contains("access denied")
@@ -95,11 +103,12 @@ pub fn diagnose_remote_credential_error(err_str: &str, is_remote: bool) -> &'sta
         || lower.contains("missing secret")
         || lower.contains("forbidden")
     {
-        " [Hint: Missing S3 secret on remote Quack? Add '-- @remote' above your CREATE SECRET]"
+        " [Hint: Missing S3 secret on remote Quack? Run 'CREATE SECRET ...']"
     } else {
         ""
     }
 }
+
 
 /// Recursively discovers all `.sql` query files under a root queries directory.
 pub fn collect_queries_recursive(dir: &Path, base: &Path, queries: &mut Vec<String>) {

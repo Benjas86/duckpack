@@ -193,6 +193,8 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "APPROX",
     "VARIANT",
     "POSITIONAL",
+    "SECURE",
+    "LAMBDA",
 ];
 
 /// SQL boolean & null literal values.
@@ -210,7 +212,7 @@ pub const SQL_KEYWORD_PATTERN: &str =
     DISCONNECT|PRIMARY|KEY|FOREIGN|REFERENCES|DEFAULT|CHECK|UNIQUE|CONSTRAINT|CASCADE|\
     RESTRICT|GENERATED|ALWAYS|IDENTITY|AUTO_INCREMENT|COLLATE|IF|EXISTS|AND|OR|NOT|IN|IS|\
     BETWEEN|LIKE|ILIKE|SIMILAR|CASE|WHEN|THEN|ELSE|END|COALESCE|NULLIF|CAST|TRY_CAST|\
-    APPROX|VARIANT|POSITIONAL|TRUE|FALSE|NULL|\
+    APPROX|VARIANT|POSITIONAL|SECURE|LAMBDA|TRUE|FALSE|NULL|\
     TINYINT|INT1|SMALLINT|INT2|SHORT|INTEGER|INT|INT4|SIGNED|BIGINT|INT8|LONG|HUGEINT|\
     UTINYINT|USMALLINT|UINTEGER|UINT|UBIGINT|UHUGEINT|FLOAT|FLOAT4|REAL|DOUBLE|FLOAT8|\
     PRECISION|DECIMAL|NUMERIC|BOOLEAN|BOOL|VARCHAR|CHAR|BPCHAR|TEXT|STRING|BLOB|BYTEA|\
@@ -398,6 +400,10 @@ mod tests {
         assert!(re.is_match("UNIQUE"));
         assert!(re.is_match("EXISTS"));
         assert!(re.is_match("RETURNING"));
+        assert!(re.is_match("SECURE"));
+        assert!(re.is_match("LAMBDA"));
+        assert!(re.is_match("VARIANT"));
+
 
         // Negative match (regular table or column names)
         assert!(!re.is_match("user_orders"));

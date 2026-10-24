@@ -4033,9 +4033,12 @@ mod tests {
     #[test]
     fn test_live_quack_metadata_loading() {
         let db_uri = "quack:0.0.0.0:9494";
-        let token = "your_quack_token_here";
+        let token_var = std::env::var("QUACK_TOKEN").unwrap_or_default();
+        if token_var.is_empty() {
+            return;
+        }
         // Connect to live quack container if running
-        let conn_res = crate::engine::connect_target_db(db_uri, Some(token), true);
+        let conn_res = crate::engine::connect_target_db(db_uri, Some(&token_var), true);
         if let Ok(conn) = conn_res {
             let temp_dir = std::env::temp_dir().join(format!("dp_live_quack_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             let _ = std::fs::create_dir_all(&temp_dir);
@@ -4099,8 +4102,11 @@ mod tests {
     #[test]
     fn test_live_insert_users() {
         let db_uri = "quack:0.0.0.0:9494";
-        let token = "your_quack_token_here";
-        if let Ok(conn) = crate::engine::connect_target_db(db_uri, Some(token), true) {
+        let token_var = std::env::var("QUACK_TOKEN").unwrap_or_default();
+        if token_var.is_empty() {
+            return;
+        }
+        if let Ok(conn) = crate::engine::connect_target_db(db_uri, Some(&token_var), true) {
             let temp_dir = std::env::temp_dir().join(format!("dp_live_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             let _ = std::fs::create_dir_all(&temp_dir);
 
@@ -4472,8 +4478,11 @@ mod tests {
     #[test]
     fn test_live_quack_compute_and_apply_ide_diff() {
         let db_uri = "quack:0.0.0.0:9494";
-        let token = "your_quack_token_here";
-        if let Ok(conn) = crate::engine::connect_target_db(db_uri, Some(token), true) {
+        let token_var = std::env::var("QUACK_TOKEN").unwrap_or_default();
+        if token_var.is_empty() {
+            return;
+        }
+        if let Ok(conn) = crate::engine::connect_target_db(db_uri, Some(&token_var), true) {
             let temp_dir = std::env::temp_dir().join(format!("dp_quack_diff_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
             let _ = std::fs::create_dir_all(temp_dir.join("tables"));
 
