@@ -470,13 +470,21 @@ pub fn apply_diff(
         conn.query_row("SELECT current_database()", [], |r| r.get(0)).unwrap_or_default()
     };
 
-    let target_cat = catalog.unwrap_or(&orig_db);
+    let mut target_cat = catalog.unwrap_or(&orig_db);
+    // If connected via Quack, 'target_db' is merely DuckPack's client-side attachment alias.
+    // The remote Quack database server does NOT have a catalog named 'target_db'.
+    // Therefore, any target catalog pointing to 'target_db' must resolve to the remote server's active database (orig_db).
+    if is_quack && (target_cat == "target_db" || target_cat.is_empty()) {
+        target_cat = &orig_db;
+    }
 
     if !is_quack && !target_cat.is_empty() && target_cat != orig_db {
         conn.execute_batch(&format!("USE \"{}\";", target_cat.replace('\"', "\"\"")))?;
     }
 
-    if is_remote {
+    let is_remote_effective = is_remote || is_quack;
+
+    if is_remote_effective {
         if is_quack {
             let _ = conn.execute_batch("CALL target_db.query('BEGIN TRANSACTION;');");
         } else {
@@ -488,8 +496,13 @@ pub fn apply_diff(
         if is_quack {
             let safe_cat = target_cat.replace('\'', "''");
             let safe_sql = sql.replace('\'', "''");
-            conn.execute_batch(&format!("CALL target_db.query('USE \"{}\"; {}')", safe_cat, safe_sql))
-                .with_context(|| format!("Failed executing DDL on catalog '{}' via Quack", target_cat))?;
+            if !safe_cat.is_empty() {
+                conn.execute_batch(&format!("CALL target_db.query('USE \"{}\"; {}')", safe_cat, safe_sql))
+                    .with_context(|| format!("Failed executing DDL on catalog '{}' via Quack", target_cat))?;
+            } else {
+                conn.execute_batch(&format!("CALL target_db.query('{}')", safe_sql))
+                    .with_context(|| "Failed executing DDL via Quack".to_string())?;
+            }
         } else {
             conn.execute_batch(sql)?;
         }
@@ -577,7 +590,7 @@ pub fn apply_diff(
         Ok(())
     })();
 
-    if is_remote {
+    if is_remote_effective {
         if result.is_ok() {
             if is_quack {
                 let _ = conn.execute_batch("CALL target_db.query('COMMIT;');");
@@ -1019,7 +1032,7 @@ where
                     progress_made = true;
                 }
                 Err(e) => {
-                    last_error = Some(anyhow::anyhow!("Failed: {}", e));
+                    last_error = Some(e);
                     remaining.push(sql);
                 }
             }

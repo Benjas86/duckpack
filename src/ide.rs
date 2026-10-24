@@ -230,24 +230,36 @@ pub(crate) fn compute_ide_diff(
     target_conn: &Connection,
 ) -> Result<crate::diff::DiffResult, String> {
     let shadow_conn = crate::engine::build_shadow_db(project_dir)
-        .map_err(|e| format!("Shadow DB Build Error: {}", e))?;
-    let active_catalog = "target_db";
-    let target_cat = if target_conn.query_row("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db'", [], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0 {
-        Some(active_catalog)
+        .map_err(|e| format!("Shadow DB Build Error: {:#}", e))?;
+
+    let is_quack = target_conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) > 0;
+
+    let target_cat = if is_quack {
+        crate::diff::validate_target_catalog(target_conn, None, false).ok()
+    } else if target_conn.query_row("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db'", [], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0 {
+        Some("target_db".to_string())
     } else {
         None
     };
 
-    let shadow_schemas = crate::diff::get_schemas(&shadow_conn, None).map_err(|e| e.to_string())?;
-    let target_schemas = crate::diff::get_schemas(target_conn, target_cat).map_err(|e| e.to_string())?;
-    let shadow_schema = crate::diff::get_schema(&shadow_conn, None).map_err(|e| e.to_string())?;
-    let target_schema = crate::diff::get_schema(target_conn, target_cat).map_err(|e| e.to_string())?;
-    let shadow_views = crate::diff::get_views(&shadow_conn, None).map_err(|e| e.to_string())?;
-    let target_views = crate::diff::get_views(target_conn, target_cat).map_err(|e| e.to_string())?;
-    let shadow_macros = crate::diff::get_macros(&shadow_conn, None).map_err(|e| e.to_string())?;
-    let target_macros = crate::diff::get_macros(target_conn, target_cat).map_err(|e| e.to_string())?;
-    let shadow_triggers = crate::diff::get_triggers(&shadow_conn, None).map_err(|e| e.to_string())?;
-    let target_triggers = crate::diff::get_triggers(target_conn, target_cat).map_err(|e| e.to_string())?;
+    let target_cat_ref = target_cat.as_deref();
+
+    let shadow_schemas = crate::diff::get_schemas(&shadow_conn, None).map_err(|e| format!("{:#}", e))?;
+    let target_schemas = crate::diff::get_schemas(target_conn, target_cat_ref).map_err(|e| format!("{:#}", e))?;
+    let shadow_schema = crate::diff::get_schema(&shadow_conn, None).map_err(|e| format!("{:#}", e))?;
+    let target_schema = crate::diff::get_schema(target_conn, target_cat_ref).map_err(|e| format!("{:#}", e))?;
+    let shadow_views = crate::diff::get_views(&shadow_conn, None).map_err(|e| format!("{:#}", e))?;
+    let target_views = crate::diff::get_views(target_conn, target_cat_ref).map_err(|e| format!("{:#}", e))?;
+    let shadow_macros = crate::diff::get_macros(&shadow_conn, None).map_err(|e| format!("{:#}", e))?;
+    let target_macros = crate::diff::get_macros(target_conn, target_cat_ref).map_err(|e| format!("{:#}", e))?;
+    let shadow_triggers = crate::diff::get_triggers(&shadow_conn, None).map_err(|e| format!("{:#}", e))?;
+    let target_triggers = crate::diff::get_triggers(target_conn, target_cat_ref).map_err(|e| format!("{:#}", e))?;
     let ignore_list = crate::engine::load_ignore_rules(project_dir);
 
     Ok(crate::diff::compute_diff(
@@ -272,9 +284,18 @@ pub(crate) fn apply_ide_diff(
     target_conn: &Connection,
     diff_result: &crate::diff::DiffResult,
 ) -> Result<(), String> {
-    let active_catalog = "target_db";
-    let target_cat = if target_conn.query_row("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db'", [], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0 {
-        Some(active_catalog)
+    let is_quack = target_conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) > 0;
+
+    let target_cat = if is_quack {
+        crate::diff::validate_target_catalog(target_conn, None, true).ok()
+    } else if target_conn.query_row("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db'", [], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0 {
+        Some("target_db".to_string())
     } else {
         None
     };
@@ -283,10 +304,10 @@ pub(crate) fn apply_ide_diff(
         target_conn,
         diff_result,
         false,
-        false,
+        is_quack,
         &project_dir.to_path_buf(),
-        target_cat,
-    ).map_err(|e| e.to_string())
+        target_cat.as_deref(),
+    ).map_err(|e| format!("{:#}", e))
 }
 
 /// Passively detects the current Git branch and file status without modifying Git index.
@@ -1823,12 +1844,13 @@ pub fn run_ide_loop(
                 f.render_widget(modal_block.clone(), popup_area);
 
                 let inner_area = modal_block.inner(popup_area);
+                let err_height = if in_ide_diff_modal.error_msg.is_some() { 3 } else { 2 };
                 let diff_layout = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(2), // 0: Summary header
                         Constraint::Min(6),    // 1: Changes list
-                        Constraint::Length(2), // 2: Error message or hint
+                        Constraint::Length(err_height), // 2: Error message or hint
                         Constraint::Length(3), // 3: Action buttons
                     ])
                     .split(inner_area);
@@ -1911,7 +1933,12 @@ pub fn run_ide_loop(
                         f.render_widget(changes_list, diff_layout[1]);
 
                         if let Some(ref err) = in_ide_diff_modal.error_msg {
-                            f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), diff_layout[2]);
+                            f.render_widget(
+                                Paragraph::new(format!(" ⚠️ {}", err))
+                                    .style(Style::default().fg(Color::LightRed))
+                                    .wrap(Wrap { trim: true }),
+                                diff_layout[2],
+                            );
                         } else {
                             f.render_widget(Paragraph::new("  Space: Toggle Selection | a: Toggle All | Enter: Apply Selected | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), diff_layout[2]);
                         }
@@ -4426,6 +4453,51 @@ mod tests {
         assert_eq!(diff_after.items.len(), 0);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_live_quack_compute_and_apply_ide_diff() {
+        let db_uri = "quack:0.0.0.0:9494";
+        let token = "your_quack_token_here";
+        if let Ok(conn) = crate::engine::connect_target_db(db_uri, Some(token), true) {
+            let temp_dir = std::env::temp_dir().join(format!("dp_quack_diff_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            let _ = std::fs::create_dir_all(temp_dir.join("tables"));
+
+            // Ensure test table is dropped on remote
+            let _ = conn.execute_batch("CALL target_db.query('DROP TABLE IF EXISTS __duckpack_ide_quack_test_tbl;');");
+
+            let table_file = temp_dir.join("tables").join("__duckpack_ide_quack_test_tbl.sql");
+            std::fs::write(&table_file, "CREATE TABLE __duckpack_ide_quack_test_tbl (id INTEGER PRIMARY KEY, note VARCHAR);").unwrap();
+
+            // 1. Compute diff against live Quack connection
+            let diff_result = compute_ide_diff(&temp_dir, &conn).expect("compute_ide_diff failed on Quack");
+            let pending_item = diff_result.items.iter().find(|i| i.obj_name == "__duckpack_ide_quack_test_tbl");
+            assert!(pending_item.is_some(), "Expected pending create table for __duckpack_ide_quack_test_tbl");
+
+            // 2. Filter diff result to only apply our test table
+            let mut test_diff = diff_result.clone();
+            for item in &mut test_diff.items {
+                if item.obj_name != "__duckpack_ide_quack_test_tbl" {
+                    item.selected = false;
+                }
+            }
+
+            // 3. Apply diff via apply_ide_diff - this tests catalog resolution, transactions, and Quack DDL execution
+            let apply_res = apply_ide_diff(&temp_dir, &conn, &test_diff);
+            assert!(apply_res.is_ok(), "apply_ide_diff on Quack failed: {:?}", apply_res.err());
+
+            // 4. Verify table exists on remote Quack database
+            let count: i64 = conn.query_row(
+                "SELECT * FROM target_db.query('SELECT count(*) FROM __duckpack_ide_quack_test_tbl')",
+                [],
+                |r| r.get(0),
+            ).expect("Failed to query created test table on remote Quack");
+            assert_eq!(count, 0);
+
+            // Cleanup remote table
+            let _ = conn.execute_batch("CALL target_db.query('DROP TABLE IF EXISTS __duckpack_ide_quack_test_tbl;');");
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
     }
 
     #[test]
