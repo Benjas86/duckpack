@@ -123,7 +123,7 @@ pub struct DiffItem {
 }
 
 /// The final collection of computed schema differences between the target and shadow databases.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DiffResult {
     pub items: Vec<DiffItem>,
 }
