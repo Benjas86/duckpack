@@ -9,7 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, BorderType, List, ListItem, ListState, Padding, Paragraph, Row, Table, Tabs, Wrap},
     Terminal,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tui_textarea::{CursorMove, TextArea};
 
@@ -25,6 +25,25 @@ enum FocusPane {
     Results,
 }
 
+/// Mode for the Explorer sidebar: live database catalog or declarative project files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplorerMode {
+    Database,
+    Project,
+}
+
+/// Categorizes declarative project assets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectCategory {
+    Schema,
+    Table,
+    View,
+    Macro,
+    Query,
+    Seed,
+    Config,
+}
+
 /// Categorizes the type of entity currently being rendered in the Explorer tree.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum NodeType {
@@ -36,6 +55,7 @@ pub(crate) enum NodeType {
     Query,
     Macro,
     Column { data_type: String, is_pk: bool, is_fk: bool, fk_target: Option<String> },
+    ProjectFile { path: PathBuf, category: ProjectCategory },
 }
 
 /// Formats the display line for a column in the database explorer tree.
@@ -58,6 +78,460 @@ fn format_column_display(
     } else {
         format!("{}└─ {} ({})", indent, name, data_type)
     }
+}
+
+/// State for the New Asset modal dialog (a or n in Project view).
+#[derive(Clone, Debug)]
+pub(crate) struct NewAssetModalState {
+    pub(crate) is_open: bool,
+    pub(crate) category_index: usize, // 0: Table, 1: View, 2: Macro, 3: Schema, 4: Query
+    pub(crate) name: String,
+    pub(crate) active_field: usize, // 0: category, 1: name, 2: create, 3: cancel
+    pub(crate) error_msg: Option<String>,
+}
+
+impl NewAssetModalState {
+    pub(crate) fn new() -> Self {
+        Self {
+            is_open: false,
+            category_index: 0,
+            name: String::new(),
+            active_field: 1,
+            error_msg: None,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.is_open = true;
+        self.category_index = 0;
+        self.name.clear();
+        self.active_field = 1;
+        self.error_msg = None;
+    }
+
+    pub(crate) fn current_category(&self) -> ProjectCategory {
+        match self.category_index {
+            0 => ProjectCategory::Table,
+            1 => ProjectCategory::View,
+            2 => ProjectCategory::Macro,
+            3 => ProjectCategory::Schema,
+            _ => ProjectCategory::Query,
+        }
+    }
+
+    pub(crate) fn category_label(&self) -> &'static str {
+        match self.category_index {
+            0 => "Table",
+            1 => "View",
+            2 => "Macro",
+            3 => "Schema",
+            _ => "Query",
+        }
+    }
+}
+
+/// State for the in-IDE Diff and Apply modal dialog (F6 or Ctrl+D).
+#[derive(Clone, Debug)]
+pub(crate) struct InIdeDiffModalState {
+    pub(crate) is_open: bool,
+    pub(crate) diff_result: Option<crate::diff::DiffResult>,
+    pub(crate) selected_index: usize,
+    pub(crate) error_msg: Option<String>,
+}
+
+impl InIdeDiffModalState {
+    pub(crate) fn new() -> Self {
+        Self {
+            is_open: false,
+            diff_result: None,
+            selected_index: 0,
+            error_msg: None,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.is_open = false;
+        self.diff_result = None;
+        self.selected_index = 0;
+        self.error_msg = None;
+    }
+}
+
+/// Generates starting DDL boilerplate for newly scaffolded project assets.
+pub(crate) fn generate_asset_boilerplate(category: ProjectCategory, name: &str) -> String {
+    let clean = name.trim().trim_end_matches(".sql");
+    match category {
+        ProjectCategory::Table => format!(
+            "-- Table: {}\nCREATE TABLE {} (\n    id INTEGER PRIMARY KEY,\n    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n);\n",
+            clean, clean
+        ),
+        ProjectCategory::View => format!(
+            "-- View: {}\nCREATE VIEW {} AS\nSELECT 1 AS placeholder;\n",
+            clean, clean
+        ),
+        ProjectCategory::Macro => format!(
+            "-- Macro: {}\nCREATE MACRO {}(val) AS val;\n",
+            clean, clean
+        ),
+        ProjectCategory::Schema => format!(
+            "-- Schema: {}\nCREATE SCHEMA IF NOT EXISTS {};\n",
+            clean, clean
+        ),
+        ProjectCategory::Query => format!(
+            "-- Query: {}\nSELECT 1;\n",
+            clean
+        ),
+        _ => String::new(),
+    }
+}
+
+/// Computes the disk file path for a project asset category and name.
+pub(crate) fn get_asset_file_path(project_dir: &Path, category: ProjectCategory, name: &str) -> PathBuf {
+    let mut clean_name = name.trim().to_string();
+    if !clean_name.ends_with(".sql") {
+        clean_name.push_str(".sql");
+    }
+    let sub = match category {
+        ProjectCategory::Schema => "schemas",
+        ProjectCategory::Table => "tables",
+        ProjectCategory::View => "views",
+        ProjectCategory::Macro => "macros",
+        ProjectCategory::Query => "queries",
+        ProjectCategory::Seed => "seeds",
+        ProjectCategory::Config => "",
+    };
+    if sub.is_empty() {
+        project_dir.join(&clean_name)
+    } else {
+        project_dir.join(sub).join(&clean_name)
+    }
+}
+
+/// Computes declarative diff between project definitions and the target database.
+pub(crate) fn compute_ide_diff(
+    project_dir: &Path,
+    target_conn: &Connection,
+) -> Result<crate::diff::DiffResult, String> {
+    let shadow_conn = crate::engine::build_shadow_db(project_dir)
+        .map_err(|e| format!("Shadow DB Build Error: {}", e))?;
+    let active_catalog = "target_db";
+    let target_cat = if target_conn.query_row("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db'", [], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0 {
+        Some(active_catalog)
+    } else {
+        None
+    };
+
+    let shadow_schemas = crate::diff::get_schemas(&shadow_conn, None).map_err(|e| e.to_string())?;
+    let target_schemas = crate::diff::get_schemas(target_conn, target_cat).map_err(|e| e.to_string())?;
+    let shadow_schema = crate::diff::get_schema(&shadow_conn, None).map_err(|e| e.to_string())?;
+    let target_schema = crate::diff::get_schema(target_conn, target_cat).map_err(|e| e.to_string())?;
+    let shadow_views = crate::diff::get_views(&shadow_conn, None).map_err(|e| e.to_string())?;
+    let target_views = crate::diff::get_views(target_conn, target_cat).map_err(|e| e.to_string())?;
+    let shadow_macros = crate::diff::get_macros(&shadow_conn, None).map_err(|e| e.to_string())?;
+    let target_macros = crate::diff::get_macros(target_conn, target_cat).map_err(|e| e.to_string())?;
+    let shadow_triggers = crate::diff::get_triggers(&shadow_conn, None).map_err(|e| e.to_string())?;
+    let target_triggers = crate::diff::get_triggers(target_conn, target_cat).map_err(|e| e.to_string())?;
+    let ignore_list = crate::engine::load_ignore_rules(project_dir);
+
+    Ok(crate::diff::compute_diff(
+        &shadow_schemas,
+        &target_schemas,
+        &shadow_schema,
+        &target_schema,
+        &shadow_views,
+        &target_views,
+        &shadow_macros,
+        &target_macros,
+        &shadow_triggers,
+        &target_triggers,
+        &project_dir.to_path_buf(),
+        &ignore_list,
+    ))
+}
+
+/// Applies declarative diff items to the target database catalog.
+pub(crate) fn apply_ide_diff(
+    project_dir: &Path,
+    target_conn: &Connection,
+    diff_result: &crate::diff::DiffResult,
+) -> Result<(), String> {
+    let active_catalog = "target_db";
+    let target_cat = if target_conn.query_row("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db'", [], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0 {
+        Some(active_catalog)
+    } else {
+        None
+    };
+
+    crate::engine::apply_diff(
+        target_conn,
+        diff_result,
+        false,
+        false,
+        &project_dir.to_path_buf(),
+        target_cat,
+    ).map_err(|e| e.to_string())
+}
+
+/// Passively detects the current Git branch and file status without modifying Git index.
+pub(crate) fn get_git_branch_and_status(project_dir: &Path) -> (Option<String>, HashMap<PathBuf, String>) {
+    let mut branch = None;
+    let mut status_map = HashMap::new();
+
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(project_dir)
+        .output()
+    {
+        if output.status.success() {
+            let b = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !b.is_empty() {
+                branch = Some(b);
+            }
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(project_dir)
+        .output()
+    {
+        if output.status.success() {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            for line in out_str.lines() {
+                if line.len() >= 4 {
+                    let code = &line[..2];
+                    let file_part = line[3..].trim();
+                    let file_path = project_dir.join(file_part);
+                    let badge = if code.contains('M') {
+                        "[M]".to_string()
+                    } else if code.contains('?') || code.contains('A') {
+                        "[+]".to_string()
+                    } else if code.contains('D') {
+                        "[D]".to_string()
+                    } else {
+                        format!("[{}]", code.trim())
+                    };
+                    status_map.insert(file_path, badge);
+                }
+            }
+        }
+    }
+
+    (branch, status_map)
+}
+
+/// Scans the declarative project folder and builds a categorical asset hierarchy tree.
+pub(crate) fn rebuild_project_nodes(
+    project_dir: &Path,
+    expanded_groups: &HashSet<String>,
+    git_status: &HashMap<PathBuf, String>,
+) -> Vec<ExplorerNode> {
+    let mut items = Vec::new();
+
+    let scan_dir = |sub: &str, ext: Option<&str>| -> Vec<PathBuf> {
+        let dir = project_dir.join(sub);
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(expected_ext) = ext {
+                        if path.extension().and_then(|s| s.to_str()) == Some(expected_ext) {
+                            files.push(path);
+                        }
+                    } else {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+        files.sort();
+        files
+    };
+
+    // 1. Schemas
+    let schemas = scan_dir("schemas", Some("sql"));
+    let is_schemas_expanded = expanded_groups.contains("proj:schemas");
+    items.push(ExplorerNode {
+        name: "proj:schemas".to_string(),
+        display: format!("📁 Schemas ({})", schemas.len()),
+        level: 0,
+        is_expandable: true,
+        is_expanded: is_schemas_expanded,
+        node_type: NodeType::Group,
+    });
+    if is_schemas_expanded {
+        for p in &schemas {
+            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+            items.push(ExplorerNode {
+                name: fname.clone(),
+                display: format!("  ├─ {}{}", fname, badge),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Schema },
+            });
+        }
+    }
+
+    // 2. Tables
+    let tables = scan_dir("tables", Some("sql"));
+    let is_tables_expanded = expanded_groups.contains("proj:tables");
+    items.push(ExplorerNode {
+        name: "proj:tables".to_string(),
+        display: format!("📦 Tables ({})", tables.len()),
+        level: 0,
+        is_expandable: true,
+        is_expanded: is_tables_expanded,
+        node_type: NodeType::Group,
+    });
+    if is_tables_expanded {
+        for p in &tables {
+            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+            items.push(ExplorerNode {
+                name: fname.clone(),
+                display: format!("  ├─ {}{}", fname, badge),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Table },
+            });
+        }
+    }
+
+    // 3. Views
+    let views = scan_dir("views", Some("sql"));
+    let is_views_expanded = expanded_groups.contains("proj:views");
+    items.push(ExplorerNode {
+        name: "proj:views".to_string(),
+        display: format!("👁️ Views ({})", views.len()),
+        level: 0,
+        is_expandable: true,
+        is_expanded: is_views_expanded,
+        node_type: NodeType::Group,
+    });
+    if is_views_expanded {
+        for p in &views {
+            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+            items.push(ExplorerNode {
+                name: fname.clone(),
+                display: format!("  ├─ {}{}", fname, badge),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::View },
+            });
+        }
+    }
+
+    // 4. Macros
+    let macros = scan_dir("macros", Some("sql"));
+    let is_macros_expanded = expanded_groups.contains("proj:macros");
+    items.push(ExplorerNode {
+        name: "proj:macros".to_string(),
+        display: format!("🔧 Macros ({})", macros.len()),
+        level: 0,
+        is_expandable: true,
+        is_expanded: is_macros_expanded,
+        node_type: NodeType::Group,
+    });
+    if is_macros_expanded {
+        for p in &macros {
+            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+            items.push(ExplorerNode {
+                name: fname.clone(),
+                display: format!("  ├─ {}{}", fname, badge),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Macro },
+            });
+        }
+    }
+
+    // 5. Queries
+    let queries = scan_dir("queries", Some("sql"));
+    let is_queries_expanded = expanded_groups.contains("proj:queries");
+    items.push(ExplorerNode {
+        name: "proj:queries".to_string(),
+        display: format!("📄 Queries ({})", queries.len()),
+        level: 0,
+        is_expandable: true,
+        is_expanded: is_queries_expanded,
+        node_type: NodeType::Group,
+    });
+    if is_queries_expanded {
+        for p in &queries {
+            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+            items.push(ExplorerNode {
+                name: fname.clone(),
+                display: format!("  ├─ {}{}", fname, badge),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Query },
+            });
+        }
+    }
+
+    // 6. Seeds
+    let seeds = scan_dir("seeds", None);
+    if !seeds.is_empty() {
+        let is_seeds_expanded = expanded_groups.contains("proj:seeds");
+        items.push(ExplorerNode {
+            name: "proj:seeds".to_string(),
+            display: format!("🌱 Seeds ({})", seeds.len()),
+            level: 0,
+            is_expandable: true,
+            is_expanded: is_seeds_expanded,
+            node_type: NodeType::Group,
+        });
+        if is_seeds_expanded {
+            for p in &seeds {
+                let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let badge = git_status.get(p).map(|b| format!(" {}", b)).unwrap_or_default();
+                items.push(ExplorerNode {
+                    name: fname.clone(),
+                    display: format!("  ├─ {}{}", fname, badge),
+                    level: 1,
+                    is_expandable: false,
+                    is_expanded: false,
+                    node_type: NodeType::ProjectFile { path: p.clone(), category: ProjectCategory::Seed },
+                });
+            }
+        }
+    }
+
+    // 7. Config files
+    let config_candidates = ["duckpack.toml", ".env", ".duckdbignore"];
+    let mut configs = Vec::new();
+    for c in &config_candidates {
+        let p = project_dir.join(c);
+        if p.exists() {
+            configs.push(p);
+        }
+    }
+    if !configs.is_empty() {
+        for p in configs {
+            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let badge = git_status.get(&p).map(|b| format!(" {}", b)).unwrap_or_default();
+            items.push(ExplorerNode {
+                name: fname.clone(),
+                display: format!("⚙️ {}{}", fname, badge),
+                level: 0,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::ProjectFile { path: p, category: ProjectCategory::Config },
+            });
+        }
+    }
+
+    items
 }
 
 /// State for the Attach Database modal dialog (Ctrl+A).
@@ -116,6 +590,7 @@ pub(crate) struct ExplorerNode {
 struct EditorTab<'a> {
     textarea: TextArea<'a>,
     active_file: Option<PathBuf>,
+    is_dirty: bool,
     query_results: Vec<Vec<String>>,
     column_names: Vec<String>,
     horizontal_scroll: usize,
@@ -135,6 +610,7 @@ impl<'a> EditorTab<'a> {
         Self {
             textarea,
             active_file: None,
+            is_dirty: false,
             query_results: Vec::new(),
             column_names: Vec::new(),
             horizontal_scroll: 0,
@@ -697,6 +1173,15 @@ pub fn run_ide_loop(
 
     let queries_dir = project_dir.join("queries");
 
+    let mut explorer_mode = ExplorerMode::Database;
+    let (mut git_branch, mut git_status) = get_git_branch_and_status(project_dir);
+    let mut expanded_project_groups: HashSet<String> = vec![
+        "proj:schemas", "proj:tables", "proj:views", "proj:macros", "proj:queries", "proj:seeds"
+    ].into_iter().map(|s| s.to_string()).collect();
+
+    let mut new_asset_modal = NewAssetModalState::new();
+    let mut in_ide_diff_modal = InIdeDiffModalState::new();
+
     let mut explorer_state = ListState::default();
     let mut explorer_horizontal_scroll: usize = 0;
     let mut explorer_width_percent: u16 = 25;
@@ -788,10 +1273,26 @@ pub fn run_ide_loop(
                 Style::default()
             };
 
-            let explorer_title = if focus == FocusPane::Explorer {
-                format!(" Explorer ({}%) [W: Width | +/-: Resize | R: Refresh | q: Query] ", exp_pct)
-            } else {
-                format!(" Explorer ({}%) [Ctrl+A: Attach] ", exp_pct)
+            let explorer_title = match explorer_mode {
+                ExplorerMode::Database => {
+                    if focus == FocusPane::Explorer {
+                        format!(" [F3: DB* | F4: Project] Database ({}%) [W: Width | +/-: Resize | q: Query] ", exp_pct)
+                    } else {
+                        format!(" [F3: DB* | F4: Project] Database ({}%) ", exp_pct)
+                    }
+                }
+                ExplorerMode::Project => {
+                    let git_tag = if let Some(ref b) = git_branch {
+                        format!(" ({})", b)
+                    } else {
+                        String::new()
+                    };
+                    if focus == FocusPane::Explorer {
+                        format!(" [F3: DB | F4: Project*] Project{} ({}%) [a: New | Enter: Open | F6: Diff] ", git_tag, exp_pct)
+                    } else {
+                        format!(" [F3: DB | F4: Project*] Project{} ({}%) ", git_tag, exp_pct)
+                    }
+                }
             };
 
             let explorer_list = List::new(list_items)
@@ -807,12 +1308,13 @@ pub fn run_ide_loop(
                 } else {
                     format!("New Query {}", i + 1)
                 };
+                let dirty = if tab.is_dirty { " *" } else { "" };
                 let style = if i == active_tab_index {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
-                Line::from(vec![Span::styled(format!(" {} ", name), style)])
+                Line::from(vec![Span::styled(format!(" {}{} ", name, dirty), style)])
             }).collect();
             
             let tabs_widget = Tabs::new(tab_titles)
@@ -825,9 +1327,11 @@ pub fn run_ide_loop(
             // Editor Pane
             let active_tab = &mut tabs[active_tab_index];
             let editor_title = if let Some(ref path) = active_tab.active_file {
-                format!(" Editor [{}] ", path.file_name().unwrap_or(std::ffi::OsStr::new("unknown")).to_string_lossy())
+                let dirty = if active_tab.is_dirty { " *" } else { "" };
+                format!(" Editor [{}{}] ", path.file_name().unwrap_or(std::ffi::OsStr::new("unknown")).to_string_lossy(), dirty)
             } else {
-                " Editor [New Query] ".to_string()
+                let dirty = if active_tab.is_dirty { " *" } else { "" };
+                format!(" Editor [New Query{}] ", dirty)
             };
 
             let sql_keywords = SQL_KEYWORD_PATTERN;
@@ -969,6 +1473,12 @@ pub fn run_ide_loop(
                 let help_lines = vec![
                     Line::from(vec![Span::styled(" [?]       ", Style::default().fg(Color::Cyan)), Span::raw("Toggle Help Menu")]),
                     Line::from(""),
+                    Line::from(vec![Span::styled(" F3 / 1    ", Style::default().fg(Color::Yellow)), Span::raw("Switch Explorer to Database Catalog")]),
+                    Line::from(vec![Span::styled(" F4 / 2    ", Style::default().fg(Color::Yellow)), Span::raw("Switch Explorer to Project Files")]),
+                    Line::from(vec![Span::styled(" a / n     ", Style::default().fg(Color::Yellow)), Span::raw("New Project Asset (Table, View, Macro, Schema, Query)")]),
+                    Line::from(vec![Span::styled(" Ctrl+B / v", Style::default().fg(Color::Yellow)), Span::raw("Validate Project Syntax & Dependencies (Shadow DB)")]),
+                    Line::from(vec![Span::styled(" F6/Ctrl+D ", Style::default().fg(Color::Yellow)), Span::raw("In-IDE Declarative Diff & Apply to Target DB")]),
+                    Line::from(""),
                     Line::from(vec![Span::styled(" Ctrl+T    ", Style::default().fg(Color::Cyan)), Span::raw("New Tab")]),
                     Line::from(vec![Span::styled(" Ctrl+W    ", Style::default().fg(Color::Cyan)), Span::raw("Close Tab")]),
                     Line::from(vec![Span::styled(" Ctrl+N/P  ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Tab")]),
@@ -976,7 +1486,7 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" Ctrl+G    ", Style::default().fg(Color::Cyan)), Span::raw("Visualize Schema (Graph)")]),
                     Line::from(vec![Span::styled(" Ctrl+A    ", Style::default().fg(Color::Cyan)), Span::raw("Attach Database (DuckDB, SQLite, PG, etc.)")]),
                     Line::from(vec![Span::styled(" Ctrl+C/V  ", Style::default().fg(Color::Cyan)), Span::raw("Copy / Paste")]),
-                    Line::from(vec![Span::styled(" Ctrl+S    ", Style::default().fg(Color::Cyan)), Span::raw("Save Query")]),
+                    Line::from(vec![Span::styled(" Ctrl+S    ", Style::default().fg(Color::Cyan)), Span::raw("Save Query / Project File")]),
                     Line::from(vec![Span::styled(" Ctrl+F    ", Style::default().fg(Color::Cyan)), Span::raw("Format Query")]),
                     Line::from(vec![Span::styled(" Ctrl+Space", Style::default().fg(Color::Cyan)), Span::raw("Autocomplete")]),
                     Line::from(vec![Span::styled(" n / p     ", Style::default().fg(Color::Cyan)), Span::raw("Next/Prev Page (in Results pane)")]),
@@ -1099,6 +1609,171 @@ pub fn run_ide_loop(
                     Span::styled(" [ Cancel ] ", cancel_btn_style),
                 ]);
                 f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[5]);
+            } else if new_asset_modal.is_open {
+                let popup_width = 62.min(f.area().width.saturating_sub(4));
+                let popup_height = 16.min(f.area().height.saturating_sub(2));
+                let popup_area = ratatui::layout::Rect {
+                    x: (f.area().width.saturating_sub(popup_width)) / 2,
+                    y: (f.area().height.saturating_sub(popup_height)) / 2,
+                    width: popup_width,
+                    height: popup_height,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+
+                let modal_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" ✨ New Project Asset (a / n) ")
+                    .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+                f.render_widget(modal_block.clone(), popup_area);
+
+                let inner_area = modal_block.inner(popup_area);
+                let field_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), // 0: Category
+                        Constraint::Length(3), // 1: Name
+                        Constraint::Length(2), // 2: Filepath preview
+                        Constraint::Length(2), // 3: Hint/Error
+                        Constraint::Length(3), // 4: Buttons
+                    ])
+                    .split(inner_area);
+
+                // Field 0: Category
+                let f0_style = if new_asset_modal.active_field == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let cat_label = format!("  ◄ [ {} ] ►   (◄ / ► to switch)", new_asset_modal.category_label());
+                let p0 = Paragraph::new(cat_label)
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Asset Type ").border_style(f0_style));
+                f.render_widget(p0, field_layout[0]);
+
+                // Field 1: Name
+                let f1_style = if new_asset_modal.active_field == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let p1 = Paragraph::new(format!("{}{}", new_asset_modal.name, if new_asset_modal.active_field == 1 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Asset Name (e.g. users, sales_summary) ").border_style(f1_style));
+                f.render_widget(p1, field_layout[1]);
+
+                // Field 2: Preview target path
+                let target_path = if new_asset_modal.name.trim().is_empty() {
+                    "<enter name>".to_string()
+                } else {
+                    let p = get_asset_file_path(project_dir, new_asset_modal.current_category(), &new_asset_modal.name);
+                    p.strip_prefix(project_dir).unwrap_or(&p).display().to_string()
+                };
+                let p_preview = Paragraph::new(format!("  📁 Target File: {}", target_path)).style(Style::default().fg(Color::Cyan));
+                f.render_widget(p_preview, field_layout[2]);
+
+                // Field 3: Error or Hint
+                if let Some(ref err) = new_asset_modal.error_msg {
+                    f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), field_layout[3]);
+                } else {
+                    f.render_widget(Paragraph::new("  Tab: Next Field | Enter: Create & Open | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), field_layout[3]);
+                }
+
+                // Field 4: Buttons
+                let create_btn_style = if new_asset_modal.active_field == 2 {
+                    Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                let cancel_btn_style = if new_asset_modal.active_field == 3 {
+                    Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let buttons = Line::from(vec![
+                    Span::styled(" [ Create & Open ] ", create_btn_style),
+                    Span::raw("    "),
+                    Span::styled(" [ Cancel ] ", cancel_btn_style),
+                ]);
+                f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[4]);
+            } else if in_ide_diff_modal.is_open {
+                let popup_width = 80.min(f.area().width.saturating_sub(4));
+                let popup_height = 22.min(f.area().height.saturating_sub(2));
+                let popup_area = ratatui::layout::Rect {
+                    x: (f.area().width.saturating_sub(popup_width)) / 2,
+                    y: (f.area().height.saturating_sub(popup_height)) / 2,
+                    width: popup_width,
+                    height: popup_height,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+
+                let modal_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" 🔍 Declarative Diff & Apply (F6 / Ctrl+D) ")
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                f.render_widget(modal_block.clone(), popup_area);
+
+                let inner_area = modal_block.inner(popup_area);
+                let diff_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(2), // 0: Summary header
+                        Constraint::Min(6),    // 1: Changes list
+                        Constraint::Length(2), // 2: Error message or hint
+                        Constraint::Length(3), // 3: Action buttons
+                    ])
+                    .split(inner_area);
+
+                if let Some(ref diff) = in_ide_diff_modal.diff_result {
+                    let active_items: Vec<_> = diff.items.iter().filter(|i| !i.ignored).collect();
+                    if active_items.is_empty() {
+                        let msg = Paragraph::new("\n  ✨ Target database catalog is completely up to date with project files!\n\n  No pending migrations or schema changes detected.")
+                            .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
+                        f.render_widget(msg, diff_layout[1]);
+
+                        let close_btn = Line::from(Span::styled(" [ Close (Esc) ] ", Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)));
+                        f.render_widget(Paragraph::new(close_btn).alignment(Alignment::Center), diff_layout[3]);
+                    } else {
+                        let summary_text = format!(" Found {} pending declarative change(s) between project files and database:", active_items.len());
+                        f.render_widget(Paragraph::new(summary_text).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)), diff_layout[0]);
+
+                        let list_lines: Vec<Line> = active_items.iter().enumerate().map(|(idx, item)| {
+                            let (badge, style) = match item.item_type {
+                                crate::diff::DiffItemType::CreateTable | crate::diff::DiffItemType::CreateSchema | crate::diff::DiffItemType::CreateView | crate::diff::DiffItemType::CreateMacro | crate::diff::DiffItemType::CreateTrigger => {
+                                    ("[+]", Style::default().fg(Color::Green))
+                                }
+                                crate::diff::DiffItemType::AlterTable | crate::diff::DiffItemType::AddConstraint | crate::diff::DiffItemType::RenameTable | crate::diff::DiffItemType::RenameColumn => {
+                                    ("[~]", Style::default().fg(Color::Yellow))
+                                }
+                                crate::diff::DiffItemType::RecreateTable => {
+                                    ("[⚡]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+                                }
+                                crate::diff::DiffItemType::DropTable | crate::diff::DiffItemType::DropSchema | crate::diff::DiffItemType::DropView | crate::diff::DiffItemType::DropMacro | crate::diff::DiffItemType::DropColumn | crate::diff::DiffItemType::DropTrigger => {
+                                    ("[-]", Style::default().fg(Color::Red))
+                                }
+                            };
+                            let cursor = if idx == in_ide_diff_modal.selected_index { "▶ " } else { "  " };
+                            Line::from(vec![
+                                Span::styled(cursor, Style::default().fg(Color::Yellow)),
+                                Span::styled(format!("{} ", badge), style.add_modifier(Modifier::BOLD)),
+                                Span::raw(format!("{:?}: {}", item.item_type, item.obj_name)),
+                            ])
+                        }).collect();
+
+                        let changes_list = Paragraph::new(list_lines)
+                            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Pending Changes "));
+                        f.render_widget(changes_list, diff_layout[1]);
+
+                        if let Some(ref err) = in_ide_diff_modal.error_msg {
+                            f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), diff_layout[2]);
+                        } else {
+                            f.render_widget(Paragraph::new("  Enter: Apply All Changes | Esc: Close without Applying").style(Style::default().fg(Color::DarkGray)), diff_layout[2]);
+                        }
+
+                        let apply_btn_style = Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD);
+                        let close_btn_style = Style::default().fg(Color::DarkGray);
+                        let buttons = Line::from(vec![
+                            Span::styled(format!(" [ Apply All {} Change(s) (Enter) ] ", active_items.len()), apply_btn_style),
+                            Span::raw("    "),
+                            Span::styled(" [ Cancel (Esc) ] ", close_btn_style),
+                        ]);
+                        f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), diff_layout[3]);
+                    }
+                } else {
+                    let loading = Paragraph::new(" Computing diff against target database...").style(Style::default().fg(Color::Cyan));
+                    f.render_widget(loading, diff_layout[1]);
+                }
             }
 
             // Status Bar
@@ -1194,8 +1869,25 @@ pub fn run_ide_loop(
                     }
 
                     // Explorer Click
-                    if mouse.row == current_explorer_rect.top() && mouse.column >= current_explorer_rect.right().saturating_sub(18) && mouse.column <= current_explorer_rect.right() {
-                        attach_modal.reset();
+                    if mouse.row == current_explorer_rect.top() {
+                        if mouse.column >= current_explorer_rect.left() + 1 && mouse.column <= current_explorer_rect.left() + 8 {
+                            explorer_mode = ExplorerMode::Database;
+                            explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+                            explorer_state.select(Some(0));
+                            status_msg = "Switched to Database Catalog view".to_string();
+                        } else if mouse.column >= current_explorer_rect.left() + 9 && mouse.column <= current_explorer_rect.left() + 22 {
+                            explorer_mode = ExplorerMode::Project;
+                            let (b, st) = get_git_branch_and_status(project_dir);
+                            git_branch = b;
+                            git_status = st;
+                            explorer_items = rebuild_project_nodes(project_dir, &expanded_project_groups, &git_status);
+                            explorer_state.select(Some(0));
+                            status_msg = "Switched to Project Files view".to_string();
+                        } else if explorer_mode == ExplorerMode::Project && mouse.column >= current_explorer_rect.right().saturating_sub(20) && mouse.column <= current_explorer_rect.right() {
+                            new_asset_modal.reset();
+                        } else if explorer_mode == ExplorerMode::Database && mouse.column >= current_explorer_rect.right().saturating_sub(18) && mouse.column <= current_explorer_rect.right() {
+                            attach_modal.reset();
+                        }
                     } else if mouse.row >= current_explorer_rect.top() + 1 && mouse.row < current_explorer_rect.bottom() - 1 {
                         if mouse.column >= current_explorer_rect.left() + 1 && mouse.column < current_explorer_rect.right() - 1 {
                             let list_offset = explorer_state.offset();
@@ -1324,7 +2016,114 @@ pub fn run_ide_loop(
                 }
             }
             Event::Key(key) => {
-                if attach_modal.is_open {
+                if new_asset_modal.is_open {
+                    if key.code == KeyCode::Esc {
+                        new_asset_modal.is_open = false;
+                    } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
+                        new_asset_modal.active_field = (new_asset_modal.active_field + 1) % 4;
+                    } else if key.code == KeyCode::BackTab || key.code == KeyCode::Up {
+                        new_asset_modal.active_field = if new_asset_modal.active_field == 0 { 3 } else { new_asset_modal.active_field - 1 };
+                    } else if key.code == KeyCode::Left || key.code == KeyCode::Char('h') {
+                        if new_asset_modal.active_field == 0 {
+                            new_asset_modal.category_index = if new_asset_modal.category_index == 0 { 4 } else { new_asset_modal.category_index - 1 };
+                        }
+                    } else if key.code == KeyCode::Right || key.code == KeyCode::Char('l') {
+                        if new_asset_modal.active_field == 0 {
+                            new_asset_modal.category_index = (new_asset_modal.category_index + 1) % 5;
+                        }
+                    } else if key.code == KeyCode::Backspace {
+                        if new_asset_modal.active_field == 1 {
+                            new_asset_modal.name.pop();
+                        }
+                    } else if key.code == KeyCode::Enter {
+                        if new_asset_modal.active_field == 3 {
+                            new_asset_modal.is_open = false;
+                        } else {
+                            let asset_name = new_asset_modal.name.trim().to_string();
+                            if asset_name.is_empty() {
+                                new_asset_modal.error_msg = Some("Asset name cannot be empty.".to_string());
+                            } else {
+                                let cat = new_asset_modal.current_category();
+                                let path = get_asset_file_path(project_dir, cat, &asset_name);
+                                if let Some(parent) = path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                if !path.exists() {
+                                    let boilerplate = generate_asset_boilerplate(cat, &asset_name);
+                                    let _ = std::fs::write(&path, boilerplate);
+                                }
+                                
+                                let mut already_open = None;
+                                for (i, tab) in tabs.iter().enumerate() {
+                                    if tab.active_file.as_ref() == Some(&path) {
+                                        already_open = Some(i);
+                                        break;
+                                    }
+                                }
+                                if let Some(i) = already_open {
+                                    active_tab_index = i;
+                                } else if let Ok(content) = std::fs::read_to_string(&path) {
+                                    let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
+                                    if !current_is_empty {
+                                        tabs.push(EditorTab::new());
+                                        active_tab_index = tabs.len() - 1;
+                                    }
+                                    tabs[active_tab_index].textarea = TextArea::from(content.lines().map(|s| s.to_string()).collect::<Vec<_>>());
+                                    tabs[active_tab_index].textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
+                                    tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                                    tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+                                    tabs[active_tab_index].active_file = Some(path.clone());
+                                    tabs[active_tab_index].is_dirty = false;
+                                }
+                                new_asset_modal.is_open = false;
+                                focus = FocusPane::Editor;
+                                trigger_explorer_refresh = true;
+                                status_msg = format!("Created and opened {}", path.file_name().unwrap_or_default().to_string_lossy());
+                            }
+                        }
+                    } else if let KeyCode::Char(c) = key.code {
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) && new_asset_modal.active_field == 1 {
+                            if c.is_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                                new_asset_modal.name.push(c);
+                            }
+                        }
+                    }
+                } else if in_ide_diff_modal.is_open {
+                    if key.code == KeyCode::Esc {
+                        in_ide_diff_modal.is_open = false;
+                    } else if key.code == KeyCode::Enter {
+                        if let Some(ref diff) = in_ide_diff_modal.diff_result {
+                            let unignored_count = diff.items.iter().filter(|i| !i.ignored).count();
+                            if unignored_count > 0 {
+                                match apply_ide_diff(project_dir, conn, diff) {
+                                    Ok(_) => {
+                                        status_msg = format!("✓ Applied {} declarative change(s) to target catalog successfully!", unignored_count);
+                                        in_ide_diff_modal.is_open = false;
+                                        trigger_explorer_refresh = true;
+                                    }
+                                    Err(e) => {
+                                        in_ide_diff_modal.error_msg = Some(format!("Apply Error: {}", e));
+                                    }
+                                }
+                            } else {
+                                in_ide_diff_modal.is_open = false;
+                            }
+                        } else {
+                            in_ide_diff_modal.is_open = false;
+                        }
+                    } else if key.code == KeyCode::Up {
+                        if in_ide_diff_modal.selected_index > 0 {
+                            in_ide_diff_modal.selected_index -= 1;
+                        }
+                    } else if key.code == KeyCode::Down {
+                        if let Some(ref diff) = in_ide_diff_modal.diff_result {
+                            let total = diff.items.iter().filter(|i| !i.ignored).count();
+                            if in_ide_diff_modal.selected_index + 1 < total {
+                                in_ide_diff_modal.selected_index += 1;
+                            }
+                        }
+                    }
+                } else if attach_modal.is_open {
                     if key.code == KeyCode::Esc {
                         attach_modal.is_open = false;
                     } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
@@ -1436,6 +2235,55 @@ pub fn run_ide_loop(
                     show_schema_visualizer = true;
                     schema_scroll = 0;
                     schema_ascii_tree = generate_schema_visualizer(conn, &mut os_clipboard, is_quack).unwrap_or_else(|e| format!("Failed to generate schema visualizer: {}", e));
+                    continue;
+                }
+
+                if key.code == KeyCode::F(3) {
+                    explorer_mode = ExplorerMode::Database;
+                    explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+                    explorer_state.select(Some(0));
+                    status_msg = "Switched to Database Catalog view".to_string();
+                    continue;
+                }
+
+                if key.code == KeyCode::F(4) {
+                    explorer_mode = ExplorerMode::Project;
+                    let (b, st) = get_git_branch_and_status(project_dir);
+                    git_branch = b;
+                    git_status = st;
+                    explorer_items = rebuild_project_nodes(project_dir, &expanded_project_groups, &git_status);
+                    explorer_state.select(Some(0));
+                    status_msg = "Switched to Project Files view".to_string();
+                    continue;
+                }
+
+                if key.code == KeyCode::F(6) || (key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+                    match compute_ide_diff(project_dir, conn) {
+                        Ok(diff) => {
+                            in_ide_diff_modal.reset();
+                            in_ide_diff_modal.diff_result = Some(diff);
+                            in_ide_diff_modal.is_open = true;
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            status_msg = format!("⚠️ Diff Failed: {}", err_str);
+                            handle_sql_error_position(&mut tabs[active_tab_index].textarea, &err_str);
+                        }
+                    }
+                    continue;
+                }
+
+                if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match crate::engine::build_shadow_db(project_dir) {
+                        Ok(_) => {
+                            status_msg = "✓ Project validated successfully (0 syntax or schema errors).".to_string();
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            status_msg = format!("⚠️ Validation Error: {}", err_str);
+                            handle_sql_error_position(&mut tabs[active_tab_index].textarea, &err_str);
+                        }
+                    }
                     continue;
                 }
 
@@ -1613,10 +2461,73 @@ pub fn run_ide_loop(
                             status_msg = format!("Explorer width: {}%", explorer_width_percent);
                         } else if key.code == KeyCode::Enter || key.code == KeyCode::Char(' ') {
                             trigger_explorer_action = true;
+                        } else if key.code == KeyCode::Char('1') {
+                            explorer_mode = ExplorerMode::Database;
+                            explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+                            explorer_state.select(Some(0));
+                            status_msg = "Switched to Database Catalog view".to_string();
+                        } else if key.code == KeyCode::Char('2') {
+                            explorer_mode = ExplorerMode::Project;
+                            let (b, st) = get_git_branch_and_status(project_dir);
+                            git_branch = b;
+                            git_status = st;
+                            explorer_items = rebuild_project_nodes(project_dir, &expanded_project_groups, &git_status);
+                            explorer_state.select(Some(0));
+                            status_msg = "Switched to Project Files view".to_string();
+                        } else if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('n') {
+                            if explorer_mode == ExplorerMode::Project {
+                                new_asset_modal.reset();
+                                if let Some(selected) = explorer_state.selected() {
+                                    if selected < explorer_items.len() {
+                                        match &explorer_items[selected].node_type {
+                                            NodeType::Group => {
+                                                let name = &explorer_items[selected].name;
+                                                if name.contains("tables") { new_asset_modal.category_index = 0; }
+                                                else if name.contains("views") { new_asset_modal.category_index = 1; }
+                                                else if name.contains("macros") { new_asset_modal.category_index = 2; }
+                                                else if name.contains("schemas") { new_asset_modal.category_index = 3; }
+                                                else if name.contains("queries") { new_asset_modal.category_index = 4; }
+                                            }
+                                            NodeType::ProjectFile { category, .. } => {
+                                                match category {
+                                                    ProjectCategory::Table => new_asset_modal.category_index = 0,
+                                                    ProjectCategory::View => new_asset_modal.category_index = 1,
+                                                    ProjectCategory::Macro => new_asset_modal.category_index = 2,
+                                                    ProjectCategory::Schema => new_asset_modal.category_index = 3,
+                                                    ProjectCategory::Query => new_asset_modal.category_index = 4,
+                                                    _ => {}
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        } else if key.code == KeyCode::Char('v') || key.code == KeyCode::Char('V') {
+                            if explorer_mode == ExplorerMode::Project {
+                                match crate::engine::build_shadow_db(project_dir) {
+                                    Ok(_) => {
+                                        status_msg = "✓ Project validated successfully (0 syntax or schema errors).".to_string();
+                                    }
+                                    Err(e) => {
+                                        let err_str = e.to_string();
+                                        status_msg = format!("⚠️ Validation Error: {}", err_str);
+                                        handle_sql_error_position(&mut tabs[active_tab_index].textarea, &err_str);
+                                    }
+                                }
+                            }
                         } else if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
-                            refresh_attached_catalog(conn, db_path, quack_disable_ssl);
-                            trigger_explorer_refresh = true;
-                            status_msg = "Explorer refreshed.".to_string();
+                            if explorer_mode == ExplorerMode::Project {
+                                let (b, st) = get_git_branch_and_status(project_dir);
+                                git_branch = b;
+                                git_status = st;
+                                explorer_items = rebuild_project_nodes(project_dir, &expanded_project_groups, &git_status);
+                                status_msg = "Project files and git status refreshed.".to_string();
+                            } else {
+                                refresh_attached_catalog(conn, db_path, quack_disable_ssl);
+                                trigger_explorer_refresh = true;
+                                status_msg = "Explorer refreshed.".to_string();
+                            }
                         } else if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('s') {
                             if let Some(selected) = explorer_state.selected() {
                                 if selected < explorer_items.len() {
@@ -1725,6 +2636,7 @@ pub fn run_ide_loop(
                                                 tabs[active_tab_index].textarea.delete_char();
                                             }
                                             tabs[active_tab_index].textarea.insert_str(match_str);
+                                            tabs[active_tab_index].is_dirty = true;
                                             status_msg = format!("Autocomplete: {} ({}/{})", match_str, autocomplete_index + 1, autocomplete_matches.len());
                                         } else {
                                             status_msg = format!("No autocomplete matches for '{}'", autocomplete_original_word);
@@ -1733,7 +2645,9 @@ pub fn run_ide_loop(
                                 }
                             }
                         } else {
-                            tabs[active_tab_index].textarea.input(key);
+                            if tabs[active_tab_index].textarea.input(key) {
+                                tabs[active_tab_index].is_dirty = true;
+                            }
                         }
                     }
                     FocusPane::Results => {
@@ -1832,15 +2746,18 @@ pub fn run_ide_loop(
             tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
             tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
             status_msg = "Formatted SQL".to_string();
+            tabs[active_tab_index].is_dirty = true;
         }
 
         if save_query {
             let content = tabs[active_tab_index].textarea.lines().join("\n");
-            if let Some(ref path) = tabs[active_tab_index].active_file {
-                if let Err(e) = std::fs::write(path, content) {
+            if let Some(path) = tabs[active_tab_index].active_file.clone() {
+                if let Err(e) = std::fs::write(&path, content) {
                     status_msg = format!("Error saving file: {}", e);
                 } else {
+                    tabs[active_tab_index].is_dirty = false;
                     status_msg = format!("Saved {}", path.display());
+                    trigger_explorer_refresh = true;
                 }
             } else {
                 let name = format!("query_{}.sql", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
@@ -1849,15 +2766,9 @@ pub fn run_ide_loop(
                     status_msg = format!("Error saving new file: {}", e);
                 } else {
                     tabs[active_tab_index].active_file = Some(path.clone());
-                    explorer_items.push(ExplorerNode {
-                        name: name.clone(),
-                        display: format!("📄 {}", name),
-                        level: 0,
-                        is_expandable: false,
-                        is_expanded: false,
-                        node_type: NodeType::Query,
-                    });
+                    tabs[active_tab_index].is_dirty = false;
                     status_msg = format!("Saved as {}", name);
+                    trigger_explorer_refresh = true;
                 }
             }
         }
@@ -2202,23 +3113,30 @@ pub fn run_ide_loop(
 
         if trigger_explorer_refresh {
             let prev_selected = explorer_state.selected();
-            meta = load_explorer_metadata(conn, project_dir, is_quack);
-            dictionary = meta.dictionary.clone();
-            autocomplete_matches.clear();
-            if !meta.queries.is_empty() {
-                expanded_groups.insert("Queries".to_string());
-            }
-            if meta.databases.len() > 1 {
-                for db in &meta.databases {
-                    if db.is_active {
-                        expanded_groups.insert(format!("db:{}", db.name));
-                        expanded_groups.insert(format!("{}:Tables", db.name));
-                    }
-                }
+            if explorer_mode == ExplorerMode::Project {
+                let (b, st) = get_git_branch_and_status(project_dir);
+                git_branch = b;
+                git_status = st;
+                explorer_items = rebuild_project_nodes(project_dir, &expanded_project_groups, &git_status);
             } else {
-                expanded_groups.insert("Tables".to_string());
+                meta = load_explorer_metadata(conn, project_dir, is_quack);
+                dictionary = meta.dictionary.clone();
+                autocomplete_matches.clear();
+                if !meta.queries.is_empty() {
+                    expanded_groups.insert("Queries".to_string());
+                }
+                if meta.databases.len() > 1 {
+                    for db in &meta.databases {
+                        if db.is_active {
+                            expanded_groups.insert(format!("db:{}", db.name));
+                            expanded_groups.insert(format!("{}:Tables", db.name));
+                        }
+                    }
+                } else {
+                    expanded_groups.insert("Tables".to_string());
+                }
+                explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
             }
-            explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
             if let Some(sel) = prev_selected {
                 explorer_state.select(Some(sel.min(explorer_items.len().saturating_sub(1))));
             } else if !explorer_items.is_empty() {
@@ -2243,13 +3161,23 @@ pub fn run_ide_loop(
                             explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                         }
                         NodeType::Group => {
-                            if expanded_groups.contains(&item_name) {
-                                expanded_groups.remove(&item_name);
+                            if explorer_mode == ExplorerMode::Project {
+                                if expanded_project_groups.contains(&item_name) {
+                                    expanded_project_groups.remove(&item_name);
+                                } else {
+                                    expanded_project_groups.insert(item_name);
+                                }
+                                explorer_items = rebuild_project_nodes(project_dir, &expanded_project_groups, &git_status);
+                                explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                             } else {
-                                expanded_groups.insert(item_name);
+                                if expanded_groups.contains(&item_name) {
+                                    expanded_groups.remove(&item_name);
+                                } else {
+                                    expanded_groups.insert(item_name);
+                                }
+                                explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+                                explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                             }
-                            explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
-                            explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                         }
                         NodeType::Table { database, schema, is_temporary: _ } | NodeType::View { database, schema, is_temporary: _ } => {
                             let key = match (&database, &schema) {
@@ -2294,6 +3222,36 @@ pub fn run_ide_loop(
                                 tabs[active_tab_index].active_file = Some(path);
                                 focus = FocusPane::Editor;
                                 status_msg = format!("Loaded {}", item_name);
+                            }
+                        }
+                        NodeType::ProjectFile { path, .. } => {
+                            let mut already_open = None;
+                            for (i, tab) in tabs.iter().enumerate() {
+                                if tab.active_file.as_ref() == Some(&path) {
+                                    already_open = Some(i);
+                                    break;
+                                }
+                            }
+
+                            if let Some(i) = already_open {
+                                active_tab_index = i;
+                                focus = FocusPane::Editor;
+                                status_msg = format!("Switched to {}", path.file_name().unwrap_or_default().to_string_lossy());
+                            } else if let Ok(content) = std::fs::read_to_string(&path) {
+                                let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
+                                if !current_is_empty {
+                                    tabs.push(EditorTab::new());
+                                    active_tab_index = tabs.len() - 1;
+                                }
+
+                                tabs[active_tab_index].textarea = TextArea::from(content.lines().map(|s| s.to_string()).collect::<Vec<_>>());
+                                tabs[active_tab_index].textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
+                                tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                                tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+                                tabs[active_tab_index].active_file = Some(path.clone());
+                                tabs[active_tab_index].is_dirty = false;
+                                focus = FocusPane::Editor;
+                                status_msg = format!("Loaded {}", path.file_name().unwrap_or_default().to_string_lossy());
                             }
                         }
                         NodeType::Column { .. } => {}
@@ -3079,6 +4037,158 @@ mod tests {
         let composite_fk = parent_id_nodes[1];
         assert!(composite_fk.display.contains("🔑🔗 parent_id"), "Expected 🔑🔗 for composite parent_id: {}", composite_fk.display);
         assert!(composite_fk.display.contains("[PK, FK -> parent.id]"), "Expected [PK, FK -> parent.id]: {}", composite_fk.display);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_new_asset_modal_state() {
+        let mut modal = NewAssetModalState::new();
+        assert!(!modal.is_open);
+        assert_eq!(modal.category_index, 0);
+        assert_eq!(modal.current_category(), ProjectCategory::Table);
+        assert_eq!(modal.category_label(), "Table");
+
+        modal.reset();
+        assert!(modal.is_open);
+        assert_eq!(modal.active_field, 1);
+        assert_eq!(modal.name, "");
+
+        modal.category_index = 1;
+        assert_eq!(modal.current_category(), ProjectCategory::View);
+        assert_eq!(modal.category_label(), "View");
+
+        modal.category_index = 2;
+        assert_eq!(modal.current_category(), ProjectCategory::Macro);
+        assert_eq!(modal.category_label(), "Macro");
+
+        modal.category_index = 3;
+        assert_eq!(modal.current_category(), ProjectCategory::Schema);
+        assert_eq!(modal.category_label(), "Schema");
+
+        modal.category_index = 4;
+        assert_eq!(modal.current_category(), ProjectCategory::Query);
+        assert_eq!(modal.category_label(), "Query");
+    }
+
+    #[test]
+    fn test_generate_asset_boilerplate() {
+        let table_sql = generate_asset_boilerplate(ProjectCategory::Table, "customers");
+        assert!(table_sql.contains("CREATE TABLE customers"));
+        assert!(table_sql.contains("id INTEGER PRIMARY KEY"));
+
+        let view_sql = generate_asset_boilerplate(ProjectCategory::View, "active_users.sql");
+        assert!(view_sql.contains("CREATE VIEW active_users AS"));
+
+        let macro_sql = generate_asset_boilerplate(ProjectCategory::Macro, "to_cents");
+        assert!(macro_sql.contains("CREATE MACRO to_cents(val)"));
+
+        let schema_sql = generate_asset_boilerplate(ProjectCategory::Schema, "analytics");
+        assert!(schema_sql.contains("CREATE SCHEMA IF NOT EXISTS analytics"));
+
+        let query_sql = generate_asset_boilerplate(ProjectCategory::Query, "adhoc_report");
+        assert!(query_sql.contains("SELECT 1;"));
+    }
+
+    #[test]
+    fn test_get_asset_file_path() {
+        let root = PathBuf::from("/test/project");
+        assert_eq!(
+            get_asset_file_path(&root, ProjectCategory::Schema, "staging"),
+            root.join("schemas").join("staging.sql")
+        );
+        assert_eq!(
+            get_asset_file_path(&root, ProjectCategory::Table, "orders.sql"),
+            root.join("tables").join("orders.sql")
+        );
+        assert_eq!(
+            get_asset_file_path(&root, ProjectCategory::View, "v_orders"),
+            root.join("views").join("v_orders.sql")
+        );
+        assert_eq!(
+            get_asset_file_path(&root, ProjectCategory::Macro, "my_macro"),
+            root.join("macros").join("my_macro.sql")
+        );
+        assert_eq!(
+            get_asset_file_path(&root, ProjectCategory::Query, "analysis"),
+            root.join("queries").join("analysis.sql")
+        );
+        assert_eq!(
+            get_asset_file_path(&root, ProjectCategory::Seed, "countries"),
+            root.join("seeds").join("countries.sql")
+        );
+    }
+
+    #[test]
+    fn test_rebuild_project_nodes_and_git_badges() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_proj_nodes_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(temp_dir.join("tables")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("views")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("macros")).unwrap();
+
+        let table_file = temp_dir.join("tables").join("users.sql");
+        std::fs::write(&table_file, "CREATE TABLE users (id INT PRIMARY KEY);").unwrap();
+
+        let view_file = temp_dir.join("views").join("v_users.sql");
+        std::fs::write(&view_file, "CREATE VIEW v_users AS SELECT * FROM users;").unwrap();
+
+        std::fs::write(temp_dir.join("duckpack.toml"), "[project]\nname = \"test\"\n").unwrap();
+
+        let mut git_status = HashMap::new();
+        git_status.insert(table_file.clone(), "[M]".to_string());
+        git_status.insert(view_file.clone(), "[+]".to_string());
+
+        let mut expanded = HashSet::new();
+        expanded.insert("proj:tables".to_string());
+        expanded.insert("proj:views".to_string());
+
+        let nodes = rebuild_project_nodes(&temp_dir, &expanded, &git_status);
+
+        // Verify tables group
+        let table_group = nodes.iter().find(|n| n.name == "proj:tables").expect("proj:tables group not found");
+        assert!(table_group.display.contains("Tables (1)"));
+
+        // Verify users.sql with [M] badge
+        let user_node = nodes.iter().find(|n| n.name == "users.sql").expect("users.sql node not found");
+        assert!(user_node.display.contains("[M]"));
+
+        // Verify views group
+        let view_group = nodes.iter().find(|n| n.name == "proj:views").expect("proj:views group not found");
+        assert!(view_group.display.contains("Views (1)"));
+
+        // Verify v_users.sql with [+] badge
+        let view_node = nodes.iter().find(|n| n.name == "v_users.sql").expect("v_users.sql node not found");
+        assert!(view_node.display.contains("[+]"));
+
+        // Verify duckpack.toml config node
+        let config_node = nodes.iter().find(|n| n.name == "duckpack.toml").expect("duckpack.toml node not found");
+        assert!(config_node.display.contains("duckpack.toml"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_compute_and_apply_ide_diff() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_ide_diff_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(temp_dir.join("tables")).unwrap();
+
+        let table_file = temp_dir.join("tables").join("items.sql");
+        std::fs::write(&table_file, "CREATE TABLE items (id INTEGER PRIMARY KEY, title VARCHAR);").unwrap();
+
+        let target_conn = Connection::open_in_memory().unwrap();
+
+        // 1. Compute diff (should detect items table needs to be created)
+        let diff_result = compute_ide_diff(&temp_dir, &target_conn).expect("compute_ide_diff failed");
+        assert_eq!(diff_result.items.len(), 1);
+        assert_eq!(diff_result.items[0].obj_name, "items");
+        assert_eq!(diff_result.items[0].item_type, crate::diff::DiffItemType::CreateTable);
+
+        // 2. Apply diff in target_conn
+        apply_ide_diff(&temp_dir, &target_conn, &diff_result).expect("apply_ide_diff failed");
+
+        // 3. Recompute diff (should be 0 changes now)
+        let diff_after = compute_ide_diff(&temp_dir, &target_conn).expect("recompute failed");
+        assert_eq!(diff_after.items.len(), 0);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
