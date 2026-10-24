@@ -70,10 +70,11 @@ impl ConstraintSchema {
 
 /// Represents the resolved structure of a DuckDB table.
 /// Contains the raw creation SQL, a map of column names to their data types, and parsed constraints.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TableSchema {
     pub create_sql: String,
     pub columns: HashMap<String, String>,
+    pub column_defaults: HashMap<String, String>,
     pub constraints: Vec<ConstraintSchema>,
 }
 
@@ -277,6 +278,7 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
         tables.insert(table_name.clone(), TableSchema {
             create_sql: sql,
             columns: HashMap::new(),
+            column_defaults: HashMap::new(),
             constraints: Vec::new(),
         });
     }
@@ -303,6 +305,7 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
                     tables.entry(table_name).or_insert_with(|| TableSchema {
                         create_sql: sql.clone(),
                         columns: HashMap::new(),
+                        column_defaults: HashMap::new(),
                         constraints: Vec::new(),
                     });
                 }
@@ -312,19 +315,27 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
 
     let col_sql = format!(
         "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
-         column_name, data_type \
+         column_name, data_type, column_default \
          FROM duckdb_columns() WHERE internal = false AND database_name = '{}'",
         safe_cat
     );
     let mut col_stmt = conn.prepare(&col_sql)?;
     let col_rows = col_stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
     })?;
 
     for row in col_rows {
-        let (table_name, column_name, data_type) = row?;
+        let (table_name, column_name, data_type, column_default) = row?;
         if let Some(table) = tables.get_mut(&table_name) {
-            table.columns.insert(column_name, data_type);
+            table.columns.insert(column_name.clone(), data_type);
+            if let Some(def) = column_default {
+                table.column_defaults.insert(column_name, def);
+            }
         }
     }
 
@@ -332,16 +343,28 @@ pub fn get_schema(conn: &Connection, catalog: Option<&str>) -> Result<HashMap<St
     if is_quack || any_col_empty {
         let q_col_sql = format!(
             "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
-             column_name, data_type \
-             FROM target_db.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
+             column_name, data_type, column_default \
+             FROM target_db.query('SELECT schema_name, table_name, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
             safe_cat
         );
         if let Ok(mut q_col_stmt) = conn.prepare(&q_col_sql) {
-            if let Ok(q_col_rows) = q_col_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))) {
+            if let Ok(q_col_rows) = q_col_stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            }) {
                 for row in q_col_rows.flatten() {
-                    let (table_name, column_name, data_type) = row;
+                    let (table_name, column_name, data_type, column_default) = row;
                     if let Some(table) = tables.get_mut(&table_name) {
-                        table.columns.insert(column_name, data_type);
+                        table.columns.insert(column_name.clone(), data_type);
+                        if let Some(def) = column_default {
+                            table.column_defaults.insert(column_name, def);
+                        } else {
+                            table.column_defaults.remove(&column_name);
+                        }
                     }
                 }
             }
@@ -752,7 +775,11 @@ pub fn compute_diff(
             for col_name in &created_cols {
                 if !matched_created_cols.contains(col_name) {
                     let shadow_type = shadow_table.columns.get(col_name).unwrap();
-                    safe_sqls.push(format!("ALTER TABLE {} ADD COLUMN {} {};", table_name, col_name, shadow_type));
+                    if let Some(def_val) = shadow_table.column_defaults.get(col_name) {
+                        safe_sqls.push(format!("ALTER TABLE {} ADD COLUMN {} {} DEFAULT {};", table_name, col_name, shadow_type, def_val));
+                    } else {
+                        safe_sqls.push(format!("ALTER TABLE {} ADD COLUMN {} {};", table_name, col_name, shadow_type));
+                    }
                 }
             }
 
@@ -766,6 +793,24 @@ pub fn compute_diff(
                 if let Some(target_type) = target_table.columns.get(col_name) {
                     if shadow_type != target_type {
                         safe_sqls.push(format!("ALTER TABLE {} ALTER {} TYPE {};", table_name, col_name, shadow_type));
+                    }
+
+                    let shadow_def = shadow_table.column_defaults.get(col_name);
+                    let target_def = target_table.column_defaults.get(col_name);
+
+                    match (shadow_def, target_def) {
+                        (Some(s_def), Some(t_def)) => {
+                            if !s_def.trim().eq_ignore_ascii_case(t_def.trim()) {
+                                safe_sqls.push(format!("ALTER TABLE {} ALTER {} SET DEFAULT {};", table_name, col_name, s_def));
+                            }
+                        }
+                        (Some(s_def), None) => {
+                            safe_sqls.push(format!("ALTER TABLE {} ALTER {} SET DEFAULT {};", table_name, col_name, s_def));
+                        }
+                        (None, Some(_)) => {
+                            safe_sqls.push(format!("ALTER TABLE {} ALTER {} DROP DEFAULT;", table_name, col_name));
+                        }
+                        (None, None) => {}
                     }
                 }
             }
@@ -1135,6 +1180,7 @@ mod tests {
         shadow.insert("users".to_string(), TableSchema {
             create_sql: "CREATE TABLE users (id INTEGER);".to_string(),
             columns,
+            column_defaults: HashMap::new(),
             constraints: Vec::new(),
         });
         
@@ -1301,12 +1347,14 @@ mod tests {
         target.insert("users".to_string(), TableSchema {
             create_sql: "CREATE TABLE users (id INTEGER, name VARCHAR);".to_string(),
             columns: cols.clone(),
+            column_defaults: HashMap::new(),
             constraints: Vec::new(),
         });
 
         shadow.insert("users".to_string(), TableSchema {
             create_sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR);".to_string(),
             columns: cols,
+            column_defaults: HashMap::new(),
             constraints: vec![ConstraintSchema {
                 constraint_type: "PRIMARY KEY".to_string(),
                 constraint_name: Some("users_id_pkey".to_string()),
@@ -1354,12 +1402,14 @@ mod tests {
         target.insert("users".to_string(), TableSchema {
             create_sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR);".to_string(),
             columns: cols.clone(),
+            column_defaults: HashMap::new(),
             constraints: vec![pk.clone()],
         });
 
         shadow.insert("users".to_string(), TableSchema {
             create_sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR UNIQUE);".to_string(),
             columns: cols,
+            column_defaults: HashMap::new(),
             constraints: vec![
                 pk,
                 ConstraintSchema {
@@ -1410,12 +1460,14 @@ mod tests {
         target.insert("orders".to_string(), TableSchema {
             create_sql: "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER);".to_string(),
             columns: cols.clone(),
+            column_defaults: HashMap::new(),
             constraints: vec![pk.clone()],
         });
 
         shadow.insert("orders".to_string(), TableSchema {
             create_sql: "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));".to_string(),
             columns: cols,
+            column_defaults: HashMap::new(),
             constraints: vec![
                 pk,
                 ConstraintSchema {
@@ -1478,6 +1530,7 @@ mod tests {
         target.insert("users".to_string(), TableSchema {
             create_sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR UNIQUE);".to_string(),
             columns: cols.clone(),
+            column_defaults: HashMap::new(),
             constraints: vec![pk.clone(), uq],
         });
 
@@ -1485,6 +1538,7 @@ mod tests {
         shadow.insert("users".to_string(), TableSchema {
             create_sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR);".to_string(),
             columns: cols,
+            column_defaults: HashMap::new(),
             constraints: vec![pk],
         });
 
@@ -1513,6 +1567,99 @@ mod tests {
         assert_eq!(users_tbl.constraints.len(), 2);
         assert!(users_tbl.constraints.iter().any(|c| c.constraint_type == "PRIMARY KEY" && c.columns == vec!["id"]));
         assert!(users_tbl.constraints.iter().any(|c| c.constraint_type == "UNIQUE" && c.columns == vec!["email"]));
+    }
+
+    #[test]
+    fn test_compute_diff_column_defaults() {
+        let mut shadow = HashMap::new();
+        let mut target = HashMap::new();
+
+        let mut cols = HashMap::new();
+        cols.insert("id".to_string(), "INTEGER".to_string());
+        cols.insert("processed".to_string(), "BOOLEAN".to_string());
+        cols.insert("col_drop_def".to_string(), "VARCHAR".to_string());
+        cols.insert("col_change_def".to_string(), "INTEGER".to_string());
+
+        let mut target_defs = HashMap::new();
+        target_defs.insert("col_drop_def".to_string(), "'old_default'".to_string());
+        target_defs.insert("col_change_def".to_string(), "1".to_string());
+
+        let mut shadow_defs = HashMap::new();
+        shadow_defs.insert("processed".to_string(), "false".to_string());
+        shadow_defs.insert("col_change_def".to_string(), "2".to_string());
+
+        target.insert("orders".to_string(), TableSchema {
+            create_sql: "CREATE TABLE orders (id INTEGER, processed BOOLEAN, col_drop_def VARCHAR, col_change_def INTEGER);".to_string(),
+            columns: cols.clone(),
+            column_defaults: target_defs,
+            constraints: Vec::new(),
+        });
+
+        shadow.insert("orders".to_string(), TableSchema {
+            create_sql: "CREATE TABLE orders (id INTEGER, processed BOOLEAN DEFAULT false, col_drop_def VARCHAR, col_change_def INTEGER DEFAULT 2);".to_string(),
+            columns: cols,
+            column_defaults: shadow_defs,
+            constraints: Vec::new(),
+        });
+
+        let diff = compute_diff(
+            &HashSet::new(), &HashSet::new(),
+            &shadow, &target,
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[]
+        );
+
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::AlterTable);
+        assert!(diff.items[0].sql.contains("ALTER TABLE orders ALTER processed SET DEFAULT false;"));
+        assert!(diff.items[0].sql.contains("ALTER TABLE orders ALTER col_change_def SET DEFAULT 2;"));
+        assert!(diff.items[0].sql.contains("ALTER TABLE orders ALTER col_drop_def DROP DEFAULT;"));
+    }
+
+    #[test]
+    fn test_compute_diff_add_column_with_default() {
+        let mut shadow = HashMap::new();
+        let mut target = HashMap::new();
+
+        let mut target_cols = HashMap::new();
+        target_cols.insert("id".to_string(), "INTEGER".to_string());
+
+        let mut shadow_cols = target_cols.clone();
+        shadow_cols.insert("processed".to_string(), "BOOLEAN".to_string());
+
+        let mut shadow_defs = HashMap::new();
+        shadow_defs.insert("processed".to_string(), "false".to_string());
+
+        target.insert("orders".to_string(), TableSchema {
+            create_sql: "CREATE TABLE orders (id INTEGER);".to_string(),
+            columns: target_cols,
+            column_defaults: HashMap::new(),
+            constraints: Vec::new(),
+        });
+
+        shadow.insert("orders".to_string(), TableSchema {
+            create_sql: "CREATE TABLE orders (id INTEGER, processed BOOLEAN DEFAULT false);".to_string(),
+            columns: shadow_cols,
+            column_defaults: shadow_defs,
+            constraints: Vec::new(),
+        });
+
+        let diff = compute_diff(
+            &HashSet::new(), &HashSet::new(),
+            &shadow, &target,
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &HashMap::new(), &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[]
+        );
+
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::AlterTable);
+        assert_eq!(diff.items[0].sql, "ALTER TABLE orders ADD COLUMN processed BOOLEAN DEFAULT false;");
     }
 }
 

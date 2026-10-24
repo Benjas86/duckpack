@@ -1226,6 +1226,7 @@ fn introspect_py_catalog(
                 schema_diff::TableSchema {
                     create_sql: row[1].clone(),
                     columns: HashMap::new(),
+                    column_defaults: HashMap::new(),
                     constraints: Vec::new(),
                 },
             );
@@ -1234,7 +1235,7 @@ fn introspect_py_catalog(
 
     // 3. Columns
     let col_query = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type FROM duckdb_columns() WHERE internal = false AND database_name = '{}'",
+        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND database_name = '{}'",
         safe_cat
     );
     let (_, col_rows) = executor
@@ -1244,6 +1245,12 @@ fn introspect_py_catalog(
         if row.len() >= 3 {
             if let Some(t) = table_map.get_mut(&row[0]) {
                 t.columns.insert(row[1].clone(), row[2].clone());
+                if row.len() >= 4 {
+                    let def = &row[3];
+                    if !def.is_empty() && def != "NULL" {
+                        t.column_defaults.insert(row[1].clone(), def.clone());
+                    }
+                }
             }
         }
     }
@@ -1267,6 +1274,7 @@ fn introspect_py_catalog(
                         schema_diff::TableSchema {
                             create_sql: row[1].clone(),
                             columns: HashMap::new(),
+                            column_defaults: HashMap::new(),
                             constraints: Vec::new(),
                         }
                     });
@@ -1275,7 +1283,7 @@ fn introspect_py_catalog(
         }
 
         let col_sql = format!(
-            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type FROM {}.query('SELECT schema_name, table_name, column_name, data_type FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
+            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type, column_default FROM {}.query('SELECT schema_name, table_name, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
             safe_cat, safe_cat
         );
         if let Ok((_, q_cols)) = executor.query_rows(&col_sql) {
@@ -1283,6 +1291,14 @@ fn introspect_py_catalog(
                 if row.len() >= 3 {
                     if let Some(t) = table_map.get_mut(&row[0]) {
                         t.columns.insert(row[1].clone(), row[2].clone());
+                        if row.len() >= 4 {
+                            let def = &row[3];
+                            if !def.is_empty() && def != "NULL" {
+                                t.column_defaults.insert(row[1].clone(), def.clone());
+                            } else {
+                                t.column_defaults.remove(&row[1]);
+                            }
+                        }
                     }
                 }
             }
