@@ -348,16 +348,17 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | | `Ctrl+B` / `v` | **Validate Project:** Verify SQL syntax and cross-asset dependencies against Shadow DB |
 | | `Alt+W` | Cycle Explorer width presets (`25%` $\rightarrow$ `35%` $\rightarrow$ `50%`) |
 | | `Alt+]` / `Alt+[` | Widen / narrow Explorer pane by 5% |
-| | `Ctrl+C` / `Esc` | Cancel operation / exit modal / quit IDE |
+| | `Ctrl+C` / `Esc` | Cancel operation / exit modal / confirm quit IDE |
 | **Editor** | `Ctrl+E` / `F5` | **Execute query** in active tab (or execute highlighted selection) |
 | | `Shift + Arrows` | Highlight text to isolate and execute *only* the selection on `Ctrl+E` |
-| | `Ctrl+Space` | Trigger **Intelligent Autocomplete** (catalog-aware tables, views, columns) |
+| | `F2` | **Switch Attached Database:** Quick-picker modal to switch active tab's target catalog (`▲`/`▼` or `j`/`k`, `Enter`, `Esc`) |
+| | `Ctrl+Space` | Trigger **Intelligent Autocomplete** (prioritizes active tab's target catalog entities) |
 | | `Ctrl+F` | **Auto-format** SQL statement using SQL parser |
 | | `Ctrl+S` | **Save** active query or project file to disk (clears dirty `*` indicator) |
 | | `Ctrl+Y` / `Ctrl+C` | **Copy** selected text (or active cell/line) to system clipboard |
 | | `Ctrl+V` | **Paste** from OS system clipboard into editor |
-| | `Ctrl+G` / `F2` | Open **Schema Visualizer** (ASCII tree + copies Mermaid.js ERD to clipboard) |
-| **Tabs** | `Ctrl+T` | Open a new blank query tab |
+| | `Ctrl+G` | Open **Schema Visualizer** (ASCII tree + copies Mermaid.js ERD to clipboard) |
+| **Tabs** | `Ctrl+T` | Open a new blank query tab (inherits target database of current tab) |
 | | `Ctrl+W` | Close the active query tab |
 | | `Ctrl+N` / `Ctrl+P` | Switch to the **Next** / **Previous** tab |
 | **Explorer** | `Up` / `Down` | Navigate through databases/categories, table groups, tables, and columns |
@@ -457,19 +458,33 @@ DuckPack dynamically detects your active catalogs:
 
 ### Live Database Attachment with Provider Presets (`Ctrl+A` / `d`)
 
-Press **`Ctrl+A`** from anywhere in the IDE to open the interactive **Attach Database** modal dialog with field-adaptive provider presets:
+Press **`Ctrl+A`** from anywhere in the IDE to open the interactive **Attach Database** modal dialog with field-adaptive provider presets and structured input boxes:
 
 - **Provider Presets (cycle via `◄` / `►` or `h` / `l`):**
   - **`DuckDB (Local / In-Memory)`**: Attach `.duckdb` files or `:memory:` scratchpads.
-  - **`Remote Quack Server`**: Connect to live remote Quack server instances with optional token credentials.
-  - **`MotherDuck Cloud`**: Attach MotherDuck cloud databases (`md:database_name`) with optional MotherDuck service token injection.
-  - **`SQLite`**: Attach SQLite database files (`.db`, `.sqlite`) with automatic installation and loading of the DuckDB `sqlite` extension (`INSTALL sqlite; LOAD sqlite;`).
-  - **`PostgreSQL`**: Connect to remote Postgres servers via connection URI (`postgres://user:pass@host:5432/dbname`) with automatic extension handling.
-  - **`MySQL`**: Connect to remote MySQL servers via connection URI (`mysql://user:pass@host:3306/dbname`) with automatic extension handling.
-- **Dynamic Field Guidance**: Prompts, placeholders, and catalog alias hints dynamically adapt to the selected provider.
-- **Masked Token/Password Field**: Passwords and service tokens are rendered with `*` mask characters.
+  - **`Remote Quack Server`**: Connect to live remote Quack server instances with optional token credentials and SSL disable toggles.
+  - **`MotherDuck Cloud`**: Attach MotherDuck cloud databases (`md:database_name`) with optional service token injection.
+  - **`SQLite`**: Attach SQLite database files (`.db`, `.sqlite`) with automatic installation and loading of the DuckDB `sqlite` extension.
+  - **`PostgreSQL`**: Connect to remote Postgres servers via structured input fields (Host, Port, Database, User ID, Password, SSL Mode).
+  - **`MySQL`**: Connect to remote MySQL servers via structured input fields (Host, Port, Database, User ID, Password, SSL Mode).
+  - **`Microsoft SQL Server (MSSQL)`**: Connect to remote SQL Server instances via structured input fields (Host, Port `1433`, Database, User ID `sa`, Password, Trust Server Certificate toggle).
+- **Structured Form Inputs**: No need to manually format complex connection strings; dedicated input boxes for Host, Port, Database, Username, Password, and Alias automatically assemble standard connection parameters.
+- **Masked Token/Password Field**: Passwords and service tokens are rendered with `*` mask characters to protect against shoulder surfing or screen shares.
 - **Read-Only Toggle**: Press `Space` to toggle `READ_ONLY` mode.
 - **Safe Detach**: Select any attached database in the Explorer and press **`d`** (or `Delete`) to safely detach it from the active session.
+
+### Per-Tab Attached Database Context & Quick-Picker (`F2`)
+
+DuckPack enables seamless multitasking across multiple attached database catalogs:
+
+- **Per-Tab Isolation**: Each editor tab independently tracks its own target database context (`target_database`). Switching between tabs automatically changes the active DuckDB catalog search path (`USE "<target_db>";`).
+- **Dual Visual Indicators**:
+  - **Tab Strip**: Displays catalog badges beside filenames (e.g. `New Query 1 (mssql_db) * | report.sql (memory)`).
+  - **Editor Header**: Prominently displays the provider icon, catalog alias, and engine type (e.g. `Editor [query.sql *] ── DB: 🔌 mssql_db (mssql) [F2: Switch DB]`).
+- **Database Quick-Picker Modal (`F2`)**: Press **`F2`** (or click `🗄️ DB (F2)` in the editor footer) from anywhere to summon a modal dialog listing all attached databases. Navigate with `▲`/`▼` or `j`/`k`, and press `Enter` to switch the active tab's target catalog instantly.
+- **Catalog-Aware Autocomplete**: Pressing `Ctrl+Space` prioritizes tables, views, and columns from the active tab's target database at the top of the suggestion list.
+- **Context Inheritance**: Creating a new tab (`Ctrl+T`), querying a table from Explorer (`q`/`s`), or attaching a new database (`Ctrl+A`) automatically initializes the tab's target catalog.
+- **Federated Cross-Database Queries**: DuckDB's cross-database querying is completely preserved; queries can still freely `JOIN` across any attached catalogs (`SELECT * FROM mssql_db.dbo.orders JOIN memory.local_users ...`).
 
 ### Cloud Secrets Management & S3 Bucket Explorer (`Ctrl+K`)
 

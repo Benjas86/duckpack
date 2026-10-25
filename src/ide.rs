@@ -1575,6 +1575,71 @@ impl AddBucketModalState {
     }
 }
 
+/// State for the Database Picker modal dialog (F2).
+#[derive(Clone, Debug)]
+pub(crate) struct DatabasePickerModalState {
+    pub(crate) is_open: bool,
+    pub(crate) selected_index: usize,
+}
+
+impl DatabasePickerModalState {
+    pub(crate) fn new() -> Self {
+        Self {
+            is_open: false,
+            selected_index: 0,
+        }
+    }
+
+    pub(crate) fn open_for_current(&mut self, current_db: &str, databases: &[crate::catalog::DatabaseInfo]) {
+        self.is_open = true;
+        if let Some(pos) = databases.iter().position(|d| d.name == current_db) {
+            self.selected_index = pos;
+        } else {
+            self.selected_index = 0;
+        }
+    }
+
+    pub(crate) fn next(&mut self, total: usize) {
+        if total > 0 {
+            self.selected_index = (self.selected_index + 1).min(total.saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn prev(&mut self) {
+        self.selected_index = self.selected_index.saturating_sub(1);
+    }
+}
+
+/// State for the Exit Confirmation modal dialog (Esc).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExitConfirmationModalState {
+    pub(crate) is_open: bool,
+    pub(crate) confirm_exit: bool,
+}
+
+impl ExitConfirmationModalState {
+    pub(crate) fn new() -> Self {
+        Self {
+            is_open: false,
+            confirm_exit: false,
+        }
+    }
+
+    pub(crate) fn open(&mut self) {
+        self.is_open = true;
+        self.confirm_exit = false; // default to safe cancel
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.is_open = false;
+        self.confirm_exit = false;
+    }
+
+    pub(crate) fn toggle(&mut self) {
+        self.confirm_exit = !self.confirm_exit;
+    }
+}
+
 /// Populates SecretModalState with existing secret configuration from DuckDB and .env for in-place editing.
 pub(crate) fn populate_secret_modal_for_edit(
     conn: &duckdb::Connection,
@@ -1681,10 +1746,11 @@ struct EditorTab<'a> {
     pagination_offset: usize,
     pagination_limit: usize,
     is_paginated: bool,
+    target_database: String,
 }
 
 impl<'a> EditorTab<'a> {
-    fn new() -> Self {
+    fn new(target_database: String) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
         textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
@@ -1701,7 +1767,17 @@ impl<'a> EditorTab<'a> {
             pagination_offset: 0,
             pagination_limit: 500,
             is_paginated: false,
+            target_database,
         }
+    }
+}
+
+/// Formats the database provider icon based on database type.
+pub(crate) fn db_icon(db_type: &str) -> &'static str {
+    match db_type.to_lowercase().as_str() {
+        "sqlite" => "🗃️",
+        "postgres" | "postgresql" | "mysql" | "mssql" => "🔌",
+        _ => "📁",
     }
 }
 
@@ -1719,11 +1795,7 @@ pub(crate) fn rebuild_explorer_nodes(
         for db in &meta.databases {
             let db_key = format!("db:{}", db.name);
             let is_db_expanded = expanded_groups.contains(&db_key);
-            let icon = match db.db_type.to_lowercase().as_str() {
-                "sqlite" => "🗃️",
-                "postgres" | "postgresql" | "mysql" | "mssql" => "🔌",
-                _ => "📁",
-            };
+            let icon = db_icon(&db.db_type);
             let active_tag = if db.is_active { " [Active]" } else { "" };
             let ro_tag = if db.readonly { " [RO]" } else { "" };
             let type_tag = format!(" ({})", db.db_type);
@@ -2348,12 +2420,6 @@ pub fn run_ide_loop(
     db_path: &str,
     quack_disable_ssl: bool,
 ) -> Result<()> {
-    let mut tabs: Vec<EditorTab> = vec![EditorTab::new()];
-    let mut active_tab_index: usize = 0;
-
-    let mut focus = FocusPane::Editor;
-    let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
-
     let is_quack = db_path.starts_with("quack:");
     let is_remote_db = is_quack || db_path.starts_with("md:") || db_path.starts_with("motherduck:");
 
@@ -2375,6 +2441,14 @@ pub fn run_ide_loop(
     let _ = crate::engine::ensure_extension_loaded(conn, "parquet");
 
     let mut meta = load_explorer_metadata(conn, project_dir, is_quack);
+    let mut tabs: Vec<EditorTab> = vec![EditorTab::new(meta.active_database.clone())];
+    let mut active_tab_index: usize = 0;
+    let mut db_picker_modal = DatabasePickerModalState::new();
+    let mut exit_confirm_modal = ExitConfirmationModalState::new();
+
+    let mut focus = FocusPane::Editor;
+    let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
+
     let mut expanded_groups: HashSet<String> = if meta.databases.len() > 1 {
         let mut set = HashSet::new();
         for db in &meta.databases {
@@ -2425,6 +2499,7 @@ pub fn run_ide_loop(
     let mut current_tabs_rect = Rect::default();
     let mut current_results_rect = Rect::default();
     let mut current_status_rect = Rect::default();
+    let mut current_exit_dialog_rect = Rect::default();
     let mut show_help = false;
     let mut show_schema_visualizer = false;
     let mut schema_ascii_tree = String::new();
@@ -2433,6 +2508,15 @@ pub fn run_ide_loop(
     let mut os_clipboard: Option<arboard::Clipboard> = arboard::Clipboard::new().ok();
 
     loop {
+        let current_target = &tabs[active_tab_index].target_database;
+        if !current_target.is_empty() && meta.active_database != *current_target {
+            let _ = conn.execute(&format!("USE \"{}\";", current_target.replace('"', "\"\"")), []);
+            meta.active_database = current_target.clone();
+            for db in &mut meta.databases {
+                db.is_active = db.name == *current_target;
+            }
+        }
+
         terminal.draw(|f| {
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -2538,12 +2622,17 @@ pub fn run_ide_loop(
                     format!("New Query {}", i + 1)
                 };
                 let dirty = if tab.is_dirty { " *" } else { "" };
+                let db_badge = if !tab.target_database.is_empty() {
+                    format!(" ({})", tab.target_database)
+                } else {
+                    String::new()
+                };
                 let style = if i == active_tab_index {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
-                Line::from(vec![Span::styled(format!(" {}{} ", name, dirty), style)])
+                Line::from(vec![Span::styled(format!(" {}{}{} ", name, db_badge, dirty), style)])
             }).collect();
             
             let tabs_widget = Tabs::new(tab_titles)
@@ -2555,12 +2644,21 @@ pub fn run_ide_loop(
 
             // Editor Pane
             let active_tab = &mut tabs[active_tab_index];
-            let editor_title = if let Some(ref path) = active_tab.active_file {
-                let dirty = if active_tab.is_dirty { " *" } else { "" };
-                format!(" Editor [{}{}] ", path.file_name().unwrap_or(std::ffi::OsStr::new("unknown")).to_string_lossy(), dirty)
+            let file_display = if let Some(ref path) = active_tab.active_file {
+                path.file_name().unwrap_or(std::ffi::OsStr::new("unknown")).to_string_lossy().to_string()
             } else {
-                let dirty = if active_tab.is_dirty { " *" } else { "" };
-                format!(" Editor [New Query{}] ", dirty)
+                format!("New Query {}", active_tab_index + 1)
+            };
+            let dirty = if active_tab.is_dirty { " *" } else { "" };
+            let (icon, db_type_tag) = if let Some(d) = meta.databases.iter().find(|d| d.name == active_tab.target_database) {
+                (db_icon(&d.db_type), format!(" ({})", d.db_type))
+            } else {
+                ("📁", String::new())
+            };
+            let editor_title = if !active_tab.target_database.is_empty() {
+                format!(" Editor [{}{}] ── DB: {} {}{} [F2: Switch DB] ", file_display, dirty, icon, active_tab.target_database, db_type_tag)
+            } else {
+                format!(" Editor [{}{}] [F2: Switch DB] ", file_display, dirty)
             };
 
             let sql_keywords = SQL_KEYWORD_PATTERN;
@@ -2580,7 +2678,7 @@ pub fn run_ide_loop(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(editor_title)
-                    .title_bottom(Line::from(" ➕ New (Ctrl+T)  |  ❌ Close (Ctrl+W)  |  💾 Save (Ctrl+S)  |  ✨ Format (Ctrl+F) ").alignment(Alignment::Left))
+                    .title_bottom(Line::from(" ➕ New (Ctrl+T)  |  ❌ Close (Ctrl+W)  |  💾 Save (Ctrl+S)  |  ✨ Format (Ctrl+F)  |  🗄️ DB (F2) ").alignment(Alignment::Left))
                     .title_bottom(Line::from(" ▶ Run (F5) ").alignment(Alignment::Right))
                     .border_style(editor_border_style)
             );
@@ -2690,7 +2788,82 @@ pub fn run_ide_loop(
             }
             current_results_rect = right_chunks[2];
 
-            if show_help {
+            if exit_confirm_modal.is_open {
+                let has_dirty_tabs = tabs.iter().any(|t| t.is_dirty);
+                let popup_width = 54.min(f.area().width.saturating_sub(4));
+                let popup_height = if has_dirty_tabs { 9 } else { 7 };
+                let popup_area = ratatui::layout::Rect {
+                    x: (f.area().width.saturating_sub(popup_width)) / 2,
+                    y: (f.area().height.saturating_sub(popup_height)) / 2,
+                    width: popup_width,
+                    height: popup_height,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+
+                let modal_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" ⚠️ Exit DuckPack IDE ")
+                    .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+                f.render_widget(modal_block.clone(), popup_area);
+                current_exit_dialog_rect = popup_area;
+
+                let inner = modal_block.inner(popup_area);
+                let exit_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(if has_dirty_tabs {
+                        vec![
+                            Constraint::Length(1), // Question
+                            Constraint::Length(1), // Warning
+                            Constraint::Min(1),    // Spacer
+                            Constraint::Length(1), // Buttons
+                        ]
+                    } else {
+                        vec![
+                            Constraint::Length(1), // Question
+                            Constraint::Min(1),    // Spacer
+                            Constraint::Length(1), // Buttons
+                        ]
+                    })
+                    .split(inner);
+
+                let question = Paragraph::new("Are you sure you want to exit DuckPack?")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+                f.render_widget(question, exit_layout[0]);
+
+                if has_dirty_tabs {
+                    let dirty_count = tabs.iter().filter(|t| t.is_dirty).count();
+                    let warning_text = if dirty_count == 1 {
+                        "⚠️ 1 tab has unsaved changes!".to_string()
+                    } else {
+                        format!("⚠️ {} tabs have unsaved changes!", dirty_count)
+                    };
+                    let warning = Paragraph::new(warning_text)
+                        .alignment(Alignment::Center)
+                        .style(Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD));
+                    f.render_widget(warning, exit_layout[1]);
+                }
+
+                let btn_idx = if has_dirty_tabs { 3 } else { 2 };
+                let yes_style = if exit_confirm_modal.confirm_exit {
+                    Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let cancel_style = if !exit_confirm_modal.confirm_exit {
+                    Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                let buttons = Line::from(vec![
+                    Span::styled(" [y] Yes, Exit ", yes_style),
+                    Span::raw("    "),
+                    Span::styled(" [n / Esc] Cancel ", cancel_style),
+                ]);
+                f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), exit_layout[btn_idx]);
+            } else if show_help {
                 let popup_area = ratatui::layout::Rect {
                     x: f.area().width / 6,
                     y: f.area().height / 6,
@@ -2701,6 +2874,7 @@ pub fn run_ide_loop(
                 
                 let help_lines = vec![
                     Line::from(vec![Span::styled(" [?]       ", Style::default().fg(Color::Cyan)), Span::raw("Toggle Help Menu")]),
+                    Line::from(vec![Span::styled(" F2        ", Style::default().fg(Color::Cyan)), Span::raw("Switch Attached Database for Active Tab")]),
                     Line::from(""),
                     Line::from(vec![Span::styled(" F3 / 1    ", Style::default().fg(Color::Yellow)), Span::raw("Switch Explorer to Database Catalog")]),
                     Line::from(vec![Span::styled(" F4 / 2    ", Style::default().fg(Color::Yellow)), Span::raw("Switch Explorer to Project Files")]),
@@ -2763,6 +2937,65 @@ pub fn run_ide_loop(
                         .alignment(Alignment::Left)
                         .scroll((schema_scroll, 0));
                 f.render_widget(tree_paragraph, popup_area);
+            } else if db_picker_modal.is_open {
+                let popup_width = 58.min(f.area().width.saturating_sub(4));
+                let item_count = meta.databases.len().max(1);
+                let popup_height = (item_count + 6).min(f.area().height.saturating_sub(2) as usize) as u16;
+                let popup_area = ratatui::layout::Rect {
+                    x: (f.area().width.saturating_sub(popup_width)) / 2,
+                    y: (f.area().height.saturating_sub(popup_height)) / 2,
+                    width: popup_width,
+                    height: popup_height,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+
+                let modal_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" 🗄️ Switch Attached Database (F2) ")
+                    .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                f.render_widget(modal_block.clone(), popup_area);
+
+                let inner = modal_block.inner(popup_area);
+                let picker_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1), // Subtitle / hint
+                        Constraint::Min(1),    // List of databases
+                        Constraint::Length(1), // Controls hint
+                    ])
+                    .split(inner);
+
+                let sub_hint = Paragraph::new(" Choose target database for current editor tab:")
+                    .style(Style::default().fg(Color::DarkGray));
+                f.render_widget(sub_hint, picker_layout[0]);
+
+                let list_items: Vec<ListItem> = meta.databases.iter().enumerate().map(|(idx, db)| {
+                    let is_selected = idx == db_picker_modal.selected_index;
+                    let is_current = db.name == tabs[active_tab_index].target_database;
+                    let icon = db_icon(&db.db_type);
+                    let current_marker = if is_current { " [Active for Tab]" } else { "" };
+                    let type_tag = format!("({})", db.db_type);
+                    let cursor = if is_selected { "▶ " } else { "  " };
+
+                    let content = format!("{}{} {} {} {}", cursor, icon, db.name, type_tag, current_marker);
+                    let style = if is_selected {
+                        Style::default().bg(Color::DarkGray).fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else if is_current {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(content).style(style)
+                }).collect();
+
+                let list_widget = List::new(list_items);
+                f.render_widget(list_widget, picker_layout[1]);
+
+                let footer_hint = Paragraph::new(" ▲/▼ or j/k: Navigate | Enter: Select | Esc: Cancel")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+                f.render_widget(footer_hint, picker_layout[2]);
             } else if attach_modal.is_open {
                 let popup_width = 76.min(f.area().width.saturating_sub(4));
                 let err_lines = if attach_modal.error_msg.is_some() { 4 } else { 2 };
@@ -3643,7 +3876,21 @@ pub fn run_ide_loop(
         match ev {
             Event::Mouse(mouse) => {
                 if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                    if mouse.row >= current_status_rect.top() && mouse.row < current_status_rect.bottom()
+                    if exit_confirm_modal.is_open {
+                        if mouse.row == current_exit_dialog_rect.bottom().saturating_sub(2) {
+                            let center_x = current_exit_dialog_rect.left() + current_exit_dialog_rect.width / 2;
+                            if mouse.column >= current_exit_dialog_rect.left() && mouse.column < center_x {
+                                break;
+                            } else if mouse.column >= center_x && mouse.column <= current_exit_dialog_rect.right() {
+                                exit_confirm_modal.close();
+                                status_msg = "Exit cancelled".to_string();
+                            }
+                        } else if mouse.row < current_exit_dialog_rect.top() || mouse.row >= current_exit_dialog_rect.bottom()
+                            || mouse.column < current_exit_dialog_rect.left() || mouse.column >= current_exit_dialog_rect.right() {
+                            exit_confirm_modal.close();
+                            status_msg = "Exit cancelled".to_string();
+                        }
+                    } else if mouse.row >= current_status_rect.top() && mouse.row < current_status_rect.bottom()
                         && mouse.column >= current_status_rect.left() && mouse.column < current_status_rect.right()
                     {
                         let clean_text = if let Some(stripped) = status_msg.strip_prefix("📋 [Copied] ") {
@@ -3673,6 +3920,9 @@ pub fn run_ide_loop(
                         }
                         if mouse.column > current_editor_rect.left() + 61 && mouse.column <= current_editor_rect.left() + 85 {
                             format_query = true;
+                        }
+                        if mouse.column > current_editor_rect.left() + 85 && mouse.column <= current_editor_rect.left() + 105 {
+                            db_picker_modal.open_for_current(&tabs[active_tab_index].target_database, &meta.databases);
                         }
                     } else if mouse.row == current_results_rect.bottom().saturating_sub(1) {
                         if mouse.column >= current_results_rect.right().saturating_sub(10) && mouse.column <= current_results_rect.right() {
@@ -3725,7 +3975,13 @@ pub fn run_ide_loop(
                             } else {
                                 format!("New Query {}", i + 1)
                             };
-                            let tab_width = tab_name.chars().count() as u16 + 2; // " name "
+                            let dirty = if tab.is_dirty { " *" } else { "" };
+                            let db_badge = if !tab.target_database.is_empty() {
+                                format!(" ({})", tab.target_database)
+                            } else {
+                                String::new()
+                            };
+                            let tab_width = (tab_name.chars().count() + db_badge.chars().count() + dirty.chars().count() + 2) as u16;
                             let display_width = tab_width + 3; // Ratatui divider " | "
                             if mouse.column >= current_x && mouse.column < current_x + display_width {
                                 active_tab_index = i;
@@ -3832,7 +4088,23 @@ pub fn run_ide_loop(
                 }
             }
             Event::Key(key) => {
-                if new_asset_modal.is_open {
+                if exit_confirm_modal.is_open {
+                    if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('Y') {
+                        break;
+                    } else if key.code == KeyCode::Char('n') || key.code == KeyCode::Char('N') || key.code == KeyCode::Esc {
+                        exit_confirm_modal.close();
+                        status_msg = "Exit cancelled".to_string();
+                    } else if key.code == KeyCode::Left || key.code == KeyCode::Right || key.code == KeyCode::Tab || key.code == KeyCode::BackTab || key.code == KeyCode::Char('h') || key.code == KeyCode::Char('l') {
+                        exit_confirm_modal.toggle();
+                    } else if key.code == KeyCode::Enter {
+                        if exit_confirm_modal.confirm_exit {
+                            break;
+                        } else {
+                            exit_confirm_modal.close();
+                            status_msg = "Exit cancelled".to_string();
+                        }
+                    }
+                } else if new_asset_modal.is_open {
                     if key.code == KeyCode::Esc {
                         new_asset_modal.is_open = false;
                     } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
@@ -3879,7 +4151,7 @@ pub fn run_ide_loop(
                                 } else if let Ok(content) = std::fs::read_to_string(&path) {
                                     let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
                                     if !current_is_empty {
-                                        tabs.push(EditorTab::new());
+                                        tabs.push(EditorTab::new(tabs[active_tab_index].target_database.clone()));
                                         active_tab_index = tabs.len() - 1;
                                     }
                                     tabs[active_tab_index].textarea = TextArea::from(content.lines().map(|s| s.to_string()).collect::<Vec<_>>());
@@ -4046,7 +4318,8 @@ pub fn run_ide_loop(
                                         match conn.execute(&attach_sql, []) {
                                             Ok(_) => {
                                                 attach_modal.is_open = false;
-                                                status_msg = format!("Attached database '{}' successfully.", alias);
+                                                tabs[active_tab_index].target_database = alias.clone();
+                                                status_msg = format!("Attached database '{}' successfully and switched active tab context.", alias);
                                                 trigger_explorer_refresh = true;
                                             }
                                             Err(e) => {
@@ -4267,6 +4540,26 @@ pub fn run_ide_loop(
                             add_bucket_modal.uri.push(c);
                         }
                     }
+                } else if db_picker_modal.is_open {
+                    if key.code == KeyCode::Esc {
+                        db_picker_modal.is_open = false;
+                    } else if key.code == KeyCode::Up || key.code == KeyCode::Char('k') {
+                        db_picker_modal.prev();
+                    } else if key.code == KeyCode::Down || key.code == KeyCode::Char('j') {
+                        db_picker_modal.next(meta.databases.len());
+                    } else if key.code == KeyCode::Enter {
+                        if let Some(target_db) = meta.databases.get(db_picker_modal.selected_index) {
+                            let db_name = target_db.name.clone();
+                            tabs[active_tab_index].target_database = db_name.clone();
+                            let _ = conn.execute(&format!("USE \"{}\";", db_name.replace('"', "\"\"")), []);
+                            meta.active_database = db_name.clone();
+                            for db in &mut meta.databases {
+                                db.is_active = db.name == db_name;
+                            }
+                            status_msg = format!("Target database switched to '{}' for active tab.", db_name);
+                        }
+                        db_picker_modal.is_open = false;
+                    }
                 } else if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     attach_modal.reset();
                 } else if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -4283,6 +4576,11 @@ pub fn run_ide_loop(
                         }
                     }
                 } else {
+                    if key.code == KeyCode::F(2) {
+                        db_picker_modal.open_for_current(&tabs[active_tab_index].target_database, &meta.databases);
+                        continue;
+                    }
+
                     if key.code == KeyCode::Char('?') {
                     show_help = true;
                     continue;
@@ -4369,9 +4667,10 @@ pub fn run_ide_loop(
                     }
                 }
 
-                // Global quit
+                // Global quit confirmation prompt
                 if key.code == KeyCode::Esc {
-                    break;
+                    exit_confirm_modal.open();
+                    continue;
                 }
 
                 // Global tab navigation (forward)
@@ -4418,7 +4717,7 @@ pub fn run_ide_loop(
                 if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     tabs.remove(active_tab_index);
                     if tabs.is_empty() {
-                        tabs.push(EditorTab::new());
+                        tabs.push(EditorTab::new(meta.active_database.clone()));
                     }
                     if active_tab_index >= tabs.len() {
                         active_tab_index = tabs.len() - 1;
@@ -4660,8 +4959,10 @@ pub fn run_ide_loop(
 
                                             let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
                                             if !current_is_empty {
-                                                tabs.push(EditorTab::new());
+                                                tabs.push(EditorTab::new(db_name.to_string()));
                                                 active_tab_index = tabs.len() - 1;
+                                            } else {
+                                                tabs[active_tab_index].target_database = db_name.to_string();
                                             }
 
                                             tabs[active_tab_index].textarea = TextArea::from(vec![qualified_sql]);
@@ -4684,7 +4985,7 @@ pub fn run_ide_loop(
                                             let query = format!("SELECT * FROM {}('{}') LIMIT 500;", read_fn, path);
                                             let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
                                             if !current_is_empty {
-                                                tabs.push(EditorTab::new());
+                                                tabs.push(EditorTab::new(tabs[active_tab_index].target_database.clone()));
                                                 active_tab_index = tabs.len() - 1;
                                             }
                                             tabs[active_tab_index].textarea = TextArea::from(vec![query]);
@@ -4699,7 +5000,7 @@ pub fn run_ide_loop(
                                         NodeType::CloudSecret { name, .. } => {
                                             let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
                                             if !current_is_empty {
-                                                tabs.push(EditorTab::new());
+                                                tabs.push(EditorTab::new(tabs[active_tab_index].target_database.clone()));
                                                 active_tab_index = tabs.len() - 1;
                                             }
                                             let query = format!("SELECT * FROM duckdb_secrets() WHERE name = '{}';", name);
@@ -4810,9 +5111,37 @@ pub fn run_ide_loop(
                                             autocomplete_index = (autocomplete_index + 1) % autocomplete_matches.len();
                                         } else {
                                             autocomplete_original_word = current_word.to_string();
-                                            autocomplete_matches = dictionary.iter()
+                                            let mut matches: Vec<String> = dictionary.iter()
                                                 .filter(|d| d.to_lowercase().starts_with(&autocomplete_original_word.to_lowercase()))
                                                 .cloned().collect();
+                                            let target_db = &tabs[active_tab_index].target_database;
+                                            if !target_db.is_empty() {
+                                                let target_prefix = format!("{}.", target_db.to_lowercase());
+                                                let target_entities: HashSet<String> = if let Some(d) = meta.databases.iter().find(|d| d.name == *target_db) {
+                                                    let mut set = HashSet::new();
+                                                    set.insert(d.name.to_lowercase());
+                                                    for t in &d.tables {
+                                                        set.insert(t.name.to_lowercase());
+                                                        set.insert(t.display_name().to_lowercase());
+                                                    }
+                                                    for v in &d.views {
+                                                        set.insert(v.name.to_lowercase());
+                                                        set.insert(v.display_name().to_lowercase());
+                                                    }
+                                                    set
+                                                } else {
+                                                    HashSet::new()
+                                                };
+
+                                                matches.sort_by(|a, b| {
+                                                    let a_low = a.to_lowercase();
+                                                    let b_low = b.to_lowercase();
+                                                    let a_score = if a_low.starts_with(&target_prefix) || target_entities.contains(&a_low) { 0 } else { 1 };
+                                                    let b_score = if b_low.starts_with(&target_prefix) || target_entities.contains(&b_low) { 0 } else { 1 };
+                                                    a_score.cmp(&b_score).then_with(|| a.len().cmp(&b.len())).then_with(|| a.cmp(b))
+                                                });
+                                            }
+                                            autocomplete_matches = matches;
                                             autocomplete_index = 0;
                                         }
 
@@ -4908,7 +5237,7 @@ pub fn run_ide_loop(
         }
 
         if new_tab {
-            tabs.push(EditorTab::new());
+            tabs.push(EditorTab::new(tabs[active_tab_index].target_database.clone()));
             active_tab_index = tabs.len() - 1;
             status_msg = "New tab opened".to_string();
         }
@@ -4916,7 +5245,7 @@ pub fn run_ide_loop(
         if close_tab {
             tabs.remove(active_tab_index);
             if tabs.is_empty() {
-                tabs.push(EditorTab::new());
+                tabs.push(EditorTab::new(meta.active_database.clone()));
             }
             if active_tab_index >= tabs.len() {
                 active_tab_index = tabs.len() - 1;
@@ -4990,6 +5319,13 @@ pub fn run_ide_loop(
 
         if execute_query || trigger_pagination.is_some() {
             let active_tab = &mut tabs[active_tab_index];
+            if !active_tab.target_database.is_empty() {
+                let _ = conn.execute(&format!("USE \"{}\";", active_tab.target_database.replace('"', "\"\"")), []);
+                meta.active_database = active_tab.target_database.clone();
+                for db in &mut meta.databases {
+                    db.is_active = db.name == active_tab.target_database;
+                }
+            }
             
             let query_to_execute = if let Some(dir) = trigger_pagination {
                 if let Some(bq) = &active_tab.base_query {
@@ -5368,6 +5704,19 @@ pub fn run_ide_loop(
 
                     match item_type {
                         NodeType::Database { .. } => {
+                            let clean_db_name = if let Some(stripped) = item_name.strip_prefix("db:") {
+                                stripped.to_string()
+                            } else {
+                                item_name.clone()
+                            };
+                            tabs[active_tab_index].target_database = clean_db_name.clone();
+                            let _ = conn.execute(&format!("USE \"{}\";", clean_db_name.replace('"', "\"\"")), []);
+                            meta.active_database = clean_db_name.clone();
+                            for db in &mut meta.databases {
+                                db.is_active = db.name == clean_db_name;
+                            }
+                            status_msg = format!("Target database switched to '{}' for active tab.", clean_db_name);
+
                             if expanded_groups.contains(&item_name) {
                                 expanded_groups.remove(&item_name);
                             } else {
@@ -5446,7 +5795,7 @@ pub fn run_ide_loop(
                             } else if let Ok(content) = std::fs::read_to_string(&path) {
                                 let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
                                 if !current_is_empty {
-                                    tabs.push(EditorTab::new());
+                                    tabs.push(EditorTab::new(tabs[active_tab_index].target_database.clone()));
                                     active_tab_index = tabs.len() - 1;
                                 }
                                 
@@ -5475,7 +5824,7 @@ pub fn run_ide_loop(
                             } else if let Ok(content) = std::fs::read_to_string(&path) {
                                 let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
                                 if !current_is_empty {
-                                    tabs.push(EditorTab::new());
+                                    tabs.push(EditorTab::new(tabs[active_tab_index].target_database.clone()));
                                     active_tab_index = tabs.len() - 1;
                                 }
 
@@ -5501,7 +5850,7 @@ pub fn run_ide_loop(
                         NodeType::CloudSecret { name, .. } => {
                             let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
                             if !current_is_empty {
-                                tabs.push(EditorTab::new());
+                                tabs.push(EditorTab::new(tabs[active_tab_index].target_database.clone()));
                                 active_tab_index = tabs.len() - 1;
                             }
                             let query = format!("SELECT * FROM duckdb_secrets() WHERE name = '{}';", name);
@@ -5543,7 +5892,7 @@ pub fn run_ide_loop(
                                 let query = format!("SELECT * FROM {}('{}') LIMIT 500;", read_fn, path);
                                 let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
                                 if !current_is_empty {
-                                    tabs.push(EditorTab::new());
+                                    tabs.push(EditorTab::new(tabs[active_tab_index].target_database.clone()));
                                     active_tab_index = tabs.len() - 1;
                                 }
                                 tabs[active_tab_index].textarea = TextArea::from(vec![query]);
@@ -6872,6 +7221,108 @@ mod tests {
         assert!(!modal.use_ssl);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_database_picker_modal_state() {
+        let mut modal = DatabasePickerModalState::new();
+        assert!(!modal.is_open);
+        assert_eq!(modal.selected_index, 0);
+
+        let dbs = vec![
+            crate::catalog::DatabaseInfo {
+                name: "memory".to_string(),
+                db_type: "duckdb".to_string(),
+                path: None,
+                is_active: true,
+                readonly: false,
+                tables: vec![],
+                views: vec![],
+                triggers: vec![],
+            },
+            crate::catalog::DatabaseInfo {
+                name: "analytics_db".to_string(),
+                db_type: "postgres".to_string(),
+                path: Some("postgres://...".to_string()),
+                is_active: false,
+                readonly: false,
+                tables: vec![],
+                views: vec![],
+                triggers: vec![],
+            },
+            crate::catalog::DatabaseInfo {
+                name: "mssql_db".to_string(),
+                db_type: "mssql".to_string(),
+                path: None,
+                is_active: false,
+                readonly: false,
+                tables: vec![],
+                views: vec![],
+                triggers: vec![],
+            },
+        ];
+
+        modal.open_for_current("analytics_db", &dbs);
+        assert!(modal.is_open);
+        assert_eq!(modal.selected_index, 1);
+
+        modal.next(dbs.len());
+        assert_eq!(modal.selected_index, 2);
+
+        // Next at end should clamp to last element
+        modal.next(dbs.len());
+        assert_eq!(modal.selected_index, 2);
+
+        modal.prev();
+        assert_eq!(modal.selected_index, 1);
+
+        modal.prev();
+        assert_eq!(modal.selected_index, 0);
+
+        // Prev at beginning should clamp to 0
+        modal.prev();
+        assert_eq!(modal.selected_index, 0);
+
+        // Opening for unknown db falls back to index 0
+        modal.open_for_current("unknown_catalog", &dbs);
+        assert_eq!(modal.selected_index, 0);
+    }
+
+    #[test]
+    fn test_editor_tab_target_database_and_db_icon() {
+        let tab = EditorTab::new("mssql_db".to_string());
+        assert_eq!(tab.target_database, "mssql_db");
+        assert!(!tab.is_dirty);
+        assert!(tab.active_file.is_none());
+
+        assert_eq!(db_icon("sqlite"), "🗃️");
+        assert_eq!(db_icon("postgres"), "🔌");
+        assert_eq!(db_icon("postgresql"), "🔌");
+        assert_eq!(db_icon("mysql"), "🔌");
+        assert_eq!(db_icon("mssql"), "🔌");
+        assert_eq!(db_icon("duckdb"), "📁");
+        assert_eq!(db_icon("unknown"), "📁");
+    }
+
+    #[test]
+    fn test_exit_confirmation_modal_state() {
+        let mut modal = ExitConfirmationModalState::new();
+        assert!(!modal.is_open);
+        assert!(!modal.confirm_exit);
+
+        modal.open();
+        assert!(modal.is_open);
+        assert!(!modal.confirm_exit); // Safe default: Cancel
+
+        modal.toggle();
+        assert!(modal.confirm_exit); // Toggled to Exit
+
+        modal.toggle();
+        assert!(!modal.confirm_exit); // Toggled back to Cancel
+
+        modal.close();
+        assert!(!modal.is_open);
+        assert!(!modal.confirm_exit);
     }
 }
 
