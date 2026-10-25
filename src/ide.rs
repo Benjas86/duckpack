@@ -61,6 +61,7 @@ pub(crate) enum NodeType {
     CloudBucket { bucket: String },
     CloudFile { path: String, is_dir: bool },
     AddSecretAction,
+    AddBucketAction,
 }
 
 /// Formats the display line for a column in the database explorer tree.
@@ -872,6 +873,36 @@ impl SecretModalState {
     }
 }
 
+/// State for the Add Cloud Bucket modal dialog.
+#[derive(Clone, Debug)]
+pub(crate) struct AddBucketModalState {
+    pub(crate) is_open: bool,
+    pub(crate) uri: String,
+    pub(crate) save_to_env: bool,
+    pub(crate) active_field: usize, // 0: uri, 1: save_to_env, 2: submit, 3: cancel
+    pub(crate) error_msg: Option<String>,
+}
+
+impl AddBucketModalState {
+    pub(crate) fn new() -> Self {
+        Self {
+            is_open: false,
+            uri: String::new(),
+            save_to_env: true,
+            active_field: 0,
+            error_msg: None,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.is_open = true;
+        self.uri.clear();
+        self.save_to_env = true;
+        self.active_field = 0;
+        self.error_msg = None;
+    }
+}
+
 /// Represents a single renderable node in the Explorer sidebar.
 /// Tracks its hierarchical depth (`level`) and expandability state for collapsing/expanding tables.
 #[derive(Clone, Debug)]
@@ -1296,6 +1327,15 @@ pub(crate) fn rebuild_explorer_nodes(
             node_type: NodeType::AddSecretAction,
         });
 
+        items.push(ExplorerNode {
+            name: "add_cloud_bucket".to_string(),
+            display: "  ➕ Add S3 Bucket (Enter)".to_string(),
+            level: 1,
+            is_expandable: false,
+            is_expanded: false,
+            node_type: NodeType::AddBucketAction,
+        });
+
         for (sec_name, sec_type) in &meta.secrets {
             items.push(ExplorerNode {
                 name: sec_name.clone(),
@@ -1541,6 +1581,7 @@ pub fn run_ide_loop(
     let mut expanded_tables: HashSet<String> = HashSet::new();
     let mut attach_modal = AttachModalState::new();
     let mut secret_modal = SecretModalState::new();
+    let mut add_bucket_modal = AddBucketModalState::new();
 
     let mut dictionary = meta.dictionary.clone();
     let mut autocomplete_matches: Vec<String> = Vec::new();
@@ -2123,6 +2164,70 @@ pub fn run_ide_loop(
                     Span::styled(" [ Cancel ] ", cancel_btn_style),
                 ]);
                 f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[8]);
+            } else if add_bucket_modal.is_open {
+                let popup_width = 64.min(f.area().width.saturating_sub(4));
+                let popup_height = 14.min(f.area().height.saturating_sub(2));
+                let popup_area = ratatui::layout::Rect {
+                    x: (f.area().width.saturating_sub(popup_width)) / 2,
+                    y: (f.area().height.saturating_sub(popup_height)) / 2,
+                    width: popup_width,
+                    height: popup_height,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+
+                let modal_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" 🪣 Add S3 / Cloud Bucket ")
+                    .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+                f.render_widget(modal_block.clone(), popup_area);
+
+                let inner_area = modal_block.inner(popup_area);
+                let field_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), // 0: Bucket URI
+                        Constraint::Length(2), // 1: Persist in .env toggle
+                        Constraint::Length(2), // 2: Hint / error
+                        Constraint::Length(3), // 3: Buttons
+                    ])
+                    .split(inner_area);
+
+                // Field 0: URI
+                let f0_style = if add_bucket_modal.active_field == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let p0 = Paragraph::new(format!("{}{}", add_bucket_modal.uri, if add_bucket_modal.active_field == 0 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Bucket URI or Name (e.g. s3://my-lake) ").border_style(f0_style));
+                f.render_widget(p0, field_layout[0]);
+
+                // Field 1: Persist toggle
+                let f1_style = if add_bucket_modal.active_field == 1 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                let env_label = format!("  [{}] Persist to .env (Space to toggle)", if add_bucket_modal.save_to_env { "X" } else { " " });
+                f.render_widget(Paragraph::new(env_label).style(f1_style), field_layout[1]);
+
+                // Field 2: Hint / Error
+                if let Some(ref err) = add_bucket_modal.error_msg {
+                    f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), field_layout[2]);
+                } else {
+                    f.render_widget(Paragraph::new("  Tab: Next Field | Space: Toggle | Enter: Add Bucket | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), field_layout[2]);
+                }
+
+                // Field 3: Buttons
+                let add_btn_style = if add_bucket_modal.active_field == 2 {
+                    Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                let cancel_btn_style = if add_bucket_modal.active_field == 3 {
+                    Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let buttons = Line::from(vec![
+                    Span::styled(" [ Add Bucket ] ", add_btn_style),
+                    Span::raw("    "),
+                    Span::styled(" [ Cancel ] ", cancel_btn_style),
+                ]);
+                f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[3]);
             } else if new_asset_modal.is_open {
                 let popup_width = 62.min(f.area().width.saturating_sub(4));
                 let popup_height = 16.min(f.area().height.saturating_sub(2));
@@ -2972,6 +3077,65 @@ pub fn run_ide_loop(
                             }
                         }
                     }
+                } else if add_bucket_modal.is_open {
+                    if key.code == KeyCode::Esc {
+                        add_bucket_modal.is_open = false;
+                    } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
+                        add_bucket_modal.active_field = (add_bucket_modal.active_field + 1) % 4;
+                    } else if key.code == KeyCode::BackTab || key.code == KeyCode::Up {
+                        add_bucket_modal.active_field = if add_bucket_modal.active_field == 0 { 3 } else { add_bucket_modal.active_field - 1 };
+                    } else if add_bucket_modal.active_field >= 2 && (key.code == KeyCode::Left || key.code == KeyCode::Right) {
+                        add_bucket_modal.active_field = if add_bucket_modal.active_field == 2 { 3 } else { 2 };
+                    } else if key.code == KeyCode::Char(' ') && add_bucket_modal.active_field == 1 {
+                        add_bucket_modal.save_to_env = !add_bucket_modal.save_to_env;
+                    } else if key.code == KeyCode::Enter {
+                        if add_bucket_modal.active_field == 3 {
+                            add_bucket_modal.is_open = false;
+                        } else if add_bucket_modal.active_field == 1 {
+                            add_bucket_modal.save_to_env = !add_bucket_modal.save_to_env;
+                        } else {
+                            let clean_uri = add_bucket_modal.uri.trim();
+                            if clean_uri.is_empty() {
+                                add_bucket_modal.error_msg = Some("Bucket URI or name cannot be empty.".to_string());
+                            } else {
+                                let mut normalized = clean_uri.to_string();
+                                if !normalized.starts_with("s3://") && !normalized.starts_with("r2://") && !normalized.starts_with("gcs://") && !normalized.starts_with("azure://") {
+                                    normalized = format!("s3://{}", normalized);
+                                }
+
+                                if add_bucket_modal.save_to_env {
+                                    let _ = crate::engine::append_cloud_bucket_to_env(project_dir, &normalized);
+                                }
+
+                                unsafe {
+                                    let current = std::env::var("DUCKPACK_S3_BUCKETS").or_else(|_| std::env::var("DUCKPACK_S3_BUCKET")).unwrap_or_default();
+                                    let new_var = if current.is_empty() {
+                                        normalized.clone()
+                                    } else if !current.split(',').any(|b| b.trim() == normalized) {
+                                        format!("{},{}", current, normalized)
+                                    } else {
+                                        current
+                                    };
+                                    std::env::set_var("DUCKPACK_S3_BUCKETS", &new_var);
+                                    std::env::set_var("DUCKPACK_S3_BUCKET", &new_var);
+                                }
+
+                                let bucket_key = format!("bucket:{}", normalized);
+                                expanded_groups.insert("Secrets & Cloud Buckets".to_string());
+                                expanded_groups.insert(bucket_key);
+
+                                add_bucket_modal.is_open = false;
+                                status_msg = format!("Added bucket '{}' to explorer.", normalized);
+                                trigger_explorer_refresh = true;
+                            }
+                        }
+                    } else if key.code == KeyCode::Backspace && add_bucket_modal.active_field == 0 {
+                        add_bucket_modal.uri.pop();
+                    } else if let KeyCode::Char(c) = key.code {
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) && add_bucket_modal.active_field == 0 {
+                            add_bucket_modal.uri.push(c);
+                        }
+                    }
                 } else if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     attach_modal.reset();
                 } else if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -3275,8 +3439,11 @@ pub fn run_ide_loop(
                                             NodeType::Group if explorer_items[selected].name == "Secrets & Cloud Buckets" => {
                                                 secret_modal.reset();
                                             }
-                                            NodeType::AddSecretAction | NodeType::CloudSecret { .. } | NodeType::CloudBucket { .. } | NodeType::CloudFile { .. } => {
+                                            NodeType::AddSecretAction | NodeType::CloudSecret { .. } => {
                                                 secret_modal.reset();
+                                            }
+                                            NodeType::AddBucketAction | NodeType::CloudBucket { .. } | NodeType::CloudFile { .. } => {
+                                                add_bucket_modal.reset();
                                             }
                                             _ => {
                                                 attach_modal.reset();
@@ -3420,21 +3587,49 @@ pub fn run_ide_loop(
                         } else if key.code == KeyCode::Char('d') || key.code == KeyCode::Delete {
                             if let Some(selected) = explorer_state.selected() {
                                 if selected < explorer_items.len() {
-                                    if let NodeType::Database { is_active, .. } = &explorer_items[selected].node_type {
-                                        if *is_active {
-                                            status_msg = "⚠️ Cannot detach the primary active database.".to_string();
-                                        } else {
-                                            let db_name = explorer_items[selected].name.strip_prefix("db:").unwrap_or(&explorer_items[selected].name);
-                                            match conn.execute(&format!("DETACH {};", db_name), []) {
-                                                Ok(_) => {
-                                                    status_msg = format!("Detached database '{}' successfully.", db_name);
-                                                    trigger_explorer_refresh = true;
-                                                }
-                                                Err(e) => {
-                                                    status_msg = format!("Failed to detach '{}': {}", db_name, e);
+                                    match &explorer_items[selected].node_type {
+                                        NodeType::Database { is_active, .. } => {
+                                            if *is_active {
+                                                status_msg = "⚠️ Cannot detach the primary active database.".to_string();
+                                            } else {
+                                                let db_name = explorer_items[selected].name.strip_prefix("db:").unwrap_or(&explorer_items[selected].name);
+                                                match conn.execute(&format!("DETACH {};", db_name), []) {
+                                                    Ok(_) => {
+                                                        status_msg = format!("Detached database '{}' successfully.", db_name);
+                                                        trigger_explorer_refresh = true;
+                                                    }
+                                                    Err(e) => {
+                                                        status_msg = format!("Failed to detach '{}': {}", db_name, e);
+                                                    }
                                                 }
                                             }
                                         }
+                                        NodeType::CloudSecret { name, .. } => {
+                                            match conn.execute(&format!("DROP SECRET IF EXISTS {};", name), []) {
+                                                Ok(_) => {
+                                                    status_msg = format!("Dropped secret '{}' successfully.", name);
+                                                    trigger_explorer_refresh = true;
+                                                }
+                                                Err(e) => {
+                                                    status_msg = format!("Failed to drop secret '{}': {}", name, e);
+                                                }
+                                            }
+                                        }
+                                        NodeType::CloudBucket { bucket } => {
+                                            let current = std::env::var("DUCKPACK_S3_BUCKETS").or_else(|_| std::env::var("DUCKPACK_S3_BUCKET")).unwrap_or_default();
+                                            let parts: Vec<&str> = current.split(',')
+                                                .map(|s| s.trim())
+                                                .filter(|s| !s.is_empty() && *s != bucket.as_str() && *s != bucket.trim_start_matches("s3://"))
+                                                .collect();
+                                            let new_val = parts.join(",");
+                                            unsafe {
+                                                std::env::set_var("DUCKPACK_S3_BUCKETS", &new_val);
+                                                std::env::set_var("DUCKPACK_S3_BUCKET", &new_val);
+                                            }
+                                            status_msg = format!("Removed bucket '{}' from session view.", bucket);
+                                            trigger_explorer_refresh = true;
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -4110,6 +4305,9 @@ pub fn run_ide_loop(
                         NodeType::Trigger { .. } => {}
                         NodeType::AddSecretAction => {
                             secret_modal.reset();
+                        }
+                        NodeType::AddBucketAction => {
+                            add_bucket_modal.reset();
                         }
                         NodeType::CloudSecret { name, .. } => {
                             let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
@@ -5356,6 +5554,7 @@ mod tests {
         expanded_groups.insert("Secrets & Cloud Buckets".to_string());
         let nodes_expanded = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
         assert!(nodes_expanded.iter().any(|n| n.name == "add_cloud_secret"));
+        assert!(nodes_expanded.iter().any(|n| n.name == "add_cloud_bucket"));
         assert!(nodes_expanded.iter().any(|n| n.name == "my_s3_secret"));
         assert!(nodes_expanded.iter().any(|n| n.name == "bucket:s3://analytics-lake"));
     }

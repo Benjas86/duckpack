@@ -755,6 +755,45 @@ pub fn save_cloud_secret_to_env(
     Ok(())
 }
 
+/// Safely appends or updates a cloud bucket URI into the project's `.env` file under DUCKPACK_S3_BUCKETS.
+pub fn append_cloud_bucket_to_env(project_dir: &std::path::Path, bucket: &str) -> Result<()> {
+    let env_path = project_dir.join(".env");
+    let mut lines: Vec<String> = if env_path.exists() {
+        std::fs::read_to_string(&env_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let clean_bucket = bucket.trim();
+    let mut found = false;
+
+    for line in &mut lines {
+        let key_opt = line.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()));
+        if let Some((k, v)) = key_opt {
+            if k == "DUCKPACK_S3_BUCKET" || k == "DUCKPACK_S3_BUCKETS" {
+                let mut buckets: Vec<String> = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                if !buckets.contains(&clean_bucket.to_string()) {
+                    buckets.push(clean_bucket.to_string());
+                }
+                *line = format!("DUCKPACK_S3_BUCKETS={}", buckets.join(","));
+                found = true;
+            }
+        }
+    }
+
+    if !found {
+        lines.push(format!("DUCKPACK_S3_BUCKET={}", clean_bucket));
+    }
+
+    let output = lines.join("\n") + "\n";
+    std::fs::write(&env_path, output)?;
+    Ok(())
+}
+
 /// Resolves target configuration from duckpack.toml, supporting [target] defaults and [env.<profile>] overrides.
 pub fn resolve_target_config(project_dir: &std::path::Path, env_profile: Option<&str>) -> ResolvedTargetConfig {
     load_env_files(project_dir, env_profile);
@@ -1493,6 +1532,29 @@ token_env = "TEST_RESOLVER_PROD_TOKEN"
         assert!(env_content.contains("AWS_REGION=us-east-1"));
         assert!(env_content.contains("AWS_ENDPOINT=http://localhost:9000"));
         assert!(env_content.contains("DUCKPACK_S3_BUCKET=s3://my-test-lake"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_append_cloud_bucket_to_env() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_env_bkt_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // First append creates DUCKPACK_S3_BUCKET
+        let _ = append_cloud_bucket_to_env(&temp_dir, "s3://lake-one");
+        let content1 = std::fs::read_to_string(temp_dir.join(".env")).unwrap();
+        assert!(content1.contains("DUCKPACK_S3_BUCKET=s3://lake-one"));
+
+        // Second append turns it into comma-separated DUCKPACK_S3_BUCKETS
+        let _ = append_cloud_bucket_to_env(&temp_dir, "s3://lake-two");
+        let content2 = std::fs::read_to_string(temp_dir.join(".env")).unwrap();
+        assert!(content2.contains("DUCKPACK_S3_BUCKETS=s3://lake-one,s3://lake-two"));
+
+        // Third append of duplicate should not duplicate
+        let _ = append_cloud_bucket_to_env(&temp_dir, "s3://lake-two");
+        let content3 = std::fs::read_to_string(temp_dir.join(".env")).unwrap();
+        assert!(content3.contains("DUCKPACK_S3_BUCKETS=s3://lake-one,s3://lake-two"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
