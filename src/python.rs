@@ -1332,12 +1332,13 @@ fn introspect_py_catalog(
 
     // 3b. Constraints
     let constr_query = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
-         constraint_type, constraint_name, COALESCE(array_to_string(constraint_column_names, ','), ''), \
-         expression, referenced_table, COALESCE(array_to_string(referenced_column_names, ','), '') \
-         FROM duckdb_constraints() \
-         WHERE (database_name = '{}' OR database_name = 'target_db') AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
-        safe_cat
+        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, \
+         c.constraint_type, c.constraint_name, COALESCE(array_to_string(c.constraint_column_names, ','), ''), \
+         c.expression, c.referenced_table, COALESCE(array_to_string(c.referenced_column_names, ','), '') \
+         FROM duckdb_constraints() c \
+         JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name \
+         WHERE (c.database_name = '{}' OR c.database_name = 'target_db') AND c.constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
+        schema_diff::FULL_SCHEMAS_CTE, safe_cat
     );
     if let Ok((_, constr_rows)) = executor.query_rows(&constr_query) {
         for row in constr_rows {
