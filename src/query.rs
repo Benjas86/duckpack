@@ -110,6 +110,41 @@ pub fn diagnose_remote_credential_error(err_str: &str, is_remote: bool) -> &'sta
 }
 
 
+/// Extracts the extension name if an error was caused by DuckDB extension autoloading or download failure.
+pub fn extract_autoload_extension_name(err_str: &str) -> Option<String> {
+    if !err_str.contains("Extension Autoloading Error")
+        && !err_str.contains("Failed to download extension")
+        && !err_str.contains("is an existing extension") {
+        return None;
+    }
+    // Pattern 1: required extension 'name
+    if let Some(pos) = err_str.find("required extension '") {
+        let rem = &err_str[pos + "required extension '".len()..];
+        let name: String = rem.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    // Pattern 2: Failed to download extension "name" or 'name'
+    if let Some(pos) = err_str.find("Failed to download extension ") {
+        let rem = &err_str[pos + "Failed to download extension ".len()..];
+        let trimmed = rem.trim_start_matches(|c| c == '\'' || c == '"');
+        let name: String = trimmed.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    // Pattern 3: Extension "name" is an existing extension
+    if let Some(pos) = err_str.find("Extension \"") {
+        let rem = &err_str[pos + "Extension \"".len()..];
+        let name: String = rem.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Recursively discovers all `.sql` query files under a root queries directory.
 pub fn collect_queries_recursive(dir: &Path, base: &Path, queries: &mut Vec<String>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -229,5 +264,20 @@ mod tests {
         assert!(re.is_match("MATERIALIZED"));
         assert!(re.is_match("SELECT"));
         assert!(!re.is_match("random_identifier"));
+    }
+
+    #[test]
+    fn test_extract_autoload_extension_name() {
+        let err1 = "Prepare Error: Extension Autoloading Error: An error occurred while trying to automatically install the required extension 'parquet: Failed to download extension \"parquet\" at URL \"https://extensions.duckdb.org/d54cbbe3df/linux_amd64/parquet.duckdb_extension.gz\" (HTTP 404)\nExtension \"parquet\" is an existing extension.";
+        assert_eq!(extract_autoload_extension_name(err1), Some("parquet".to_string()));
+
+        let err2 = "Failed to download extension \"excel\" at URL ...";
+        assert_eq!(extract_autoload_extension_name(err2), Some("excel".to_string()));
+
+        let err3 = "Failed to download extension 'mssql' at URL ...";
+        assert_eq!(extract_autoload_extension_name(err3), Some("mssql".to_string()));
+
+        let err4 = "Table with name 'users' does not exist!";
+        assert_eq!(extract_autoload_extension_name(err4), None);
     }
 }

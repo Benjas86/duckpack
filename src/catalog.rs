@@ -1104,22 +1104,54 @@ pub fn load_explorer_metadata(
     }
 }
 
-/// Lists files and subdirectories within a cloud bucket URI using DuckDB glob.
-pub fn list_s3_bucket_objects(conn: &Connection, bucket_uri: &str) -> Vec<(String, bool)> {
+/// Lists files and subdirectories within a cloud bucket URI using DuckDB glob, returning descriptive errors if unreachable.
+pub fn list_s3_bucket_objects(conn: &Connection, bucket_uri: &str) -> Result<Vec<(String, bool)>, String> {
     let clean_bucket = bucket_uri.trim_end_matches('/');
-    let glob_sql = format!("SELECT file FROM glob('{clean_bucket}/*') LIMIT 50;");
+    let glob_sql = format!("SELECT file FROM glob('{clean_bucket}/*') LIMIT 100;");
     let mut results = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(&glob_sql) {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
+    
+    let mut stmt = conn.prepare(&glob_sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        if let Ok(file_path) = row.get::<_, String>(0) {
+            let is_dir = file_path.ends_with('/') || !file_path.contains('.');
+            results.push((file_path, is_dir));
+        }
+    }
+
+    if !results.is_empty() {
+        return Ok(results);
+    }
+
+    // Direct glob returned 0 items; attempt recursive glob to discover nested folders/files
+    let rec_sql = format!("SELECT file FROM glob('{clean_bucket}/**') LIMIT 150;");
+    if let Ok(mut rec_stmt) = conn.prepare(&rec_sql) {
+        if let Ok(mut rec_rows) = rec_stmt.query([]) {
+            let prefix_with_slash = format!("{}/", clean_bucket);
+            let mut seen_dirs = std::collections::HashSet::new();
+
+            while let Ok(Some(row)) = rec_rows.next() {
                 if let Ok(file_path) = row.get::<_, String>(0) {
-                    let is_dir = file_path.ends_with('/') || !file_path.contains('.');
-                    results.push((file_path, is_dir));
+                    if let Some(rel) = file_path.strip_prefix(&prefix_with_slash) {
+                        if let Some(slash_idx) = rel.find('/') {
+                            let dir_name = &rel[..slash_idx];
+                            let dir_path = format!("{}{}", prefix_with_slash, dir_name);
+                            if seen_dirs.insert(dir_path.clone()) {
+                                results.push((dir_path, true));
+                            }
+                        } else {
+                            results.push((file_path, false));
+                        }
+                    } else {
+                        let is_dir = file_path.ends_with('/') || !file_path.contains('.');
+                        results.push((file_path, is_dir));
+                    }
                 }
             }
         }
     }
-    results
+
+    Ok(results)
 }
 
 /// Refreshes the attached remote database catalog so that the client's internal planner and

@@ -197,19 +197,43 @@ pub fn open_duckdb_connection() -> Result<Connection> {
     Connection::open_in_memory().context("Failed to open in-memory DuckDB connection")
 }
 
-/// Loads the `quack` extension, gracefully handling local version path mismatches
-/// (e.g., ~/.duckdb/extensions/v2.0.0 vs dev commit hashes) before falling back to network install.
-pub fn load_quack_extension(conn: &Connection) -> Result<()> {
-    // 1. Try standard LOAD quack;
-    if conn.execute_batch("LOAD quack;").is_ok() {
+/// Returns the release version tag (e.g. "v2.0.0", "v1.2.0") and optional commit hash of the active DuckDB connection.
+pub fn get_duckdb_version_info(conn: &Connection) -> (String, Option<String>) {
+    if let Ok((ver, hash)) = conn.query_row("PRAGMA version;", [], |r| {
+        let v: String = r.get(0)?;
+        let h: String = r.get(1)?;
+        Ok((v, h))
+    }) {
+        let clean_ver = ver.split('-').next().unwrap_or(&ver).to_string();
+        let release_tag = if clean_ver.starts_with('v') {
+            clean_ver
+        } else {
+            format!("v{}", clean_ver)
+        };
+        let commit_hash = if !hash.is_empty() { Some(hash) } else { None };
+        (release_tag, commit_hash)
+    } else {
+        ("v2.0.0".to_string(), None)
+    }
+}
+
+/// Loads any DuckDB extension, gracefully handling local version path mismatches
+/// (e.g. ~/.duckdb/extensions/v2.0.0 vs dev commit hashes) and automatically installing
+/// from the official release CDN repository if DuckDB's internal autoload returns HTTP 404.
+pub fn ensure_extension_loaded(conn: &Connection, ext_name: &str) -> Result<()> {
+    // 1. Try standard LOAD <ext>;
+    if conn.execute_batch(&format!("LOAD {};", ext_name)).is_ok() {
         return Ok(());
     }
 
-    // 2. Search local extension directory (~/.duckdb/extensions) for existing quack.duckdb_extension
+    let (release_tag, commit_hash) = get_duckdb_version_info(conn);
+
+    // 2. Search local extension directory (~/.duckdb/extensions) for existing <ext>.duckdb_extension
     if let Ok(home) = std::env::var("HOME") {
         let base_ext_dir = PathBuf::from(home).join(".duckdb").join("extensions");
         if base_ext_dir.exists() {
             let mut candidates = Vec::new();
+            let target_filename = format!("{}.duckdb_extension", ext_name);
             if let Ok(entries) = fs::read_dir(&base_ext_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -217,13 +241,13 @@ pub fn load_quack_extension(conn: &Connection) -> Result<()> {
                         if let Ok(sub_entries) = fs::read_dir(&path) {
                             for sub in sub_entries.flatten() {
                                 let sub_path = sub.path();
-                                let ext_file = sub_path.join("quack.duckdb_extension");
+                                let ext_file = sub_path.join(&target_filename);
                                 if ext_file.exists() {
                                     candidates.push(ext_file);
                                 }
                             }
                         }
-                        let direct_ext = path.join("quack.duckdb_extension");
+                        let direct_ext = path.join(&target_filename);
                         if direct_ext.exists() {
                             candidates.push(direct_ext);
                         }
@@ -231,16 +255,25 @@ pub fn load_quack_extension(conn: &Connection) -> Result<()> {
                 }
             }
 
-            // Prioritize exact hash match or v2.0.0
+            let hash_str = commit_hash.as_deref().unwrap_or("");
             candidates.sort_by(|a, b| {
                 let a_str = a.to_string_lossy();
                 let b_str = b.to_string_lossy();
-                let a_score = if a_str.contains("v2.0.0") { 3 } else if a_str.contains("d54cbbe3df") { 4 } else { 1 };
-                let b_score = if b_str.contains("v2.0.0") { 3 } else if b_str.contains("d54cbbe3df") { 4 } else { 1 };
-                b_score.cmp(&a_score)
+                let score = |s: &str| {
+                    if !hash_str.is_empty() && s.contains(hash_str) {
+                        4
+                    } else if s.contains(&release_tag) {
+                        3
+                    } else if s.contains("v2.0") {
+                        2
+                    } else {
+                        1
+                    }
+                };
+                score(&b_str).cmp(&score(&a_str))
             });
 
-            for candidate in candidates {
+            for candidate in &candidates {
                 let load_sql = format!("LOAD '{}';", candidate.to_string_lossy().replace('\'', "''"));
                 if conn.execute(&load_sql, []).is_ok() {
                     return Ok(());
@@ -249,11 +282,64 @@ pub fn load_quack_extension(conn: &Connection) -> Result<()> {
         }
     }
 
-    // 3. Fallback to INSTALL quack; LOAD quack;
-    conn.execute_batch("INSTALL quack; LOAD quack;")
-        .or_else(|_| conn.execute_batch("INSTALL quack FROM community; LOAD quack;"))
-        .context("Failed to install/load quack extension")?;
+    // 3. Fallback to direct URL install from official DuckDB CDN and Community Extensions CDN
+    let platform = if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") { "osx_arm64" } else { "osx_amd64" }
+    } else if cfg!(target_os = "windows") {
+        "windows_amd64"
+    } else {
+        if cfg!(target_arch = "aarch64") { "linux_arm64" } else { "linux_amd64" }
+    };
+
+    let versions = vec![release_tag.clone(), "v2.0.0".to_string(), "v1.2.0".to_string()];
+    let mut candidate_urls = Vec::new();
+    for ver in &versions {
+        // Official Core CDN
+        candidate_urls.push(format!("https://extensions.duckdb.org/{}/{}/{}.duckdb_extension.gz", ver, platform, ext_name));
+        // Community Extensions CDN (e.g. mssql, etc.)
+        candidate_urls.push(format!("https://community-extensions.duckdb.org/{}/{}/{}.duckdb_extension.gz", ver, platform, ext_name));
+    }
+
+    for cdn_url in &candidate_urls {
+        let install_res = conn.execute(&format!("INSTALL '{}';", cdn_url), [])
+            .or_else(|_| conn.execute(&format!("FORCE INSTALL '{}';", cdn_url), []));
+        if install_res.is_ok() {
+            let load_res = conn.execute(&format!("LOAD {};", ext_name), [])
+                .or_else(|_| {
+                    if let Ok(home) = std::env::var("HOME") {
+                        let path = PathBuf::from(&home).join(".duckdb").join("extensions").join(&release_tag).join(platform).join(format!("{}.duckdb_extension", ext_name));
+                        if path.exists() {
+                            return conn.execute(&format!("LOAD '{}';", path.to_string_lossy().replace('\'', "''")), []);
+                        }
+                    }
+                    Err(duckdb::Error::QueryReturnedNoRows)
+                });
+            if load_res.is_ok() {
+                // Also copy to dev hash folder if present so future loads from disk succeed instantly
+                if let (Ok(home), Some(hash)) = (std::env::var("HOME"), commit_hash.as_ref()) {
+                    let src_file = PathBuf::from(&home).join(".duckdb").join("extensions").join(&release_tag).join(platform).join(format!("{}.duckdb_extension", ext_name));
+                    let dest_dir = PathBuf::from(&home).join(".duckdb").join("extensions").join(hash).join(platform);
+                    let _ = std::fs::create_dir_all(&dest_dir);
+                    if src_file.exists() && dest_dir.exists() {
+                        let _ = std::fs::copy(&src_file, dest_dir.join(format!("{}.duckdb_extension", ext_name)));
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // 4. Final fallback to standard INSTALL/LOAD
+    conn.execute_batch(&format!("INSTALL {}; LOAD {};", ext_name, ext_name))
+        .or_else(|_| conn.execute_batch(&format!("INSTALL {} FROM community; LOAD {};", ext_name, ext_name)))
+        .context(format!("Failed to install/load {} extension", ext_name))?;
     Ok(())
+}
+
+/// Loads the `quack` extension, gracefully handling local version path mismatches
+/// before falling back to network install.
+pub fn load_quack_extension(conn: &Connection) -> Result<()> {
+    ensure_extension_loaded(conn, "quack")
 }
 
 /// Connects to the target DuckDB database (local, motherduck remote, or quack remote).
@@ -1272,12 +1358,20 @@ mod tests {
     #[test]
     fn test_embedded_duckdb_version() {
         let v = embedded_duckdb_version();
-        println!("Rust embedded_duckdb_version: {}", v);
-        let conn = open_duckdb_connection().unwrap();
-        let pragma: (String, String, String) = conn.query_row("PRAGMA version;", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
-        println!("Rust PRAGMA version: {:?}", pragma);
         assert!(!v.is_empty());
         assert!(v.starts_with('v') || v.chars().next().map_or(false, |c| c.is_ascii_digit()));
+
+        let conn = open_duckdb_connection().unwrap();
+        let (ver, hash) = get_duckdb_version_info(&conn);
+        assert!(ver.starts_with('v'));
+        assert!(hash.is_some());
+    }
+
+    #[test]
+    fn test_ensure_extension_loaded_mssql() {
+        let conn = open_duckdb_connection().unwrap();
+        let res = ensure_extension_loaded(&conn, "mssql");
+        assert!(res.is_ok(), "ensure_extension_loaded mssql failed: {:?}", res);
     }
 
     #[test]

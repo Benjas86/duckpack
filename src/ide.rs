@@ -687,6 +687,7 @@ pub(crate) enum AttachProvider {
     SQLite,
     PostgreSQL,
     MySQL,
+    MSSQL,
 }
 
 impl AttachProvider {
@@ -698,7 +699,25 @@ impl AttachProvider {
             AttachProvider::SQLite => "SQLite",
             AttachProvider::PostgreSQL => "PostgreSQL",
             AttachProvider::MySQL => "MySQL",
+            AttachProvider::MSSQL => "SQL Server / MSSQL (Community)",
         }
+    }
+
+    pub(crate) fn is_relational(&self) -> bool {
+        matches!(self, AttachProvider::PostgreSQL | AttachProvider::MySQL | AttachProvider::MSSQL)
+    }
+
+    pub(crate) fn is_quack(&self) -> bool {
+        matches!(self, AttachProvider::Quack)
+    }
+
+    pub(crate) fn is_motherduck(&self) -> bool {
+        matches!(self, AttachProvider::MotherDuck)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_file_based(&self) -> bool {
+        matches!(self, AttachProvider::DuckDB | AttachProvider::SQLite)
     }
 }
 
@@ -706,41 +725,62 @@ impl AttachProvider {
 #[derive(Clone, Debug)]
 pub(crate) struct AttachModalState {
     pub(crate) is_open: bool,
-    pub(crate) provider_index: usize, // 0: DuckDB, 1: Quack, 2: MotherDuck, 3: SQLite, 4: PostgreSQL, 5: MySQL
-    pub(crate) path: String,
-    pub(crate) alias: String,
+    pub(crate) provider_index: usize, // 0: DuckDB, 1: Quack, 2: MotherDuck, 3: SQLite, 4: PostgreSQL, 5: MySQL, 6: MSSQL
+    pub(crate) path: String,          // For DuckDB / SQLite file path, MotherDuck DB name
+    pub(crate) host: String,          // Host / Server (localhost, etc.)
+    pub(crate) port: String,          // Port (1433, 5432, 3306, 9494)
+    pub(crate) database: String,      // Database name (mydb, postgres, etc.)
+    pub(crate) username: String,      // Username / User ID (sa, postgres, root)
+    pub(crate) password: String,      // Password / Auth Token (Masked)
+    pub(crate) alias: String,         // Catalog alias
     pub(crate) alias_is_custom: bool,
-    pub(crate) token: String,
     pub(crate) read_only: bool,
-    pub(crate) active_field: usize, // 0: provider, 1: path, 2: alias, 3: token, 4: readonly, 5: submit, 6: cancel
+    pub(crate) disable_ssl: bool,
+    pub(crate) insecure: bool,
+    pub(crate) active_field: usize,
     pub(crate) error_msg: Option<String>,
 }
 
 impl AttachModalState {
     pub(crate) fn new() -> Self {
-        Self {
+        let mut s = Self {
             is_open: false,
             provider_index: 0,
             path: String::new(),
+            host: String::new(),
+            port: String::new(),
+            database: String::new(),
+            username: String::new(),
+            password: String::new(),
             alias: String::new(),
             alias_is_custom: false,
-            token: String::new(),
             read_only: false,
+            disable_ssl: false,
+            insecure: false,
             active_field: 1,
             error_msg: None,
-        }
+        };
+        s.set_provider(0);
+        s
     }
 
     pub(crate) fn reset(&mut self) {
         self.is_open = true;
         self.provider_index = 0;
         self.path.clear();
+        self.host.clear();
+        self.port.clear();
+        self.database.clear();
+        self.username.clear();
+        self.password.clear();
         self.alias.clear();
         self.alias_is_custom = false;
-        self.token.clear();
         self.read_only = false;
+        self.disable_ssl = false;
+        self.insecure = false;
         self.active_field = 1;
         self.error_msg = None;
+        self.set_provider(0);
     }
 
     pub(crate) fn provider(&self) -> AttachProvider {
@@ -750,7 +790,636 @@ impl AttachModalState {
             3 => AttachProvider::SQLite,
             4 => AttachProvider::PostgreSQL,
             5 => AttachProvider::MySQL,
+            6 => AttachProvider::MSSQL,
             _ => AttachProvider::DuckDB,
+        }
+    }
+
+    pub(crate) fn set_provider(&mut self, idx: usize) {
+        self.provider_index = idx % 7;
+        self.error_msg = None;
+        let is_default_port = matches!(self.port.as_str(), "" | "1433" | "5432" | "3306" | "9494");
+        let is_default_user = matches!(self.username.as_str(), "" | "sa" | "postgres" | "root");
+
+        match self.provider() {
+            AttachProvider::MSSQL => {
+                if self.host.is_empty() { self.host = "localhost".to_string(); }
+                if is_default_port { self.port = "1433".to_string(); }
+                if is_default_user { self.username = "sa".to_string(); }
+                if !self.alias_is_custom {
+                    self.alias = if !self.database.is_empty() { self.database.clone() } else { "mssql_db".to_string() };
+                }
+            }
+            AttachProvider::PostgreSQL => {
+                if self.host.is_empty() { self.host = "localhost".to_string(); }
+                if is_default_port { self.port = "5432".to_string(); }
+                if is_default_user { self.username = "postgres".to_string(); }
+                if !self.alias_is_custom {
+                    self.alias = if !self.database.is_empty() { self.database.clone() } else { "pg_db".to_string() };
+                }
+            }
+            AttachProvider::MySQL => {
+                if self.host.is_empty() { self.host = "localhost".to_string(); }
+                if is_default_port { self.port = "3306".to_string(); }
+                if is_default_user { self.username = "root".to_string(); }
+                if !self.alias_is_custom {
+                    self.alias = if !self.database.is_empty() { self.database.clone() } else { "mysql_db".to_string() };
+                }
+            }
+            AttachProvider::Quack => {
+                if self.host.is_empty() { self.host = "localhost".to_string(); }
+                if is_default_port { self.port = "9494".to_string(); }
+                if !self.alias_is_custom {
+                    self.alias = "quack_remote".to_string();
+                }
+            }
+            AttachProvider::MotherDuck => {
+                if !self.alias_is_custom {
+                    self.alias = if !self.path.is_empty() { self.path.trim_start_matches("md:").to_string() } else { "my_db".to_string() };
+                }
+            }
+            AttachProvider::SQLite => {
+                if !self.alias_is_custom {
+                    self.alias = "sqlite_db".to_string();
+                }
+            }
+            AttachProvider::DuckDB => {
+                if !self.alias_is_custom {
+                    self.alias = "attached_db".to_string();
+                }
+            }
+        }
+        let total = self.field_count();
+        if self.active_field >= total {
+            self.active_field = 1;
+        }
+    }
+
+    pub(crate) fn field_count(&self) -> usize {
+        let p = self.provider();
+        if p.is_relational() {
+            12
+        } else if p.is_quack() {
+            10
+        } else if p.is_motherduck() {
+            7
+        } else {
+            6
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_submit(&self) -> bool {
+        let p = self.provider();
+        if p.is_relational() {
+            self.active_field == 10
+        } else if p.is_quack() {
+            self.active_field == 8
+        } else if p.is_motherduck() {
+            self.active_field == 5
+        } else {
+            self.active_field == 4
+        }
+    }
+
+    pub(crate) fn is_cancel(&self) -> bool {
+        let p = self.provider();
+        if p.is_relational() {
+            self.active_field == 11
+        } else if p.is_quack() {
+            self.active_field == 9
+        } else if p.is_motherduck() {
+            self.active_field == 6
+        } else {
+            self.active_field == 5
+        }
+    }
+
+    pub(crate) fn is_toggle_field(&self) -> bool {
+        let p = self.provider();
+        if p.is_relational() {
+            (7..=9).contains(&self.active_field)
+        } else if p.is_quack() {
+            (5..=7).contains(&self.active_field)
+        } else if p.is_motherduck() {
+            self.active_field == 4
+        } else {
+            self.active_field == 3
+        }
+    }
+
+    pub(crate) fn toggle_active(&mut self) {
+        let p = self.provider();
+        if p.is_relational() {
+            match self.active_field {
+                7 => self.read_only = !self.read_only,
+                8 => self.disable_ssl = !self.disable_ssl,
+                9 => self.insecure = !self.insecure,
+                _ => {}
+            }
+        } else if p.is_quack() {
+            match self.active_field {
+                5 => self.read_only = !self.read_only,
+                6 => self.disable_ssl = !self.disable_ssl,
+                7 => self.insecure = !self.insecure,
+                _ => {}
+            }
+        } else if p.is_motherduck() {
+            if self.active_field == 4 {
+                self.read_only = !self.read_only;
+            }
+        } else if self.active_field == 3 {
+            self.read_only = !self.read_only;
+        }
+    }
+
+    pub(crate) fn next_field(&mut self) {
+        let total = self.field_count();
+        self.active_field = (self.active_field + 1) % total;
+    }
+
+    pub(crate) fn prev_field(&mut self) {
+        let total = self.field_count();
+        self.active_field = if self.active_field == 0 { total - 1 } else { self.active_field - 1 };
+    }
+
+    pub(crate) fn nav_left(&mut self) {
+        let p = self.provider();
+        if self.active_field == 0 {
+            let prev = if self.provider_index == 0 { 6 } else { self.provider_index - 1 };
+            self.set_provider(prev);
+        } else if p.is_relational() {
+            match self.active_field {
+                1 => self.active_field = 2,
+                2 => self.active_field = 1,
+                3 => self.active_field = 4,
+                4 => self.active_field = 3,
+                5 => self.active_field = 6,
+                6 => self.active_field = 5,
+                7 => self.active_field = 9,
+                8 => self.active_field = 7,
+                9 => self.active_field = 8,
+                10 => self.active_field = 11,
+                11 => self.active_field = 10,
+                _ => {}
+            }
+        } else if p.is_quack() {
+            match self.active_field {
+                1 => self.active_field = 2,
+                2 => self.active_field = 1,
+                3 => self.active_field = 4,
+                4 => self.active_field = 3,
+                5 => self.active_field = 7,
+                6 => self.active_field = 5,
+                7 => self.active_field = 6,
+                8 => self.active_field = 9,
+                9 => self.active_field = 8,
+                _ => {}
+            }
+        } else if p.is_motherduck() {
+            match self.active_field {
+                2 => self.active_field = 3,
+                3 => self.active_field = 2,
+                5 => self.active_field = 6,
+                6 => self.active_field = 5,
+                _ => {}
+            }
+        } else {
+            match self.active_field {
+                4 => self.active_field = 5,
+                5 => self.active_field = 4,
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn nav_right(&mut self) {
+        let p = self.provider();
+        if self.active_field == 0 {
+            let next = (self.provider_index + 1) % 7;
+            self.set_provider(next);
+        } else if p.is_relational() {
+            match self.active_field {
+                1 => self.active_field = 2,
+                2 => self.active_field = 1,
+                3 => self.active_field = 4,
+                4 => self.active_field = 3,
+                5 => self.active_field = 6,
+                6 => self.active_field = 5,
+                7 => self.active_field = 8,
+                8 => self.active_field = 9,
+                9 => self.active_field = 7,
+                10 => self.active_field = 11,
+                11 => self.active_field = 10,
+                _ => {}
+            }
+        } else if p.is_quack() {
+            match self.active_field {
+                1 => self.active_field = 2,
+                2 => self.active_field = 1,
+                3 => self.active_field = 4,
+                4 => self.active_field = 3,
+                5 => self.active_field = 6,
+                6 => self.active_field = 7,
+                7 => self.active_field = 5,
+                8 => self.active_field = 9,
+                9 => self.active_field = 8,
+                _ => {}
+            }
+        } else if p.is_motherduck() {
+            match self.active_field {
+                2 => self.active_field = 3,
+                3 => self.active_field = 2,
+                5 => self.active_field = 6,
+                6 => self.active_field = 5,
+                _ => {}
+            }
+        } else {
+            match self.active_field {
+                4 => self.active_field = 5,
+                5 => self.active_field = 4,
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn nav_down(&mut self) {
+        let p = self.provider();
+        if p.is_relational() {
+            self.active_field = match self.active_field {
+                0 => 1,
+                1 | 2 => 3,
+                3 | 4 => 5,
+                5 | 6 => 7,
+                7..=9 => 10,
+                10 | 11 => 0,
+                _ => 0,
+            };
+        } else if p.is_quack() {
+            self.active_field = match self.active_field {
+                0 => 1,
+                1 | 2 => 3,
+                3 | 4 => 5,
+                5..=7 => 8,
+                8 | 9 => 0,
+                _ => 0,
+            };
+        } else if p.is_motherduck() {
+            self.active_field = match self.active_field {
+                0 => 1,
+                1 => 2,
+                2 | 3 => 4,
+                4 => 5,
+                5 | 6 => 0,
+                _ => 0,
+            };
+        } else {
+            self.active_field = match self.active_field {
+                0 => 1,
+                1 => 2,
+                2 => 3,
+                3 => 4,
+                4 | 5 => 0,
+                _ => 0,
+            };
+        }
+    }
+
+    pub(crate) fn nav_up(&mut self) {
+        let p = self.provider();
+        if p.is_relational() {
+            self.active_field = match self.active_field {
+                0 => 10,
+                1 | 2 => 0,
+                3 | 4 => 1,
+                5 | 6 => 3,
+                7..=9 => 5,
+                10 | 11 => 7,
+                _ => 0,
+            };
+        } else if p.is_quack() {
+            self.active_field = match self.active_field {
+                0 => 8,
+                1 | 2 => 0,
+                3 | 4 => 1,
+                5..=7 => 3,
+                8 | 9 => 5,
+                _ => 0,
+            };
+        } else if p.is_motherduck() {
+            self.active_field = match self.active_field {
+                0 => 5,
+                1 => 0,
+                2 | 3 => 1,
+                4 => 2,
+                5 | 6 => 4,
+                _ => 0,
+            };
+        } else {
+            self.active_field = match self.active_field {
+                0 => 4,
+                1 => 0,
+                2 => 1,
+                3 => 2,
+                4 | 5 => 3,
+                _ => 0,
+            };
+        }
+    }
+
+    pub(crate) fn handle_char(&mut self, c: char) {
+        let p = self.provider();
+        if p.is_relational() {
+            match self.active_field {
+                1 => self.host.push(c),
+                2 => if c.is_ascii_digit() { self.port.push(c); },
+                3 => {
+                    self.database.push(c);
+                    if !self.alias_is_custom {
+                        self.alias = self.database.clone();
+                    }
+                }
+                4 => self.username.push(c),
+                5 => self.password.push(c),
+                6 => {
+                    self.alias.push(c);
+                    self.alias_is_custom = true;
+                }
+                _ => {}
+            }
+        } else if p.is_quack() {
+            match self.active_field {
+                1 => self.host.push(c),
+                2 => if c.is_ascii_digit() { self.port.push(c); },
+                3 => self.password.push(c),
+                4 => {
+                    self.alias.push(c);
+                    self.alias_is_custom = true;
+                }
+                _ => {}
+            }
+        } else if p.is_motherduck() {
+            match self.active_field {
+                1 => {
+                    self.path.push(c);
+                    if !self.alias_is_custom {
+                        self.alias = self.path.trim_start_matches("md:").to_string();
+                    }
+                }
+                2 => self.password.push(c),
+                3 => {
+                    self.alias.push(c);
+                    self.alias_is_custom = true;
+                }
+                _ => {}
+            }
+        } else {
+            match self.active_field {
+                1 => {
+                    self.path.push(c);
+                    if !self.alias_is_custom {
+                        let stem = Path::new(&self.path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                        self.alias = stem.to_string();
+                    }
+                }
+                2 => {
+                    self.alias.push(c);
+                    self.alias_is_custom = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn handle_backspace(&mut self) {
+        let p = self.provider();
+        if p.is_relational() {
+            match self.active_field {
+                1 => { self.host.pop(); }
+                2 => { self.port.pop(); }
+                3 => {
+                    self.database.pop();
+                    if !self.alias_is_custom {
+                        self.alias = self.database.clone();
+                    }
+                }
+                4 => { self.username.pop(); }
+                5 => { self.password.pop(); }
+                6 => {
+                    self.alias.pop();
+                    self.alias_is_custom = true;
+                }
+                _ => {}
+            }
+        } else if p.is_quack() {
+            match self.active_field {
+                1 => { self.host.pop(); }
+                2 => { self.port.pop(); }
+                3 => { self.password.pop(); }
+                4 => {
+                    self.alias.pop();
+                    self.alias_is_custom = true;
+                }
+                _ => {}
+            }
+        } else if p.is_motherduck() {
+            match self.active_field {
+                1 => {
+                    self.path.pop();
+                    if !self.alias_is_custom {
+                        self.alias = self.path.trim_start_matches("md:").to_string();
+                    }
+                }
+                2 => { self.password.pop(); }
+                3 => {
+                    self.alias.pop();
+                    self.alias_is_custom = true;
+                }
+                _ => {}
+            }
+        } else {
+            match self.active_field {
+                1 => {
+                    self.path.pop();
+                    if !self.alias_is_custom {
+                        let stem = Path::new(&self.path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                        self.alias = stem.to_string();
+                    }
+                }
+                2 => {
+                    self.alias.pop();
+                    self.alias_is_custom = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn build_connection_target(&self) -> std::result::Result<(String, String), String> {
+        let provider = self.provider();
+        match provider {
+            AttachProvider::MSSQL => {
+                if self.host.trim().is_empty() {
+                    return Err("Host / Server address cannot be empty for MSSQL.".to_string());
+                }
+                let host_raw = self.host.trim();
+                let mut conn_str = if host_raw.contains('=') {
+                    host_raw.to_string()
+                } else {
+                    let port = if self.port.trim().is_empty() { "1433" } else { self.port.trim() };
+                    format!("Server={},{}", host_raw, port)
+                };
+                if !self.database.trim().is_empty() && !conn_str.to_lowercase().contains("database=") {
+                    conn_str.push_str(&format!(";Database={}", self.database.trim()));
+                }
+                if !self.username.trim().is_empty() && !conn_str.to_lowercase().contains("user id=") && !conn_str.to_lowercase().contains("uid=") {
+                    conn_str.push_str(&format!(";User Id={}", self.username.trim()));
+                }
+                if !self.password.trim().is_empty() && !conn_str.to_lowercase().contains("password=") && !conn_str.to_lowercase().contains("pwd=") {
+                    conn_str.push_str(&format!(";Password={}", self.password.trim()));
+                }
+                if (self.insecure || conn_str.contains("localhost") || conn_str.contains("127.0.0.1"))
+                    && !conn_str.to_lowercase().contains("trustservercertificate=")
+                {
+                    conn_str.push_str(";TrustServerCertificate=yes");
+                }
+                if self.disable_ssl && !conn_str.to_lowercase().contains("encrypt=") {
+                    conn_str.push_str(";Encrypt=no");
+                }
+                let alias = if self.alias.trim().is_empty() {
+                    if !self.database.trim().is_empty() { self.database.trim().to_string() } else { "mssql_db".to_string() }
+                } else {
+                    self.alias.trim().to_string()
+                };
+                Ok((conn_str.replace('\'', "''"), alias))
+            }
+            AttachProvider::PostgreSQL => {
+                if self.host.trim().is_empty() {
+                    return Err("Host / Server address cannot be empty for PostgreSQL.".to_string());
+                }
+                let host_raw = self.host.trim();
+                let mut uri = if host_raw.contains("://") {
+                    host_raw.to_string()
+                } else {
+                    let port = if self.port.trim().is_empty() { "5432" } else { self.port.trim() };
+                    let user_part = if !self.username.trim().is_empty() && !self.password.trim().is_empty() {
+                        format!("{}:{}@", self.username.trim(), self.password.trim())
+                    } else if !self.username.trim().is_empty() {
+                        format!("{}@", self.username.trim())
+                    } else {
+                        String::new()
+                    };
+                    let db_part = if !self.database.trim().is_empty() {
+                        format!("/{}", self.database.trim())
+                    } else {
+                        String::new()
+                    };
+                    format!("postgres://{}{}:{}{}", user_part, host_raw, port, db_part)
+                };
+                if self.disable_ssl {
+                    if uri.contains('?') {
+                        if !uri.to_lowercase().contains("sslmode=") { uri.push_str("&sslmode=disable"); }
+                    } else {
+                        uri.push_str("?sslmode=disable");
+                    }
+                } else if self.insecure {
+                    if uri.contains('?') {
+                        if !uri.to_lowercase().contains("sslmode=") { uri.push_str("&sslmode=prefer"); }
+                    } else {
+                        uri.push_str("?sslmode=prefer");
+                    }
+                }
+                let alias = if self.alias.trim().is_empty() {
+                    if !self.database.trim().is_empty() { self.database.trim().to_string() } else { "pg_db".to_string() }
+                } else {
+                    self.alias.trim().to_string()
+                };
+                Ok((uri.replace('\'', "''"), alias))
+            }
+            AttachProvider::MySQL => {
+                if self.host.trim().is_empty() {
+                    return Err("Host / Server address cannot be empty for MySQL.".to_string());
+                }
+                let host_raw = self.host.trim();
+                let mut uri = if host_raw.contains("://") {
+                    host_raw.to_string()
+                } else {
+                    let port = if self.port.trim().is_empty() { "3306" } else { self.port.trim() };
+                    let user_part = if !self.username.trim().is_empty() && !self.password.trim().is_empty() {
+                        format!("{}:{}@", self.username.trim(), self.password.trim())
+                    } else if !self.username.trim().is_empty() {
+                        format!("{}@", self.username.trim())
+                    } else {
+                        String::new()
+                    };
+                    let db_part = if !self.database.trim().is_empty() {
+                        format!("/{}", self.database.trim())
+                    } else {
+                        String::new()
+                    };
+                    format!("mysql://{}{}:{}{}", user_part, host_raw, port, db_part)
+                };
+                if self.disable_ssl {
+                    if uri.contains('?') {
+                        if !uri.to_lowercase().contains("ssl-mode=") { uri.push_str("&ssl-mode=DISABLED"); }
+                    } else {
+                        uri.push_str("?ssl-mode=DISABLED");
+                    }
+                }
+                let alias = if self.alias.trim().is_empty() {
+                    if !self.database.trim().is_empty() { self.database.trim().to_string() } else { "mysql_db".to_string() }
+                } else {
+                    self.alias.trim().to_string()
+                };
+                Ok((uri.replace('\'', "''"), alias))
+            }
+            AttachProvider::Quack => {
+                if self.host.trim().is_empty() {
+                    return Err("Host / Server cannot be empty for Remote Quack.".to_string());
+                }
+                let host_raw = self.host.trim();
+                let stripped = host_raw.strip_prefix("quack://").or_else(|| host_raw.strip_prefix("quack:")).unwrap_or(host_raw);
+                let endpoint = if stripped.contains(':') {
+                    stripped.to_string()
+                } else {
+                    let port = if self.port.trim().is_empty() { "9494" } else { self.port.trim() };
+                    format!("{}:{}", stripped, port)
+                };
+                let target = format!("quack:{}", endpoint);
+                let alias = if self.alias.trim().is_empty() { "quack_remote".to_string() } else { self.alias.trim().to_string() };
+                Ok((target.replace('\'', "''"), alias))
+            }
+            AttachProvider::MotherDuck => {
+                if self.path.trim().is_empty() {
+                    return Err("MotherDuck database name cannot be empty.".to_string());
+                }
+                let target = if self.path.trim().starts_with("md:") {
+                    self.path.trim().to_string()
+                } else {
+                    format!("md:{}", self.path.trim())
+                };
+                let alias = if self.alias.trim().is_empty() {
+                    self.path.trim().trim_start_matches("md:").to_string()
+                } else {
+                    self.alias.trim().to_string()
+                };
+                Ok((target.replace('\'', "''"), alias))
+            }
+            AttachProvider::SQLite | AttachProvider::DuckDB => {
+                if self.path.trim().is_empty() {
+                    return Err("Database file path cannot be empty.".to_string());
+                }
+                let alias = if self.alias.trim().is_empty() {
+                    Path::new(self.path.trim())
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("attached_db")
+                        .to_string()
+                } else {
+                    self.alias.trim().to_string()
+                };
+                Ok((self.path.trim().replace('\'', "''"), alias))
+            }
         }
     }
 }
@@ -877,6 +1546,7 @@ impl SecretModalState {
 #[derive(Clone, Debug)]
 pub(crate) struct AddBucketModalState {
     pub(crate) is_open: bool,
+    pub(crate) initial_uri: Option<String>,
     pub(crate) uri: String,
     pub(crate) save_to_env: bool,
     pub(crate) active_field: usize, // 0: uri, 1: save_to_env, 2: submit, 3: cancel
@@ -887,6 +1557,7 @@ impl AddBucketModalState {
     pub(crate) fn new() -> Self {
         Self {
             is_open: false,
+            initial_uri: None,
             uri: String::new(),
             save_to_env: true,
             active_field: 0,
@@ -896,10 +1567,91 @@ impl AddBucketModalState {
 
     pub(crate) fn reset(&mut self) {
         self.is_open = true;
+        self.initial_uri = None;
         self.uri.clear();
         self.save_to_env = true;
         self.active_field = 0;
         self.error_msg = None;
+    }
+}
+
+/// Populates SecretModalState with existing secret configuration from DuckDB and .env for in-place editing.
+pub(crate) fn populate_secret_modal_for_edit(
+    conn: &duckdb::Connection,
+    project_dir: &std::path::Path,
+    secret_name: &str,
+    modal: &mut SecretModalState,
+) {
+    modal.is_open = true;
+    modal.name = secret_name.to_string();
+    modal.active_field = 2; // Focus on Key ID by default
+    modal.error_msg = None;
+
+    // 1. Query DuckDB's duckdb_secrets() to extract existing config
+    let sql = format!("SELECT secret_string FROM duckdb_secrets() WHERE name = '{}';", secret_name.replace('\'', "''"));
+    let mut secret_string_opt = None;
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(mut rows) = stmt.query([]) {
+            if let Ok(Some(row)) = rows.next() {
+                secret_string_opt = row.get::<_, String>(0).ok();
+            }
+        }
+    }
+    if secret_string_opt.is_none() {
+        let fallback_sql = format!("SELECT secret_string FROM duckdb_secrets WHERE name = '{}';", secret_name.replace('\'', "''"));
+        if let Ok(mut stmt) = conn.prepare(&fallback_sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                if let Ok(Some(row)) = rows.next() {
+                    secret_string_opt = row.get::<_, String>(0).ok();
+                }
+            }
+        }
+    }
+    if let Some(secret_string) = secret_string_opt {
+        for part in secret_string.split(';') {
+            if let Some((k, v)) = part.split_once('=') {
+                match k.trim() {
+                    "key_id" => modal.key_id = v.trim().to_string(),
+                    "region" => modal.region = v.trim().to_string(),
+                    "endpoint" => modal.endpoint = v.trim().to_string(),
+                    "use_ssl" => modal.use_ssl = v.trim().eq_ignore_ascii_case("true"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 2. Read .env file for secrets / bucket if available
+    let env_path = project_dir.join(".env");
+    if let Ok(content) = std::fs::read_to_string(&env_path) {
+        for line in content.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim();
+                let val = v.trim().trim_matches('"').trim_matches('\'');
+                match key {
+                    "AWS_ACCESS_KEY_ID" if modal.key_id.is_empty() => modal.key_id = val.to_string(),
+                    "AWS_SECRET_ACCESS_KEY" => modal.secret_key = val.to_string(),
+                    "AWS_REGION" if modal.region.is_empty() => modal.region = val.to_string(),
+                    "AWS_ENDPOINT" if modal.endpoint.is_empty() => modal.endpoint = val.to_string(),
+                    "DUCKPACK_S3_BUCKET" if modal.bucket.is_empty() => modal.bucket = val.to_string(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 3. Infer provider index from endpoint
+    let ep_lower = modal.endpoint.to_lowercase();
+    if ep_lower.contains("r2.cloudflarestorage.com") {
+        modal.provider_index = 1;
+    } else if ep_lower.contains("localhost:9000") || ep_lower.contains("127.0.0.1:9000") || ep_lower.contains("minio") || ep_lower.contains("rustfs") {
+        modal.provider_index = 2;
+    } else if ep_lower.contains("wasabisys.com") {
+        modal.provider_index = 3;
+    } else if !modal.endpoint.is_empty() {
+        modal.provider_index = 4;
+    } else {
+        modal.provider_index = 0;
     }
 }
 
@@ -1363,27 +2115,39 @@ pub(crate) fn rebuild_explorer_nodes(
             });
 
             if is_bucket_expanded {
-                let objects = crate::catalog::list_s3_bucket_objects(conn, bucket);
-                if objects.is_empty() {
-                    items.push(ExplorerNode {
-                        name: format!("{}:empty", bucket),
-                        display: "    (empty or inaccessible)".to_string(),
-                        level: 2,
-                        is_expandable: false,
-                        is_expanded: false,
-                        node_type: NodeType::Group,
-                    });
-                } else {
-                    for (obj_path, is_dir) in objects {
-                        let filename = obj_path.split('/').last().unwrap_or(&obj_path);
-                        let icon = if is_dir { "📁" } else if filename.ends_with(".parquet") { "📊" } else if filename.ends_with(".csv") { "📝" } else { "📄" };
+                match crate::catalog::list_s3_bucket_objects(conn, bucket) {
+                    Ok(objects) if objects.is_empty() => {
                         items.push(ExplorerNode {
-                            name: obj_path.clone(),
-                            display: format!("    {} {}", icon, filename),
+                            name: format!("{}:empty", bucket),
+                            display: "    (bucket is empty)".to_string(),
                             level: 2,
-                            is_expandable: is_dir,
+                            is_expandable: false,
                             is_expanded: false,
-                            node_type: NodeType::CloudFile { path: obj_path, is_dir },
+                            node_type: NodeType::Group,
+                        });
+                    }
+                    Ok(objects) => {
+                        render_cloud_objects(&objects, 2, expanded_groups, conn, &mut items);
+                    }
+                    Err(err_msg) => {
+                        let short_err = if err_msg.contains("403") || err_msg.contains("SignatureDoesNotMatch") || err_msg.contains("InvalidAccessKeyId") {
+                            "⚠️ Auth failed: Check Key/Secret (press 'e' to edit)"
+                        } else if err_msg.contains("404") || err_msg.contains("NoSuchBucket") {
+                            "⚠️ Bucket not found (press 'e' to edit URI)"
+                        } else if err_msg.contains("Malformed S3 list") {
+                            "⚠️ Malformed S3 response (URL_STYLE path required)"
+                        } else if err_msg.contains("Connection refused") || err_msg.contains("Could not resolve host") {
+                            "⚠️ Connection refused (check endpoint/container)"
+                        } else {
+                            "⚠️ Inaccessible (press Enter to inspect error)"
+                        };
+                        items.push(ExplorerNode {
+                            name: format!("{}:error:{}", bucket, err_msg),
+                            display: format!("    {}", short_err),
+                            level: 2,
+                            is_expandable: false,
+                            is_expanded: false,
+                            node_type: NodeType::Group,
                         });
                     }
                 }
@@ -1392,6 +2156,50 @@ pub(crate) fn rebuild_explorer_nodes(
     }
 
     items
+}
+
+/// Recursively renders cloud files and directory nodes with expandable folder support.
+fn render_cloud_objects(
+    objects: &[(String, bool)],
+    level: usize,
+    expanded_groups: &HashSet<String>,
+    conn: &duckdb::Connection,
+    items: &mut Vec<ExplorerNode>,
+) {
+    let indent = "  ".repeat(level);
+    for (obj_path, is_dir) in objects {
+        let filename = obj_path.split('/').last().unwrap_or(obj_path);
+        let icon = if *is_dir { "📁" } else if filename.ends_with(".parquet") { "📊" } else if filename.ends_with(".csv") { "📝" } else { "📄" };
+        let dir_key = format!("bucket_dir:{}", obj_path);
+        let is_expanded = *is_dir && expanded_groups.contains(&dir_key);
+        items.push(ExplorerNode {
+            name: obj_path.clone(),
+            display: format!("{}{} {}", indent, icon, filename),
+            level,
+            is_expandable: *is_dir,
+            is_expanded,
+            node_type: NodeType::CloudFile { path: obj_path.clone(), is_dir: *is_dir },
+        });
+
+        if is_expanded {
+            match crate::catalog::list_s3_bucket_objects(conn, obj_path) {
+                Ok(sub_objects) if sub_objects.is_empty() => {
+                    items.push(ExplorerNode {
+                        name: format!("{}:empty", obj_path),
+                        display: format!("{}  (empty folder)", indent),
+                        level: level + 1,
+                        is_expandable: false,
+                        is_expanded: false,
+                        node_type: NodeType::Group,
+                    });
+                }
+                Ok(sub_objects) => {
+                    render_cloud_objects(&sub_objects, level + 1, expanded_groups, conn, items);
+                }
+                Err(_) => {}
+            }
+        }
+    }
 }
 
 /// Dynamically calculates the required vertical height of the status bar pane
@@ -1561,6 +2369,10 @@ pub fn run_ide_loop(
     } else {
         None
     };
+
+    // Eagerly ensure fundamental cloud and analytical extensions (httpfs, parquet) are loaded
+    let _ = crate::engine::ensure_extension_loaded(conn, "httpfs");
+    let _ = crate::engine::ensure_extension_loaded(conn, "parquet");
 
     let mut meta = load_explorer_metadata(conn, project_dir, is_quack);
     let mut expanded_groups: HashSet<String> = if meta.databases.len() > 1 {
@@ -1913,7 +2725,9 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" +/- or [/]", Style::default().fg(Color::Cyan)), Span::raw("Resize Explorer Width (in 5% increments)")]),
                     Line::from(vec![Span::styled(" ◄ / ► / h/l", Style::default().fg(Color::Cyan)), Span::raw("Scroll Explorer horizontally (Shift: 10 chars, Home: reset)")]),
                     Line::from(vec![Span::styled(" q / s     ", Style::default().fg(Color::Cyan)), Span::raw("Query Table (in Explorer pane)")]),
-                    Line::from(vec![Span::styled(" d         ", Style::default().fg(Color::Cyan)), Span::raw("Detach Database (in Explorer pane)")]),
+                    Line::from(vec![Span::styled(" e         ", Style::default().fg(Color::Cyan)), Span::raw("Edit Secret / Edit Bucket (in Explorer pane)")]),
+                    Line::from(vec![Span::styled(" a / n     ", Style::default().fg(Color::Cyan)), Span::raw("Add Asset / Secret / Bucket (in Explorer pane)")]),
+                    Line::from(vec![Span::styled(" d / Del   ", Style::default().fg(Color::Cyan)), Span::raw("Detach DB / Drop Secret / Remove Bucket (Explorer)")]),
                     Line::from(vec![Span::styled(" ◄ / ►     ", Style::default().fg(Color::Cyan)), Span::raw("Scroll Columns (in Results pane, Shift+◄/► fast)")]),
                     Line::from(vec![Span::styled(" Home/End  ", Style::default().fg(Color::Cyan)), Span::raw("First/Last Column (in Results pane)")]),
                     Line::from(""),
@@ -1950,8 +2764,14 @@ pub fn run_ide_loop(
                         .scroll((schema_scroll, 0));
                 f.render_widget(tree_paragraph, popup_area);
             } else if attach_modal.is_open {
-                let popup_width = 68.min(f.area().width.saturating_sub(4));
-                let popup_height = 21.min(f.area().height.saturating_sub(2));
+                let popup_width = 76.min(f.area().width.saturating_sub(4));
+                let err_lines = if attach_modal.error_msg.is_some() { 4 } else { 2 };
+                let is_relational = attach_modal.provider().is_relational();
+                let popup_height = if is_relational {
+                    (19 + err_lines).min(f.area().height.saturating_sub(2))
+                } else {
+                    (16 + err_lines).min(f.area().height.saturating_sub(2))
+                };
                 let popup_area = ratatui::layout::Rect {
                     x: (f.area().width.saturating_sub(popup_width)) / 2,
                     y: (f.area().height.saturating_sub(popup_height)) / 2,
@@ -1968,82 +2788,382 @@ pub fn run_ide_loop(
                 f.render_widget(modal_block.clone(), popup_area);
 
                 let inner_area = modal_block.inner(popup_area);
-                let field_layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3), // 0: Provider
-                        Constraint::Length(3), // 1: Path or URI
-                        Constraint::Length(3), // 2: Alias
-                        Constraint::Length(3), // 3: Token / Password (optional)
-                        Constraint::Length(2), // 4: Read-Only toggle
-                        Constraint::Length(2), // 5: Error/hint
-                        Constraint::Length(3), // 6: Buttons
-                    ])
-                    .split(inner_area);
 
-                // Field 0: Provider selector
-                let f0_style = if attach_modal.active_field == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-                let prov_label = format!("  ◄ [ {} ] ►   (◄ / ► to switch)", attach_modal.provider().name());
-                let p0 = Paragraph::new(prov_label)
-                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Provider Preset ").border_style(f0_style));
-                f.render_widget(p0, field_layout[0]);
+                if is_relational {
+                    let field_layout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3), // 0: Provider
+                            Constraint::Length(3), // 1: Host & Port
+                            Constraint::Length(3), // 2: Database & Username
+                            Constraint::Length(3), // 3: Password & Alias
+                            Constraint::Length(2), // 4: Toggles
+                            Constraint::Length(err_lines), // 5: Error/hint
+                            Constraint::Length(3), // 6: Buttons
+                        ])
+                        .split(inner_area);
 
-                // Field 1: Path or URI
-                let path_title = match attach_modal.provider() {
-                    AttachProvider::DuckDB => " Database File Path (e.g. data.duckdb or :memory:) ",
-                    AttachProvider::Quack => " Remote Quack URL/Host (e.g. 127.0.0.1:4213 or quack://host) ",
-                    AttachProvider::MotherDuck => " MotherDuck Database Name (e.g. md:my_db or my_db) ",
-                    AttachProvider::SQLite => " SQLite Database File Path (.db, .sqlite) ",
-                    AttachProvider::PostgreSQL => " PostgreSQL URI (postgres://user:pass@host:5432/dbname) ",
-                    AttachProvider::MySQL => " MySQL URI (mysql://user:pass@host:3306/dbname) ",
-                };
-                let f1_style = if attach_modal.active_field == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-                let p1 = Paragraph::new(format!("{}{}", attach_modal.path, if attach_modal.active_field == 1 { "█" } else { "" }))
-                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(path_title).border_style(f1_style));
-                f.render_widget(p1, field_layout[1]);
+                    // Field 0: Provider selector
+                    let f0_style = if attach_modal.active_field == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let prov_label = format!("  ◄ [ {} ] ►   (◄ / ► to switch)", attach_modal.provider().name());
+                    let p0 = Paragraph::new(prov_label)
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Provider Preset ").border_style(f0_style));
+                    f.render_widget(p0, field_layout[0]);
 
-                // Field 2: Alias
-                let f2_style = if attach_modal.active_field == 2 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-                let p2 = Paragraph::new(format!("{}{}", attach_modal.alias, if attach_modal.active_field == 2 { "█" } else { "" }))
-                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Catalog Alias ").border_style(f2_style));
-                f.render_widget(p2, field_layout[2]);
+                    // Field 1 & 2: Host & Port
+                    let host_port_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+                        .split(field_layout[1]);
+                    let f1_style = if attach_modal.active_field == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p1 = Paragraph::new(format!("{}{}", attach_modal.host, if attach_modal.active_field == 1 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Host / Server Address ").border_style(f1_style));
+                    f.render_widget(p1, host_port_cols[0]);
 
-                // Field 3: Token / Password (Masked)
-                let f3_style = if attach_modal.active_field == 3 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-                let masked_token = "*".repeat(attach_modal.token.len());
-                let p3 = Paragraph::new(format!("{}{}", masked_token, if attach_modal.active_field == 3 { "█" } else { "" }))
-                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Token / Password (Optional, Masked) ").border_style(f3_style));
-                f.render_widget(p3, field_layout[3]);
+                    let f2_style = if attach_modal.active_field == 2 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p2 = Paragraph::new(format!("{}{}", attach_modal.port, if attach_modal.active_field == 2 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Port ").border_style(f2_style));
+                    f.render_widget(p2, host_port_cols[1]);
 
-                // Field 4: Read-Only toggle
-                let f4_style = if attach_modal.active_field == 4 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
-                let ro_text = format!("  [{}] Read-Only Mode (Space to toggle)", if attach_modal.read_only { "X" } else { " " });
-                f.render_widget(Paragraph::new(ro_text).style(f4_style), field_layout[4]);
+                    // Field 3 & 4: Database & Username
+                    let db_user_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(field_layout[2]);
+                    let f3_style = if attach_modal.active_field == 3 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p3 = Paragraph::new(format!("{}{}", attach_modal.database, if attach_modal.active_field == 3 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Name ").border_style(f3_style));
+                    f.render_widget(p3, db_user_cols[0]);
 
-                // Error or navigation hint
-                if let Some(ref err) = attach_modal.error_msg {
-                    f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), field_layout[5]);
+                    let user_title = match attach_modal.provider() {
+                        AttachProvider::MSSQL => " User ID (e.g. sa) ",
+                        AttachProvider::PostgreSQL => " Username (e.g. postgres) ",
+                        _ => " Username (e.g. root) ",
+                    };
+                    let f4_style = if attach_modal.active_field == 4 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p4 = Paragraph::new(format!("{}{}", attach_modal.username, if attach_modal.active_field == 4 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(user_title).border_style(f4_style));
+                    f.render_widget(p4, db_user_cols[1]);
+
+                    // Field 5 & 6: Password & Catalog Alias
+                    let pass_alias_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(field_layout[3]);
+                    let f5_style = if attach_modal.active_field == 5 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let masked_pass = "*".repeat(attach_modal.password.len());
+                    let p5 = Paragraph::new(format!("{}{}", masked_pass, if attach_modal.active_field == 5 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Password (Masked) ").border_style(f5_style));
+                    f.render_widget(p5, pass_alias_cols[0]);
+
+                    let f6_style = if attach_modal.active_field == 6 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p6 = Paragraph::new(format!("{}{}", attach_modal.alias, if attach_modal.active_field == 6 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Catalog Alias ").border_style(f6_style));
+                    f.render_widget(p6, pass_alias_cols[1]);
+
+                    // Field 7, 8, 9: Toggles
+                    let toggle_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(34)])
+                        .split(field_layout[4]);
+                    let f7_style = if attach_modal.active_field == 7 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                    f.render_widget(Paragraph::new(format!("  [{}] Read-Only", if attach_modal.read_only { "X" } else { " " })).style(f7_style), toggle_cols[0]);
+
+                    let f8_style = if attach_modal.active_field == 8 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                    f.render_widget(Paragraph::new(format!("  [{}] Disable SSL", if attach_modal.disable_ssl { "X" } else { " " })).style(f8_style), toggle_cols[1]);
+
+                    let f9_style = if attach_modal.active_field == 9 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                    f.render_widget(Paragraph::new(format!("  [{}] Insecure / Trust", if attach_modal.insecure { "X" } else { " " })).style(f9_style), toggle_cols[2]);
+
+                    // Hint / Error
+                    if let Some(ref err) = attach_modal.error_msg {
+                        f.render_widget(
+                            Paragraph::new(format!(" ⚠️ {}", err))
+                                .style(Style::default().fg(Color::LightRed))
+                                .wrap(Wrap { trim: true }),
+                            field_layout[5],
+                        );
+                    } else {
+                        f.render_widget(
+                            Paragraph::new("  Tab/Arrows: Navigate | Space: Toggle | Enter: Attach | Esc: Cancel")
+                                .style(Style::default().fg(Color::DarkGray))
+                                .wrap(Wrap { trim: true }),
+                            field_layout[5],
+                        );
+                    }
+
+                    // Buttons
+                    let attach_btn_style = if attach_modal.active_field == 10 {
+                        Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    let cancel_btn_style = if attach_modal.active_field == 11 {
+                        Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let buttons = Line::from(vec![
+                        Span::styled(" [ Attach Database ] ", attach_btn_style),
+                        Span::raw("    "),
+                        Span::styled(" [ Cancel ] ", cancel_btn_style),
+                    ]);
+                    f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[6]);
+                } else if attach_modal.provider().is_quack() {
+                    let field_layout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3), // 0: Provider
+                            Constraint::Length(3), // 1: Host & Port
+                            Constraint::Length(3), // 2: Token & Alias
+                            Constraint::Length(2), // 3: Toggles
+                            Constraint::Length(err_lines), // 4: Error/hint
+                            Constraint::Length(3), // 5: Buttons
+                        ])
+                        .split(inner_area);
+
+                    // Field 0: Provider selector
+                    let f0_style = if attach_modal.active_field == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let prov_label = format!("  ◄ [ {} ] ►   (◄ / ► to switch)", attach_modal.provider().name());
+                    let p0 = Paragraph::new(prov_label)
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Provider Preset ").border_style(f0_style));
+                    f.render_widget(p0, field_layout[0]);
+
+                    // Field 1 & 2: Host & Port
+                    let host_port_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+                        .split(field_layout[1]);
+                    let f1_style = if attach_modal.active_field == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p1 = Paragraph::new(format!("{}{}", attach_modal.host, if attach_modal.active_field == 1 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Remote Quack Host / IP (e.g. localhost) ").border_style(f1_style));
+                    f.render_widget(p1, host_port_cols[0]);
+
+                    let f2_style = if attach_modal.active_field == 2 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p2 = Paragraph::new(format!("{}{}", attach_modal.port, if attach_modal.active_field == 2 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Port ").border_style(f2_style));
+                    f.render_widget(p2, host_port_cols[1]);
+
+                    // Field 3 & 4: Token & Alias
+                    let tok_alias_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(field_layout[2]);
+                    let f3_style = if attach_modal.active_field == 3 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let masked_token = "*".repeat(attach_modal.password.len());
+                    let p3 = Paragraph::new(format!("{}{}", masked_token, if attach_modal.active_field == 3 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Auth Token (Optional, Masked) ").border_style(f3_style));
+                    f.render_widget(p3, tok_alias_cols[0]);
+
+                    let f4_style = if attach_modal.active_field == 4 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p4 = Paragraph::new(format!("{}{}", attach_modal.alias, if attach_modal.active_field == 4 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Catalog Alias ").border_style(f4_style));
+                    f.render_widget(p4, tok_alias_cols[1]);
+
+                    // Field 5, 6, 7: Toggles
+                    let toggle_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(34)])
+                        .split(field_layout[3]);
+                    let f5_style = if attach_modal.active_field == 5 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                    f.render_widget(Paragraph::new(format!("  [{}] Read-Only", if attach_modal.read_only { "X" } else { " " })).style(f5_style), toggle_cols[0]);
+
+                    let f6_style = if attach_modal.active_field == 6 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                    f.render_widget(Paragraph::new(format!("  [{}] Disable SSL", if attach_modal.disable_ssl { "X" } else { " " })).style(f6_style), toggle_cols[1]);
+
+                    let f7_style = if attach_modal.active_field == 7 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                    f.render_widget(Paragraph::new(format!("  [{}] Insecure / Trust", if attach_modal.insecure { "X" } else { " " })).style(f7_style), toggle_cols[2]);
+
+                    // Hint / Error
+                    if let Some(ref err) = attach_modal.error_msg {
+                        f.render_widget(
+                            Paragraph::new(format!(" ⚠️ {}", err))
+                                .style(Style::default().fg(Color::LightRed))
+                                .wrap(Wrap { trim: true }),
+                            field_layout[4],
+                        );
+                    } else {
+                        f.render_widget(
+                            Paragraph::new("  Tab/Arrows: Navigate | Space: Toggle | Enter: Attach | Esc: Cancel")
+                                .style(Style::default().fg(Color::DarkGray))
+                                .wrap(Wrap { trim: true }),
+                            field_layout[4],
+                        );
+                    }
+
+                    // Buttons
+                    let attach_btn_style = if attach_modal.active_field == 8 {
+                        Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    let cancel_btn_style = if attach_modal.active_field == 9 {
+                        Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let buttons = Line::from(vec![
+                        Span::styled(" [ Attach Database ] ", attach_btn_style),
+                        Span::raw("    "),
+                        Span::styled(" [ Cancel ] ", cancel_btn_style),
+                    ]);
+                    f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[5]);
+                } else if attach_modal.provider().is_motherduck() {
+                    let field_layout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3), // 0: Provider
+                            Constraint::Length(3), // 1: Database Name
+                            Constraint::Length(3), // 2: Token & Alias
+                            Constraint::Length(2), // 3: Toggles
+                            Constraint::Length(err_lines), // 4: Error/hint
+                            Constraint::Length(3), // 5: Buttons
+                        ])
+                        .split(inner_area);
+
+                    // Field 0: Provider selector
+                    let f0_style = if attach_modal.active_field == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let prov_label = format!("  ◄ [ {} ] ►   (◄ / ► to switch)", attach_modal.provider().name());
+                    let p0 = Paragraph::new(prov_label)
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Provider Preset ").border_style(f0_style));
+                    f.render_widget(p0, field_layout[0]);
+
+                    // Field 1: Database Name
+                    let f1_style = if attach_modal.active_field == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p1 = Paragraph::new(format!("{}{}", attach_modal.path, if attach_modal.active_field == 1 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" MotherDuck Database Name (e.g. my_db or md:my_db) ").border_style(f1_style));
+                    f.render_widget(p1, field_layout[1]);
+
+                    // Field 2 & 3: Token & Alias
+                    let tok_alias_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(field_layout[2]);
+                    let f2_style = if attach_modal.active_field == 2 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let masked_token = "*".repeat(attach_modal.password.len());
+                    let p2 = Paragraph::new(format!("{}{}", masked_token, if attach_modal.active_field == 2 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Service Token (Optional, Masked) ").border_style(f2_style));
+                    f.render_widget(p2, tok_alias_cols[0]);
+
+                    let f3_style = if attach_modal.active_field == 3 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p3 = Paragraph::new(format!("{}{}", attach_modal.alias, if attach_modal.active_field == 3 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Catalog Alias ").border_style(f3_style));
+                    f.render_widget(p3, tok_alias_cols[1]);
+
+                    // Field 4: Read-Only Toggle
+                    let f4_style = if attach_modal.active_field == 4 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                    f.render_widget(Paragraph::new(format!("  [{}] Read-Only", if attach_modal.read_only { "X" } else { " " })).style(f4_style), field_layout[3]);
+
+                    // Hint / Error
+                    if let Some(ref err) = attach_modal.error_msg {
+                        f.render_widget(
+                            Paragraph::new(format!(" ⚠️ {}", err))
+                                .style(Style::default().fg(Color::LightRed))
+                                .wrap(Wrap { trim: true }),
+                            field_layout[4],
+                        );
+                    } else {
+                        f.render_widget(
+                            Paragraph::new("  Tab/Arrows: Navigate | Space: Toggle | Enter: Attach | Esc: Cancel")
+                                .style(Style::default().fg(Color::DarkGray))
+                                .wrap(Wrap { trim: true }),
+                            field_layout[4],
+                        );
+                    }
+
+                    // Buttons
+                    let attach_btn_style = if attach_modal.active_field == 5 {
+                        Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    let cancel_btn_style = if attach_modal.active_field == 6 {
+                        Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let buttons = Line::from(vec![
+                        Span::styled(" [ Attach Database ] ", attach_btn_style),
+                        Span::raw("    "),
+                        Span::styled(" [ Cancel ] ", cancel_btn_style),
+                    ]);
+                    f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[5]);
                 } else {
-                    f.render_widget(Paragraph::new("  Tab: Next Field | Enter: Attach | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), field_layout[5]);
+                    let field_layout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3), // 0: Provider
+                            Constraint::Length(3), // 1: File Path
+                            Constraint::Length(3), // 2: Alias
+                            Constraint::Length(2), // 3: Read-Only toggle
+                            Constraint::Length(err_lines), // 4: Error/hint
+                            Constraint::Length(3), // 5: Buttons
+                        ])
+                        .split(inner_area);
+
+                    // Field 0: Provider selector
+                    let f0_style = if attach_modal.active_field == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let prov_label = format!("  ◄ [ {} ] ►   (◄ / ► to switch)", attach_modal.provider().name());
+                    let p0 = Paragraph::new(prov_label)
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Provider Preset ").border_style(f0_style));
+                    f.render_widget(p0, field_layout[0]);
+
+                    // Field 1: File Path
+                    let path_title = if attach_modal.provider() == AttachProvider::DuckDB {
+                        " Database File Path (e.g. data.duckdb or :memory:) "
+                    } else {
+                        " SQLite Database File Path (.db, .sqlite) "
+                    };
+                    let f1_style = if attach_modal.active_field == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p1 = Paragraph::new(format!("{}{}", attach_modal.path, if attach_modal.active_field == 1 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(path_title).border_style(f1_style));
+                    f.render_widget(p1, field_layout[1]);
+
+                    // Field 2: Catalog Alias
+                    let f2_style = if attach_modal.active_field == 2 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                    let p2 = Paragraph::new(format!("{}{}", attach_modal.alias, if attach_modal.active_field == 2 { "█" } else { "" }))
+                        .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Catalog Alias ").border_style(f2_style));
+                    f.render_widget(p2, field_layout[2]);
+
+                    // Field 3: Read-Only Toggle
+                    let f3_style = if attach_modal.active_field == 3 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                    f.render_widget(Paragraph::new(format!("  [{}] Read-Only", if attach_modal.read_only { "X" } else { " " })).style(f3_style), field_layout[3]);
+
+                    // Hint / Error
+                    if let Some(ref err) = attach_modal.error_msg {
+                        f.render_widget(
+                            Paragraph::new(format!(" ⚠️ {}", err))
+                                .style(Style::default().fg(Color::LightRed))
+                                .wrap(Wrap { trim: true }),
+                            field_layout[4],
+                        );
+                    } else {
+                        f.render_widget(
+                            Paragraph::new("  Tab/Arrows: Navigate | Space: Toggle | Enter: Attach | Esc: Cancel")
+                                .style(Style::default().fg(Color::DarkGray))
+                                .wrap(Wrap { trim: true }),
+                            field_layout[4],
+                        );
+                    }
+
+                    // Buttons
+                    let attach_btn_style = if attach_modal.active_field == 4 {
+                        Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    let cancel_btn_style = if attach_modal.active_field == 5 {
+                        Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let buttons = Line::from(vec![
+                        Span::styled(" [ Attach Database ] ", attach_btn_style),
+                        Span::raw("    "),
+                        Span::styled(" [ Cancel ] ", cancel_btn_style),
+                    ]);
+                    f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[5]);
                 }
-
-                // Buttons
-                let attach_btn_style = if attach_modal.active_field == 5 {
-                    Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Cyan)
-                };
-                let cancel_btn_style = if attach_modal.active_field == 6 {
-                    Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                let buttons = Line::from(vec![
-                    Span::styled(" [ Attach Database ] ", attach_btn_style),
-                    Span::raw("    "),
-                    Span::styled(" [ Cancel ] ", cancel_btn_style),
-                ]);
-                f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[6]);
             } else if secret_modal.is_open {
                 let popup_width = 72.min(f.area().width.saturating_sub(4));
                 let popup_height = 24.min(f.area().height.saturating_sub(2));
@@ -2142,9 +3262,19 @@ pub fn run_ide_loop(
 
                 // Field 7: Error or navigation hint
                 if let Some(ref err) = secret_modal.error_msg {
-                    f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), field_layout[7]);
+                    f.render_widget(
+                        Paragraph::new(format!(" ⚠️ {}", err))
+                            .style(Style::default().fg(Color::LightRed))
+                            .wrap(Wrap { trim: true }),
+                        field_layout[7],
+                    );
                 } else {
-                    f.render_widget(Paragraph::new("  Tab: Next Field | Space: Toggle | Enter: Save Secret | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), field_layout[7]);
+                    f.render_widget(
+                        Paragraph::new("  Tab: Next Field | Space: Toggle | Enter: Save Secret | Esc: Cancel")
+                            .style(Style::default().fg(Color::DarkGray))
+                            .wrap(Wrap { trim: true }),
+                        field_layout[7],
+                    );
                 }
 
                 // Field 8: Buttons
@@ -2206,9 +3336,19 @@ pub fn run_ide_loop(
 
                 // Field 2: Hint / Error
                 if let Some(ref err) = add_bucket_modal.error_msg {
-                    f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), field_layout[2]);
+                    f.render_widget(
+                        Paragraph::new(format!(" ⚠️ {}", err))
+                            .style(Style::default().fg(Color::LightRed))
+                            .wrap(Wrap { trim: true }),
+                        field_layout[2],
+                    );
                 } else {
-                    f.render_widget(Paragraph::new("  Tab: Next Field | Space: Toggle | Enter: Add Bucket | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), field_layout[2]);
+                    f.render_widget(
+                        Paragraph::new("  Tab: Next Field | Space: Toggle | Enter: Add Bucket | Esc: Cancel")
+                            .style(Style::default().fg(Color::DarkGray))
+                            .wrap(Wrap { trim: true }),
+                        field_layout[2],
+                    );
                 }
 
                 // Field 3: Buttons
@@ -2283,9 +3423,19 @@ pub fn run_ide_loop(
 
                 // Field 3: Error or Hint
                 if let Some(ref err) = new_asset_modal.error_msg {
-                    f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), field_layout[3]);
+                    f.render_widget(
+                        Paragraph::new(format!(" ⚠️ {}", err))
+                            .style(Style::default().fg(Color::LightRed))
+                            .wrap(Wrap { trim: true }),
+                        field_layout[3],
+                    );
                 } else {
-                    f.render_widget(Paragraph::new("  Tab: Next Field | Enter: Create & Open | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), field_layout[3]);
+                    f.render_widget(
+                        Paragraph::new("  Tab: Next Field | Enter: Create & Open | Esc: Cancel")
+                            .style(Style::default().fg(Color::DarkGray))
+                            .wrap(Wrap { trim: true }),
+                        field_layout[3],
+                    );
                 }
 
                 // Field 4: Buttons
@@ -2823,143 +3973,95 @@ pub fn run_ide_loop(
                 } else if attach_modal.is_open {
                     if key.code == KeyCode::Esc {
                         attach_modal.is_open = false;
-                    } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
-                        attach_modal.active_field = (attach_modal.active_field + 1) % 7;
-                    } else if key.code == KeyCode::BackTab || key.code == KeyCode::Up {
-                        attach_modal.active_field = if attach_modal.active_field == 0 { 6 } else { attach_modal.active_field - 1 };
-                    } else if attach_modal.active_field == 0 && (key.code == KeyCode::Left || key.code == KeyCode::Char('h')) {
-                        attach_modal.provider_index = if attach_modal.provider_index == 0 { 5 } else { attach_modal.provider_index - 1 };
-                    } else if attach_modal.active_field == 0 && (key.code == KeyCode::Right || key.code == KeyCode::Char('l')) {
-                        attach_modal.provider_index = (attach_modal.provider_index + 1) % 6;
-                    } else if attach_modal.active_field >= 5 && (key.code == KeyCode::Left || key.code == KeyCode::Right) {
-                        attach_modal.active_field = if attach_modal.active_field == 5 { 6 } else { 5 };
-                    } else if key.code == KeyCode::Char(' ') && attach_modal.active_field == 4 {
-                        attach_modal.read_only = !attach_modal.read_only;
+                    } else if key.code == KeyCode::Tab {
+                        attach_modal.next_field();
+                    } else if key.code == KeyCode::BackTab {
+                        attach_modal.prev_field();
+                    } else if key.code == KeyCode::Down {
+                        attach_modal.nav_down();
+                    } else if key.code == KeyCode::Up {
+                        attach_modal.nav_up();
+                    } else if key.code == KeyCode::Left || (attach_modal.active_field == 0 && key.code == KeyCode::Char('h')) {
+                        attach_modal.nav_left();
+                    } else if key.code == KeyCode::Right || (attach_modal.active_field == 0 && key.code == KeyCode::Char('l')) {
+                        attach_modal.nav_right();
+                    } else if key.code == KeyCode::Char(' ') && attach_modal.is_toggle_field() {
+                        attach_modal.toggle_active();
                     } else if key.code == KeyCode::Enter {
-                        if attach_modal.active_field == 6 {
+                        if attach_modal.is_cancel() {
                             attach_modal.is_open = false;
-                        } else if attach_modal.active_field == 4 {
-                            attach_modal.read_only = !attach_modal.read_only;
+                        } else if attach_modal.is_toggle_field() {
+                            attach_modal.toggle_active();
                         } else {
-                            if attach_modal.path.trim().is_empty() {
-                                attach_modal.error_msg = Some("Database path or URI cannot be empty.".to_string());
-                            } else {
-                                let provider = attach_modal.provider();
-                                let mut safe_path = attach_modal.path.trim().replace("'", "''");
-                                let alias = if attach_modal.alias.trim().is_empty() {
-                                    match provider {
-                                        AttachProvider::MotherDuck => {
-                                            attach_modal.path.trim().trim_start_matches("md:").to_string()
-                                        }
-                                        AttachProvider::Quack => "quack_remote".to_string(),
-                                        AttachProvider::PostgreSQL => "pg_db".to_string(),
-                                        AttachProvider::MySQL => "mysql_db".to_string(),
-                                        _ => {
-                                            Path::new(attach_modal.path.trim())
-                                                .file_stem()
-                                                .and_then(|s| s.to_str())
-                                                .unwrap_or("attached_db")
-                                                .to_string()
-                                        }
-                                    }
-                                } else {
-                                    attach_modal.alias.trim().to_string()
-                                };
+                            match attach_modal.build_connection_target() {
+                                Err(err) => {
+                                    attach_modal.error_msg = Some(err);
+                                }
+                                Ok((safe_path, alias)) => {
+                                    let provider = attach_modal.provider();
+                                    let ext_res = match provider {
+                                        AttachProvider::SQLite => crate::engine::ensure_extension_loaded(conn, "sqlite"),
+                                        AttachProvider::PostgreSQL => crate::engine::ensure_extension_loaded(conn, "postgres"),
+                                        AttachProvider::MySQL => crate::engine::ensure_extension_loaded(conn, "mysql"),
+                                        AttachProvider::MSSQL => crate::engine::ensure_extension_loaded(conn, "mssql"),
+                                        AttachProvider::MotherDuck => crate::engine::ensure_extension_loaded(conn, "motherduck"),
+                                        AttachProvider::Quack => crate::engine::load_quack_extension(conn),
+                                        AttachProvider::DuckDB => Ok(()),
+                                    };
 
-                                match provider {
-                                    AttachProvider::SQLite => {
-                                        let _ = conn.execute("INSTALL sqlite; LOAD sqlite;", []);
-                                    }
-                                    AttachProvider::PostgreSQL => {
-                                        let _ = conn.execute("INSTALL postgres; LOAD postgres;", []);
-                                    }
-                                    AttachProvider::MySQL => {
-                                        let _ = conn.execute("INSTALL mysql; LOAD mysql;", []);
-                                    }
-                                    AttachProvider::MotherDuck => {
-                                        let _ = conn.execute("INSTALL motherduck; LOAD motherduck;", []);
-                                        if !attach_modal.token.trim().is_empty() {
-                                            let safe_token = attach_modal.token.trim().replace("'", "''");
+                                    if let Err(e) = ext_res {
+                                        attach_modal.error_msg = Some(format!("Failed to load required extension for {}: {}", provider.name(), e));
+                                    } else {
+                                        if provider == AttachProvider::MotherDuck && !attach_modal.password.trim().is_empty() {
+                                            let safe_token = attach_modal.password.trim().replace('\'', "''");
                                             let _ = conn.execute(&format!("SET motherduck_token='{}';", safe_token), []);
                                         }
-                                        if !safe_path.starts_with("md:") {
-                                            safe_path = format!("md:{}", safe_path);
+                                        if provider == AttachProvider::Quack && !attach_modal.password.trim().is_empty() {
+                                            let safe_token = attach_modal.password.trim().replace('\'', "''");
+                                            let _ = conn.execute(&format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token), []);
                                         }
-                                    }
-                                    AttachProvider::Quack => {
-                                        if !safe_path.starts_with("quack://") && !safe_path.starts_with("http://") && !safe_path.starts_with("https://") {
-                                            let token_prefix = if !attach_modal.token.trim().is_empty() {
-                                                format!(":{}@", attach_modal.token.trim())
-                                            } else {
-                                                String::new()
-                                            };
-                                            safe_path = format!("quack://{}{}", token_prefix, safe_path);
+
+                                        let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, alias);
+                                        let mut opts = Vec::new();
+                                        match provider {
+                                            AttachProvider::SQLite => opts.push("TYPE SQLITE".to_string()),
+                                            AttachProvider::PostgreSQL => opts.push("TYPE POSTGRES".to_string()),
+                                            AttachProvider::MySQL => opts.push("TYPE MYSQL".to_string()),
+                                            AttachProvider::MSSQL => opts.push("TYPE MSSQL".to_string()),
+                                            AttachProvider::Quack => {
+                                                if attach_modal.disable_ssl || attach_modal.insecure || crate::engine::should_disable_quack_ssl(&safe_path, false) {
+                                                    opts.push("DISABLE_SSL true".to_string());
+                                                }
+                                            }
+                                            _ => {}
                                         }
-                                    }
-                                    AttachProvider::DuckDB => {}
-                                }
+                                        if attach_modal.read_only {
+                                            opts.push("READ_ONLY".to_string());
+                                        }
+                                        if !opts.is_empty() {
+                                            attach_sql.push_str(&format!(" ({})", opts.join(", ")));
+                                        }
+                                        attach_sql.push(';');
 
-                                let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, alias);
-                                let mut opts = Vec::new();
-                                match provider {
-                                    AttachProvider::SQLite => opts.push("TYPE SQLITE".to_string()),
-                                    AttachProvider::PostgreSQL => opts.push("TYPE POSTGRES".to_string()),
-                                    AttachProvider::MySQL => opts.push("TYPE MYSQL".to_string()),
-                                    _ => {}
-                                }
-                                if attach_modal.read_only {
-                                    opts.push("READ_ONLY".to_string());
-                                }
-                                if !opts.is_empty() {
-                                    attach_sql.push_str(&format!(" ({})", opts.join(", ")));
-                                }
-                                attach_sql.push(';');
-
-                                match conn.execute(&attach_sql, []) {
-                                    Ok(_) => {
-                                        attach_modal.is_open = false;
-                                        status_msg = format!("Attached database '{}' successfully.", alias);
-                                        trigger_explorer_refresh = true;
-                                    }
-                                    Err(e) => {
-                                        attach_modal.error_msg = Some(format!("Attach Error: {}", e));
+                                        match conn.execute(&attach_sql, []) {
+                                            Ok(_) => {
+                                                attach_modal.is_open = false;
+                                                status_msg = format!("Attached database '{}' successfully.", alias);
+                                                trigger_explorer_refresh = true;
+                                            }
+                                            Err(e) => {
+                                                attach_modal.error_msg = Some(format!("Attach Error: {}", e));
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     } else if key.code == KeyCode::Backspace {
-                        match attach_modal.active_field {
-                            1 => {
-                                attach_modal.path.pop();
-                                if !attach_modal.alias_is_custom {
-                                    let stem = Path::new(&attach_modal.path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                                    attach_modal.alias = stem.to_string();
-                                }
-                            }
-                            2 => {
-                                attach_modal.alias.pop();
-                                attach_modal.alias_is_custom = true;
-                            }
-                            3 => { attach_modal.token.pop(); }
-                            _ => {}
-                        }
+                        attach_modal.handle_backspace();
                     } else if let KeyCode::Char(c) = key.code {
                         if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                            match attach_modal.active_field {
-                                1 => {
-                                    attach_modal.path.push(c);
-                                    if !attach_modal.alias_is_custom {
-                                        let stem = Path::new(&attach_modal.path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                                        attach_modal.alias = stem.to_string();
-                                    }
-                                }
-                                2 => {
-                                    attach_modal.alias.push(c);
-                                    attach_modal.alias_is_custom = true;
-                                }
-                                3 => { attach_modal.token.push(c); }
-                                _ => {}
-                            }
+                            attach_modal.handle_char(c);
                         }
                     }
                 } else if secret_modal.is_open {
@@ -3009,10 +4111,19 @@ pub fn run_ide_loop(
                                 if !safe_region.is_empty() {
                                     clauses.push(format!("REGION '{}'", safe_region));
                                 }
+                                let mut use_ssl = secret_modal.use_ssl;
                                 if !safe_endpoint.is_empty() {
-                                    clauses.push(format!("ENDPOINT '{}'", safe_endpoint));
+                                    let clean_ep = safe_endpoint
+                                        .trim_start_matches("http://")
+                                        .trim_start_matches("https://")
+                                        .trim_end_matches('/');
+                                    clauses.push(format!("ENDPOINT '{}'", clean_ep));
+                                    clauses.push("URL_STYLE 'path'".to_string());
+                                    if safe_endpoint.starts_with("http://") || clean_ep.starts_with("localhost") || clean_ep.starts_with("127.0.0.1") {
+                                        use_ssl = false;
+                                    }
                                 }
-                                clauses.push(format!("USE_SSL {}", secret_modal.use_ssl));
+                                clauses.push(format!("USE_SSL {}", use_ssl));
 
                                 let secret_body = clauses.join(", ");
                                 let persistent_sql = format!("CREATE OR REPLACE PERSISTENT SECRET {} ({});", safe_name, secret_body);
@@ -3101,6 +4212,26 @@ pub fn run_ide_loop(
                                 let mut normalized = clean_uri.to_string();
                                 if !normalized.starts_with("s3://") && !normalized.starts_with("r2://") && !normalized.starts_with("gcs://") && !normalized.starts_with("azure://") {
                                     normalized = format!("s3://{}", normalized);
+                                }
+
+                                if let Some(ref old_uri) = add_bucket_modal.initial_uri {
+                                    if old_uri != &normalized {
+                                        expanded_groups.remove(&format!("bucket:{}", old_uri));
+                                        unsafe {
+                                            let current = std::env::var("DUCKPACK_S3_BUCKETS").or_else(|_| std::env::var("DUCKPACK_S3_BUCKET")).unwrap_or_default();
+                                            let parts: Vec<&str> = current.split(',')
+                                                .map(|s| s.trim())
+                                                .filter(|s| !s.is_empty() && *s != old_uri.as_str() && *s != old_uri.trim_start_matches("s3://"))
+                                                .collect();
+                                            let mut new_parts = parts;
+                                            if !new_parts.contains(&normalized.as_str()) {
+                                                new_parts.push(&normalized);
+                                            }
+                                            let joined = new_parts.join(",");
+                                            std::env::set_var("DUCKPACK_S3_BUCKETS", &joined);
+                                            std::env::set_var("DUCKPACK_S3_BUCKET", &joined);
+                                        }
+                                    }
                                 }
 
                                 if add_bucket_modal.save_to_env {
@@ -3633,6 +4764,26 @@ pub fn run_ide_loop(
                                     }
                                 }
                             }
+                        } else if key.code == KeyCode::Char('e') || key.code == KeyCode::Char('E') {
+                            if let Some(selected) = explorer_state.selected() {
+                                if selected < explorer_items.len() {
+                                    match &explorer_items[selected].node_type {
+                                        NodeType::CloudSecret { name, .. } => {
+                                            populate_secret_modal_for_edit(conn, project_dir, name, &mut secret_modal);
+                                            status_msg = format!("Editing cloud secret '{}'", name);
+                                        }
+                                        NodeType::CloudBucket { bucket } => {
+                                            add_bucket_modal.is_open = true;
+                                            add_bucket_modal.initial_uri = Some(bucket.clone());
+                                            add_bucket_modal.uri = bucket.clone();
+                                            add_bucket_modal.active_field = 0;
+                                            add_bucket_modal.error_msg = None;
+                                            status_msg = format!("Editing bucket URI '{}'", bucket);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                         }
                     }
                     FocusPane::Editor => {
@@ -3926,14 +5077,34 @@ pub fn run_ide_loop(
                         || clean_lower.starts_with("reset")
                         || clean_lower.starts_with("copy")
                         || clean_lower.starts_with("checkpoint")
-                        || clean_lower.starts_with("vacuum");
+                        || clean_lower.starts_with("vacuum")
+                        || clean_lower.starts_with("install")
+                        || clean_lower.starts_with("load");
                     (query_to_execute.clone(), is_pag, is_mut)
                 };
 
                 if is_mutation {
                     active_tab.is_paginated = false;
                     let start_time = std::time::Instant::now();
-                    match conn.execute_batch(&exec_query) {
+                    let mut exec_batch_res = conn.execute_batch(&exec_query);
+                    if let Err(ref e) = exec_batch_res {
+                        let err_str = e.to_string();
+                        let lower_exec = exec_query.trim().to_lowercase();
+                        if let Some(ext) = extract_autoload_extension_name(&err_str) {
+                            if crate::engine::ensure_extension_loaded(conn, &ext).is_ok() {
+                                exec_batch_res = Ok(());
+                            }
+                        } else if lower_exec.starts_with("install ") {
+                            let after = lower_exec["install ".len()..].trim();
+                            let ext = after.trim_matches(|c| c == '\'' || c == '"' || c == ';').split_whitespace().next().unwrap_or("");
+                            if !ext.is_empty() && !ext.starts_with("http") {
+                                if crate::engine::ensure_extension_loaded(conn, ext).is_ok() {
+                                    exec_batch_res = Ok(());
+                                }
+                            }
+                        }
+                    }
+                    match exec_batch_res {
                         Ok(()) => {
                             active_tab.query_results.clear();
                             active_tab.column_names.clear();
@@ -3967,7 +5138,17 @@ pub fn run_ide_loop(
                         exec_query.clone()
                     };
 
-                    match conn.prepare(&final_query) {
+                    let mut prepare_res = conn.prepare(&final_query);
+                    if let Err(ref e) = prepare_res {
+                        let err_str = e.to_string();
+                        if let Some(ext) = extract_autoload_extension_name(&err_str) {
+                            if crate::engine::ensure_extension_loaded(conn, &ext).is_ok() {
+                                prepare_res = conn.prepare(&final_query);
+                            }
+                        }
+                    }
+
+                    match prepare_res {
                     Ok(mut stmt) => {
                         let mut exec_rows = Vec::new();
                         let mut count = 0;
@@ -4216,13 +5397,21 @@ pub fn run_ide_loop(
                                     explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                                 }
                             } else {
-                                if expanded_groups.contains(&item_name) {
-                                    expanded_groups.remove(&item_name);
+                                if item_name.contains(":error:") {
+                                    if let Some((_, err_text)) = item_name.split_once(":error:") {
+                                        status_msg = format!("⚠️ Cloud Bucket Error: {}", err_text);
+                                    }
+                                } else if item_name.ends_with(":empty") {
+                                    status_msg = "Bucket or directory is empty (0 matching objects found).".to_string();
                                 } else {
-                                    expanded_groups.insert(item_name);
+                                    if expanded_groups.contains(&item_name) {
+                                        expanded_groups.remove(&item_name);
+                                    } else {
+                                        expanded_groups.insert(item_name);
+                                    }
+                                    explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+                                    explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                                 }
-                                explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
-                                explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
                             }
                         }
                         NodeType::Table { database, schema, is_temporary: _ } | NodeType::View { database, schema, is_temporary: _ } => {
@@ -5486,17 +6675,118 @@ mod tests {
         assert!(modal.is_open);
         assert_eq!(modal.active_field, 1);
 
-        modal.provider_index = 1;
+        modal.set_provider(1);
         assert_eq!(modal.provider(), AttachProvider::Quack);
+        assert_eq!(modal.host, "localhost");
+        assert_eq!(modal.port, "9494");
+        assert_eq!(modal.alias, "quack_remote");
 
-        modal.provider_index = 2;
+        modal.set_provider(2);
         assert_eq!(modal.provider(), AttachProvider::MotherDuck);
 
-        modal.provider_index = 3;
+        modal.set_provider(3);
         assert_eq!(modal.provider(), AttachProvider::SQLite);
 
-        modal.provider_index = 4;
+        modal.set_provider(4);
         assert_eq!(modal.provider(), AttachProvider::PostgreSQL);
+        assert_eq!(modal.host, "localhost");
+        assert_eq!(modal.port, "5432");
+        assert_eq!(modal.username, "postgres");
+
+        modal.set_provider(5);
+        assert_eq!(modal.provider(), AttachProvider::MySQL);
+        assert_eq!(modal.host, "localhost");
+        assert_eq!(modal.port, "3306");
+        assert_eq!(modal.username, "root");
+
+        modal.set_provider(6);
+        assert_eq!(modal.provider(), AttachProvider::MSSQL);
+        assert_eq!(modal.host, "localhost");
+        assert_eq!(modal.port, "1433");
+        assert_eq!(modal.username, "sa");
+
+        // Test MSSQL Connection String building
+        modal.database = "mydb".to_string();
+        modal.alias = "mssql_db".to_string();
+        modal.password = "secretpass".to_string();
+        let (conn_str, alias) = modal.build_connection_target().unwrap();
+        assert_eq!(alias, "mssql_db");
+        assert!(conn_str.contains("Server=localhost,1433"));
+        assert!(conn_str.contains("Database=mydb"));
+        assert!(conn_str.contains("User Id=sa"));
+        assert!(conn_str.contains("Password=secretpass"));
+        assert!(conn_str.contains("TrustServerCertificate=yes"));
+
+        modal.disable_ssl = true;
+        let (conn_str_no_ssl, _) = modal.build_connection_target().unwrap();
+        assert!(conn_str_no_ssl.contains("Encrypt=no"));
+
+        // Test Postgres URI building
+        modal.reset();
+        modal.set_provider(4);
+        modal.database = "analytics".to_string();
+        modal.alias = "analytics".to_string();
+        modal.password = "pgpass".to_string();
+        modal.disable_ssl = true;
+        let (pg_uri, pg_alias) = modal.build_connection_target().unwrap();
+        assert_eq!(pg_alias, "analytics");
+        assert_eq!(pg_uri, "postgres://postgres:pgpass@localhost:5432/analytics?sslmode=disable");
+
+        // Test MySQL URI building
+        modal.reset();
+        modal.set_provider(5);
+        modal.database = "store".to_string();
+        modal.alias = "store".to_string();
+        modal.password = "mysqlpass".to_string();
+        modal.disable_ssl = true;
+        let (mysql_uri, mysql_alias) = modal.build_connection_target().unwrap();
+        assert_eq!(mysql_alias, "store");
+        assert_eq!(mysql_uri, "mysql://root:mysqlpass@localhost:3306/store?ssl-mode=DISABLED");
+
+        // Test Quack Target building
+        modal.reset();
+        modal.set_provider(1);
+        let (quack_target, quack_alias) = modal.build_connection_target().unwrap();
+        assert_eq!(quack_alias, "quack_remote");
+        assert_eq!(quack_target, "quack:localhost:9494");
+
+        // Test Typing and Backspace with auto-sync alias
+        modal.reset();
+        modal.set_provider(6);
+        modal.active_field = 3; // Database Name field
+        modal.handle_char('p');
+        modal.handle_char('r');
+        modal.handle_char('o');
+        modal.handle_char('d');
+        assert_eq!(modal.database, "prod");
+        assert_eq!(modal.alias, "prod"); // Alias auto-populated
+        modal.handle_backspace();
+        assert_eq!(modal.database, "pro");
+        assert_eq!(modal.alias, "pro");
+
+        modal.active_field = 1; // Host field
+        modal.host.clear();
+        modal.handle_char('1');
+        modal.handle_char('0');
+        modal.handle_char('.');
+        modal.handle_char('0');
+        assert_eq!(modal.host, "10.0");
+        modal.handle_backspace();
+        assert_eq!(modal.host, "10.");
+
+        // Test Navigation
+        modal.active_field = 1;
+        modal.nav_right();
+        assert_eq!(modal.active_field, 2); // To Port
+        modal.nav_left();
+        assert_eq!(modal.active_field, 1); // Back to Host
+        modal.nav_down();
+        assert_eq!(modal.active_field, 3); // Down to Database Name
+
+        modal.reset();
+        assert!(!modal.disable_ssl);
+        assert!(!modal.insecure);
+        assert!(!modal.read_only);
     }
 
     #[test]
@@ -5557,6 +6847,31 @@ mod tests {
         assert!(nodes_expanded.iter().any(|n| n.name == "add_cloud_bucket"));
         assert!(nodes_expanded.iter().any(|n| n.name == "my_s3_secret"));
         assert!(nodes_expanded.iter().any(|n| n.name == "bucket:s3://analytics-lake"));
+    }
+
+    #[test]
+    fn test_populate_secret_modal_for_edit() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TEMPORARY TABLE duckdb_secrets (name VARCHAR, secret_string VARCHAR);", []).unwrap();
+        conn.execute("INSERT INTO duckdb_secrets VALUES ('test_edit', 'name=test_edit;endpoint=localhost:9000;key_id=my_key;use_ssl=false');", []).unwrap();
+
+        let temp_dir = std::env::temp_dir().join(format!("dp_ide_edit_sec_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let _ = std::fs::write(temp_dir.join(".env"), "AWS_SECRET_ACCESS_KEY=my_secret_val\nDUCKPACK_S3_BUCKET=s3://test-bucket\n");
+
+        let mut modal = SecretModalState::new();
+        populate_secret_modal_for_edit(&conn, &temp_dir, "test_edit", &mut modal);
+
+        assert!(modal.is_open);
+        assert_eq!(modal.name, "test_edit");
+        assert_eq!(modal.key_id, "my_key");
+        assert_eq!(modal.secret_key, "my_secret_val");
+        assert_eq!(modal.endpoint, "localhost:9000");
+        assert_eq!(modal.bucket, "s3://test-bucket");
+        assert_eq!(modal.provider(), CloudProvider::MinIO);
+        assert!(!modal.use_ssl);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 
