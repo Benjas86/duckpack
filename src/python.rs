@@ -1811,55 +1811,13 @@ pub fn explore(
             let _ = target.call_method1("execute", (format!("USE \"{}\";", cat.replace('\"', "\"\"")),));
         }
 
-        // Live DuckDB connection in Python:
-        let db_name = target
-            .getattr("execute")
-            .ok()
-            .and_then(|_| {
-                target.call_method1("execute", ("PRAGMA database_list;",)).ok()
-            })
-            .and_then(|res| res.call_method0("fetchall").ok())
-            .and_then(|rows| {
-                if let Ok(r) = rows.extract::<Vec<(Bound<'_, PyAny>, Bound<'_, PyAny>, String)>>() {
-                    r.into_iter().next().map(|t| t.2)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| ":memory:".to_string());
+        let mut bridge = SessionBridge::new(target.clone(), Some("duckpack_py"), None);
+        let active_db_target = bridge.start(py)?;
+        let active_bridge: Option<SessionBridge> = Some(bridge);
 
-        let mut active_bridge: Option<SessionBridge> = None;
-        let has_temp = connection_has_temp_objects(target);
-
-        let active_db_target = if !db_name.is_empty() && db_name != ":memory:" && !has_temp {
-            match engine::connect_target_db(&db_name, None, false) {
-                Ok(_) => db_name,
-                Err(e) => {
-                    // Fall back to serving via Python's active connection using SessionBridge
-                    eprintln!("💡 Notice: Direct connection to target database file '{}' failed: {}.", db_name, e);
-                    eprintln!("   Seamlessly falling back to live Python Quack bridge...");
-
-                    let mut bridge = SessionBridge::new(target.clone(), Some("duckpack_py"), None);
-                    let server_uri = bridge.start(py)?;
-                    active_bridge = Some(bridge);
-                    server_uri
-                }
-            }
-        } else {
-            // For in-memory connection, start quack_serve on an available port using SessionBridge
-            let mut bridge = SessionBridge::new(target.clone(), Some("duckpack_py"), None);
-            let server_uri = bridge.start(py)?;
-            active_bridge = Some(bridge);
-            server_uri
-        };
-
-        let is_bridge = active_bridge.is_some();
+        let is_bridge = true;
         let ide_res = py.allow_threads(|| -> anyhow::Result<()> {
-            let conn = if is_bridge {
-                engine::connect_target_db(&active_db_target, Some("duckpack_py"), false)?
-            } else {
-                engine::connect_target_db(&active_db_target, None, false)?
-            };
+            let conn = engine::connect_target_db(&active_db_target, Some("duckpack_py"), true)?;
 
             if is_bridge {
                 engine::restore_quack_temp_bridge(&conn);

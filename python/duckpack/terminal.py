@@ -6,6 +6,7 @@ Notebooks or VS Code Interactive.
 """
 
 import os
+from pathlib import Path
 import shutil
 import socket
 import subprocess
@@ -98,60 +99,39 @@ def launch_terminal_window(
 
     # 1. Resolve database target and quack bridge if in-memory
     cleanup_fn = None
-    if isinstance(target, str):
-        db_arg = target
+    if isinstance(target, (str, Path)):
+        db_arg = str(target)
         token_arg = quack_token
         insecure_arg = insecure
     else:
-        # Python connection object
-        db_path = None
+        # Live Python connection object (in-memory or file-backed):
+        # Spawning an external terminal process to open the same database file on disk
+        # will collide with Python's active write lock ("Conflicting lock is held").
+        # Always use SessionBridge to connect via loopback Quack without file locks!
+        bridge = SessionBridge(target)
         try:
-            db_info = target.execute("PRAGMA database_list;").fetchall()
-            if db_info and len(db_info[0]) >= 3:
-                db_path = db_info[0][2]
-        except Exception:
-            db_path = None
+            db_arg = bridge.start()
+        except Exception as e:
+            print(f"Warning: Could not start local quack bridge for Python connection: {e}")
+            return False
 
-        has_temp = False
-        try:
-            has_temp = SessionBridge.has_temp_objects(target)
-        except Exception:
-            pass
+        token_arg = bridge.token
+        insecure_arg = True
 
-        if db_path and db_path != ":memory:" and os.path.exists(db_path) and not has_temp:
-            db_arg = db_path
-            token_arg = None
-            insecure_arg = False
-        else:
-            # Live in-memory DuckDB connection or connection with temporary tables! Spin up local Quack bridge via SessionBridge:
-            bridge = SessionBridge(target)
+        def cleanup():
             try:
-                db_arg = bridge.start()
-            except Exception as e:
-                print(f"Warning: Could not start local quack bridge for in-memory DB: {e}")
-                return False
+                bridge.stop()
+            except Exception:
+                pass
 
-            token_arg = bridge.token
-            insecure_arg = False
-
-            def cleanup():
-                try:
-                    bridge.stop()
-                except Exception:
-                    pass
-
-            cleanup_fn = cleanup
+        cleanup_fn = cleanup
 
     # 2. Build the command to run inside the terminal
     eff_proj = project_dir
     if eff_proj == ".":
-        for cand in ["duckpack", "duckdb_project", "duckdb", "demo_project"]:
-            if os.path.isdir(cand) and (
-                os.path.isdir(os.path.join(cand, "queries"))
-                or os.path.exists(os.path.join(cand, "duckpack.toml"))
-            ):
-                eff_proj = cand
-                break
+        from . import _discover_project_dir
+
+        eff_proj = _discover_project_dir(eff_proj)
 
     if mode == "apply":
         cli_cmd = [sys.executable, "-m", "duckpack", "apply", "-p", eff_proj, "-d", db_arg, "--interactive"]

@@ -122,38 +122,25 @@ def render_notebook_card(
     token_arg = quack_token
     is_in_memory_bridge = False
 
-    if isinstance(target, str):
-        db_arg = target
+    if project_dir == ".":
+        from . import _discover_project_dir
+
+        project_dir = _discover_project_dir(project_dir)
+
+    if isinstance(target, (str, Path)):
+        db_arg = str(target)
     elif hasattr(target, "execute"):
-        # Check if connected to a persistent database file
-        db_path = None
+        # Live Python connection: spin up Quack bridge so terminal command can connect without file lock conflict
+        stop_server()  # Clean up any existing bridge first
+        bridge = SessionBridge(target)
         try:
-            db_info = target.execute("PRAGMA database_list;").fetchall()
-            if db_info and len(db_info[0]) >= 3:
-                db_path = db_info[0][2]
-        except Exception:
-            db_path = None
-
-        has_temp = False
-        try:
-            has_temp = SessionBridge.has_temp_objects(target)
-        except Exception:
-            pass
-
-        if db_path and db_path != ":memory:" and os.path.exists(db_path) and not has_temp:
-            db_arg = db_path
-        else:
-            # In-memory session or temporary tables present -> start Quack bridge via SessionBridge
-            stop_server()  # Clean up any existing bridge first
-            bridge = SessionBridge(target)
-            try:
-                db_arg = bridge.start()
-                token_arg = bridge.token
-                _ACTIVE_NOTEBOOK_BRIDGE = bridge
-                is_in_memory_bridge = True
-            except Exception as e:
-                print(f"[DuckPack] Warning: Could not start local Quack bridge: {e}")
-                return False
+            db_arg = bridge.start()
+            token_arg = bridge.token
+            _ACTIVE_NOTEBOOK_BRIDGE = bridge
+            is_in_memory_bridge = True
+        except Exception as e:
+            print(f"[DuckPack] Warning: Could not start local Quack bridge: {e}")
+            return False
     else:
         db_arg = "local.duckdb"
 
@@ -167,7 +154,7 @@ def render_notebook_card(
         cmd_parts.extend(["--database", active_cat])
     if token_arg:
         cmd_parts.extend(["--quack-token", token_arg])
-    if insecure:
+    if insecure or is_in_memory_bridge:
         cmd_parts.append("--insecure")
     if env:
         cmd_parts.extend(["-e", env])

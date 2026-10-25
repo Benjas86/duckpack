@@ -2,6 +2,7 @@
 DuckPack: Declarative schema management, interactive terminal IDE, and in-memory inspection for DuckDB.
 """
 
+import os
 import sys
 from pathlib import Path
 from ._duckpack import (
@@ -21,6 +22,76 @@ from ._duckpack import (
     __duckdb_version__,
 )
 from .runner import InteractionRunner
+
+
+def _is_db_conn(obj):
+    return obj is not None and hasattr(obj, "execute") and not isinstance(obj, (str, Path))
+
+
+def _discover_project_dir(start="."):
+    """Auto-discovers the nearest declarative DuckPack project directory."""
+    try:
+        start_path = Path(start).resolve()
+    except Exception:
+        return start
+
+    def is_proj(p):
+        return (
+            (p / "duckpack.toml").exists()
+            or (p / "queries").is_dir()
+            or (p / "tables").is_dir()
+            or (p / "schemas").is_dir()
+        )
+
+    if is_proj(start_path):
+        return str(start_path)
+
+    # 1. Candidate subdirectories
+    for cand in ["cli", "duckpack", "duckdb_project", "duckdb", "project", "demo_project"]:
+        sub = start_path / cand
+        if sub.is_dir() and is_proj(sub):
+            return str(sub)
+
+    # 2. Check parent directories up to filesystem root
+    curr = start_path.parent
+    while curr and curr != curr.parent:
+        if is_proj(curr):
+            return str(curr)
+        curr = curr.parent
+
+    # 3. Check sibling directories under parent (e.g. from 0.2.0/python to 0.2.0/cli)
+    parent = start_path.parent
+    if parent and parent != start_path:
+        for cand in ["cli", "duckpack", "duckdb_project", "duckdb", "project", "demo_project"]:
+            sib = parent / cand
+            if sib.is_dir() and is_proj(sib):
+                return str(sib)
+
+    return start
+
+
+def _normalize_session_args(target, project_dir, database, catalog):
+    # Case A: user passed connection as database=con or catalog=con
+    if target is None:
+        if _is_db_conn(database):
+            target = database
+            database = None
+        elif _is_db_conn(catalog):
+            target = catalog
+            catalog = None
+
+    # Case B: user passed (project_dir, con) as positional args: explore("../cli", con)
+    if _is_db_conn(project_dir) and (isinstance(target, (str, Path)) or target is None):
+        target, project_dir = project_dir, target or "."
+
+    project_dir = str(project_dir) if project_dir is not None else "."
+    active_cat = database or catalog
+
+    # Discover project_dir if default "." has no project markers
+    if project_dir == ".":
+        project_dir = _discover_project_dir(project_dir)
+
+    return target, project_dir, active_cat
 
 
 def _auto_attach_toml_target_if_needed(target, project_dir=".", env=None):
@@ -106,12 +177,17 @@ def diff(
     - insecure: disable SSL for local/plain HTTP Quack connections
     - env: optional environment profile name (e.g. 'staging', 'prod') to load from duckpack.toml and .env.<env>
     """
-    project_dir = str(project_dir)
-    active_cat = database or catalog
+    target, project_dir, active_cat = _normalize_session_args(
+        target, project_dir, database, catalog
+    )
 
     if target is None:
         cfg = _native_get_target_config(project_dir=project_dir, env=env)
         target = cfg.get("db") or "local.duckdb"
+        if not any(str(target).startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:")) and not os.path.isabs(str(target)):
+            cand = os.path.join(project_dir, str(target))
+            if os.path.exists(cand):
+                target = cand
         if not active_cat:
             catalogs = cfg.get("catalogs") or []
             if catalogs:
@@ -158,12 +234,17 @@ def apply(
     - insecure: disable SSL for local/plain HTTP Quack connections
     - env: optional environment profile name (e.g. 'staging', 'prod') to load from duckpack.toml and .env.<env>
     """
-    project_dir = str(project_dir)
-    active_cat = database or catalog
+    target, project_dir, active_cat = _normalize_session_args(
+        target, project_dir, database, catalog
+    )
 
     if target is None:
         cfg = _native_get_target_config(project_dir=project_dir, env=env)
         target = cfg.get("db") or "local.duckdb"
+        if not any(str(target).startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:")) and not os.path.isabs(str(target)):
+            cand = os.path.join(project_dir, str(target))
+            if os.path.exists(cand):
+                target = cand
         if not active_cat:
             catalogs = cfg.get("catalogs") or []
             if catalogs:
@@ -291,12 +372,17 @@ def explore(
     - database: Target database catalog name when multiple databases are attached (alias: catalog).
     - env: optional environment profile name (e.g. 'staging', 'prod') to load from duckpack.toml and .env.<env>
     """
-    project_dir = str(project_dir)
-    active_cat = database or catalog
+    target, project_dir, active_cat = _normalize_session_args(
+        target, project_dir, database, catalog
+    )
 
     if target is None:
         cfg = _native_get_target_config(project_dir=project_dir, env=env)
         target = cfg.get("db") or "local.duckdb"
+        if not any(str(target).startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:")) and not os.path.isabs(str(target)):
+            cand = os.path.join(project_dir, str(target))
+            if os.path.exists(cand):
+                target = cand
         if not active_cat:
             catalogs = cfg.get("catalogs") or []
             if catalogs:
@@ -345,6 +431,8 @@ def compile(project_dir, out):
 
 def build(project_dir="."):
     """Validate project SQL syntax against an in-memory Shadow DB."""
+    if project_dir == ".":
+        project_dir = _discover_project_dir(project_dir)
     return _native_build(str(project_dir))
 
 
@@ -355,6 +443,8 @@ def init(project_dir="."):
 
 def get_target_config(project_dir=".", env=None):
     """Inspect resolved target configuration and credentials from duckpack.toml and .env."""
+    if project_dir == ".":
+        project_dir = _discover_project_dir(project_dir)
     return _native_get_target_config(str(project_dir), env)
 
 

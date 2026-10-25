@@ -325,6 +325,22 @@ pub fn connect_target_db(
             if let Some(diagnostic) = diagnose_storage_version_error(&err_msg, db) {
                 return Err(anyhow::anyhow!("{}\n\nOriginal error: {}", diagnostic, err_msg));
             }
+            if err_msg.contains("Conflicting lock is held") || err_msg.contains("Could not set lock on file") {
+                return Err(anyhow::anyhow!(
+                    "Failed to attach local database '{}': {}\n\n\
+                    💡 DuckDB File Lock Detected:\n\
+                      Another process (such as a Jupyter Notebook kernel, Python REPL, or IDE)\n\
+                      currently holds an open write lock on this database file.\n\n\
+                    Troubleshooting:\n\
+                      • If running in Python / Jupyter, pass your live connection object:\n\
+                          >>> duckpack.explore(con)\n\
+                        DuckPack will connect directly to your live session over loopback Quack without file locks.\n\
+                      • Or close the connection in your other process:\n\
+                          >>> con.close()\n\
+                      • If a background kernel or zombie process is holding the lock, restart the kernel or terminate the process.",
+                    db, err_msg
+                ));
+            }
             return Err(anyhow::anyhow!("Failed to attach local database '{}': {}", db, err_msg));
         }
         if conn.execute("CONNECT target_db;", []).is_err() {
