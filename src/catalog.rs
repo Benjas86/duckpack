@@ -100,6 +100,8 @@ pub struct ExplorerMetadata {
     pub triggers: Vec<String>,
     pub queries: Vec<String>,
     pub dictionary: Vec<String>,
+    pub secrets: Vec<(String, String)>,
+    pub cloud_buckets: Vec<String>,
 }
 
 /// Formats an integer count with comma separators and singular/plural suffixes (e.g. "1 row", "10,000 rows").
@@ -1065,6 +1067,26 @@ pub fn load_explorer_metadata(
     }
     queries.sort();
 
+    let mut secrets: Vec<(String, String)> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT name, type FROM duckdb_secrets() WHERE type IN ('s3', 'r2', 'gcs', 'azure', 'quack', 'motherduck')") {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                    secrets.push((name, typ));
+                }
+            }
+        }
+    }
+
+    let mut cloud_buckets: Vec<String> = Vec::new();
+    if let Ok(val) = std::env::var("DUCKPACK_S3_BUCKET").or_else(|_| std::env::var("DUCKPACK_S3_BUCKETS")) {
+        for b in val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !cloud_buckets.contains(&b.to_string()) {
+                cloud_buckets.push(b.to_string());
+            }
+        }
+    }
+
     ExplorerMetadata {
         databases,
         active_database,
@@ -1077,7 +1099,27 @@ pub fn load_explorer_metadata(
         triggers,
         queries,
         dictionary,
+        secrets,
+        cloud_buckets,
     }
+}
+
+/// Lists files and subdirectories within a cloud bucket URI using DuckDB glob.
+pub fn list_s3_bucket_objects(conn: &Connection, bucket_uri: &str) -> Vec<(String, bool)> {
+    let clean_bucket = bucket_uri.trim_end_matches('/');
+    let glob_sql = format!("SELECT file FROM glob('{clean_bucket}/*') LIMIT 50;");
+    let mut results = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(&glob_sql) {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(file_path) = row.get::<_, String>(0) {
+                    let is_dir = file_path.ends_with('/') || !file_path.contains('.');
+                    results.push((file_path, is_dir));
+                }
+            }
+        }
+    }
+    results
 }
 
 /// Refreshes the attached remote database catalog so that the client's internal planner and

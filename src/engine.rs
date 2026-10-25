@@ -695,6 +695,66 @@ pub fn load_env_files(project_dir: &std::path::Path, env_profile: Option<&str>) 
     }
 }
 
+/// Safely writes or updates S3 / cloud credentials into the project's `.env` file (git-ignored).
+pub fn save_cloud_secret_to_env(
+    project_dir: &std::path::Path,
+    key_id: &str,
+    secret_key: &str,
+    region: &str,
+    endpoint: &str,
+    bucket: &str,
+) -> Result<()> {
+    let env_path = project_dir.join(".env");
+    let mut lines: Vec<String> = if env_path.exists() {
+        std::fs::read_to_string(&env_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut keys_to_set = std::collections::BTreeMap::new();
+    if !key_id.is_empty() {
+        keys_to_set.insert("AWS_ACCESS_KEY_ID", key_id.to_string());
+    }
+    if !secret_key.is_empty() {
+        keys_to_set.insert("AWS_SECRET_ACCESS_KEY", secret_key.to_string());
+    }
+    if !region.is_empty() {
+        keys_to_set.insert("AWS_REGION", region.to_string());
+        keys_to_set.insert("AWS_DEFAULT_REGION", region.to_string());
+    }
+    if !endpoint.is_empty() {
+        keys_to_set.insert("AWS_ENDPOINT", endpoint.to_string());
+    }
+    if !bucket.is_empty() {
+        keys_to_set.insert("DUCKPACK_S3_BUCKET", bucket.to_string());
+    }
+
+    let mut updated_keys = std::collections::HashSet::new();
+    for line in &mut lines {
+        let key_opt = line.split_once('=').map(|(k, _)| k.trim().to_string());
+        if let Some(trimmed_k) = key_opt {
+            if let Some(new_val) = keys_to_set.get(trimmed_k.as_str()) {
+                *line = format!("{}={}", trimmed_k, new_val);
+                updated_keys.insert(trimmed_k);
+            }
+        }
+    }
+
+    for (k, v) in keys_to_set {
+        if !updated_keys.contains(k) {
+            lines.push(format!("{}={}", k, v));
+        }
+    }
+
+    let output = lines.join("\n") + "\n";
+    std::fs::write(&env_path, output)?;
+    Ok(())
+}
+
 /// Resolves target configuration from duckpack.toml, supporting [target] defaults and [env.<profile>] overrides.
 pub fn resolve_target_config(project_dir: &std::path::Path, env_profile: Option<&str>) -> ResolvedTargetConfig {
     load_env_files(project_dir, env_profile);
@@ -1404,6 +1464,35 @@ token_env = "TEST_RESOLVER_PROD_TOKEN"
 
         let rules = load_ignore_rules(&temp_dir);
         assert_eq!(rules, vec!["scratch_*".to_string(), "temp_*".to_string(), "raw_data".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_save_cloud_secret_to_env() {
+        let temp_dir = std::env::temp_dir().join(format!("dp_env_sec_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Prepopulate with unrelated env variable
+        std::fs::write(temp_dir.join(".env"), "FOO=bar\nAWS_REGION=us-west-2\n").unwrap();
+
+        let res = save_cloud_secret_to_env(
+            &temp_dir,
+            "test_key_id",
+            "test_secret_val",
+            "us-east-1",
+            "http://localhost:9000",
+            "s3://my-test-lake",
+        );
+        assert!(res.is_ok());
+
+        let env_content = std::fs::read_to_string(temp_dir.join(".env")).unwrap();
+        assert!(env_content.contains("FOO=bar"));
+        assert!(env_content.contains("AWS_ACCESS_KEY_ID=test_key_id"));
+        assert!(env_content.contains("AWS_SECRET_ACCESS_KEY=test_secret_val"));
+        assert!(env_content.contains("AWS_REGION=us-east-1"));
+        assert!(env_content.contains("AWS_ENDPOINT=http://localhost:9000"));
+        assert!(env_content.contains("DUCKPACK_S3_BUCKET=s3://my-test-lake"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

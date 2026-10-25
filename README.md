@@ -40,7 +40,8 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
   - [Primary Key & Foreign Key Visual Identifiers](#primary-key--foreign-key-visual-identifiers)
   - [Dynamic Explorer Width Resizing & Snappy Scrolling](#dynamic-explorer-width-resizing--snappy-scrolling)
   - [Catalog-Aware Multi-Database Exploration & Cross-DB Joins](#catalog-aware-multi-database-exploration--cross-db-joins)
-  - [Live Database Attachment & Detach (`Ctrl+A` / `d`)](#live-database-attachment--detach-ctrla--d)
+  - [Live Database Attachment with Provider Presets (`Ctrl+A` / `d`)](#live-database-attachment-with-provider-presets-ctrla--d)
+  - [Cloud Secrets Management & S3 Bucket Explorer (`Ctrl+K`)](#cloud-secrets-management--s3-bucket-explorer-ctrlk)
   - [Multi-Tab Query System & Isolated Results](#multi-tab-query-system--isolated-results)
   - [Interactive Schema Visualizer & Mermaid.js ERD](#interactive-schema-visualizer--mermaidjs-erd)
   - [Dynamic Status Bar & Error Interception](#dynamic-status-bar--error-interception)
@@ -80,7 +81,8 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
 - **Visual Primary Key & Foreign Key Indicators:** Inspect table structures in the Explorer tree with visual icons (`🔑` for Primary Keys, `🔗` for Foreign Keys with reference targets `[FK -> table.col]`, and composite `🔑🔗` badges).
 - **Dynamic Explorer Width Resizing & Snappy Scrolling:** Adjust sidebar width on the fly via `W` (cycling 25%/35%/50% presets) or `+`/`-` and `[`/`]` (5% increments from 15% to 60%). Navigate wide schemas quickly with 4-char arrow scrolling, `Shift+Arrow` 10-char jumps, and `Home` margin snap.
 - **Catalog-Aware Multi-Database Exploration:** Inspect multiple attached catalogs (local DuckDB, in-memory `memory` scratchpad, attached SQLite/Postgres/MySQL/MSSQL, and remote Quack `target_db` instances) in a unified hierarchical tree with catalog-qualified query generation and cross-database joins.
-- **Live Catalog Attach & Detach (`Ctrl+A` / `d` / `b`):** Dynamically attach third-party databases, DuckDB files, or remote Quack instances directly inside the IDE without restarting; cycle target catalogs on the fly.
+- **Live Catalog Attach with Provider Presets (`Ctrl+A` / `d` / `b`):** Dynamically attach third-party databases, DuckDB files, MotherDuck, or remote Quack instances directly inside the IDE with provider presets and auto-installed extensions; cycle target catalogs on the fly.
+- **Cloud Secrets Management & S3 Bucket Explorer (`Ctrl+K`):** Visually configure cloud storage credentials (AWS S3, Cloudflare R2, MinIO, Wasabi, Custom S3) with masked inputs (`*`) and dual-persistence (`CREATE PERSISTENT SECRET` + `.env`). Live-explore remote S3 buckets (`glob()`) and sample remote files (`read_parquet`, `read_csv`) with a single keypress.
 - **Temporary Table Discovery & Python Two-Way Sync:** Temporary tables and views (`CREATE TEMP TABLE ...`) appear seamlessly in the active database's Explorer tree with a distinct `[temp]` badge. Instant DDL auto-refresh updates the sidebar on `CREATE`/`DROP`/`ALTER`, and interactive Python exploration (`duckpack.explore(con)`) performs safe two-way session synchronization across the Quack bridge.
 - **Python Integration with Jupyter / VS Code Support:** Import `duckpack` into Python pipelines, pytest fixtures, or Jupyter notebooks (`duckpack.explore(con)`). Automatically spawns a connected native terminal window in non-interactive notebook environments.
 - **Embedded DuckDB Version Transparency:** Engine version reporting via `duckpack --version` and Python `__duckdb_version__`, backed by proactive storage format compatibility diagnostics.
@@ -369,7 +371,8 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | | `Shift + Left` / `Right` | **Fast horizontal scroll** by 10 characters |
 | | `Home` | **Snap horizontal scroll** back to left margin |
 | | `q` / `s` | **Query table/view** (generates catalog-qualified SQL into editor) |
-| | `Ctrl+A` | **Attach Database** dialog (DuckDB, SQLite, Postgres, MySQL, MSSQL, Quack) |
+| | `Ctrl+A` | **Attach Database** dialog with Provider Presets (DuckDB, SQLite, Postgres, MySQL, MotherDuck, Quack) |
+| | `Ctrl+K` | **Cloud Secrets & S3 Buckets:** Add S3/R2/MinIO credentials with masking, `.env` persistence, and bucket exploration |
 | | `d` | **Detach Database** from current session |
 | | `b` | **Cycle Target Catalog** for diff/apply operations |
 | | `r` / `R` | **Refresh Explorer:** re-scans live database (in DB mode) or disk & git status (in Project mode) |
@@ -452,14 +455,44 @@ DuckPack dynamically detects your active catalogs:
     JOIN memory.local_users lu ON ro.customer_id = lu.id;
     ```
 
-### Live Database Attachment & Detach (`Ctrl+A` / `d`)
+### Live Database Attachment with Provider Presets (`Ctrl+A` / `d`)
 
-Press **`Ctrl+A`** from anywhere in the IDE to open the interactive **Attach Database** modal dialog:
-- Attach local DuckDB files (`.duckdb`, `.db`, `.ddb`).
-- Attach SQLite databases (`TYPE SQLITE`).
-- Connect to remote PostgreSQL, MySQL, or Microsoft SQL Server instances.
-- Attach remote DuckDB instances over Quack (`TYPE QUACK`).
-- Select attached databases in the Explorer and press **`d`** to safely detach them from the live session.
+Press **`Ctrl+A`** from anywhere in the IDE to open the interactive **Attach Database** modal dialog with field-adaptive provider presets:
+
+- **Provider Presets (cycle via `◄` / `►` or `h` / `l`):**
+  - **`DuckDB (Local / In-Memory)`**: Attach `.duckdb` files or `:memory:` scratchpads.
+  - **`Remote Quack Server`**: Connect to live remote Quack server instances with optional token credentials.
+  - **`MotherDuck Cloud`**: Attach MotherDuck cloud databases (`md:database_name`) with optional MotherDuck service token injection.
+  - **`SQLite`**: Attach SQLite database files (`.db`, `.sqlite`) with automatic installation and loading of the DuckDB `sqlite` extension (`INSTALL sqlite; LOAD sqlite;`).
+  - **`PostgreSQL`**: Connect to remote Postgres servers via connection URI (`postgres://user:pass@host:5432/dbname`) with automatic extension handling.
+  - **`MySQL`**: Connect to remote MySQL servers via connection URI (`mysql://user:pass@host:3306/dbname`) with automatic extension handling.
+- **Dynamic Field Guidance**: Prompts, placeholders, and catalog alias hints dynamically adapt to the selected provider.
+- **Masked Token/Password Field**: Passwords and service tokens are rendered with `*` mask characters.
+- **Read-Only Toggle**: Press `Space` to toggle `READ_ONLY` mode.
+- **Safe Detach**: Select any attached database in the Explorer and press **`d`** (or `Delete`) to safely detach it from the active session.
+
+### Cloud Secrets Management & S3 Bucket Explorer (`Ctrl+K`)
+
+DuckPack provides complete cloud data lake support directly in your terminal without requiring you to remember low-level `CREATE SECRET` SQL syntax:
+
+- **Dedicated "Secrets & Cloud Buckets" Sidebar Drawer (`🔐 Secrets & Cloud`):**
+  - Displays all active secrets from `duckdb_secrets()` (e.g. `🔑 s3_secret [s3]`).
+  - Lists tracked cloud buckets (`🪣 s3://analytics-lake`).
+  - Displays quick action `➕ Add Cloud Secret (Ctrl+K)`.
+- **Live S3 Bucket Explorer:**
+  - Expanding a bucket node runs a background DuckDB `glob('{bucket}/*')` query to list remote files and directories.
+  - Formatted file icons identify `.parquet` (📊), `.csv` (📝), and general files (📄).
+  - Pressing **`Enter`**, **`q`**, or **`s`** on any cloud file instantly loads an optimized query into the editor tab:
+    ```sql
+    SELECT * FROM read_parquet('s3://my-bucket/events/2026/01/data.parquet') LIMIT 500;
+    ```
+- **Cloud Secrets Modal (`Ctrl+K` or Explorer `a`/`n`):**
+  - **Provider Presets**: Cycle between **AWS S3**, **Cloudflare R2**, **MinIO**, **Wasabi**, and **Custom S3 Endpoint**.
+  - **Visual Masking**: Secret access keys are visually masked with `*` to protect against screen-sharing leaks.
+  - **Dual Persistence Architecture**:
+    - **DuckDB Persistent Secret**: Creates persistent secrets in DuckDB via `CREATE OR REPLACE PERSISTENT SECRET` (with fallback to session secrets).
+    - **Project `.env` Persistence**: Optionally appends or updates `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT`, and `DUCKPACK_S3_BUCKET` in the project `.env` file (strictly git-ignored).
+  - **Automatic Extension Installation**: Transparently executes `INSTALL httpfs; LOAD httpfs;` so remote operations never fail.
 
 ---
 

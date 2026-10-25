@@ -57,6 +57,10 @@ pub(crate) enum NodeType {
     Macro,
     Column { data_type: String, is_pk: bool, is_fk: bool, fk_target: Option<String> },
     ProjectFile { path: PathBuf, category: ProjectCategory },
+    CloudSecret { name: String, secret_type: String },
+    CloudBucket { bucket: String },
+    CloudFile { path: String, is_dir: bool },
+    AddSecretAction,
 }
 
 /// Formats the display line for a column in the database explorer tree.
@@ -673,42 +677,198 @@ pub(crate) fn rebuild_project_nodes(
     items
 }
 
+/// Supported database presets for the Attach Database modal dialog (Ctrl+A).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum AttachProvider {
+    DuckDB,
+    Quack,
+    MotherDuck,
+    SQLite,
+    PostgreSQL,
+    MySQL,
+}
+
+impl AttachProvider {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            AttachProvider::DuckDB => "DuckDB (Local / In-Memory)",
+            AttachProvider::Quack => "Remote Quack Server",
+            AttachProvider::MotherDuck => "MotherDuck Cloud",
+            AttachProvider::SQLite => "SQLite",
+            AttachProvider::PostgreSQL => "PostgreSQL",
+            AttachProvider::MySQL => "MySQL",
+        }
+    }
+}
+
 /// State for the Attach Database modal dialog (Ctrl+A).
 #[derive(Clone, Debug)]
-struct AttachModalState {
-    is_open: bool,
-    path: String,
-    alias: String,
-    alias_is_custom: bool,
-    db_type: String,
-    read_only: bool,
-    active_field: usize, // 0: path, 1: alias, 2: type, 3: readonly, 4: submit, 5: cancel
-    error_msg: Option<String>,
+pub(crate) struct AttachModalState {
+    pub(crate) is_open: bool,
+    pub(crate) provider_index: usize, // 0: DuckDB, 1: Quack, 2: MotherDuck, 3: SQLite, 4: PostgreSQL, 5: MySQL
+    pub(crate) path: String,
+    pub(crate) alias: String,
+    pub(crate) alias_is_custom: bool,
+    pub(crate) token: String,
+    pub(crate) read_only: bool,
+    pub(crate) active_field: usize, // 0: provider, 1: path, 2: alias, 3: token, 4: readonly, 5: submit, 6: cancel
+    pub(crate) error_msg: Option<String>,
 }
 
 impl AttachModalState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             is_open: false,
+            provider_index: 0,
             path: String::new(),
             alias: String::new(),
             alias_is_custom: false,
-            db_type: String::new(),
+            token: String::new(),
             read_only: false,
-            active_field: 0,
+            active_field: 1,
             error_msg: None,
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.is_open = true;
+        self.provider_index = 0;
         self.path.clear();
         self.alias.clear();
         self.alias_is_custom = false;
-        self.db_type.clear();
+        self.token.clear();
         self.read_only = false;
-        self.active_field = 0;
+        self.active_field = 1;
         self.error_msg = None;
+    }
+
+    pub(crate) fn provider(&self) -> AttachProvider {
+        match self.provider_index {
+            1 => AttachProvider::Quack,
+            2 => AttachProvider::MotherDuck,
+            3 => AttachProvider::SQLite,
+            4 => AttachProvider::PostgreSQL,
+            5 => AttachProvider::MySQL,
+            _ => AttachProvider::DuckDB,
+        }
+    }
+}
+
+/// Supported cloud storage providers for secrets and bucket exploration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CloudProvider {
+    S3,
+    CloudflareR2,
+    MinIO,
+    Wasabi,
+    CustomS3,
+}
+
+impl CloudProvider {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            CloudProvider::S3 => "AWS S3",
+            CloudProvider::CloudflareR2 => "Cloudflare R2",
+            CloudProvider::MinIO => "MinIO (Self-hosted)",
+            CloudProvider::Wasabi => "Wasabi Cloud",
+            CloudProvider::CustomS3 => "Custom S3 Endpoint",
+        }
+    }
+}
+
+/// State for the Cloud Secrets & S3 modal dialog (Ctrl+K).
+#[derive(Clone, Debug)]
+pub(crate) struct SecretModalState {
+    pub(crate) is_open: bool,
+    pub(crate) provider_index: usize, // 0: S3, 1: R2, 2: MinIO, 3: Wasabi, 4: Custom
+    pub(crate) name: String,
+    pub(crate) key_id: String,
+    pub(crate) secret_key: String,
+    pub(crate) region: String,
+    pub(crate) endpoint: String,
+    pub(crate) bucket: String,
+    pub(crate) use_ssl: bool,
+    pub(crate) save_to_env: bool,
+    pub(crate) active_field: usize, // 0: provider, 1: name, 2: key_id, 3: secret_key, 4: region, 5: endpoint, 6: bucket, 7: use_ssl, 8: save_to_env, 9: submit, 10: cancel
+    pub(crate) error_msg: Option<String>,
+}
+
+impl SecretModalState {
+    pub(crate) fn new() -> Self {
+        Self {
+            is_open: false,
+            provider_index: 0,
+            name: "s3_secret".to_string(),
+            key_id: String::new(),
+            secret_key: String::new(),
+            region: "us-east-1".to_string(),
+            endpoint: String::new(),
+            bucket: String::new(),
+            use_ssl: true,
+            save_to_env: true,
+            active_field: 2,
+            error_msg: None,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.is_open = true;
+        self.provider_index = 0;
+        self.name = "s3_secret".to_string();
+        self.key_id.clear();
+        self.secret_key.clear();
+        self.region = "us-east-1".to_string();
+        self.endpoint.clear();
+        self.bucket.clear();
+        self.use_ssl = true;
+        self.save_to_env = true;
+        self.active_field = 2;
+        self.error_msg = None;
+    }
+
+    pub(crate) fn provider(&self) -> CloudProvider {
+        match self.provider_index {
+            1 => CloudProvider::CloudflareR2,
+            2 => CloudProvider::MinIO,
+            3 => CloudProvider::Wasabi,
+            4 => CloudProvider::CustomS3,
+            _ => CloudProvider::S3,
+        }
+    }
+
+    pub(crate) fn set_provider(&mut self, idx: usize) {
+        self.provider_index = idx % 5;
+        match self.provider() {
+            CloudProvider::S3 => {
+                if self.endpoint == "localhost:9000" || self.endpoint == "s3.wasabisys.com" || self.endpoint.contains(".r2.cloudflarestorage.com") {
+                    self.endpoint.clear();
+                }
+                if self.region == "auto" {
+                    self.region = "us-east-1".to_string();
+                }
+                self.use_ssl = true;
+            }
+            CloudProvider::CloudflareR2 => {
+                if self.endpoint.is_empty() || self.endpoint == "localhost:9000" || self.endpoint == "s3.wasabisys.com" {
+                    self.endpoint = "<account_id>.r2.cloudflarestorage.com".to_string();
+                }
+                self.region = "auto".to_string();
+                self.use_ssl = true;
+            }
+            CloudProvider::MinIO => {
+                self.endpoint = "localhost:9000".to_string();
+                self.region = "us-east-1".to_string();
+                self.use_ssl = false;
+            }
+            CloudProvider::Wasabi => {
+                self.endpoint = "s3.wasabisys.com".to_string();
+                self.region = "us-east-1".to_string();
+                self.use_ssl = true;
+            }
+            CloudProvider::CustomS3 => {
+                self.use_ssl = true;
+            }
+        }
     }
 }
 
@@ -1115,6 +1275,82 @@ pub(crate) fn rebuild_explorer_nodes(
         }
     }
 
+    // Secrets & Cloud Buckets Section
+    let is_secrets_expanded = expanded_groups.contains("Secrets & Cloud Buckets");
+    let total_secrets = meta.secrets.len() + meta.cloud_buckets.len();
+    items.push(ExplorerNode {
+        name: "Secrets & Cloud Buckets".to_string(),
+        display: format!("🔐 Secrets & Cloud ({})", total_secrets),
+        level: 0,
+        is_expandable: true,
+        is_expanded: is_secrets_expanded,
+        node_type: NodeType::Group,
+    });
+    if is_secrets_expanded {
+        items.push(ExplorerNode {
+            name: "add_cloud_secret".to_string(),
+            display: "  ➕ Add Cloud Secret (Ctrl+K)".to_string(),
+            level: 1,
+            is_expandable: false,
+            is_expanded: false,
+            node_type: NodeType::AddSecretAction,
+        });
+
+        for (sec_name, sec_type) in &meta.secrets {
+            items.push(ExplorerNode {
+                name: sec_name.clone(),
+                display: format!("  🔑 {} [{}]", sec_name, sec_type),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::CloudSecret {
+                    name: sec_name.clone(),
+                    secret_type: sec_type.clone(),
+                },
+            });
+        }
+
+        for bucket in &meta.cloud_buckets {
+            let bucket_key = format!("bucket:{}", bucket);
+            let is_bucket_expanded = expanded_groups.contains(&bucket_key);
+            items.push(ExplorerNode {
+                name: bucket_key.clone(),
+                display: format!("  🪣 {}", bucket),
+                level: 1,
+                is_expandable: true,
+                is_expanded: is_bucket_expanded,
+                node_type: NodeType::CloudBucket { bucket: bucket.clone() },
+            });
+
+            if is_bucket_expanded {
+                let objects = crate::catalog::list_s3_bucket_objects(conn, bucket);
+                if objects.is_empty() {
+                    items.push(ExplorerNode {
+                        name: format!("{}:empty", bucket),
+                        display: "    (empty or inaccessible)".to_string(),
+                        level: 2,
+                        is_expandable: false,
+                        is_expanded: false,
+                        node_type: NodeType::Group,
+                    });
+                } else {
+                    for (obj_path, is_dir) in objects {
+                        let filename = obj_path.split('/').last().unwrap_or(&obj_path);
+                        let icon = if is_dir { "📁" } else if filename.ends_with(".parquet") { "📊" } else if filename.ends_with(".csv") { "📝" } else { "📄" };
+                        items.push(ExplorerNode {
+                            name: obj_path.clone(),
+                            display: format!("    {} {}", icon, filename),
+                            level: 2,
+                            is_expandable: is_dir,
+                            is_expanded: false,
+                            node_type: NodeType::CloudFile { path: obj_path, is_dir },
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     items
 }
 
@@ -1297,13 +1533,14 @@ pub fn run_ide_loop(
         set.insert("Queries".to_string());
         set
     } else {
-        vec!["Tables", "Views", "Macros", "Queries"]
+        vec!["Tables", "Views", "Macros", "Queries", "Secrets & Cloud Buckets"]
             .into_iter()
             .map(|s| s.to_string())
             .collect()
     };
     let mut expanded_tables: HashSet<String> = HashSet::new();
     let mut attach_modal = AttachModalState::new();
+    let mut secret_modal = SecretModalState::new();
 
     let mut dictionary = meta.dictionary.clone();
     let mut autocomplete_matches: Vec<String> = Vec::new();
@@ -1624,6 +1861,7 @@ pub fn run_ide_loop(
                     Line::from(vec![Span::styled(" Ctrl+E/F5 ", Style::default().fg(Color::Cyan)), Span::raw("Execute Query (or selected text)")]),
                     Line::from(vec![Span::styled(" Ctrl+G    ", Style::default().fg(Color::Cyan)), Span::raw("Visualize Schema (Graph)")]),
                     Line::from(vec![Span::styled(" Ctrl+A    ", Style::default().fg(Color::Cyan)), Span::raw("Attach Database (DuckDB, SQLite, PG, etc.)")]),
+                    Line::from(vec![Span::styled(" Ctrl+K    ", Style::default().fg(Color::Cyan)), Span::raw("Cloud Secrets & S3 Buckets (AWS, R2, MinIO)")]),
                     Line::from(vec![Span::styled(" Ctrl+C/V  ", Style::default().fg(Color::Cyan)), Span::raw("Copy / Paste")]),
                     Line::from(vec![Span::styled(" Ctrl+S    ", Style::default().fg(Color::Cyan)), Span::raw("Save Query / Project File")]),
                     Line::from(vec![Span::styled(" Ctrl+F    ", Style::default().fg(Color::Cyan)), Span::raw("Format Query")]),
@@ -1671,8 +1909,8 @@ pub fn run_ide_loop(
                         .scroll((schema_scroll, 0));
                 f.render_widget(tree_paragraph, popup_area);
             } else if attach_modal.is_open {
-                let popup_width = 64.min(f.area().width.saturating_sub(4));
-                let popup_height = 18.min(f.area().height.saturating_sub(2));
+                let popup_width = 68.min(f.area().width.saturating_sub(4));
+                let popup_height = 21.min(f.area().height.saturating_sub(2));
                 let popup_area = ratatui::layout::Rect {
                     x: (f.area().width.saturating_sub(popup_width)) / 2,
                     y: (f.area().height.saturating_sub(popup_height)) / 2,
@@ -1692,52 +1930,69 @@ pub fn run_ide_loop(
                 let field_layout = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(3), // 0: Path
-                        Constraint::Length(3), // 1: Alias
-                        Constraint::Length(3), // 2: Type
-                        Constraint::Length(2), // 3: Read-Only toggle
-                        Constraint::Length(2), // 4: Error/hint
-                        Constraint::Length(3), // 5: Buttons
+                        Constraint::Length(3), // 0: Provider
+                        Constraint::Length(3), // 1: Path or URI
+                        Constraint::Length(3), // 2: Alias
+                        Constraint::Length(3), // 3: Token / Password (optional)
+                        Constraint::Length(2), // 4: Read-Only toggle
+                        Constraint::Length(2), // 5: Error/hint
+                        Constraint::Length(3), // 6: Buttons
                     ])
                     .split(inner_area);
 
-                // Field 0: Path
+                // Field 0: Provider selector
                 let f0_style = if attach_modal.active_field == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-                let p0 = Paragraph::new(format!("{}{}", attach_modal.path, if attach_modal.active_field == 0 { "█" } else { "" }))
-                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Path or URI ").border_style(f0_style));
+                let prov_label = format!("  ◄ [ {} ] ►   (◄ / ► to switch)", attach_modal.provider().name());
+                let p0 = Paragraph::new(prov_label)
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Provider Preset ").border_style(f0_style));
                 f.render_widget(p0, field_layout[0]);
 
-                // Field 1: Alias
+                // Field 1: Path or URI
+                let path_title = match attach_modal.provider() {
+                    AttachProvider::DuckDB => " Database File Path (e.g. data.duckdb or :memory:) ",
+                    AttachProvider::Quack => " Remote Quack URL/Host (e.g. 127.0.0.1:4213 or quack://host) ",
+                    AttachProvider::MotherDuck => " MotherDuck Database Name (e.g. md:my_db or my_db) ",
+                    AttachProvider::SQLite => " SQLite Database File Path (.db, .sqlite) ",
+                    AttachProvider::PostgreSQL => " PostgreSQL URI (postgres://user:pass@host:5432/dbname) ",
+                    AttachProvider::MySQL => " MySQL URI (mysql://user:pass@host:3306/dbname) ",
+                };
                 let f1_style = if attach_modal.active_field == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-                let p1 = Paragraph::new(format!("{}{}", attach_modal.alias, if attach_modal.active_field == 1 { "█" } else { "" }))
-                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Catalog Alias ").border_style(f1_style));
+                let p1 = Paragraph::new(format!("{}{}", attach_modal.path, if attach_modal.active_field == 1 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(path_title).border_style(f1_style));
                 f.render_widget(p1, field_layout[1]);
 
-                // Field 2: Type
+                // Field 2: Alias
                 let f2_style = if attach_modal.active_field == 2 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-                let p2 = Paragraph::new(format!("{}{}", attach_modal.db_type, if attach_modal.active_field == 2 { "█" } else { "" }))
-                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Database Type (Optional: SQLITE, POSTGRES, MYSQL) ").border_style(f2_style));
+                let p2 = Paragraph::new(format!("{}{}", attach_modal.alias, if attach_modal.active_field == 2 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Catalog Alias ").border_style(f2_style));
                 f.render_widget(p2, field_layout[2]);
 
-                // Field 3: Read-Only toggle
-                let f3_style = if attach_modal.active_field == 3 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                // Field 3: Token / Password (Masked)
+                let f3_style = if attach_modal.active_field == 3 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let masked_token = "*".repeat(attach_modal.token.len());
+                let p3 = Paragraph::new(format!("{}{}", masked_token, if attach_modal.active_field == 3 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Token / Password (Optional, Masked) ").border_style(f3_style));
+                f.render_widget(p3, field_layout[3]);
+
+                // Field 4: Read-Only toggle
+                let f4_style = if attach_modal.active_field == 4 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
                 let ro_text = format!("  [{}] Read-Only Mode (Space to toggle)", if attach_modal.read_only { "X" } else { " " });
-                f.render_widget(Paragraph::new(ro_text).style(f3_style), field_layout[3]);
+                f.render_widget(Paragraph::new(ro_text).style(f4_style), field_layout[4]);
 
                 // Error or navigation hint
                 if let Some(ref err) = attach_modal.error_msg {
-                    f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), field_layout[4]);
+                    f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), field_layout[5]);
                 } else {
-                    f.render_widget(Paragraph::new("  Tab: Next Field | Enter: Attach | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), field_layout[4]);
+                    f.render_widget(Paragraph::new("  Tab: Next Field | Enter: Attach | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), field_layout[5]);
                 }
 
                 // Buttons
-                let attach_btn_style = if attach_modal.active_field == 4 {
+                let attach_btn_style = if attach_modal.active_field == 5 {
                     Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Cyan)
                 };
-                let cancel_btn_style = if attach_modal.active_field == 5 {
+                let cancel_btn_style = if attach_modal.active_field == 6 {
                     Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
@@ -1747,7 +2002,127 @@ pub fn run_ide_loop(
                     Span::raw("    "),
                     Span::styled(" [ Cancel ] ", cancel_btn_style),
                 ]);
-                f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[5]);
+                f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[6]);
+            } else if secret_modal.is_open {
+                let popup_width = 72.min(f.area().width.saturating_sub(4));
+                let popup_height = 24.min(f.area().height.saturating_sub(2));
+                let popup_area = ratatui::layout::Rect {
+                    x: (f.area().width.saturating_sub(popup_width)) / 2,
+                    y: (f.area().height.saturating_sub(popup_height)) / 2,
+                    width: popup_width,
+                    height: popup_height,
+                };
+                f.render_widget(ratatui::widgets::Clear, popup_area);
+
+                let modal_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" 🔐 Cloud Secrets & S3 Buckets (Ctrl+K) ")
+                    .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+                f.render_widget(modal_block.clone(), popup_area);
+
+                let inner_area = modal_block.inner(popup_area);
+                let field_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), // 0: Provider
+                        Constraint::Length(3), // 1: Name
+                        Constraint::Length(3), // 2: Key ID
+                        Constraint::Length(3), // 3: Secret Key
+                        Constraint::Length(3), // 4: Region & Endpoint
+                        Constraint::Length(3), // 5: Bucket
+                        Constraint::Length(2), // 6: SSL & Save-to-.env toggles
+                        Constraint::Length(1), // 7: Hint / Error
+                        Constraint::Length(3), // 8: Buttons
+                    ])
+                    .split(inner_area);
+
+                // Field 0: Cloud Provider
+                let f0_style = if secret_modal.active_field == 0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let prov_label = format!("  ◄ [ {} ] ►   (◄ / ► to switch)", secret_modal.provider().name());
+                let p0 = Paragraph::new(prov_label)
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Storage Provider ").border_style(f0_style));
+                f.render_widget(p0, field_layout[0]);
+
+                // Field 1: Secret Name
+                let f1_style = if secret_modal.active_field == 1 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let p1 = Paragraph::new(format!("{}{}", secret_modal.name, if secret_modal.active_field == 1 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" DuckDB Secret Identifier ").border_style(f1_style));
+                f.render_widget(p1, field_layout[1]);
+
+                // Field 2: Key ID
+                let f2_style = if secret_modal.active_field == 2 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let p2 = Paragraph::new(format!("{}{}", secret_modal.key_id, if secret_modal.active_field == 2 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Access Key ID (AWS_ACCESS_KEY_ID) ").border_style(f2_style));
+                f.render_widget(p2, field_layout[2]);
+
+                // Field 3: Secret Key (Masked)
+                let f3_style = if secret_modal.active_field == 3 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let masked_secret = "*".repeat(secret_modal.secret_key.len());
+                let p3 = Paragraph::new(format!("{}{}", masked_secret, if secret_modal.active_field == 3 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Secret Access Key (AWS_SECRET_ACCESS_KEY, Masked) ").border_style(f3_style));
+                f.render_widget(p3, field_layout[3]);
+
+                // Field 4: Region & Endpoint
+                let reg_end_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+                    .split(field_layout[4]);
+
+                let f4_reg_style = if secret_modal.active_field == 4 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let p_reg = Paragraph::new(format!("{}{}", secret_modal.region, if secret_modal.active_field == 4 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Region ").border_style(f4_reg_style));
+                f.render_widget(p_reg, reg_end_cols[0]);
+
+                let f5_end_style = if secret_modal.active_field == 5 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let p_end = Paragraph::new(format!("{}{}", secret_modal.endpoint, if secret_modal.active_field == 5 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Custom Endpoint (Optional) ").border_style(f5_end_style));
+                f.render_widget(p_end, reg_end_cols[1]);
+
+                // Field 5: Bucket
+                let f6_style = if secret_modal.active_field == 6 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+                let p6 = Paragraph::new(format!("{}{}", secret_modal.bucket, if secret_modal.active_field == 6 { "█" } else { "" }))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Default Bucket to Explore (e.g. s3://my-bucket) ").border_style(f6_style));
+                f.render_widget(p6, field_layout[5]);
+
+                // Field 6: SSL & Save-to-.env toggles
+                let toggle_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(field_layout[6]);
+
+                let f7_ssl_style = if secret_modal.active_field == 7 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                let ssl_label = format!("  [{}] Use SSL / HTTPS (Space)", if secret_modal.use_ssl { "X" } else { " " });
+                f.render_widget(Paragraph::new(ssl_label).style(f7_ssl_style), toggle_cols[0]);
+
+                let f8_env_style = if secret_modal.active_field == 8 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                let env_label = format!("  [{}] Persist in .env (Space)", if secret_modal.save_to_env { "X" } else { " " });
+                f.render_widget(Paragraph::new(env_label).style(f8_env_style), toggle_cols[1]);
+
+                // Field 7: Error or navigation hint
+                if let Some(ref err) = secret_modal.error_msg {
+                    f.render_widget(Paragraph::new(format!(" ⚠️ {}", err)).style(Style::default().fg(Color::LightRed)), field_layout[7]);
+                } else {
+                    f.render_widget(Paragraph::new("  Tab: Next Field | Space: Toggle | Enter: Save Secret | Esc: Cancel").style(Style::default().fg(Color::DarkGray)), field_layout[7]);
+                }
+
+                // Field 8: Buttons
+                let save_btn_style = if secret_modal.active_field == 9 {
+                    Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                let cancel_btn_style = if secret_modal.active_field == 10 {
+                    Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let buttons = Line::from(vec![
+                    Span::styled(" [ Save & Attach Secret ] ", save_btn_style),
+                    Span::raw("    "),
+                    Span::styled(" [ Cancel ] ", cancel_btn_style),
+                ]);
+                f.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), field_layout[8]);
             } else if new_asset_modal.is_open {
                 let popup_width = 62.min(f.area().width.saturating_sub(4));
                 let popup_height = 16.min(f.area().height.saturating_sub(2));
@@ -2344,33 +2719,88 @@ pub fn run_ide_loop(
                     if key.code == KeyCode::Esc {
                         attach_modal.is_open = false;
                     } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
-                        attach_modal.active_field = (attach_modal.active_field + 1) % 6;
+                        attach_modal.active_field = (attach_modal.active_field + 1) % 7;
                     } else if key.code == KeyCode::BackTab || key.code == KeyCode::Up {
-                        attach_modal.active_field = if attach_modal.active_field == 0 { 5 } else { attach_modal.active_field - 1 };
+                        attach_modal.active_field = if attach_modal.active_field == 0 { 6 } else { attach_modal.active_field - 1 };
+                    } else if attach_modal.active_field == 0 && (key.code == KeyCode::Left || key.code == KeyCode::Char('h')) {
+                        attach_modal.provider_index = if attach_modal.provider_index == 0 { 5 } else { attach_modal.provider_index - 1 };
+                    } else if attach_modal.active_field == 0 && (key.code == KeyCode::Right || key.code == KeyCode::Char('l')) {
+                        attach_modal.provider_index = (attach_modal.provider_index + 1) % 6;
+                    } else if attach_modal.active_field >= 5 && (key.code == KeyCode::Left || key.code == KeyCode::Right) {
+                        attach_modal.active_field = if attach_modal.active_field == 5 { 6 } else { 5 };
+                    } else if key.code == KeyCode::Char(' ') && attach_modal.active_field == 4 {
+                        attach_modal.read_only = !attach_modal.read_only;
                     } else if key.code == KeyCode::Enter {
-                        if attach_modal.active_field == 5 {
+                        if attach_modal.active_field == 6 {
                             attach_modal.is_open = false;
-                        } else if attach_modal.active_field == 3 {
+                        } else if attach_modal.active_field == 4 {
                             attach_modal.read_only = !attach_modal.read_only;
                         } else {
                             if attach_modal.path.trim().is_empty() {
                                 attach_modal.error_msg = Some("Database path or URI cannot be empty.".to_string());
                             } else {
+                                let provider = attach_modal.provider();
+                                let mut safe_path = attach_modal.path.trim().replace("'", "''");
                                 let alias = if attach_modal.alias.trim().is_empty() {
-                                    Path::new(attach_modal.path.trim())
-                                        .file_stem()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("attached_db")
-                                        .to_string()
+                                    match provider {
+                                        AttachProvider::MotherDuck => {
+                                            attach_modal.path.trim().trim_start_matches("md:").to_string()
+                                        }
+                                        AttachProvider::Quack => "quack_remote".to_string(),
+                                        AttachProvider::PostgreSQL => "pg_db".to_string(),
+                                        AttachProvider::MySQL => "mysql_db".to_string(),
+                                        _ => {
+                                            Path::new(attach_modal.path.trim())
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("attached_db")
+                                                .to_string()
+                                        }
+                                    }
                                 } else {
                                     attach_modal.alias.trim().to_string()
                                 };
 
-                                let safe_path = attach_modal.path.trim().replace("'", "''");
+                                match provider {
+                                    AttachProvider::SQLite => {
+                                        let _ = conn.execute("INSTALL sqlite; LOAD sqlite;", []);
+                                    }
+                                    AttachProvider::PostgreSQL => {
+                                        let _ = conn.execute("INSTALL postgres; LOAD postgres;", []);
+                                    }
+                                    AttachProvider::MySQL => {
+                                        let _ = conn.execute("INSTALL mysql; LOAD mysql;", []);
+                                    }
+                                    AttachProvider::MotherDuck => {
+                                        let _ = conn.execute("INSTALL motherduck; LOAD motherduck;", []);
+                                        if !attach_modal.token.trim().is_empty() {
+                                            let safe_token = attach_modal.token.trim().replace("'", "''");
+                                            let _ = conn.execute(&format!("SET motherduck_token='{}';", safe_token), []);
+                                        }
+                                        if !safe_path.starts_with("md:") {
+                                            safe_path = format!("md:{}", safe_path);
+                                        }
+                                    }
+                                    AttachProvider::Quack => {
+                                        if !safe_path.starts_with("quack://") && !safe_path.starts_with("http://") && !safe_path.starts_with("https://") {
+                                            let token_prefix = if !attach_modal.token.trim().is_empty() {
+                                                format!(":{}@", attach_modal.token.trim())
+                                            } else {
+                                                String::new()
+                                            };
+                                            safe_path = format!("quack://{}{}", token_prefix, safe_path);
+                                        }
+                                    }
+                                    AttachProvider::DuckDB => {}
+                                }
+
                                 let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, alias);
                                 let mut opts = Vec::new();
-                                if !attach_modal.db_type.trim().is_empty() {
-                                    opts.push(format!("TYPE {}", attach_modal.db_type.trim().to_uppercase()));
+                                match provider {
+                                    AttachProvider::SQLite => opts.push("TYPE SQLITE".to_string()),
+                                    AttachProvider::PostgreSQL => opts.push("TYPE POSTGRES".to_string()),
+                                    AttachProvider::MySQL => opts.push("TYPE MYSQL".to_string()),
+                                    _ => {}
                                 }
                                 if attach_modal.read_only {
                                     opts.push("READ_ONLY".to_string());
@@ -2392,45 +2822,160 @@ pub fn run_ide_loop(
                                 }
                             }
                         }
-                    } else if key.code == KeyCode::Char(' ') && attach_modal.active_field == 3 {
-                        attach_modal.read_only = !attach_modal.read_only;
                     } else if key.code == KeyCode::Backspace {
                         match attach_modal.active_field {
-                            0 => {
+                            1 => {
                                 attach_modal.path.pop();
                                 if !attach_modal.alias_is_custom {
                                     let stem = Path::new(&attach_modal.path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
                                     attach_modal.alias = stem.to_string();
                                 }
                             }
-                            1 => {
+                            2 => {
                                 attach_modal.alias.pop();
                                 attach_modal.alias_is_custom = true;
                             }
-                            2 => { attach_modal.db_type.pop(); }
+                            3 => { attach_modal.token.pop(); }
                             _ => {}
                         }
                     } else if let KeyCode::Char(c) = key.code {
                         if !key.modifiers.contains(KeyModifiers::CONTROL) {
                             match attach_modal.active_field {
-                                0 => {
+                                1 => {
                                     attach_modal.path.push(c);
                                     if !attach_modal.alias_is_custom {
                                         let stem = Path::new(&attach_modal.path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
                                         attach_modal.alias = stem.to_string();
                                     }
                                 }
-                                1 => {
+                                2 => {
                                     attach_modal.alias.push(c);
                                     attach_modal.alias_is_custom = true;
                                 }
-                                2 => { attach_modal.db_type.push(c); }
+                                3 => { attach_modal.token.push(c); }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else if secret_modal.is_open {
+                    if key.code == KeyCode::Esc {
+                        secret_modal.is_open = false;
+                    } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
+                        secret_modal.active_field = (secret_modal.active_field + 1) % 11;
+                    } else if key.code == KeyCode::BackTab || key.code == KeyCode::Up {
+                        secret_modal.active_field = if secret_modal.active_field == 0 { 10 } else { secret_modal.active_field - 1 };
+                    } else if secret_modal.active_field == 0 && (key.code == KeyCode::Left || key.code == KeyCode::Char('h')) {
+                        let prev = if secret_modal.provider_index == 0 { 4 } else { secret_modal.provider_index - 1 };
+                        secret_modal.set_provider(prev);
+                    } else if secret_modal.active_field == 0 && (key.code == KeyCode::Right || key.code == KeyCode::Char('l')) {
+                        let next = (secret_modal.provider_index + 1) % 5;
+                        secret_modal.set_provider(next);
+                    } else if secret_modal.active_field >= 9 && (key.code == KeyCode::Left || key.code == KeyCode::Right) {
+                        secret_modal.active_field = if secret_modal.active_field == 9 { 10 } else { 9 };
+                    } else if key.code == KeyCode::Char(' ') && secret_modal.active_field == 7 {
+                        secret_modal.use_ssl = !secret_modal.use_ssl;
+                    } else if key.code == KeyCode::Char(' ') && secret_modal.active_field == 8 {
+                        secret_modal.save_to_env = !secret_modal.save_to_env;
+                    } else if key.code == KeyCode::Enter {
+                        if secret_modal.active_field == 10 {
+                            secret_modal.is_open = false;
+                        } else if secret_modal.active_field == 7 {
+                            secret_modal.use_ssl = !secret_modal.use_ssl;
+                        } else if secret_modal.active_field == 8 {
+                            secret_modal.save_to_env = !secret_modal.save_to_env;
+                        } else {
+                            let safe_name = secret_modal.name.trim().replace("'", "''");
+                            let safe_key = secret_modal.key_id.trim().replace("'", "''");
+                            let safe_secret = secret_modal.secret_key.trim().replace("'", "''");
+                            let safe_region = secret_modal.region.trim().replace("'", "''");
+                            let safe_endpoint = secret_modal.endpoint.trim().replace("'", "''");
+
+                            if safe_name.is_empty() {
+                                secret_modal.error_msg = Some("Secret name cannot be empty.".to_string());
+                            } else {
+                                let _ = conn.execute("INSTALL httpfs; LOAD httpfs;", []);
+                                let mut clauses = vec!["TYPE S3".to_string()];
+                                if !safe_key.is_empty() {
+                                    clauses.push(format!("KEY_ID '{}'", safe_key));
+                                }
+                                if !safe_secret.is_empty() {
+                                    clauses.push(format!("SECRET '{}'", safe_secret));
+                                }
+                                if !safe_region.is_empty() {
+                                    clauses.push(format!("REGION '{}'", safe_region));
+                                }
+                                if !safe_endpoint.is_empty() {
+                                    clauses.push(format!("ENDPOINT '{}'", safe_endpoint));
+                                }
+                                clauses.push(format!("USE_SSL {}", secret_modal.use_ssl));
+
+                                let secret_body = clauses.join(", ");
+                                let persistent_sql = format!("CREATE OR REPLACE PERSISTENT SECRET {} ({});", safe_name, secret_body);
+                                let create_res = conn.execute(&persistent_sql, []).or_else(|_| {
+                                    let temp_sql = format!("CREATE OR REPLACE SECRET {} ({});", safe_name, secret_body);
+                                    conn.execute(&temp_sql, [])
+                                });
+
+                                match create_res {
+                                    Ok(_) => {
+                                        if secret_modal.save_to_env {
+                                            let _ = crate::engine::save_cloud_secret_to_env(
+                                                project_dir,
+                                                secret_modal.key_id.trim(),
+                                                secret_modal.secret_key.trim(),
+                                                secret_modal.region.trim(),
+                                                secret_modal.endpoint.trim(),
+                                                secret_modal.bucket.trim(),
+                                            );
+                                        }
+
+                                        let mut bucket = secret_modal.bucket.trim().to_string();
+                                        if !bucket.is_empty() {
+                                            if !bucket.starts_with("s3://") && !bucket.starts_with("r2://") && !bucket.starts_with("gcs://") {
+                                                bucket = format!("s3://{}", bucket);
+                                            }
+                                            unsafe {
+                                                std::env::set_var("DUCKPACK_S3_BUCKET", &bucket);
+                                            }
+                                        }
+
+                                        secret_modal.is_open = false;
+                                        status_msg = format!("Configured cloud secret '{}' successfully.", safe_name);
+                                        trigger_explorer_refresh = true;
+                                    }
+                                    Err(e) => {
+                                        secret_modal.error_msg = Some(format!("Secret Error: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                    } else if key.code == KeyCode::Backspace {
+                        match secret_modal.active_field {
+                            1 => { secret_modal.name.pop(); }
+                            2 => { secret_modal.key_id.pop(); }
+                            3 => { secret_modal.secret_key.pop(); }
+                            4 => { secret_modal.region.pop(); }
+                            5 => { secret_modal.endpoint.pop(); }
+                            6 => { secret_modal.bucket.pop(); }
+                            _ => {}
+                        }
+                    } else if let KeyCode::Char(c) = key.code {
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match secret_modal.active_field {
+                                1 => { secret_modal.name.push(c); }
+                                2 => { secret_modal.key_id.push(c); }
+                                3 => { secret_modal.secret_key.push(c); }
+                                4 => { secret_modal.region.push(c); }
+                                5 => { secret_modal.endpoint.push(c); }
+                                6 => { secret_modal.bucket.push(c); }
                                 _ => {}
                             }
                         }
                     }
                 } else if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     attach_modal.reset();
+                } else if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    secret_modal.reset();
                 } else if show_help || show_schema_visualizer {
                     if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') || key.code == KeyCode::Char('?') {
                         show_help = false;
@@ -2723,6 +3268,26 @@ pub fn run_ide_loop(
                                         }
                                     }
                                 }
+                            } else {
+                                if let Some(selected) = explorer_state.selected() {
+                                    if selected < explorer_items.len() {
+                                        match &explorer_items[selected].node_type {
+                                            NodeType::Group if explorer_items[selected].name == "Secrets & Cloud Buckets" => {
+                                                secret_modal.reset();
+                                            }
+                                            NodeType::AddSecretAction | NodeType::CloudSecret { .. } | NodeType::CloudBucket { .. } | NodeType::CloudFile { .. } => {
+                                                secret_modal.reset();
+                                            }
+                                            _ => {
+                                                attach_modal.reset();
+                                            }
+                                        }
+                                    } else {
+                                        attach_modal.reset();
+                                    }
+                                } else {
+                                    attach_modal.reset();
+                                }
                             }
                         } else if key.code == KeyCode::Char('v') || key.code == KeyCode::Char('V') {
                             if explorer_mode == ExplorerMode::Project {
@@ -2809,6 +3374,44 @@ pub fn run_ide_loop(
                                             execute_query = true;
                                             let display_table = if schema_name == "main" { item_name.clone() } else { format!("{}.{}", schema_name, item_name) };
                                             status_msg = format!("Queried table '{}'", display_table);
+                                        }
+                                        NodeType::CloudFile { path, is_dir } if !*is_dir => {
+                                            let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+                                            let read_fn = match ext.as_str() {
+                                                "parquet" => "read_parquet",
+                                                "csv" => "read_csv",
+                                                "json" | "jsonl" | "ndjson" => "read_json",
+                                                _ => "read_parquet",
+                                            };
+                                            let query = format!("SELECT * FROM {}('{}') LIMIT 500;", read_fn, path);
+                                            let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
+                                            if !current_is_empty {
+                                                tabs.push(EditorTab::new());
+                                                active_tab_index = tabs.len() - 1;
+                                            }
+                                            tabs[active_tab_index].textarea = TextArea::from(vec![query]);
+                                            tabs[active_tab_index].textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
+                                            tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                                            tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+                                            focus = FocusPane::Editor;
+                                            execute_query = true;
+                                            let fname = path.split('/').last().unwrap_or(path);
+                                            status_msg = format!("Queried cloud file '{}'", fname);
+                                        }
+                                        NodeType::CloudSecret { name, .. } => {
+                                            let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
+                                            if !current_is_empty {
+                                                tabs.push(EditorTab::new());
+                                                active_tab_index = tabs.len() - 1;
+                                            }
+                                            let query = format!("SELECT * FROM duckdb_secrets() WHERE name = '{}';", name);
+                                            tabs[active_tab_index].textarea = TextArea::from(vec![query]);
+                                            tabs[active_tab_index].textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
+                                            tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                                            tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+                                            focus = FocusPane::Editor;
+                                            execute_query = true;
+                                            status_msg = format!("Inspecting secret '{}'", name);
                                         }
                                         _ => {}
                                     }
@@ -3505,6 +4108,66 @@ pub fn run_ide_loop(
                         NodeType::Column { .. } => {}
                         NodeType::Macro => {}
                         NodeType::Trigger { .. } => {}
+                        NodeType::AddSecretAction => {
+                            secret_modal.reset();
+                        }
+                        NodeType::CloudSecret { name, .. } => {
+                            let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
+                            if !current_is_empty {
+                                tabs.push(EditorTab::new());
+                                active_tab_index = tabs.len() - 1;
+                            }
+                            let query = format!("SELECT * FROM duckdb_secrets() WHERE name = '{}';", name);
+                            tabs[active_tab_index].textarea = TextArea::from(vec![query]);
+                            tabs[active_tab_index].textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
+                            tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                            tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+                            focus = FocusPane::Editor;
+                            status_msg = format!("Inspecting secret '{}'", name);
+                        }
+                        NodeType::CloudBucket { bucket } => {
+                            let key = format!("bucket:{}", bucket);
+                            if expanded_groups.contains(&key) {
+                                expanded_groups.remove(&key);
+                            } else {
+                                expanded_groups.insert(key);
+                            }
+                            explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+                            explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
+                        }
+                        NodeType::CloudFile { path, is_dir } => {
+                            if is_dir {
+                                let key = format!("bucket_dir:{}", path);
+                                if expanded_groups.contains(&key) {
+                                    expanded_groups.remove(&key);
+                                } else {
+                                    expanded_groups.insert(key);
+                                }
+                                explorer_items = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+                                explorer_state.select(Some(selected.min(explorer_items.len().saturating_sub(1))));
+                            } else {
+                                let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+                                let read_fn = match ext.as_str() {
+                                    "parquet" => "read_parquet",
+                                    "csv" => "read_csv",
+                                    "json" | "jsonl" | "ndjson" => "read_json",
+                                    _ => "read_parquet",
+                                };
+                                let query = format!("SELECT * FROM {}('{}') LIMIT 500;", read_fn, path);
+                                let current_is_empty = tabs[active_tab_index].active_file.is_none() && tabs[active_tab_index].textarea.lines().join("").trim().is_empty();
+                                if !current_is_empty {
+                                    tabs.push(EditorTab::new());
+                                    active_tab_index = tabs.len() - 1;
+                                }
+                                tabs[active_tab_index].textarea = TextArea::from(vec![query]);
+                                tabs[active_tab_index].textarea.set_search_pattern(SQL_KEYWORD_PATTERN).unwrap_or(());
+                                tabs[active_tab_index].textarea.set_search_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                                tabs[active_tab_index].textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+                                focus = FocusPane::Editor;
+                                let fname = path.split('/').last().unwrap_or(&path);
+                                status_msg = format!("Queried cloud file '{}'", fname);
+                            }
+                        }
                     }
                 }
             }
@@ -4613,6 +5276,88 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_attach_modal_state_providers() {
+        let mut modal = AttachModalState::new();
+        assert_eq!(modal.provider(), AttachProvider::DuckDB);
+        assert!(!modal.is_open);
+
+        modal.reset();
+        assert!(modal.is_open);
+        assert_eq!(modal.active_field, 1);
+
+        modal.provider_index = 1;
+        assert_eq!(modal.provider(), AttachProvider::Quack);
+
+        modal.provider_index = 2;
+        assert_eq!(modal.provider(), AttachProvider::MotherDuck);
+
+        modal.provider_index = 3;
+        assert_eq!(modal.provider(), AttachProvider::SQLite);
+
+        modal.provider_index = 4;
+        assert_eq!(modal.provider(), AttachProvider::PostgreSQL);
+    }
+
+    #[test]
+    fn test_secret_modal_state_and_providers() {
+        let mut modal = SecretModalState::new();
+        assert_eq!(modal.provider(), CloudProvider::S3);
+        assert_eq!(modal.region, "us-east-1");
+        assert!(modal.use_ssl);
+        assert!(modal.save_to_env);
+
+        modal.set_provider(1); // Cloudflare R2
+        assert_eq!(modal.provider(), CloudProvider::CloudflareR2);
+        assert_eq!(modal.region, "auto");
+        assert!(modal.endpoint.contains("r2.cloudflarestorage.com"));
+
+        modal.set_provider(2); // MinIO
+        assert_eq!(modal.provider(), CloudProvider::MinIO);
+        assert_eq!(modal.endpoint, "localhost:9000");
+        assert!(!modal.use_ssl);
+
+        modal.reset();
+        assert_eq!(modal.provider(), CloudProvider::S3);
+        assert!(modal.is_open);
+    }
+
+    #[test]
+    fn test_explorer_nodes_secrets_and_cloud_buckets() {
+        let conn = Connection::open_in_memory().unwrap();
+        let meta = ExplorerMetadata {
+            databases: vec![],
+            active_database: "memory".to_string(),
+            tables: vec![],
+            table_counts: HashMap::new(),
+            views: vec![],
+            temp_tables: HashSet::new(),
+            temp_views: HashSet::new(),
+            macros: vec![],
+            triggers: vec![],
+            queries: vec![],
+            dictionary: vec![],
+            secrets: vec![("my_s3_secret".to_string(), "s3".to_string())],
+            cloud_buckets: vec!["s3://analytics-lake".to_string()],
+        };
+
+        let mut expanded_groups = HashSet::new();
+        let expanded_tables = HashSet::new();
+
+        // Not expanded
+        let nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
+        let sec_group = nodes.iter().find(|n| n.name == "Secrets & Cloud Buckets").expect("Secrets & Cloud Buckets group");
+        assert!(sec_group.display.contains("Secrets & Cloud (2)"));
+        assert!(!nodes.iter().any(|n| n.name == "my_s3_secret"));
+
+        // Expanded
+        expanded_groups.insert("Secrets & Cloud Buckets".to_string());
+        let nodes_expanded = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
+        assert!(nodes_expanded.iter().any(|n| n.name == "add_cloud_secret"));
+        assert!(nodes_expanded.iter().any(|n| n.name == "my_s3_secret"));
+        assert!(nodes_expanded.iter().any(|n| n.name == "bucket:s3://analytics-lake"));
     }
 }
 
