@@ -27,14 +27,14 @@ db = "staging.duckdb"
 db = "prod.duckdb"
 EOF
 
-# 3. DuckIgnore rules
-cat << 'EOF' > "$DEMO_DIR/.duckignore"
+# 3. DuckDBIgnore rules
+cat << 'EOF' > "$DEMO_DIR/.duckdbignore"
 tables/ignored_*.sql
 queries/secret_*.sql
 EOF
 
 cat << 'EOF' > "$DEMO_DIR/tables/ignored_table.sql"
--- This file should be completely ignored by DuckPack because of .duckignore
+-- This file should be completely ignored by DuckPack because of .duckdbignore
 CREATE TABLE ignored_table (id INT);
 EOF
 

@@ -1,7 +1,19 @@
 [package]
 name = "duckpack"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
+
+[lib]
+name = "duckpack"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "duckpack"
+path = "src/main.rs"
+
+[features]
+default = []
+python = ["dep:pyo3"]
 
 [dependencies]
 anyhow = "1.0.103"
@@ -11,7 +23,8 @@ chrono = "0.4.45"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 crossterm = "0.28.1"
 dotenvy = "0.15.7"
-duckdb = { version = "1.10504.0", features = ["bundled"] }
+duckdb = { version = "1.20000.0", features = ["bundled"] }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"], optional = true }
 ratatui = "0.29.0"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -21,3 +34,4 @@ strsim = "0.10.0"
 tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.3"
 tui-textarea = { version = "0.7.0", features = ["search"] }
+

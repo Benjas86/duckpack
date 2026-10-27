@@ -1,0 +1,40 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "duckpack"
+version = "0.2.0"
+description = "Declarative schema management, interactive terminal IDE, and in-memory inspection for DuckDB"
+readme = "README.md"
+authors = [{ name = "Benjamen Terry", email = "benjamenjterry@gmail.com" }]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["duckdb", "schema", "migrations", "tui", "ide", "database", "sql"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+]
+
+[project.scripts]
+duckpack = "duckpack.cli:main"
+
+
+[tool.maturin]
+features = ["python"]
+bindings = "pyo3"
+module-name = "duckpack._duckpack"
+python-source = "python"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: live service integration tests (requires external daemon)",
+]
+

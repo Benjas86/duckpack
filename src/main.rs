@@ -1,25 +1,14 @@
 use std::panic;
-mod diff;
-mod tui;
-mod ide;
+use duckpack::diff;
+use duckpack::engine::*;
+use duckpack::ide;
+use duckpack::tui;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use duckdb::Connection;
 use std::fs;
-use std::path::{Path, PathBuf};
-use serde::Deserialize;
-use std::collections::HashMap;
-
-#[derive(Deserialize, Debug)]
-struct DuckpackConfig {
-    env: Option<HashMap<String, EnvConfig>>,
-}
-
-#[derive(Deserialize, Debug)]
-struct EnvConfig {
-    db: Option<String>,
-}
+use std::path::PathBuf;
 
 /// The core CLI argument parser configuration using `clap`.
 /// Dictates all available terminal commands for duckpack.
@@ -63,18 +52,50 @@ enum Commands {
         /// The connection string or path to the target DuckDB database
         #[arg(short, long, default_value = "local.duckdb")]
         db: String,
+        /// Target database catalog name if multiple databases are attached
+        #[arg(long, visible_alias = "catalog")]
+        database: Option<String>,
         /// Allow destructive drops (tables/columns)
         #[arg(long)]
         force_drop: bool,
         /// Apply automatically without showing the TUI
         #[arg(long)]
         auto_approve: bool,
+        /// Launch the interactive TUI (default behavior unless --auto-approve is specified)
+        #[arg(short, long)]
+        interactive: bool,
         /// Dry run mode: output migration SQL script to this file instead of applying
         #[arg(long)]
         out: Option<String>,
         /// Quack authentication token
         #[arg(long)]
         quack_token: Option<String>,
+        /// Disable SSL/TLS verification for Quack connection (plain HTTP)
+        #[arg(long, visible_alias = "insecure", alias = "quack-insecure")]
+        quack_disable_ssl: bool,
+    },
+    /// Show schema differences between project and target database
+    Diff {
+        /// The path to the DuckDB project directory
+        #[arg(short, long, default_value = ".")]
+        project_dir: PathBuf,
+
+        /// The connection string or path to the target DuckDB database
+        #[arg(short, long, default_value = "local.duckdb")]
+        db: String,
+
+        /// Target database catalog name if multiple databases are attached
+        #[arg(long, visible_alias = "catalog")]
+        database: Option<String>,
+
+        /// Launch the interactive TUI to review schema diffs and migrations
+        #[arg(short, long)]
+        interactive: bool,
+
+        /// Quack authentication token
+        #[arg(long)]
+        quack_token: Option<String>,
+
         /// Disable SSL/TLS verification for Quack connection (plain HTTP)
         #[arg(long, visible_alias = "insecure", alias = "quack-insecure")]
         quack_disable_ssl: bool,
@@ -115,6 +136,9 @@ enum Commands {
         /// The connection string or path to the target DuckDB database
         #[arg(short, long, default_value = "local.duckdb")]
         db: String,
+        /// Target database catalog name if multiple databases are attached
+        #[arg(long, visible_alias = "catalog")]
+        database: Option<String>,
         /// The remote server SSH target (e.g. user@10.0.0.5)
         #[arg(long)]
         remote: Option<String>,
@@ -131,138 +155,90 @@ enum Commands {
         #[arg(long, visible_alias = "insecure", alias = "quack-insecure")]
         quack_disable_ssl: bool,
     },
+    /// Manage DuckPack Python bindings in the active Python environment
+    Python {
+        #[command(subcommand)]
+        command: PythonCommands,
+    },
 }
 
-/// Determines if the provided database string refers to a remote motherduck instance.
-fn is_remote(db: &str) -> bool {
-    db.starts_with("md:") || db.starts_with("motherduck:")
-}
-
-/// Determines if the provided quack connection URI targets the 0.0.0.0 local unspecified address.
-fn is_quack_zero_host(db: &str) -> bool {
-    let stripped = db.strip_prefix("quack://").or_else(|| db.strip_prefix("quack:")).unwrap_or(db);
-    stripped.starts_with("0.0.0.0") || stripped.starts_with("[::]")
-}
-
-/// Determines if SSL should be disabled for a Quack connection.
-/// Returns true if explicitly flagged, if DUCKDB_QUACK_DISABLE_SSL is set, or if connecting to 0.0.0.0.
-pub(crate) fn should_disable_quack_ssl(db: &str, flag_disable_ssl: bool) -> bool {
-    flag_disable_ssl
-        || std::env::var("DUCKDB_QUACK_DISABLE_SSL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-            .unwrap_or(false)
-        || is_quack_zero_host(db)
-}
-
-/// Builds the SQL ATTACH statement for a Quack database.
-pub(crate) fn build_quack_attach_sql(db: &str, disable_ssl: bool) -> String {
-    let safe_db = db.replace("'", "''");
-    if disable_ssl {
-        format!("ATTACH '{}' AS target_db (DISABLE_SSL true);", safe_db)
-    } else {
-        format!("ATTACH '{}' AS target_db;", safe_db)
-    }
-}
-
-/// Connects to the target DuckDB database (local, motherduck remote, or quack remote).
-fn connect_target_db(
-    db: &str,
-    quack_token: Option<&str>,
-    quack_disable_ssl: bool,
-) -> Result<Connection> {
-    if db.starts_with("quack:") {
-        let conn = Connection::open_in_memory()
-            .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
-        conn.execute_batch("INSTALL quack; LOAD quack;")
-            .with_context(|| "Failed to install/load quack extension")?;
-
-        let token = quack_token
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("DUCKDB_QUACK_TOKEN").ok());
-
-        if let Some(token) = token {
-            let safe_token = token.replace("'", "''");
-            conn.execute(&format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token), [])
-                .with_context(|| "Failed to set quack auth secret")?;
-        }
-
-        let disable_ssl = should_disable_quack_ssl(db, quack_disable_ssl);
-        let attach_sql = build_quack_attach_sql(db, disable_ssl);
-
-        conn.execute(&attach_sql, [])
-            .with_context(|| "Failed to attach remote database")?;
-        conn.execute("USE target_db;", [])
-            .with_context(|| "Failed to switch to target database")?;
-        Ok(conn)
-    } else if is_remote(db) {
-        let conn = Connection::open_in_memory()
-            .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
-        let safe_db = db.replace("'", "''");
-        conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-            .with_context(|| "Failed to attach remote database")?;
-        conn.execute("USE target_db;", [])
-            .with_context(|| "Failed to switch to target database")?;
-        Ok(conn)
-    } else {
-        let conn = Connection::open_in_memory()
-            .with_context(|| "Failed to open in-memory DB for local ATTACH")?;
-        let safe_db = db.replace("'", "''");
-        conn.execute(&format!("ATTACH '{}' AS target_db;", safe_db), [])
-            .with_context(|| "Failed to attach local database")?;
-        conn.execute("USE target_db;", [])
-            .with_context(|| "Failed to switch to target database")?;
-        Ok(conn)
-    }
+/// Subcommands for the `duckpack python` CLI helper
+#[derive(Subcommand, Debug, PartialEq)]
+enum PythonCommands {
+    /// Install duckpack Python package into the active Python environment
+    Install {
+        /// Upgrade existing package
+        #[arg(long)]
+        upgrade: bool,
+    },
+    /// Check whether duckpack Python package is installed in the active Python environment
+    Status,
 }
 
 /// The main entry point for the DuckPack CLI.
 /// Parses the arguments and delegates to the appropriate command handler.
 fn main() -> Result<()> {
     panic::set_hook(Box::new(|info| { let bt = std::backtrace::Backtrace::force_capture(); let _ = std::fs::write("panic.log", format!("Panic: {:?}\n\n{}", info, bt)); }));
-    let mut cli = Cli::parse();
+    let embedded_ver = duckpack::engine::embedded_duckdb_version();
+    let version_str: &'static str = Box::leak(format!("{} (DuckDB engine: {})", env!("CARGO_PKG_VERSION"), embedded_ver).into_boxed_str());
+    let matches = Cli::command().version(version_str).get_matches();
+    let mut cli = Cli::from_arg_matches(&matches)?;
 
-    let project_dir = match &cli.command {
-        Commands::Init { project_dir } => project_dir,
-        Commands::Build { project_dir } => project_dir,
-        Commands::Apply { project_dir, .. } => project_dir,
-        Commands::Compile { project_dir, .. } => project_dir,
-        Commands::Deploy { project_dir, .. } => project_dir,
-        Commands::Explore { project_dir, .. } => project_dir,
+    let default_dir = PathBuf::from(".");
+    let project_dir: PathBuf = match &cli.command {
+        Commands::Init { project_dir } => project_dir.clone(),
+        Commands::Build { project_dir } => project_dir.clone(),
+        Commands::Apply { project_dir, .. } => project_dir.clone(),
+        Commands::Diff { project_dir, .. } => project_dir.clone(),
+        Commands::Compile { project_dir, .. } => project_dir.clone(),
+        Commands::Deploy { project_dir, .. } => project_dir.clone(),
+        Commands::Explore { project_dir, .. } => project_dir.clone(),
+        Commands::Python { .. } => default_dir,
     };
+    let project_dir = &project_dir;
 
-    // Load .env file into process environment if it exists
-    let env_file = if let Some(e) = &cli.env {
-        format!(".env.{}", e)
-    } else {
-        ".env".to_string()
-    };
-    dotenvy::from_path(project_dir.join(env_file)).ok();
-
-    // Check for duckpack.toml
-    let toml_path = project_dir.join("duckpack.toml");
-    if toml_path.exists() {
-        if let Ok(content) = fs::read_to_string(&toml_path) {
-            if let Ok(config) = toml::from_str::<DuckpackConfig>(&content) {
-                if let Some(cli_env) = &cli.env {
-                    if let Some(envs) = config.env {
-                        if let Some(env_config) = envs.get(cli_env) {
-                            if let Some(toml_db) = &env_config.db {
-                                // Override the db argument for applicable commands
-                                match &mut cli.command {
-                                    Commands::Apply { db, .. } |
-                                    Commands::Deploy { db, .. } |
-                                    Commands::Explore { db, .. } => {
-                                        *db = toml_db.clone();
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
+    // Apply target/env configuration overrides, defaults, and token resolution via unified TargetResolver
+    match &mut cli.command {
+        Commands::Apply { db, quack_token, quack_disable_ssl, .. } |
+        Commands::Diff { db, quack_token, quack_disable_ssl, .. } |
+        Commands::Explore { db, quack_token, quack_disable_ssl, .. } => {
+            if quack_token.is_some() {
+                eprintln!("Tip: Passing authentication tokens via CLI flags can expose credentials in shell history. Consider storing your token in .env (QUACK_TOKEN) or duckpack.toml.");
             }
+            let spec = TargetResolver::resolve(
+                project_dir,
+                cli.env.as_deref(),
+                Some(db.as_str()),
+                quack_token.as_deref(),
+                Some(*quack_disable_ssl),
+                None,
+            );
+            let mut resolved_db = spec.db;
+            if !spec.is_quack && !spec.is_motherduck && !std::path::Path::new(&resolved_db).is_absolute() && project_dir != std::path::Path::new(".") {
+                resolved_db = project_dir.join(&resolved_db).to_string_lossy().to_string();
+            }
+            *db = resolved_db;
+            *quack_token = spec.token;
+            *quack_disable_ssl = spec.disable_ssl;
         }
+        Commands::Deploy { db, .. } => {
+            let spec = TargetResolver::resolve(
+                project_dir,
+                cli.env.as_deref(),
+                Some(db.as_str()),
+                None,
+                None,
+                None,
+            );
+            let mut resolved_db = spec.db;
+            if !spec.is_quack && !spec.is_motherduck && !std::path::Path::new(&resolved_db).is_absolute() && project_dir != std::path::Path::new(".") {
+                resolved_db = project_dir.join(&resolved_db).to_string_lossy().to_string();
+            }
+            *db = resolved_db;
+        }
+        _ => {}
     }
+
 
     match &cli.command {
         Commands::Init { project_dir } => {
@@ -275,256 +251,149 @@ fn main() -> Result<()> {
             let _ = build_shadow_db(project_dir)?;
             println!("Build successful! All SQL syntax is valid.");
         }
-        Commands::Apply { project_dir, db, force_drop, auto_approve, out, quack_token, quack_disable_ssl } => {
+        Commands::Diff { project_dir, db, database, interactive, quack_token, quack_disable_ssl } => {
             if !project_dir.exists() {
                 eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
                 return Ok(());
             }
 
-            let mut terminal = if !*auto_approve && out.is_none() {
-                ratatui::crossterm::terminal::enable_raw_mode()?;
-                let mut stdout = std::io::stdout();
-                ratatui::crossterm::execute!(stdout, ratatui::crossterm::terminal::EnterAlternateScreen, ratatui::crossterm::event::EnableMouseCapture)?;
-                let backend = ratatui::backend::CrosstermBackend::new(stdout);
-                Some(ratatui::Terminal::new(backend)?)
-            } else {
-                None
-            };
-
-            let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh.");
-            let mut current_force_drop = *force_drop;
-            let mut inspect_data: Option<(String, Vec<String>, Vec<Vec<String>>, i64)> = None;
-
-            loop {
-                let shadow_conn = build_shadow_db(project_dir)?;
-                
-                let target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
-                
-                let shadow_schemas = diff::get_schemas(&shadow_conn)?;
-                let target_schemas = diff::get_schemas(&target_conn)?;
-                let shadow_schema = diff::get_schema(&shadow_conn)?;
-                let target_schema = diff::get_schema(&target_conn)?;
-                let shadow_views = diff::get_views(&shadow_conn)?;
-                let target_views = diff::get_views(&target_conn)?;
-                let shadow_macros = diff::get_macros(&shadow_conn)?;
-                let target_macros = diff::get_macros(&target_conn)?;
-
-                let mut ignore_list = Vec::new();
-                if let Ok(ignore_content) = std::fs::read_to_string(project_dir.join(".duckdbignore")) {
-                    for line in ignore_content.lines() {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                            ignore_list.push(trimmed.to_string());
-                        }
-                    }
-                }
-
-                let mut diff_result = diff::compute_diff(
-                    &shadow_schemas,
-                    &target_schemas,
-                    &shadow_schema, 
-                    &target_schema, 
-                    &shadow_views, 
-                    &target_views, 
-                    &shadow_macros, 
-                    &target_macros, 
+            if *interactive {
+                return run_diff_review_tui(
                     project_dir,
-                    &ignore_list
+                    db,
+                    database.as_deref(),
+                    cli.env.as_deref(),
+                    quack_token.as_deref(),
+                    *quack_disable_ssl,
+                    false,
+                    None,
                 );
+            }
 
-                if let Some(out_file) = out {
-                    let mut script = String::new();
-                    for item in &diff_result.items {
-                        let is_drop = matches!(item.item_type, diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro);
-                        if is_drop && !*force_drop {
-                            continue;
-                        }
-                        if !item.sql.trim().is_empty() {
-                            script.push_str(&item.sql);
-                            if !item.sql.trim().ends_with(';') {
-                                script.push(';');
-                            }
-                            script.push_str("\n\n");
-                        }
-                    }
-                    if let Err(e) = std::fs::write(out_file, script) {
-                        eprintln!("Error writing dry-run script: {}", e);
-                    } else {
-                        println!("Dry-run script successfully written to {}", out_file);
-                    }
-                    break;
+            let configured_catalog = database.clone().or_else(|| resolve_project_catalog(project_dir, cli.env.as_deref()));
+            let shadow_conn = build_shadow_db(project_dir)?;
+            let target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+            let active_catalog = diff::validate_target_catalog(&target_conn, configured_catalog.as_deref(), false)?;
+
+            let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
+            let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
+            let shadow_schema = diff::get_schema(&shadow_conn, None)?;
+            let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
+            let shadow_views = diff::get_views(&shadow_conn, None)?;
+            let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
+            let shadow_macros = diff::get_macros(&shadow_conn, None)?;
+            let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
+            let shadow_triggers = diff::get_triggers(&shadow_conn, None)?;
+            let target_triggers = diff::get_triggers(&target_conn, Some(&active_catalog))?;
+            let ignore_list = load_ignore_rules(project_dir);
+
+            let diff_result = diff::compute_diff(
+                &shadow_schemas,
+                &target_schemas,
+                &shadow_schema, 
+                &target_schema, 
+                &shadow_views, 
+                &target_views, 
+                &shadow_macros, 
+                &target_macros, 
+                &shadow_triggers,
+                &target_triggers,
+                project_dir,
+                &ignore_list
+            );
+
+            let unignored_items: Vec<_> = diff_result.items.iter().filter(|i| !i.ignored).collect();
+            if unignored_items.is_empty() {
+                println!("Target database catalog '{}' is up to date (0 pending changes).", active_catalog);
+            } else {
+                println!("Found {} pending change(s) for catalog '{}':", unignored_items.len(), active_catalog);
+                for item in unignored_items {
+                    println!("  • {:?}: {}", item.item_type, item.obj_name);
                 }
+            }
+        }
+        Commands::Apply { project_dir, db, database, force_drop, auto_approve, interactive: _, out, quack_token, quack_disable_ssl } => {
+            if !project_dir.exists() {
+                eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
+                return Ok(());
+            }
 
-                if *auto_approve {
-                    let remote = is_remote(db);
-                    let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir);
+            if *auto_approve {
+                let configured_catalogs = if let Some(d) = database {
+                    vec![d.clone()]
+                } else {
+                    let cats = resolve_project_catalogs(project_dir, cli.env.as_deref());
+                    if cats.is_empty() {
+                        let init_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                        let active = diff::validate_target_catalog(&init_conn, None, true)?;
+                        vec![active]
+                    } else {
+                        cats
+                    }
+                };
+
+                let remote = is_remote(db);
+                let mut total_applied = 0;
+                for target_cat in &configured_catalogs {
+                    let target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                    let active_catalog = diff::validate_target_catalog(&target_conn, Some(target_cat), true)?;
+                    let shadow_conn = build_shadow_db(project_dir)?;
+                    let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
+                    let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
+                    let shadow_schema = diff::get_schema(&shadow_conn, None)?;
+                    let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
+                    let shadow_views = diff::get_views(&shadow_conn, None)?;
+                    let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
+                    let shadow_macros = diff::get_macros(&shadow_conn, None)?;
+                    let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
+                    let shadow_triggers = diff::get_triggers(&shadow_conn, None)?;
+                    let target_triggers = diff::get_triggers(&target_conn, Some(&active_catalog))?;
+                    let ignore_list = load_ignore_rules(project_dir);
+
+                    let diff_result = diff::compute_diff(
+                        &shadow_schemas,
+                        &target_schemas,
+                        &shadow_schema, 
+                        &target_schema, 
+                        &shadow_views, 
+                        &target_views, 
+                        &shadow_macros, 
+                        &target_macros, 
+                        &shadow_triggers,
+                        &target_triggers,
+                        project_dir,
+                        &ignore_list
+                    );
+
+                    let pending_count = diff_result.items.iter().filter(|i| i.selected && !i.ignored).count();
+                    if pending_count == 0 {
+                        println!("Target catalog '{}' is up to date (0 pending changes).", active_catalog);
+                        continue;
+                    }
+
+                    let apply_success = apply_diff(&target_conn, &diff_result, *force_drop, remote, project_dir, Some(&active_catalog));
                     if apply_success.is_ok() {
-                        println!("Changes applied automatically!");
+                        println!("✓ Successfully applied {} change(s) automatically to catalog '{}'!", pending_count, active_catalog);
+                        total_applied += pending_count;
                     } else {
-                        eprintln!("Error applying schema: {:?}", apply_success.err());
-                    }
-                    break;
-                }
-
-                if let Some(term) = &mut terminal {
-                    match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data, &db)? {
-                        tui::TuiAction::Quit => {
-                            break;
-                        }
-                    tui::TuiAction::CopyStatus => {
-                        let _ = std::fs::write("duckpack.log", &status_msg);
-                        status_msg = "Status text copied to duckpack.log!".to_string();
-                        continue;
-                    }
-                    tui::TuiAction::Refresh => {
-                        status_msg = "Refreshed schema from disk.".to_string();
-                        continue;
-                    }
-                    tui::TuiAction::ToggleDestructiveMode => {
-                        current_force_drop = !current_force_drop;
-                        status_msg = if current_force_drop {
-                            "Destructive Mode ENABLED. Drops will be executed.".to_string()
-                        } else {
-                            "Destructive Mode DISABLED. Drops will be ignored.".to_string()
-                        };
-                        continue;
-                    }
-                    tui::TuiAction::Inspect { obj_name } => {
-                        let safe_obj = obj_name.replace("'", "''");
-                        
-                        let mut cols = Vec::new();
-                        if let Ok(mut pragma_stmt) = target_conn.prepare(&format!("PRAGMA table_info('{}')", safe_obj)) {
-                            if let Ok(mut pragma_rows) = pragma_stmt.query([]) {
-                                while let Ok(Some(row)) = pragma_rows.next() {
-                                    if let Ok(col_name) = row.get::<_, String>(1) {
-                                        cols.push(col_name);
-                                    }
-                                }
-                            }
-                        }
-
-                        if cols.is_empty() {
-                            status_msg = format!("Cannot inspect '{}': Does not exist in target database yet.", obj_name);
-                        } else {
-                            let mut row_count = 0;
-                            if let Ok(mut count_stmt) = target_conn.prepare(&format!("SELECT count(*) FROM \"{}\"", safe_obj)) {
-                                if let Ok(mut count_rows) = count_stmt.query([]) {
-                                    if let Ok(Some(row)) = count_rows.next() {
-                                        row_count = row.get::<_, i64>(0).unwrap_or(0);
-                                    }
-                                }
-                            }
-
-                            let cast_cols = cols.iter().map(|c| format!("CAST(\"{}\" AS VARCHAR)", c)).collect::<Vec<_>>().join(", ");
-                            if let Ok(mut stmt) = target_conn.prepare(&format!("SELECT {} FROM \"{}\" LIMIT 5", cast_cols, safe_obj)) {
-                                if let Ok(mut db_rows) = stmt.query([]) {
-                                    let mut rows = Vec::new();
-                                    while let Ok(Some(row)) = db_rows.next() {
-                                        let mut str_row = Vec::new();
-                                        for i in 0..cols.len() {
-                                            let val: String = row.get(i).unwrap_or_else(|_| "NULL".to_string());
-                                            str_row.push(val);
-                                        }
-                                        rows.push(str_row);
-                                    }
-                                    inspect_data = Some((obj_name, cols, rows, row_count));
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    tui::TuiAction::CloseInspect => {
-                        inspect_data = None;
-                        continue;
-                    }
-                    tui::TuiAction::Explore => {
-                        if let Some(term) = &mut terminal {
-                            ide::run_ide_loop(term, &target_conn, &project_dir, &db)?;
-                            term.clear()?;
-                        }
-                        continue;
-                    }
-                    tui::TuiAction::Apply => {
-                        status_msg = "Applying changes...".to_string();
-                        if let Some(term) = &mut terminal {
-                            let _ = tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, true, &inspect_data, &db);
-                        }
-
-                        let remote = is_remote(db);
-                        if !remote {
-                            let db_path = PathBuf::from(db);
-                            let mut b_path = db_path.clone();
-                            b_path.set_extension("duckdb.bak");
-                            if db_path.exists() {
-                                let _ = fs::copy(&db_path, &b_path);
-                            }
-                            
-                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir);
-                            
-                            if apply_success.is_ok() {
-                                status_msg = "Changes applied successfully!".to_string();
-                                if b_path.exists() {
-                                    fs::remove_file(&b_path).ok();
-                                }
-                            } else {
-                                status_msg = format!("Error applying schema: {:?}", apply_success.err());
-                                drop(target_conn); 
-                                if b_path.exists() {
-                                    let _ = fs::copy(&b_path, &db_path);
-                                    fs::remove_file(&b_path).ok();
-                                }
-                            }
-                        } else {
-                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir);
-                            if apply_success.is_ok() {
-                                status_msg = "Changes applied successfully to remote database!".to_string();
-                            } else {
-                                status_msg = format!("Error applying schema to remote database: {:?}", apply_success.err());
-                            }
-                        }
-                    }
-
-                    tui::TuiAction::Pull { obj_name, item_type } => {
-                        let sql = match item_type {
-                            diff::DiffItemType::DropTable => {
-                                if let Some(target) = target_schema.get(&obj_name) {
-                                    Some(target.create_sql.clone())
-                                } else { None }
-                            }
-                            diff::DiffItemType::DropView => target_views.get(&obj_name).cloned(),
-                            diff::DiffItemType::DropMacro => target_macros.get(&obj_name).cloned(),
-                            _ => None,
-                        };
-
-                        if let Some(sql) = sql {
-                            let mut path = project_dir.clone();
-                            match item_type {
-                                diff::DiffItemType::DropTable => path.push("tables"),
-                                diff::DiffItemType::DropView => path.push("views"),
-                                diff::DiffItemType::DropMacro => path.push("macros"),
-                                _ => {}
-                            }
-                            path.push(format!("{}.sql", obj_name));
-                            if let Err(e) = std::fs::write(&path, sql) {
-                                status_msg = format!("Error pulling '{}': {}", obj_name, e);
-                            } else {
-                                status_msg = format!("Successfully pulled '{}' back into local project!", obj_name);
-                            }
-                        } else {
-                            status_msg = format!("Cannot pull '{}': Definition not found in remote DB.", obj_name);
-                        }
+                        eprintln!("Error applying schema to catalog '{}': {:?}", active_catalog, apply_success.err());
+                        return Err(anyhow::anyhow!("Apply failed for catalog '{}'", active_catalog));
                     }
                 }
-                }
+                println!("🦆 DuckPack CI/CD: Migration completed. Applied {} total change(s) across {} catalog(s).", total_applied, configured_catalogs.len());
+                return Ok(());
             }
 
-            if !*auto_approve {
-                if let Some(term) = &mut terminal {
-                    ratatui::crossterm::terminal::disable_raw_mode()?;
-                    ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::LeaveAlternateScreen, ratatui::crossterm::event::DisableMouseCapture)?;
-                    term.show_cursor()?;
-                }
-            }
+            run_diff_review_tui(
+                project_dir,
+                db,
+                database.as_deref(),
+                cli.env.as_deref(),
+                quack_token.as_deref(),
+                *quack_disable_ssl,
+                *force_drop,
+                out.as_deref(),
+            )?;
         }
         Commands::Compile { project_dir, out } => {
             println!("Compiling project {} into DuckPack: {}", project_dir.display(), out);
@@ -553,7 +422,7 @@ fn main() -> Result<()> {
             }
             println!("Compilation complete! Artifact: {}", out);
         }
-        Commands::Explore { project_dir, db, remote, port, auto_install, quack_token, quack_disable_ssl } => {
+        Commands::Explore { project_dir, db, database, remote, port, auto_install, quack_token, quack_disable_ssl } => {
             if let Some(r) = remote {
                 let mut remote_bin = "duckpack".to_string();
                 let mut remote_tmp_bin = None;
@@ -600,6 +469,9 @@ fn main() -> Result<()> {
                 
                 println!("Launching remote TUI over SSH...");
                 let mut remote_cmd = format!("{} explore --project-dir {} --db {}", remote_bin, remote_tmp_proj, db);
+                if let Some(cat) = database {
+                    remote_cmd.push_str(&format!(" --database {}", cat));
+                }
                 if let Some(token) = quack_token {
                     remote_cmd.push_str(&format!(" --quack-token {}", token));
                 }
@@ -634,11 +506,16 @@ fn main() -> Result<()> {
             }
 
             let mut project_dir = project_dir.clone();
-            if project_dir == std::path::PathBuf::from(".") && !db.starts_with("quack:") && !is_remote(&db) {
-                let db_path = std::path::PathBuf::from(&db);
-                if let Some(parent) = db_path.parent() {
-                    if parent != std::path::Path::new("") {
-                        project_dir = parent.to_path_buf();
+            if project_dir == std::path::PathBuf::from(".") {
+                let discovered = discover_project_dir(&project_dir);
+                if discovered != project_dir {
+                    project_dir = discovered;
+                } else if !db.starts_with("quack:") && !is_remote(&db) {
+                    let db_path = std::path::PathBuf::from(&db);
+                    if let Some(parent) = db_path.parent() {
+                        if parent != std::path::Path::new("") {
+                            project_dir = parent.to_path_buf();
+                        }
                     }
                 }
             }
@@ -655,8 +532,16 @@ fn main() -> Result<()> {
             let mut terminal = ratatui::Terminal::new(backend)?;
 
             let target_conn = connect_target_db(&db, quack_token.as_deref(), *quack_disable_ssl)?;
+            let configured_catalog = database.clone().or_else(|| resolve_project_catalog(&project_dir, cli.env.as_deref()));
+            if let Some(cat) = configured_catalog {
+                let _ = target_conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
+            }
 
-            ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db)?;
+            if db.starts_with("quack:") {
+                cleanup_orphaned_quack_bridges(&target_conn);
+            }
+
+            let ide_res = ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db, *quack_disable_ssl);
 
             ratatui::crossterm::terminal::disable_raw_mode()?;
             ratatui::crossterm::execute!(
@@ -664,6 +549,8 @@ fn main() -> Result<()> {
                 ratatui::crossterm::terminal::LeaveAlternateScreen,
                 ratatui::crossterm::event::DisableMouseCapture
             )?;
+
+            ide_res?;
         }
         Commands::Deploy { project_dir, remote, db, port, auto_install } => {
             println!("Deploying {} to {} at {}", project_dir.display(), remote, db);
@@ -761,333 +648,371 @@ fn main() -> Result<()> {
                 .arg(cleanup_cmd)
                 .status();
         }
+        Commands::Python { command } => {
+            match command {
+                PythonCommands::Status => {
+                    let embedded_ver = duckpack::engine::embedded_duckdb_version();
+                    println!("🦆 DuckPack CLI: v{}", env!("CARGO_PKG_VERSION"));
+                    println!("   Embedded DuckDB engine: {}", embedded_ver);
+                    println!("\nChecking active Python environment (python3)...");
+
+                    let duckpack_py_out = std::process::Command::new("python3")
+                        .args(["-c", "import duckpack; print(duckpack.__version__)"])
+                        .output();
+                    match duckpack_py_out {
+                        Ok(out) if out.status.success() => {
+                            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            let dp_str = if ver.starts_with('v') { ver } else { format!("v{}", ver) };
+                            println!("✓ DuckPack Python package: {} (installed)", dp_str);
+                        }
+                        _ => {
+                            println!("✗ DuckPack Python package: not installed");
+                            println!("  Run 'duckpack python install' to install it via pip.");
+                        }
+                    }
+
+                    let duckdb_py_out = std::process::Command::new("python3")
+                        .args(["-c", "import duckdb; print(duckdb.__version__)"])
+                        .output();
+                    match duckdb_py_out {
+                        Ok(out) if out.status.success() => {
+                            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            let ddb_str = if ver.starts_with('v') { ver } else { format!("v{}", ver) };
+                            println!("✓ Python DuckDB package: {}", ddb_str);
+                        }
+                        _ => {
+                            println!("- Python DuckDB package: not found");
+                        }
+                    }
+                }
+                PythonCommands::Install { upgrade } => {
+                    println!("Installing DuckPack Python package into active Python environment...");
+                    let mut cmd = std::process::Command::new("python3");
+                    cmd.args(["-m", "pip", "install"]);
+                    if *upgrade {
+                        cmd.arg("--upgrade");
+                    }
+                    cmd.arg("duckpack");
+                    let status = cmd.status();
+                    match status {
+                        Ok(s) if s.success() => {
+                            println!("✓ Successfully installed DuckPack Python package!");
+                        }
+                        Ok(s) => {
+                            eprintln!("pip install exited with status {}", s);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to execute python3: {}", e);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
-/// Executes the computed schema differences against the target database.
-/// If running against a remote database, it encapsulates the entire deployment inside a single transaction
-/// so it can rollback gracefully upon failure.
-fn apply_diff(conn: &Connection, diff: &diff::DiffResult, force_drop: bool, is_remote: bool, project_dir: &PathBuf) -> Result<()> {
-    if is_remote {
-        conn.execute_batch("BEGIN TRANSACTION;")?;
+/// Launches the interactive visual diff & declarative migration review TUI.
+///
+/// Can be invoked via `duckpack diff --interactive` (or `-i`) or `duckpack apply` (default mode).
+fn run_diff_review_tui(
+    project_dir: &PathBuf,
+    db: &str,
+    database: Option<&str>,
+    env: Option<&str>,
+    quack_token: Option<&str>,
+    quack_disable_ssl: bool,
+    force_drop: bool,
+    out: Option<&str>,
+) -> Result<()> {
+    let configured_catalog = database.map(String::from).or_else(|| resolve_project_catalog(project_dir, env));
+    let init_conn = connect_target_db(db, quack_token, quack_disable_ssl)?;
+    let mut active_catalog = diff::validate_target_catalog(&init_conn, configured_catalog.as_deref(), true)?;
+    if db.starts_with("quack:") {
+        cleanup_orphaned_quack_bridges(&init_conn);
     }
+    drop(init_conn);
 
-    let result = (|| -> Result<()> {
-        let pre_deploy_dir = project_dir.join("scripts").join("pre-deploy");
-        if pre_deploy_dir.exists() {
-            execute_directory(conn, &pre_deploy_dir)?;
-        }
+    let mut terminal = if out.is_none() {
+        ratatui::crossterm::terminal::enable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        ratatui::crossterm::execute!(stdout, ratatui::crossterm::terminal::EnterAlternateScreen, ratatui::crossterm::event::EnableMouseCapture)?;
+        let backend = ratatui::backend::CrosstermBackend::new(stdout);
+        Some(ratatui::Terminal::new(backend)?)
+    } else {
+        None
+    };
 
-        let mut views_to_apply = Vec::new();
-        let mut drops_to_apply = Vec::new();
-        let mut drop_schemas = Vec::new();
+    let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh, 'b' to switch catalog, 'q' to Quit.");
+    let mut current_force_drop = force_drop;
+    let mut inspect_data: Option<(String, Vec<String>, Vec<Vec<String>>, i64)> = None;
+    let mut total_applied: usize = 0;
+    let mut applied_catalogs: Vec<String> = Vec::new();
+    let project_dir_buf = project_dir.to_path_buf();
 
-        // 1. Create schemas first
-        for item in &diff.items {
-            if !item.selected { continue; }
-            if item.item_type == diff::DiffItemType::CreateSchema {
-                conn.execute_batch(&item.sql)?;
-            }
-        }
+    let loop_res = (|| -> Result<()> {
+        loop {
+            let shadow_conn = build_shadow_db(project_dir)?;
+            let target_conn = connect_target_db(db, quack_token, quack_disable_ssl)?;
+            
+            let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
+            let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
+            let shadow_schema = diff::get_schema(&shadow_conn, None)?;
+            let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
+            let shadow_views = diff::get_views(&shadow_conn, None)?;
+            let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
+            let shadow_macros = diff::get_macros(&shadow_conn, None)?;
+            let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
+            let shadow_triggers = diff::get_triggers(&shadow_conn, None)?;
+            let target_triggers = diff::get_triggers(&target_conn, Some(&active_catalog))?;
+            let ignore_list = load_ignore_rules(project_dir);
 
-        let mut structure_to_apply = Vec::new();
-        for item in &diff.items {
-            if !item.selected { continue; }
-            match item.item_type {
-                diff::DiffItemType::CreateTable | diff::DiffItemType::AlterTable | diff::DiffItemType::CreateMacro | diff::DiffItemType::RenameTable | diff::DiffItemType::RenameColumn => {
-                    structure_to_apply.push(item.sql.clone());
-                }
-                diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro => {
-                    if force_drop {
-                        drops_to_apply.push(item.sql.clone());
+            let mut diff_result = diff::compute_diff(
+                &shadow_schemas,
+                &target_schemas,
+                &shadow_schema, 
+                &target_schema, 
+                &shadow_views, 
+                &target_views, 
+                &shadow_macros, 
+                &target_macros, 
+                &shadow_triggers,
+                &target_triggers,
+                project_dir,
+                &ignore_list
+            );
+
+            if let Some(out_file) = out {
+                let mut script = String::new();
+                for item in &diff_result.items {
+                    let is_drop = matches!(item.item_type, diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro | diff::DiffItemType::DropTrigger | diff::DiffItemType::RecreateTable);
+                    if is_drop && !current_force_drop {
+                        continue;
+                    }
+                    if !item.sql.trim().is_empty() {
+                        script.push_str(&item.sql);
+                        if !item.sql.trim().ends_with(';') {
+                            script.push(';');
+                        }
+                        script.push_str("\n\n");
                     }
                 }
-                diff::DiffItemType::DropSchema => {
-                    if force_drop {
-                        drop_schemas.push(item.sql.clone());
+                if let Err(e) = std::fs::write(out_file, script) {
+                    eprintln!("Error writing dry-run script: {}", e);
+                } else {
+                    println!("Dry-run script successfully written to {}", out_file);
+                }
+                break;
+            }
+
+            if let Some(term) = &mut terminal {
+                let display_db = if db.starts_with("quack:localhost:") || db.starts_with("quack:127.0.0.1:") {
+                    format!("{} (Python In-Memory)", db)
+                } else {
+                    db.to_string()
+                };
+                let title = format!("{} [{}]", display_db, active_catalog);
+                match tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, false, &inspect_data, &title)? {
+                    tui::TuiAction::Quit => {
+                        break;
+                    }
+                    tui::TuiAction::SwitchCatalog => {
+                        let attached = diff::list_attached_databases(&target_conn).unwrap_or_default();
+                        let writable_dbs: Vec<_> = attached
+                            .into_iter()
+                            .filter(|d| !d.readonly && (d.db_type.eq_ignore_ascii_case("duckdb") || d.db_type.eq_ignore_ascii_case("quack")))
+                            .collect();
+                        if writable_dbs.len() > 1 {
+                            let curr_idx = writable_dbs.iter().position(|d| d.name.eq_ignore_ascii_case(&active_catalog)).unwrap_or(0);
+                            let next_idx = (curr_idx + 1) % writable_dbs.len();
+                            active_catalog = writable_dbs[next_idx].name.clone();
+                            status_msg = format!("Switched target catalog to '{}'", active_catalog);
+                        } else {
+                            status_msg = format!("Catalog '{}' is the only writable DuckDB database attached.", active_catalog);
+                        }
+                        continue;
+                    }
+                    tui::TuiAction::CopyStatus => {
+                        let _ = std::fs::write("duckpack.log", &status_msg);
+                        status_msg = "Status text copied to duckpack.log!".to_string();
+                        continue;
+                    }
+                    tui::TuiAction::Refresh => {
+                        status_msg = "Refreshed schema from disk.".to_string();
+                        continue;
+                    }
+                    tui::TuiAction::ToggleDestructiveMode => {
+                        current_force_drop = !current_force_drop;
+                        status_msg = if current_force_drop {
+                            "Destructive Mode ENABLED. Drops will be executed.".to_string()
+                        } else {
+                            "Destructive Mode DISABLED. Drops will be ignored.".to_string()
+                        };
+                        continue;
+                    }
+                    tui::TuiAction::Inspect { obj_name } => {
+                        let safe_obj = obj_name.replace('\'', "''");
+                        
+                        let mut cols = Vec::new();
+                        if let Ok(mut pragma_stmt) = target_conn.prepare(&format!("PRAGMA table_info('{}')", safe_obj)) {
+                            if let Ok(mut pragma_rows) = pragma_stmt.query([]) {
+                                while let Ok(Some(row)) = pragma_rows.next() {
+                                    if let Ok(col_name) = row.get::<_, String>(1) {
+                                        cols.push(col_name);
+                                    }
+                                }
+                            }
+                        }
+
+                        if cols.is_empty() {
+                            status_msg = format!("Cannot inspect '{}': Does not exist in target database yet.", obj_name);
+                        } else {
+                            let mut row_count = 0;
+                            if let Ok(mut count_stmt) = target_conn.prepare(&format!("SELECT count(*) FROM \"{}\"", safe_obj)) {
+                                if let Ok(mut count_rows) = count_stmt.query([]) {
+                                    if let Ok(Some(row)) = count_rows.next() {
+                                        row_count = row.get::<_, i64>(0).unwrap_or(0);
+                                    }
+                                }
+                            }
+
+                            let cast_cols = cols.iter().map(|c| format!("CAST(\"{}\" AS VARCHAR)", c)).collect::<Vec<_>>().join(", ");
+                            if let Ok(mut stmt) = target_conn.prepare(&format!("SELECT {} FROM \"{}\" LIMIT 5", cast_cols, safe_obj)) {
+                                if let Ok(mut db_rows) = stmt.query([]) {
+                                    let mut rows = Vec::new();
+                                    while let Ok(Some(row)) = db_rows.next() {
+                                        let mut str_row = Vec::new();
+                                        for i in 0..cols.len() {
+                                            let val: String = row.get(i).unwrap_or_else(|_| "NULL".to_string());
+                                            str_row.push(val);
+                                        }
+                                        rows.push(str_row);
+                                    }
+                                    inspect_data = Some((obj_name, cols, rows, row_count));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    tui::TuiAction::CloseInspect => {
+                        inspect_data = None;
+                        continue;
+                    }
+                    tui::TuiAction::Explore => {
+                        if let Some(term) = &mut terminal {
+                            ide::run_ide_loop(term, &target_conn, &project_dir_buf, db, quack_disable_ssl)?;
+                            term.clear()?;
+                        }
+                        continue;
+                    }
+                    tui::TuiAction::Apply => {
+                        status_msg = "Applying changes...".to_string();
+                        if let Some(term) = &mut terminal {
+                            let _ = tui::draw_and_handle_events(term, &mut diff_result, current_force_drop, &status_msg, true, &inspect_data, &title);
+                        }
+
+                        let remote = is_remote(db);
+                        let is_quack = db.starts_with("quack:");
+                        let applied_count = diff_result.items.iter().filter(|i| i.selected && !i.ignored).count();
+                        if !remote && !is_quack {
+                            let db_path = PathBuf::from(db);
+                            let mut b_path = db_path.clone();
+                            b_path.set_extension("duckdb.bak");
+                            if db_path.exists() {
+                                let _ = fs::copy(&db_path, &b_path);
+                            }
+                            
+                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
+                            
+                            if apply_success.is_ok() {
+                                if b_path.exists() {
+                                    fs::remove_file(&b_path).ok();
+                                }
+                                total_applied += applied_count;
+                                if !applied_catalogs.contains(&active_catalog) && applied_count > 0 {
+                                    applied_catalogs.push(active_catalog.clone());
+                                }
+                                status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
+                                continue;
+                            } else {
+                                status_msg = format!("Error applying schema: {:?}", apply_success.err());
+                                drop(target_conn); 
+                                if b_path.exists() {
+                                    let _ = fs::copy(&b_path, &db_path);
+                                    fs::remove_file(&b_path).ok();
+                                }
+                                continue;
+                            }
+                        } else {
+                            let apply_success = apply_diff(&target_conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
+                            if apply_success.is_ok() {
+                                total_applied += applied_count;
+                                if !applied_catalogs.contains(&active_catalog) && applied_count > 0 {
+                                    applied_catalogs.push(active_catalog.clone());
+                                }
+                                status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
+                                continue;
+                            } else {
+                                status_msg = format!("Error applying schema to remote database: {:?}", apply_success.err());
+                                continue;
+                            }
+                        }
+                    }
+
+                    tui::TuiAction::Pull { obj_name, item_type } => {
+                        let sql = match item_type {
+                            diff::DiffItemType::DropTable => {
+                                target_schema.get(&obj_name).map(|target| target.create_sql.clone())
+                            }
+                            diff::DiffItemType::DropView => target_views.get(&obj_name).cloned(),
+                            diff::DiffItemType::DropMacro => target_macros.get(&obj_name).cloned(),
+                            diff::DiffItemType::DropTrigger => target_triggers.get(&obj_name).map(|t| t.sql.clone()),
+                            _ => None,
+                        };
+
+                        if let Some(sql) = sql {
+                            let mut path = project_dir.to_path_buf();
+                            match item_type {
+                                diff::DiffItemType::DropTable => path.push("tables"),
+                                diff::DiffItemType::DropView => path.push("views"),
+                                diff::DiffItemType::DropMacro => path.push("macros"),
+                                diff::DiffItemType::DropTrigger => path.push("triggers"),
+                                _ => {}
+                            }
+                            path.push(format!("{}.sql", obj_name));
+                            if let Err(e) = std::fs::write(&path, sql) {
+                                status_msg = format!("Error pulling '{}': {}", obj_name, e);
+                            } else {
+                                status_msg = format!("Successfully pulled '{}' back into local project!", obj_name);
+                            }
+                        } else {
+                            status_msg = format!("Cannot pull '{}': Definition not found in remote DB.", obj_name);
+                        }
                     }
                 }
-                diff::DiffItemType::CreateView => {
-                    views_to_apply.push(item.sql.clone());
-                }
-                diff::DiffItemType::CreateSchema => {} // handled above
             }
         }
-
-        if !structure_to_apply.is_empty() {
-            execute_sqls_with_retry(conn, structure_to_apply)?;
-        }
-
-
-        // 3. Views
-        if !views_to_apply.is_empty() {
-            execute_sqls_with_retry(conn, views_to_apply)?;
-        }
-
-        // 4. Drops
-        for drop_sql in drops_to_apply {
-            let _ = conn.execute_batch(&drop_sql); // Ignore errors if already dropped by cascade
-        }
-        for drop_sql in drop_schemas {
-            let _ = conn.execute_batch(&drop_sql);
-        }
-
-        let post_deploy_dir = project_dir.join("scripts").join("post-deploy");
-        if post_deploy_dir.exists() {
-            execute_directory(conn, &post_deploy_dir)?;
-        }
-
         Ok(())
     })();
 
-    if is_remote {
-        if result.is_ok() {
-            conn.execute_batch("COMMIT;")?;
+    if let Some(term) = &mut terminal {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::terminal::LeaveAlternateScreen,
+            ratatui::crossterm::event::DisableMouseCapture
+        );
+        let _ = term.show_cursor();
+    }
+
+    loop_res?;
+
+    if out.is_none() {
+        if total_applied > 0 {
+            println!("🦆 DuckPack: Applied {} total change(s) across catalog(s): [{}].", total_applied, applied_catalogs.join(", "));
         } else {
-            conn.execute_batch("ROLLBACK;")?;
-        }
-    }
-    result
-}
-
-/// Scaffolds a new declarative database project by generating the standard directory structure,
-/// configuration files (`duck-project.toml`), environment templates, and documentation.
-fn init_project(project_dir: &PathBuf) -> Result<()> {
-    let dirs = ["schemas", "tables", "views", "macros", "queries", "seeds", "scripts/pre-deploy", "scripts/post-deploy"];
-    for dir in dirs.iter() {
-        let path = project_dir.join(dir);
-        if !path.exists() {
-            fs::create_dir_all(&path).with_context(|| format!("Failed to create directory {}", path.display()))?;
-            println!("Created directory: {}", path.display());
-        }
-    }
-
-    let config_path = project_dir.join("duck-project.toml");
-    if !config_path.exists() {
-        let default_config = r#"[project]
-name = "my_duckdb_project"
-version = "0.1.0"
-description = "A declarative DuckDB database project"
-
-[target]
-default_db = "local.duckdb"
-"#;
-        fs::write(&config_path, default_config).with_context(|| "Failed to write duck-project.toml")?;
-        println!("Created config file: {}", config_path.display());
-    }
-
-    let readme_path = project_dir.join("README.md");
-    if !readme_path.exists() {
-        let readme_content = r#"# DuckDB Database Project
-
-Welcome to your declarative DuckDB project! This directory contains the desired state of your database schema.
-
-## Project Structure
-
-- `schemas/`: Contains `CREATE SCHEMA` statements. Schemas deleted from this folder will be dropped **CASCADE** on the target DB!
-- `tables/`: Contains `CREATE TABLE` statements (one per file).
-- `views/`: Contains `CREATE VIEW` statements (engine auto-forces `OR REPLACE`).
-- `macros/`: Contains `CREATE MACRO` statements.
-- `queries/`: Save your ad-hoc `.sql` queries and scratchpad files here.
-- `seeds/`: Contains static CSVs or seed scripts.
-- `scripts/`: Contains `pre-deploy` and `post-deploy` scripts.
-- `duck-project.toml`: Project configuration and targets.
-- `.env`: Environment variables for template interpolation. Write `${VAR_NAME}` in your SQL, and the engine will dynamically replace it!
-- `.duckdbignore`: Specifies tables or views to ignore during diffing (wildcards supported).
-
-## CLI Commands
-
-### 1. Build & Validate
-Validates your project syntax and verifies dependencies by compiling it against an in-memory Shadow DB.
-
-```bash
-duckpack build --project-dir .
-```
-
-### 2. Apply 
-Computes the diff against the target database and opens an interactive TUI to review and selectively apply the changes.
-
-```bash
-duckpack apply --project-dir . --db local.duckdb
-```
-
-**Options:**
-- `--force-drop`: By default, the engine operates in 'Safe Mode' and ignores deleted tables/columns to prevent data loss. Pass this flag to allow destructive `DROP TABLE` and `DROP COLUMN` commands.
-- `--auto-approve`: Apply changes without interactive confirmation.
-- `--out <FILE>`: Dry-run mode. Generates the migration SQL script and saves it to the specified file without applying it to the database.
-- `--env <PROFILE>`: Global flag to load `.env.<PROFILE>` instead of the default `.env`.
-
-**TUI Controls:**
-- `Up/Down`: Navigate the list of proposed changes.
-- `Space`: Toggle selection (checked items will be applied, unchecked items will be ignored).
-- `Enter`: Apply the selected changes transactionally.
-- `e`: Open the IDE Explorer to run queries.
-- `c`: Copy the current status text to `duckpack.log`.
-- `Esc / q`: Cancel the operation.
-
-### 3. Explore
-Launch the fully featured built-in IDE to query and explore your DuckDB database safely.
-
-```bash
-duckpack explore --project-dir . --db local.duckdb
-```
-
-**IDE Features:**
-- `Ctrl+E`: Execute query and see formatted results (supports horizontal scrolling via Left/Right arrows).
-- `Ctrl+O`: Export the results of the active query to a CSV file in the `queries/` directory.
-- `Ctrl+Space`: Autocomplete tables and column names.
-- `Ctrl+F`: Format SQL code.
-- `Ctrl+S`: Save current scratchpad query.
-- `Ctrl+T`: Open a new blank query tab.
-- `Ctrl+W`: Close the active tab.
-- `Ctrl+N` / `Ctrl+P`: Navigate to the next/previous tab.
-- **Syntax Validation:** Highlights syntax errors in red automatically.
-- **Query History**: Automatically logs successfully executed queries and timestamps to `queries/.history.sql`.
-- **Path Resolution:** Automatically infers `--project-dir` from the database path if omitted.
-"#;
-        fs::write(&readme_path, readme_content).with_context(|| "Failed to write README.md")?;
-        println!("Created documentation file: {}", readme_path.display());
-    }
-
-    let env_path = project_dir.join(".env");
-    if !env_path.exists() {
-        let env_content = r#"# Define environment variables here to interpolate into your SQL files.
-# Example: 
-# ENV=dev
-"#;
-        fs::write(&env_path, env_content).with_context(|| "Failed to write .env")?;
-        println!("Created environment file: {}", env_path.display());
-    }
-
-    let ignore_path = project_dir.join(".duckdbignore");
-    if !ignore_path.exists() {
-        let ignore_content = r#"# Specify tables or views to ignore during diffing (wildcards supported).
-# Example:
-# temp_*
-# *_backup
-"#;
-        fs::write(&ignore_path, ignore_content).with_context(|| "Failed to write .duckdbignore")?;
-        println!("Created ignore file: {}", ignore_path.display());
-    }
-
-    let gitignore_path = project_dir.join(".gitignore");
-    if !gitignore_path.exists() {
-        let gitignore_content = ".env*\n*.duckdb\n*.history.sql\nREADME.md\n*.csv\n*.duckpack\nduckpack.log\nmigration.sql\n";
-        fs::write(&gitignore_path, gitignore_content).with_context(|| "Failed to write .gitignore")?;
-        println!("Created .gitignore file: {}", gitignore_path.display());
-    }
-
-    Ok(())
-}
-
-/// Compiles all local `.sql` files into an in-memory DuckDB connection.
-/// This acts as the "Desired State" or "Shadow DB" used for validation and diff generation.
-fn build_shadow_db(project_dir: &PathBuf) -> Result<Connection> {
-    if project_dir.is_file() && project_dir.extension().unwrap_or_default() == "duckpack" {
-        return Connection::open(project_dir).with_context(|| "Failed to open .duckpack artifact");
-    }
-
-    let conn = Connection::open_in_memory().with_context(|| "Failed to create Shadow DB")?;
-    
-    let schemas_dir = project_dir.join("schemas");
-    if schemas_dir.exists() {
-        execute_directory(&conn, &schemas_dir)?;
-    }
-
-    let macros_dir = project_dir.join("macros");
-    if macros_dir.exists() {
-        execute_directory(&conn, &macros_dir)?;
-    }
-
-    let tables_dir = project_dir.join("tables");
-    if tables_dir.exists() {
-        execute_directory(&conn, &tables_dir)?;
-    }
-
-    let views_dir = project_dir.join("views");
-    if views_dir.exists() {
-        execute_directory(&conn, &views_dir)?;
-    }
-
-    Ok(conn)
-}
-
-/// A helper utility to iterate over a directory of `.sql` files and execute them against a connection.
-/// This uses a retry loop because tables/views often depend on each other (e.g. foreign keys or nested views).
-/// If one fails, it is pushed to the back of the queue. The loop terminates once all succeed, or if no progress is made.
-fn execute_directory(conn: &Connection, dir: &Path) -> Result<()> {
-    let mut pending_sqls = Vec::new();
-    let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
-    entries.sort_by_key(|e| e.path());
-    
-    for entry in entries {
-        let path = entry.path();
-        if path.is_file() && path.extension().unwrap_or_default() == "sql" {
-            pending_sqls.push(diff::read_sql_with_env(&path)?);
-        }
-    }
-    
-    let mut last_error: Option<anyhow::Error> = None;
-    let mut progress_made = true;
-
-    while !pending_sqls.is_empty() && progress_made {
-        progress_made = false;
-        let mut remaining = Vec::new();
-
-        for sql in pending_sqls {
-            match conn.execute_batch(&sql) {
-                Ok(_) => {
-                    progress_made = true;
-                }
-                Err(e) => {
-                    last_error = Some(anyhow::anyhow!("Failed: {}", e));
-                    remaining.push(sql);
-                }
-            }
-        }
-        pending_sqls = remaining;
-    }
-
-    if !pending_sqls.is_empty() {
-        if let Some(e) = last_error {
-            return Err(e).context(format!("Failed to compile SQL files in {} due to unresolvable dependencies or syntax errors", dir.display()));
-        }
-    }
-
-    Ok(())
-}
-
-/// A specialized execution engine for arbitrary SQLs.
-/// Because objects often depend on each other, this algorithm continuously loops over the list of statements
-/// and attempts to execute them. If one fails, it is pushed to the back of the queue.
-/// The loop terminates once all succeed, or if it completes a full pass without making any progress (circular dependency).
-fn execute_sqls_with_retry(conn: &Connection, mut pending_sqls: Vec<String>) -> Result<()> {
-    let mut last_error: Option<anyhow::Error> = None;
-    let mut progress_made = true;
-
-    while !pending_sqls.is_empty() && progress_made {
-        progress_made = false;
-        let mut remaining = Vec::new();
-
-        for sql in pending_sqls {
-            match conn.execute_batch(&sql) {
-                Ok(_) => {
-                    progress_made = true;
-                }
-                Err(e) => {
-                    last_error = Some(anyhow::anyhow!("Failed: {}", e));
-                    remaining.push(sql);
-                }
-            }
-        }
-        pending_sqls = remaining;
-    }
-
-    if !pending_sqls.is_empty() {
-        if let Some(e) = last_error {
-            return Err(e).context("Failed to compile SQLs due to unresolvable dependencies or syntax errors");
+            println!("🦆 DuckPack: Exited without applying changes.");
         }
     }
 
@@ -1100,10 +1025,10 @@ mod tests {
 
     #[test]
     fn test_is_remote() {
-        assert_eq!(is_remote("md:my_db"), true);
-        assert_eq!(is_remote("motherduck:"), true);
-        assert_eq!(is_remote("local.db"), false);
-        assert_eq!(is_remote("/var/lib/duckdb/prod.db"), false);
+        assert!(is_remote("md:my_db"));
+        assert!(is_remote("motherduck:"));
+        assert!(!is_remote("local.db"));
+        assert!(!is_remote("/var/lib/duckdb/prod.db"));
     }
 
     #[test]
@@ -1140,7 +1065,7 @@ mod tests {
 
     #[test]
     fn test_cli_quack_disable_ssl_flags() {
-        let cli = Cli::try_parse_from(&[
+        let cli = Cli::try_parse_from([
             "duckpack",
             "explore",
             "--db",
@@ -1152,7 +1077,7 @@ mod tests {
             _ => panic!("Expected Explore command"),
         }
 
-        let cli_insecure = Cli::try_parse_from(&[
+        let cli_insecure = Cli::try_parse_from([
             "duckpack",
             "explore",
             "--db",
@@ -1164,7 +1089,7 @@ mod tests {
             _ => panic!("Expected Explore command"),
         }
 
-        let cli_apply = Cli::try_parse_from(&[
+        let cli_apply = Cli::try_parse_from([
             "duckpack",
             "apply",
             "--db",
@@ -1176,4 +1101,53 @@ mod tests {
             _ => panic!("Expected Apply command"),
         }
     }
+
+    #[test]
+    fn test_cli_python_subcommands() {
+        let cli_status = Cli::try_parse_from(["duckpack", "python", "status"]).unwrap();
+        match cli_status.command {
+            Commands::Python { command } => assert_eq!(command, PythonCommands::Status),
+            _ => panic!("Expected Python status command"),
+        }
+
+        let cli_install = Cli::try_parse_from(["duckpack", "python", "install"]).unwrap();
+        match cli_install.command {
+            Commands::Python { command } => assert_eq!(command, PythonCommands::Install { upgrade: false }),
+            _ => panic!("Expected Python install command"),
+        }
+
+        let cli_upgrade = Cli::try_parse_from(["duckpack", "python", "install", "--upgrade"]).unwrap();
+        match cli_upgrade.command {
+            Commands::Python { command } => assert_eq!(command, PythonCommands::Install { upgrade: true }),
+            _ => panic!("Expected Python install upgrade command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_interactive_flags() {
+        let cli_diff = Cli::try_parse_from(["duckpack", "diff", "--interactive"]).unwrap();
+        match cli_diff.command {
+            Commands::Diff { interactive, .. } => assert!(interactive),
+            _ => panic!("Expected Diff command"),
+        }
+
+        let cli_diff_short = Cli::try_parse_from(["duckpack", "diff", "-i"]).unwrap();
+        match cli_diff_short.command {
+            Commands::Diff { interactive, .. } => assert!(interactive),
+            _ => panic!("Expected Diff command"),
+        }
+
+        let cli_apply = Cli::try_parse_from(["duckpack", "apply", "--interactive"]).unwrap();
+        match cli_apply.command {
+            Commands::Apply { interactive, .. } => assert!(interactive),
+            _ => panic!("Expected Apply command"),
+        }
+
+        let cli_apply_short = Cli::try_parse_from(["duckpack", "apply", "-i"]).unwrap();
+        match cli_apply_short.command {
+            Commands::Apply { interactive, .. } => assert!(interactive),
+            _ => panic!("Expected Apply command"),
+        }
+    }
 }
+

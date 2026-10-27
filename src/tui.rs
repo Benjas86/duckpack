@@ -24,12 +24,13 @@ pub enum TuiAction {
     Pull { obj_name: String, item_type: DiffItemType },
     Explore,
     CopyStatus,
+    SwitchCatalog,
 }
 
 /// Recalculates the locked state of all diff items based on their dependencies.
 /// If a parent item (like a CREATE TABLE) is deselected, dependent items (like ALTER TABLE or INSERT)
 /// are automatically locked and deselected to prevent invalid SQL execution.
-fn recompute_locks(items: &mut Vec<DiffItem>) {
+pub(crate) fn recompute_locks(items: &mut Vec<DiffItem>) {
     for item in items.iter_mut() {
         item.locked = false;
     }
@@ -51,66 +52,8 @@ fn recompute_locks(items: &mut Vec<DiffItem>) {
     }
 }
 
-/// A rudimentary SQL syntax highlighter that tokenizes a SQL string and applies Ratatui `Span` styles.
-/// Keywords are highlighted in Cyan and strings in Yellow.
-fn highlight_sql(sql: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let keywords = ["SELECT", "FROM", "WHERE", "CREATE", "TABLE", "VIEW", "OR", "REPLACE", "MACRO", "AS", "DEFAULT", "TIMESTAMP", "INTEGER", "DATE", "DECIMAL", "VARCHAR", "ALTER", "ADD", "COLUMN", "DROP", "TYPE", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "AND", "NOT", "NULL", "PRIMARY", "KEY", "UUID", "BOOLEAN"];
-    
-    let mut current_word = String::new();
-    let mut is_string = false;
-    
-    for c in sql.chars() {
-        if c == '\'' {
-            if !current_word.is_empty() {
-                let upper = current_word.to_uppercase();
-                if keywords.contains(&upper.as_str()) {
-                    spans.push(Span::styled(current_word.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-                } else {
-                    spans.push(Span::raw(current_word.clone()));
-                }
-                current_word.clear();
-            }
-            is_string = !is_string;
-            current_word.push(c);
-            if !is_string {
-                spans.push(Span::styled(current_word.clone(), Style::default().fg(Color::Yellow)));
-                current_word.clear();
-            }
-        } else if c.is_whitespace() || c == '(' || c == ')' || c == ',' || c == ';' || c == '=' {
-            if !current_word.is_empty() {
-                if is_string {
-                    current_word.push(c);
-                    continue;
-                }
-                let upper = current_word.to_uppercase();
-                if keywords.contains(&upper.as_str()) {
-                    spans.push(Span::styled(current_word.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-                } else {
-                    spans.push(Span::raw(current_word.clone()));
-                }
-                current_word.clear();
-            }
-            if !is_string {
-                spans.push(Span::raw(c.to_string()));
-            } else {
-                current_word.push(c);
-            }
-        } else {
-            current_word.push(c);
-        }
-    }
-    
-    if !current_word.is_empty() {
-        let upper = current_word.to_uppercase();
-        if !is_string && keywords.contains(&upper.as_str()) {
-            spans.push(Span::styled(current_word, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-        } else {
-            spans.push(Span::styled(current_word, if is_string { Style::default().fg(Color::Yellow) } else { Style::default() }));
-        }
-    }
-    spans
-}
+use crate::syntax::highlight_sql;
+
 
 /// Wraps the `sqlformat` crate to standardize formatting for SQL diffing.
 /// We use this to ensure that whitespace or casing differences in `.sql` files 
@@ -169,9 +112,9 @@ fn get_side_by_side_diff(old_def: &str, new_def: &str) -> (Vec<Line<'static>>, V
 fn sort_diff_items(items: &mut Vec<DiffItem>) {
     items.sort_by_key(|item| {
         match item.item_type {
-            DiffItemType::CreateSchema | DiffItemType::CreateTable | DiffItemType::CreateView | DiffItemType::CreateMacro => 1,
-            DiffItemType::AlterTable | DiffItemType::RenameTable | DiffItemType::RenameColumn => 2,
-            DiffItemType::DropSchema | DiffItemType::DropTable | DiffItemType::DropView | DiffItemType::DropMacro | DiffItemType::DropColumn => 3,
+            DiffItemType::CreateSchema | DiffItemType::CreateTable | DiffItemType::CreateView | DiffItemType::CreateMacro | DiffItemType::CreateTrigger => 1,
+            DiffItemType::AlterTable | DiffItemType::RenameTable | DiffItemType::RenameColumn | DiffItemType::AddConstraint => 2,
+            DiffItemType::DropSchema | DiffItemType::DropTable | DiffItemType::DropView | DiffItemType::DropMacro | DiffItemType::DropColumn | DiffItemType::DropTrigger | DiffItemType::RecreateTable => 3,
         }
     });
 }
@@ -277,6 +220,13 @@ pub fn draw_and_handle_events(
                             if force_drop { ("[DROP MACRO] ", Style::default().fg(Color::Red)) } 
                             else { ("[IGNORED DROP] ", Style::default().fg(Color::DarkGray)) }
                         },
+                        DiffItemType::CreateTrigger => ("[TRIGGER] ", Style::default().fg(Color::LightMagenta)),
+                        DiffItemType::DropTrigger => {
+                            if force_drop { ("[DROP TRG] ", Style::default().fg(Color::Red)) } 
+                            else { ("[IGNORED DROP] ", Style::default().fg(Color::DarkGray)) }
+                        },
+                        DiffItemType::AddConstraint => ("[ADD CONSTRAINT] ", Style::default().fg(Color::Yellow)),
+                        DiffItemType::RecreateTable => if force_drop { ("[RECREATE TABLE] ", Style::default().fg(Color::Red)) } else { ("[IGNORED RECREATE] ", Style::default().fg(Color::DarkGray)) },
                     };
 
                     if item.locked {
@@ -344,7 +294,7 @@ pub fn draw_and_handle_events(
             } else if show_help {
                 "Press 'Esc' or 'q' to close help"
             } else {
-                "Press 'Enter' to Apply, 'Space' to toggle, '?' or 'h' for Help, 'Esc' or 'q' to Quit"
+                "Press 'Enter' to Apply, 'Space' to toggle, 'b' to switch DB, '?' for Help, 'Esc' or 'q' to Quit"
             };
 
             let footer = Paragraph::new(Span::styled(footer_text, Style::default().fg(Color::Cyan)))
@@ -403,6 +353,7 @@ pub fn draw_and_handle_events(
 
                 let help_lines = vec![
                     ratatui::text::Line::from(vec![ratatui::text::Span::styled(" [?]       ", Style::default().fg(Color::Cyan)), ratatui::text::Span::raw("Toggle Help Menu")]),
+                    ratatui::text::Line::from(vec![ratatui::text::Span::styled(" [b]       ", Style::default().fg(Color::Cyan)), ratatui::text::Span::raw("Switch target database catalog")]),
                     ratatui::text::Line::from(vec![ratatui::text::Span::styled(" [p]       ", Style::default().fg(Color::Cyan)), ratatui::text::Span::raw("Pull dropped item down to local files")]),
                     ratatui::text::Line::from(vec![ratatui::text::Span::styled(" [v]       ", Style::default().fg(Color::Cyan)), ratatui::text::Span::raw("Toggle visibility of .duckdbignore items")]),
                     ratatui::text::Line::from(vec![ratatui::text::Span::styled(" [d]       ", Style::default().fg(Color::Cyan)), ratatui::text::Span::raw("Toggle destructive mode (force drop)")]),
@@ -466,6 +417,9 @@ pub fn draw_and_handle_events(
                         if key.modifiers.contains(event::KeyModifiers::CONTROL) || !key.modifiers.contains(event::KeyModifiers::CONTROL) {
                             return Ok(TuiAction::Refresh);
                         }
+                    }
+                    KeyCode::Char('b') => {
+                        return Ok(TuiAction::SwitchCatalog);
                     }
                     KeyCode::Char('e') => {
                         return Ok(TuiAction::Explore);
