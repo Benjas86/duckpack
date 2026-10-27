@@ -963,9 +963,7 @@ fn run_diff_review_tui(
                     tui::TuiAction::Pull { obj_name, item_type } => {
                         let sql = match item_type {
                             diff::DiffItemType::DropTable => {
-                                if let Some(target) = target_schema.get(&obj_name) {
-                                    Some(target.create_sql.clone())
-                                } else { None }
+                                target_schema.get(&obj_name).map(|target| target.create_sql.clone())
                             }
                             diff::DiffItemType::DropView => target_views.get(&obj_name).cloned(),
                             diff::DiffItemType::DropMacro => target_macros.get(&obj_name).cloned(),
@@ -1027,10 +1025,10 @@ mod tests {
 
     #[test]
     fn test_is_remote() {
-        assert_eq!(is_remote("md:my_db"), true);
-        assert_eq!(is_remote("motherduck:"), true);
-        assert_eq!(is_remote("local.db"), false);
-        assert_eq!(is_remote("/var/lib/duckdb/prod.db"), false);
+        assert!(is_remote("md:my_db"));
+        assert!(is_remote("motherduck:"));
+        assert!(!is_remote("local.db"));
+        assert!(!is_remote("/var/lib/duckdb/prod.db"));
     }
 
     #[test]
@@ -1067,7 +1065,7 @@ mod tests {
 
     #[test]
     fn test_cli_quack_disable_ssl_flags() {
-        let cli = Cli::try_parse_from(&[
+        let cli = Cli::try_parse_from([
             "duckpack",
             "explore",
             "--db",
@@ -1079,7 +1077,7 @@ mod tests {
             _ => panic!("Expected Explore command"),
         }
 
-        let cli_insecure = Cli::try_parse_from(&[
+        let cli_insecure = Cli::try_parse_from([
             "duckpack",
             "explore",
             "--db",
@@ -1091,7 +1089,7 @@ mod tests {
             _ => panic!("Expected Explore command"),
         }
 
-        let cli_apply = Cli::try_parse_from(&[
+        let cli_apply = Cli::try_parse_from([
             "duckpack",
             "apply",
             "--db",
@@ -1106,19 +1104,19 @@ mod tests {
 
     #[test]
     fn test_cli_python_subcommands() {
-        let cli_status = Cli::try_parse_from(&["duckpack", "python", "status"]).unwrap();
+        let cli_status = Cli::try_parse_from(["duckpack", "python", "status"]).unwrap();
         match cli_status.command {
             Commands::Python { command } => assert_eq!(command, PythonCommands::Status),
             _ => panic!("Expected Python status command"),
         }
 
-        let cli_install = Cli::try_parse_from(&["duckpack", "python", "install"]).unwrap();
+        let cli_install = Cli::try_parse_from(["duckpack", "python", "install"]).unwrap();
         match cli_install.command {
             Commands::Python { command } => assert_eq!(command, PythonCommands::Install { upgrade: false }),
             _ => panic!("Expected Python install command"),
         }
 
-        let cli_upgrade = Cli::try_parse_from(&["duckpack", "python", "install", "--upgrade"]).unwrap();
+        let cli_upgrade = Cli::try_parse_from(["duckpack", "python", "install", "--upgrade"]).unwrap();
         match cli_upgrade.command {
             Commands::Python { command } => assert_eq!(command, PythonCommands::Install { upgrade: true }),
             _ => panic!("Expected Python install upgrade command"),
@@ -1127,25 +1125,25 @@ mod tests {
 
     #[test]
     fn test_cli_interactive_flags() {
-        let cli_diff = Cli::try_parse_from(&["duckpack", "diff", "--interactive"]).unwrap();
+        let cli_diff = Cli::try_parse_from(["duckpack", "diff", "--interactive"]).unwrap();
         match cli_diff.command {
             Commands::Diff { interactive, .. } => assert!(interactive),
             _ => panic!("Expected Diff command"),
         }
 
-        let cli_diff_short = Cli::try_parse_from(&["duckpack", "diff", "-i"]).unwrap();
+        let cli_diff_short = Cli::try_parse_from(["duckpack", "diff", "-i"]).unwrap();
         match cli_diff_short.command {
             Commands::Diff { interactive, .. } => assert!(interactive),
             _ => panic!("Expected Diff command"),
         }
 
-        let cli_apply = Cli::try_parse_from(&["duckpack", "apply", "--interactive"]).unwrap();
+        let cli_apply = Cli::try_parse_from(["duckpack", "apply", "--interactive"]).unwrap();
         match cli_apply.command {
             Commands::Apply { interactive, .. } => assert!(interactive),
             _ => panic!("Expected Apply command"),
         }
 
-        let cli_apply_short = Cli::try_parse_from(&["duckpack", "apply", "-i"]).unwrap();
+        let cli_apply_short = Cli::try_parse_from(["duckpack", "apply", "-i"]).unwrap();
         match cli_apply_short.command {
             Commands::Apply { interactive, .. } => assert!(interactive),
             _ => panic!("Expected Apply command"),
