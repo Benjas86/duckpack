@@ -27,18 +27,21 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact_name: duckpack
             asset_name: duckpack-linux-arm64
+            rustflags: "-C link-arg=-Wl,--undefined=duckdb_register_static_extensions"
 
           # macOS (Intel)
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: duckpack
             asset_name: duckpack-macos-amd64
+            deployment_target: "10.15"
 
           # macOS (Apple Silicon)
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: duckpack
             asset_name: duckpack-macos-arm64
+            deployment_target: "10.15"
 
           # Windows x86_64
           - os: windows-latest
@@ -58,8 +61,8 @@ jobs:
       - name: Build Release Binary
         run: cargo build --release --target ${{ matrix.target }}
         env:
-          CXXFLAGS: "-DDUCKDB_STATIC_EXTENSION_LOADER_API=__attribute__((visibility(\"default\")))"
-          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          RUSTFLAGS: ${{ matrix.rustflags || '' }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target || '' }}
 
       - name: Rename Artifact (Linux/macOS)
         run: mv target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
@@ -90,13 +93,12 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
+            deployment_target: "10.15"
           - os: macos-latest
             target: x86_64-apple-darwin
+            deployment_target: "10.15"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "10.15"
-      CXXFLAGS: "-DDUCKDB_STATIC_EXTENSION_LOADER_API=__attribute__((visibility(\"default\")))"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -106,6 +108,8 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target || '' }}
 
       - name: Upload Release Wheels
         uses: softprops/action-gh-release@v2
