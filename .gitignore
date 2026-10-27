@@ -21,3 +21,4 @@ debug_query.txt
 /sandbox/
 /tests/fixtures/v2_0_compat/
 /tests/fixtures/
+dist/
