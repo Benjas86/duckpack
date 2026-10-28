@@ -271,36 +271,9 @@ fn main() -> Result<()> {
             }
 
             let configured_catalog = database.clone().or_else(|| resolve_project_catalog(project_dir, cli.env.as_deref()));
-            let shadow_conn = build_shadow_db(project_dir)?;
-            let target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
-            let active_catalog = diff::validate_target_catalog(&target_conn, configured_catalog.as_deref(), false)?;
-
-            let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
-            let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
-            let shadow_schema = diff::get_schema(&shadow_conn, None)?;
-            let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
-            let shadow_views = diff::get_views(&shadow_conn, None)?;
-            let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
-            let shadow_macros = diff::get_macros(&shadow_conn, None)?;
-            let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
-            let shadow_triggers = diff::get_triggers(&shadow_conn, None)?;
-            let target_triggers = diff::get_triggers(&target_conn, Some(&active_catalog))?;
-            let ignore_list = load_ignore_rules(project_dir);
-
-            let diff_result = diff::compute_diff(
-                &shadow_schemas,
-                &target_schemas,
-                &shadow_schema, 
-                &target_schema, 
-                &shadow_views, 
-                &target_views, 
-                &shadow_macros, 
-                &target_macros, 
-                &shadow_triggers,
-                &target_triggers,
-                project_dir,
-                &ignore_list
-            );
+            let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+            let active_catalog = diff::validate_target_catalog_exec(&mut target_conn, configured_catalog.as_deref(), false)?;
+            let diff_result = diff::diff_project(project_dir, &mut target_conn, Some(&active_catalog))?;
 
             let unignored_items: Vec<_> = diff_result.items.iter().filter(|i| !i.ignored).collect();
             if unignored_items.is_empty() {
@@ -324,8 +297,8 @@ fn main() -> Result<()> {
                 } else {
                     let cats = resolve_project_catalogs(project_dir, cli.env.as_deref());
                     if cats.is_empty() {
-                        let init_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
-                        let active = diff::validate_target_catalog(&init_conn, None, true)?;
+                        let mut init_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                        let active = diff::validate_target_catalog_exec(&mut init_conn, None, true)?;
                         vec![active]
                     } else {
                         cats
@@ -335,35 +308,9 @@ fn main() -> Result<()> {
                 let remote = is_remote(db);
                 let mut total_applied = 0;
                 for target_cat in &configured_catalogs {
-                    let target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
-                    let active_catalog = diff::validate_target_catalog(&target_conn, Some(target_cat), true)?;
-                    let shadow_conn = build_shadow_db(project_dir)?;
-                    let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
-                    let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
-                    let shadow_schema = diff::get_schema(&shadow_conn, None)?;
-                    let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
-                    let shadow_views = diff::get_views(&shadow_conn, None)?;
-                    let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
-                    let shadow_macros = diff::get_macros(&shadow_conn, None)?;
-                    let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
-                    let shadow_triggers = diff::get_triggers(&shadow_conn, None)?;
-                    let target_triggers = diff::get_triggers(&target_conn, Some(&active_catalog))?;
-                    let ignore_list = load_ignore_rules(project_dir);
-
-                    let diff_result = diff::compute_diff(
-                        &shadow_schemas,
-                        &target_schemas,
-                        &shadow_schema, 
-                        &target_schema, 
-                        &shadow_views, 
-                        &target_views, 
-                        &shadow_macros, 
-                        &target_macros, 
-                        &shadow_triggers,
-                        &target_triggers,
-                        project_dir,
-                        &ignore_list
-                    );
+                    let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                    let active_catalog = diff::validate_target_catalog_exec(&mut target_conn, Some(target_cat), true)?;
+                    let diff_result = diff::diff_project(project_dir, &mut target_conn, Some(&active_catalog))?;
 
                     let pending_count = diff_result.items.iter().filter(|i| i.selected && !i.ignored).count();
                     if pending_count == 0 {
@@ -371,7 +318,7 @@ fn main() -> Result<()> {
                         continue;
                     }
 
-                    let apply_success = apply_diff(&target_conn, &diff_result, *force_drop, remote, project_dir, Some(&active_catalog));
+                    let apply_success = apply_diff_with_executor(&mut target_conn, &diff_result, *force_drop, remote, project_dir, Some(&active_catalog));
                     if apply_success.is_ok() {
                         println!("✓ Successfully applied {} change(s) automatically to catalog '{}'!", pending_count, active_catalog);
                         total_applied += pending_count;
@@ -401,37 +348,21 @@ fn main() -> Result<()> {
             
             // DuckPack format: A simple duckdb file.
             let _ = std::fs::remove_file(&out); // Remove if exists
-            let out_conn = Connection::open(&out).with_context(|| "Failed to create .duckpack file")?;
-            println!("Packaging tables, views, and macros...");
-            
-            let schemas_dir = project_dir.join("schemas");
-            if schemas_dir.exists() {
-                execute_directory(&out_conn, &schemas_dir)?;
-            }
-            let tables_dir = project_dir.join("tables");
-            if tables_dir.exists() {
-                execute_directory(&out_conn, &tables_dir)?;
-            }
-            let views_dir = project_dir.join("views");
-            if views_dir.exists() {
-                execute_directory(&out_conn, &views_dir)?;
-            }
-            let macros_dir = project_dir.join("macros");
-            if macros_dir.exists() {
-                execute_directory(&out_conn, &macros_dir)?;
-            }
+            let mut out_conn = Connection::open(&out).with_context(|| "Failed to create .duckpack file")?;
+            println!("Packaging schemas, macros, tables, views, and triggers...");
+            compile_project_declarations(&mut out_conn, project_dir)?;
             println!("Compilation complete! Artifact: {}", out);
         }
         Commands::Explore { project_dir, db, database, remote, port, auto_install, quack_token, quack_disable_ssl } => {
             if let Some(r) = remote {
                 let mut remote_bin = "duckpack".to_string();
                 let mut remote_tmp_bin = None;
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                let rand_suffix = &generate_random_hex_token()[..16];
                 
                 if *auto_install {
                     println!("Auto-installing DuckPack companion binary for exploration...");
                     let current_exe = std::env::current_exe().with_context(|| "Failed to get current executable path")?;
-                    let tmp_bin = format!("/tmp/duckpack_bin_{}", ts);
+                    let tmp_bin = format!("/tmp/duckpack_bin_{}", rand_suffix);
                     
                     let scp_bin_status = std::process::Command::new("scp")
                         .arg("-P")
@@ -448,7 +379,7 @@ fn main() -> Result<()> {
                         .arg("-p")
                         .arg(port.to_string())
                         .arg(r)
-                        .arg(format!("chmod +x {}", tmp_bin))
+                        .arg(format!("chmod +x {}", shell_quote(&tmp_bin)))
                         .status()?;
                         
                     if !chmod_status.success() {
@@ -459,21 +390,27 @@ fn main() -> Result<()> {
                     remote_tmp_bin = Some(tmp_bin);
                 }
 
-                let remote_tmp_proj = format!("/tmp/duckpack_explore_{}", ts);
+                let remote_tmp_proj = format!("/tmp/duckpack_explore_{}", rand_suffix);
                 let _ = std::process::Command::new("ssh")
                     .arg("-p")
                     .arg(port.to_string())
                     .arg(r)
-                    .arg(format!("mkdir -p {}/queries", remote_tmp_proj))
+                    .arg(format!("mkdir -p {}/queries", shell_quote(&remote_tmp_proj)))
                     .status();
                 
                 println!("Launching remote TUI over SSH...");
-                let mut remote_cmd = format!("{} explore --project-dir {} --db {}", remote_bin, remote_tmp_proj, db);
-                if let Some(cat) = database {
-                    remote_cmd.push_str(&format!(" --database {}", cat));
-                }
+                let mut remote_cmd = String::new();
                 if let Some(token) = quack_token {
-                    remote_cmd.push_str(&format!(" --quack-token {}", token));
+                    remote_cmd.push_str(&format!("QUACK_TOKEN={} ", shell_quote(token)));
+                }
+                remote_cmd.push_str(&format!(
+                    "{} explore --project-dir {} --db {}",
+                    shell_quote(&remote_bin),
+                    shell_quote(&remote_tmp_proj),
+                    shell_quote(db)
+                ));
+                if let Some(cat) = database {
+                    remote_cmd.push_str(&format!(" --database {}", shell_quote(cat)));
                 }
                 if *quack_disable_ssl {
                     remote_cmd.push_str(" --quack-disable-ssl");
@@ -491,9 +428,9 @@ fn main() -> Result<()> {
                 }
 
                 println!("Cleaning up remote artifacts...");
-                let mut cleanup_cmd = format!("rm -rf {}", remote_tmp_proj);
+                let mut cleanup_cmd = format!("rm -rf {}", shell_quote(&remote_tmp_proj));
                 if let Some(tmp_bin) = remote_tmp_bin {
-                    cleanup_cmd.push_str(&format!(" {}", tmp_bin));
+                    cleanup_cmd.push_str(&format!(" {}", shell_quote(&tmp_bin)));
                 }
                 let _ = std::process::Command::new("ssh")
                     .arg("-p")
@@ -555,22 +492,19 @@ fn main() -> Result<()> {
         Commands::Deploy { project_dir, remote, db, port, auto_install } => {
             println!("Deploying {} to {} at {}", project_dir.display(), remote, db);
             
-            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-            let tmp_pack = format!("/tmp/duckpack_deploy_{}.duckpack", ts);
+            let rand_suffix = &generate_random_hex_token()[..16];
+            let tmp_pack = std::env::temp_dir()
+                .join(format!("duckpack_deploy_{}.duckpack", rand_suffix))
+                .to_string_lossy()
+                .to_string();
             
             println!("1. Compiling local DuckPack artifact...");
-            let out_conn = Connection::open(&tmp_pack).with_context(|| "Failed to create temp .duckpack file")?;
-            let schemas_dir = project_dir.join("schemas");
-            if schemas_dir.exists() { execute_directory(&out_conn, &schemas_dir)?; }
-            let tables_dir = project_dir.join("tables");
-            if tables_dir.exists() { execute_directory(&out_conn, &tables_dir)?; }
-            let views_dir = project_dir.join("views");
-            if views_dir.exists() { execute_directory(&out_conn, &views_dir)?; }
-            let macros_dir = project_dir.join("macros");
-            if macros_dir.exists() { execute_directory(&out_conn, &macros_dir)?; }
+            let _ = std::fs::remove_file(&tmp_pack);
+            let mut out_conn = Connection::open(&tmp_pack).with_context(|| "Failed to create temp .duckpack file")?;
+            compile_project_declarations(&mut out_conn, project_dir)?;
             out_conn.close().map_err(|e| anyhow::anyhow!("Failed to close DuckPack: {:?}", e.1))?;
             
-            let remote_tmp_pack = format!("/tmp/deploy_{}.duckpack", ts);
+            let remote_tmp_pack = format!("/tmp/deploy_{}.duckpack", rand_suffix);
             
             println!("2. Transferring artifact to remote server (scp)...");
             let scp_status = std::process::Command::new("scp")
@@ -581,6 +515,7 @@ fn main() -> Result<()> {
                 .status()?;
             
             if !scp_status.success() {
+                let _ = std::fs::remove_file(&tmp_pack);
                 anyhow::bail!("Failed to SCP artifact to remote server.");
             }
             
@@ -590,7 +525,7 @@ fn main() -> Result<()> {
             if *auto_install {
                 println!("2.5. Auto-installing DuckPack companion binary...");
                 let current_exe = std::env::current_exe().with_context(|| "Failed to get current executable path")?;
-                let tmp_bin = format!("/tmp/duckpack_bin_{}", ts);
+                let tmp_bin = format!("/tmp/duckpack_bin_{}", rand_suffix);
                 
                 let scp_bin_status = std::process::Command::new("scp")
                     .arg("-P")
@@ -600,6 +535,7 @@ fn main() -> Result<()> {
                     .status()?;
                     
                 if !scp_bin_status.success() {
+                    let _ = std::fs::remove_file(&tmp_pack);
                     anyhow::bail!("Failed to SCP binary to remote server.");
                 }
                 
@@ -608,10 +544,11 @@ fn main() -> Result<()> {
                     .arg("-p")
                     .arg(port.to_string())
                     .arg(remote)
-                    .arg(format!("chmod +x {}", tmp_bin))
+                    .arg(format!("chmod +x {}", shell_quote(&tmp_bin)))
                     .status()?;
                     
                 if !chmod_status.success() {
+                    let _ = std::fs::remove_file(&tmp_pack);
                     anyhow::bail!("Failed to make binary executable on remote server.");
                 }
                 
@@ -624,7 +561,12 @@ fn main() -> Result<()> {
                 .arg("-p")
                 .arg(port.to_string())
                 .arg(remote)
-                .arg(format!("{} apply --project-dir {} --db {} --auto-approve", remote_bin, remote_tmp_pack, db))
+                .arg(format!(
+                    "{} apply --project-dir {} --db {} --auto-approve",
+                    shell_quote(&remote_bin),
+                    shell_quote(&remote_tmp_pack),
+                    shell_quote(db)
+                ))
                 .status()?;
                 
             if !ssh_status.success() {
@@ -636,9 +578,9 @@ fn main() -> Result<()> {
             println!("4. Cleaning up temporary artifacts...");
             let _ = std::fs::remove_file(&tmp_pack);
             
-            let mut cleanup_cmd = format!("rm -f {}", remote_tmp_pack);
+            let mut cleanup_cmd = format!("rm -f {}", shell_quote(&remote_tmp_pack));
             if let Some(tmp_bin) = remote_tmp_bin {
-                cleanup_cmd.push_str(&format!(" {}", tmp_bin));
+                cleanup_cmd.push_str(&format!(" {}", shell_quote(&tmp_bin)));
             }
             
             let _ = std::process::Command::new("ssh")
@@ -713,6 +655,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Quotes a string as a single-quoted POSIX shell token (`'...'`, escaping embedded `'` as `'\''`).
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
 /// Launches the interactive visual diff & declarative migration review TUI.
 ///
 /// Can be invoked via `duckpack diff --interactive` (or `-i`) or `duckpack apply` (default mode).
@@ -753,41 +700,16 @@ fn run_diff_review_tui(
 
     let loop_res = (|| -> Result<()> {
         loop {
-            let shadow_conn = build_shadow_db(project_dir)?;
-            let target_conn = connect_target_db(db, quack_token, quack_disable_ssl)?;
-            
-            let shadow_schemas = diff::get_schemas(&shadow_conn, None)?;
-            let target_schemas = diff::get_schemas(&target_conn, Some(&active_catalog))?;
-            let shadow_schema = diff::get_schema(&shadow_conn, None)?;
-            let target_schema = diff::get_schema(&target_conn, Some(&active_catalog))?;
-            let shadow_views = diff::get_views(&shadow_conn, None)?;
-            let target_views = diff::get_views(&target_conn, Some(&active_catalog))?;
-            let shadow_macros = diff::get_macros(&shadow_conn, None)?;
-            let target_macros = diff::get_macros(&target_conn, Some(&active_catalog))?;
-            let shadow_triggers = diff::get_triggers(&shadow_conn, None)?;
-            let target_triggers = diff::get_triggers(&target_conn, Some(&active_catalog))?;
+            let (_shadow_conn, shadow_snapshot) = diff::CatalogSnapshot::from_project_dir(project_dir)?;
+            let mut target_conn = connect_target_db(db, quack_token, quack_disable_ssl)?;
+            let target_snapshot = diff::CatalogSnapshot::introspect(&mut target_conn, Some(&active_catalog))?;
             let ignore_list = load_ignore_rules(project_dir);
-
-            let mut diff_result = diff::compute_diff(
-                &shadow_schemas,
-                &target_schemas,
-                &shadow_schema, 
-                &target_schema, 
-                &shadow_views, 
-                &target_views, 
-                &shadow_macros, 
-                &target_macros, 
-                &shadow_triggers,
-                &target_triggers,
-                project_dir,
-                &ignore_list
-            );
+            let mut diff_result = diff::compute_diff_snapshots(&shadow_snapshot, &target_snapshot, project_dir, &ignore_list);
 
             if let Some(out_file) = out {
                 let mut script = String::new();
                 for item in &diff_result.items {
-                    let is_drop = matches!(item.item_type, diff::DiffItemType::DropTable | diff::DiffItemType::DropColumn | diff::DiffItemType::DropView | diff::DiffItemType::DropMacro | diff::DiffItemType::DropTrigger | diff::DiffItemType::RecreateTable);
-                    if is_drop && !current_force_drop {
+                    if item.is_destructive() && !current_force_drop {
                         continue;
                     }
                     if !item.sql.trim().is_empty() {
@@ -853,6 +775,7 @@ fn run_diff_review_tui(
                     }
                     tui::TuiAction::Inspect { obj_name } => {
                         let safe_obj = obj_name.replace('\'', "''");
+                        let quoted_obj = diff::quote_qualified_identifier(&obj_name);
                         
                         let mut cols = Vec::new();
                         if let Ok(mut pragma_stmt) = target_conn.prepare(&format!("PRAGMA table_info('{}')", safe_obj)) {
@@ -869,7 +792,7 @@ fn run_diff_review_tui(
                             status_msg = format!("Cannot inspect '{}': Does not exist in target database yet.", obj_name);
                         } else {
                             let mut row_count = 0;
-                            if let Ok(mut count_stmt) = target_conn.prepare(&format!("SELECT count(*) FROM \"{}\"", safe_obj)) {
+                            if let Ok(mut count_stmt) = target_conn.prepare(&format!("SELECT count(*) FROM {}", quoted_obj)) {
                                 if let Ok(mut count_rows) = count_stmt.query([]) {
                                     if let Ok(Some(row)) = count_rows.next() {
                                         row_count = row.get::<_, i64>(0).unwrap_or(0);
@@ -877,8 +800,12 @@ fn run_diff_review_tui(
                                 }
                             }
 
-                            let cast_cols = cols.iter().map(|c| format!("CAST(\"{}\" AS VARCHAR)", c)).collect::<Vec<_>>().join(", ");
-                            if let Ok(mut stmt) = target_conn.prepare(&format!("SELECT {} FROM \"{}\" LIMIT 5", cast_cols, safe_obj)) {
+                            let cast_cols = cols
+                                .iter()
+                                .map(|c| format!("CAST(\"{}\" AS VARCHAR)", c.replace('\"', "\"\"")))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            if let Ok(mut stmt) = target_conn.prepare(&format!("SELECT {} FROM {} LIMIT 5", cast_cols, quoted_obj)) {
                                 if let Ok(mut db_rows) = stmt.query([]) {
                                     let mut rows = Vec::new();
                                     while let Ok(Some(row)) = db_rows.next() {
@@ -961,33 +888,10 @@ fn run_diff_review_tui(
                     }
 
                     tui::TuiAction::Pull { obj_name, item_type } => {
-                        let sql = match item_type {
-                            diff::DiffItemType::DropTable => {
-                                target_schema.get(&obj_name).map(|target| target.create_sql.clone())
-                            }
-                            diff::DiffItemType::DropView => target_views.get(&obj_name).cloned(),
-                            diff::DiffItemType::DropMacro => target_macros.get(&obj_name).cloned(),
-                            diff::DiffItemType::DropTrigger => target_triggers.get(&obj_name).map(|t| t.sql.clone()),
-                            _ => None,
-                        };
-
-                        if let Some(sql) = sql {
-                            let mut path = project_dir.to_path_buf();
-                            match item_type {
-                                diff::DiffItemType::DropTable => path.push("tables"),
-                                diff::DiffItemType::DropView => path.push("views"),
-                                diff::DiffItemType::DropMacro => path.push("macros"),
-                                diff::DiffItemType::DropTrigger => path.push("triggers"),
-                                _ => {}
-                            }
-                            path.push(format!("{}.sql", obj_name));
-                            if let Err(e) = std::fs::write(&path, sql) {
-                                status_msg = format!("Error pulling '{}': {}", obj_name, e);
-                            } else {
-                                status_msg = format!("Successfully pulled '{}' back into local project!", obj_name);
-                            }
+                        if let Err(e) = target_snapshot.pull_object_to_project(project_dir, &item_type, &obj_name) {
+                            status_msg = format!("Error pulling '{}': {}", obj_name, e);
                         } else {
-                            status_msg = format!("Cannot pull '{}': Definition not found in remote DB.", obj_name);
+                            status_msg = format!("Successfully pulled '{}' back into local project!", obj_name);
                         }
                     }
                 }

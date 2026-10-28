@@ -203,8 +203,21 @@ pub(crate) fn generate_asset_boilerplate(category: ProjectCategory, name: &str) 
 }
 
 /// Computes the disk file path for a project asset category and name.
+/// Sanitizes path separators and `..` traversal components so the resulting path
+/// always stays within the category directory under `project_dir`.
 pub(crate) fn get_asset_file_path(project_dir: &Path, category: ProjectCategory, name: &str) -> PathBuf {
-    let mut clean_name = name.trim().to_string();
+    let mut clean_name: String = name
+        .trim()
+        .chars()
+        .filter(|&c| c != '/' && c != '\\' && c != '\0' && !c.is_control())
+        .collect();
+    while clean_name.contains("..") {
+        clean_name = clean_name.replace("..", "_");
+    }
+    clean_name = clean_name.trim_start_matches('.').to_string();
+    if clean_name.is_empty() {
+        clean_name = "unnamed".to_string();
+    }
     if category == ProjectCategory::Seed {
         if !clean_name.contains('.') {
             clean_name.push_str(".csv");
@@ -230,89 +243,52 @@ pub(crate) fn get_asset_file_path(project_dir: &Path, category: ProjectCategory,
 }
 
 /// Computes declarative diff between project definitions and the target database.
+#[allow(dead_code)]
 pub(crate) fn compute_ide_diff(
     project_dir: &Path,
     target_conn: &Connection,
 ) -> Result<crate::diff::DiffResult, String> {
-    let shadow_conn = crate::engine::build_shadow_db(project_dir)
-        .map_err(|e| format!("Shadow DB Build Error: {:#}", e))?;
+    compute_ide_diff_for_catalog(project_dir, target_conn, None)
+}
 
-    let is_quack = target_conn
-        .query_row(
-            "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0) > 0;
-
-    let target_cat = if is_quack {
-        crate::diff::validate_target_catalog(target_conn, None, false).ok()
-    } else if target_conn.query_row("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db'", [], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0 {
-        Some("target_db".to_string())
-    } else {
-        None
-    };
-
-    let target_cat_ref = target_cat.as_deref();
-
-    let shadow_schemas = crate::diff::get_schemas(&shadow_conn, None).map_err(|e| format!("{:#}", e))?;
-    let target_schemas = crate::diff::get_schemas(target_conn, target_cat_ref).map_err(|e| format!("{:#}", e))?;
-    let shadow_schema = crate::diff::get_schema(&shadow_conn, None).map_err(|e| format!("{:#}", e))?;
-    let target_schema = crate::diff::get_schema(target_conn, target_cat_ref).map_err(|e| format!("{:#}", e))?;
-    let shadow_views = crate::diff::get_views(&shadow_conn, None).map_err(|e| format!("{:#}", e))?;
-    let target_views = crate::diff::get_views(target_conn, target_cat_ref).map_err(|e| format!("{:#}", e))?;
-    let shadow_macros = crate::diff::get_macros(&shadow_conn, None).map_err(|e| format!("{:#}", e))?;
-    let target_macros = crate::diff::get_macros(target_conn, target_cat_ref).map_err(|e| format!("{:#}", e))?;
-    let shadow_triggers = crate::diff::get_triggers(&shadow_conn, None).map_err(|e| format!("{:#}", e))?;
-    let target_triggers = crate::diff::get_triggers(target_conn, target_cat_ref).map_err(|e| format!("{:#}", e))?;
-    let ignore_list = crate::engine::load_ignore_rules(project_dir);
-
-    Ok(crate::diff::compute_diff(
-        &shadow_schemas,
-        &target_schemas,
-        &shadow_schema,
-        &target_schema,
-        &shadow_views,
-        &target_views,
-        &shadow_macros,
-        &target_macros,
-        &shadow_triggers,
-        &target_triggers,
-        &project_dir.to_path_buf(),
-        &ignore_list,
-    ))
+pub(crate) fn compute_ide_diff_for_catalog(
+    project_dir: &Path,
+    target_conn: &Connection,
+    catalog: Option<&str>,
+) -> Result<crate::diff::DiffResult, String> {
+    let mut exec = target_conn;
+    let target_cat = crate::diff::validate_target_catalog_exec(&mut exec, catalog, false).ok();
+    crate::diff::diff_project(project_dir, &mut exec, target_cat.as_deref())
+        .map_err(|e| format!("{:#}", e))
 }
 
 /// Applies declarative diff items to the target database catalog.
+#[allow(dead_code)]
 pub(crate) fn apply_ide_diff(
     project_dir: &Path,
     target_conn: &Connection,
     diff_result: &crate::diff::DiffResult,
 ) -> Result<(), String> {
-    let is_quack = target_conn
-        .query_row(
-            "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0) > 0;
+    apply_ide_diff_for_catalog(project_dir, target_conn, diff_result, None)
+}
 
-    let target_cat = if is_quack {
-        crate::diff::validate_target_catalog(target_conn, None, true).ok()
-    } else if target_conn.query_row("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db'", [], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0 {
-        Some("target_db".to_string())
-    } else {
-        None
-    };
-
-    crate::engine::apply_diff(
-        target_conn,
+pub(crate) fn apply_ide_diff_for_catalog(
+    project_dir: &Path,
+    target_conn: &Connection,
+    diff_result: &crate::diff::DiffResult,
+    catalog: Option<&str>,
+) -> Result<(), String> {
+    let mut exec = target_conn;
+    let target_cat = crate::diff::validate_target_catalog_exec(&mut exec, catalog, true).ok();
+    crate::engine::apply_diff_with_executor(
+        &mut exec,
         diff_result,
+        true,
         false,
-        is_quack,
-        &project_dir.to_path_buf(),
+        project_dir,
         target_cat.as_deref(),
-    ).map_err(|e| format!("{:#}", e))
+    )
+    .map_err(|e| format!("{:#}", e))
 }
 
 /// Passively detects the current Git branch and file status without modifying Git index.
@@ -4128,6 +4104,8 @@ pub fn run_ide_loop(
                             let asset_name = new_asset_modal.name.trim().to_string();
                             if asset_name.is_empty() {
                                 new_asset_modal.error_msg = Some("Asset name cannot be empty.".to_string());
+                            } else if let Err(e) = crate::diff::validate_safe_project_filename(&asset_name) {
+                                new_asset_modal.error_msg = Some(e.to_string());
                             } else {
                                 let cat = new_asset_modal.current_category();
                                 let path = get_asset_file_path(project_dir, cat, &asset_name);
@@ -4213,7 +4191,8 @@ pub fn run_ide_loop(
                             } else {
                                 let selected_count = active_indices.iter().filter(|&&idx| diff.items[idx].selected && !diff.items[idx].locked).count();
                                 if selected_count > 0 {
-                                    match apply_ide_diff(project_dir, conn, diff) {
+                                    let tab_cat = tabs.get(active_tab_index).map(|t| t.target_database.as_str()).filter(|c| !c.is_empty() && *c != "memory");
+                                    match apply_ide_diff_for_catalog(project_dir, conn, diff, tab_cat) {
                                         Ok(_) => {
                                             status_msg = format!("✓ Applied {} selected change(s) to target catalog successfully!", selected_count);
                                             in_ide_diff_modal.is_open = false;
@@ -4613,7 +4592,8 @@ pub fn run_ide_loop(
                 }
 
                 if key.code == KeyCode::F(6) || (key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL)) {
-                    match compute_ide_diff(project_dir, conn) {
+                    let tab_cat = tabs.get(active_tab_index).map(|t| t.target_database.as_str()).filter(|c| !c.is_empty() && *c != "memory");
+                    match compute_ide_diff_for_catalog(project_dir, conn, tab_cat) {
                         Ok(diff) => {
                             in_ide_diff_modal.reset();
                             in_ide_diff_modal.diff_result = Some(diff);

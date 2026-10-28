@@ -1,7 +1,6 @@
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -72,7 +71,11 @@ impl DbExecutor for PyDbExecutor {
                             if cell.is_none() {
                                 row_data.push("NULL".to_string());
                             } else {
-                                row_data.push(cell.str().map(|s| s.to_string()).unwrap_or_else(|_| format!("{:?}", cell)));
+                                row_data.push(
+                                    cell.str()
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|_| format!("{:?}", cell)),
+                                );
                             }
                         }
                     }
@@ -134,7 +137,11 @@ fn find_available_port() -> u16 {
 }
 
 fn print_non_terminal_explorer(executor: &mut PyDbExecutor, catalog: Option<&str>) -> PyResult<()> {
-    let (_schemas, table_map, view_map, macro_map, _trigger_map) = introspect_py_catalog(executor, catalog)?;
+    let snapshot = schema_diff::CatalogSnapshot::introspect(executor, catalog)
+        .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+    let table_map = snapshot.tables;
+    let view_map = snapshot.views;
+    let macro_map = snapshot.macros;
 
     // Discover temporary tables
     let mut temp_tables: Vec<(String, Vec<(String, String)>)> = Vec::new();
@@ -169,7 +176,10 @@ fn print_non_terminal_explorer(executor: &mut PyDbExecutor, catalog: Option<&str
 
     println!("======================================================================");
     if let Some(cat) = catalog {
-        println!("🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: catalog '{}')", cat);
+        println!(
+            "🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: catalog '{}')",
+            cat
+        );
     } else {
         println!("🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode)");
     }
@@ -183,8 +193,9 @@ fn print_non_terminal_explorer(executor: &mut PyDbExecutor, catalog: Option<&str
         let mut sorted_tables: Vec<_> = table_map.iter().collect();
         sorted_tables.sort_by_key(|(name, _)| (*name).clone());
         for (name, schema) in sorted_tables {
+            let quoted_name = schema_diff::quote_qualified_identifier(name);
             let row_count = executor
-                .query_rows(&format!("SELECT count(*) FROM {}", name))
+                .query_rows(&format!("SELECT count(*) FROM {}", quoted_name))
                 .ok()
                 .and_then(|(_, rows)| rows.into_iter().next())
                 .and_then(|r| r.into_iter().next())
@@ -200,7 +211,10 @@ fn print_non_terminal_explorer(executor: &mut PyDbExecutor, catalog: Option<&str
 
         for (tname, cols) in &temp_tables {
             let row_count = executor
-                .query_rows(&format!("SELECT count(*) FROM \"{}\"", tname.replace('\"', "\"\"")))
+                .query_rows(&format!(
+                    "SELECT count(*) FROM \"{}\"",
+                    tname.replace('\"', "\"\"")
+                ))
                 .ok()
                 .and_then(|(_, rows)| rows.into_iter().next())
                 .and_then(|r| r.into_iter().next())
@@ -235,13 +249,19 @@ fn print_non_terminal_explorer(executor: &mut PyDbExecutor, catalog: Option<&str
     println!("💡 Note: Full interactive TUI (multi-tab SQL editor, autocompletion,");
     println!("   ERD diagram) requires an interactive terminal (TTY).");
     println!("   To launch the interactive IDE, run your script from a terminal shell:");
-    println!("   $ python -c \"import duckdb, duckpack; con = duckdb.connect(...); duckpack.explore(con)\"");
+    println!(
+        "   $ python -c \"import duckdb, duckpack; con = duckdb.connect(...); duckpack.explore(con)\""
+    );
     println!("======================================================================");
 
     Ok(())
 }
 
-fn print_non_terminal_db(conn: &duckdb::Connection, db_name: &str, catalog: Option<&str>) -> PyResult<()> {
+fn print_non_terminal_db(
+    conn: &duckdb::Connection,
+    db_name: &str,
+    catalog: Option<&str>,
+) -> PyResult<()> {
     let tables = schema_diff::get_schema(conn, catalog).unwrap_or_default();
     let views = schema_diff::get_views(conn, catalog).unwrap_or_default();
     let macros = schema_diff::get_macros(conn, catalog).unwrap_or_default();
@@ -286,9 +306,15 @@ fn print_non_terminal_db(conn: &duckdb::Connection, db_name: &str, catalog: Opti
 
     println!("======================================================================");
     if let Some(cat) = catalog {
-        println!("🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: {} [catalog '{}'])", db_name, cat);
+        println!(
+            "🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: {} [catalog '{}'])",
+            db_name, cat
+        );
     } else {
-        println!("🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: {})", db_name);
+        println!(
+            "🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: {})",
+            db_name
+        );
     }
     println!("======================================================================");
 
@@ -300,8 +326,9 @@ fn print_non_terminal_db(conn: &duckdb::Connection, db_name: &str, catalog: Opti
         let mut sorted_tables: Vec<_> = tables.iter().collect();
         sorted_tables.sort_by_key(|(name, _)| (*name).clone());
         for (name, schema) in sorted_tables {
+            let quoted_name = schema_diff::quote_qualified_identifier(name);
             let row_count: String = conn
-                .query_row(&format!("SELECT count(*) FROM {}", name), [], |r| {
+                .query_row(&format!("SELECT count(*) FROM {}", quoted_name), [], |r| {
                     let c: i64 = r.get(0)?;
                     Ok(c.to_string())
                 })
@@ -317,10 +344,14 @@ fn print_non_terminal_db(conn: &duckdb::Connection, db_name: &str, catalog: Opti
 
         for (tname, cols) in &temp_tables {
             let row_count: String = conn
-                .query_row(&format!("SELECT count(*) FROM \"{}\"", tname.replace('\"', "\"\"")), [], |r| {
-                    let c: i64 = r.get(0)?;
-                    Ok(c.to_string())
-                })
+                .query_row(
+                    &format!("SELECT count(*) FROM \"{}\"", tname.replace('\"', "\"\"")),
+                    [],
+                    |r| {
+                        let c: i64 = r.get(0)?;
+                        Ok(c.to_string())
+                    },
+                )
                 .unwrap_or_else(|_| "?".to_string());
 
             println!("  • {} [temp] ({} rows)", tname, row_count);
@@ -352,7 +383,9 @@ fn print_non_terminal_db(conn: &duckdb::Connection, db_name: &str, catalog: Opti
     println!("💡 Note: Full interactive TUI (multi-tab SQL editor, autocompletion,");
     println!("   ERD diagram) requires an interactive terminal (TTY).");
     println!("   To launch the interactive IDE, run your script from a terminal shell:");
-    println!("   $ python -c \"import duckdb, duckpack; con = duckdb.connect(...); duckpack.explore(con)\"");
+    println!(
+        "   $ python -c \"import duckdb, duckpack; con = duckdb.connect(...); duckpack.explore(con)\""
+    );
     println!("======================================================================");
 
     Ok(())
@@ -375,11 +408,18 @@ impl ApplyResult {
     #[new]
     #[pyo3(signature = (success = true, applied_count = 0, items = Vec::new()))]
     fn new(success: bool, applied_count: usize, items: Vec<String>) -> Self {
-        Self { success, applied_count, items }
+        Self {
+            success,
+            applied_count,
+            items,
+        }
     }
 
     fn __repr__(&self) -> String {
-        format!("<ApplyResult success={} applied_count={}>", self.success, self.applied_count)
+        format!(
+            "<ApplyResult success={} applied_count={}>",
+            self.success, self.applied_count
+        )
     }
 }
 
@@ -400,11 +440,18 @@ impl DiffSummary {
     #[new]
     #[pyo3(signature = (has_changes = false, change_count = 0, items = Vec::new()))]
     fn new(has_changes: bool, change_count: usize, items: Vec<String>) -> Self {
-        Self { has_changes, change_count, items }
+        Self {
+            has_changes,
+            change_count,
+            items,
+        }
     }
 
     fn __repr__(&self) -> String {
-        format!("<DiffSummary has_changes={} change_count={}>", self.has_changes, self.change_count)
+        format!(
+            "<DiffSummary has_changes={} change_count={}>",
+            self.has_changes, self.change_count
+        )
     }
 }
 
@@ -434,29 +481,11 @@ pub fn compile(project_dir: &str, out: &str) -> PyResult<()> {
         .map_err(|e| SchemaError::new_err(format!("Validation failed: {}", e)))?;
 
     let _ = std::fs::remove_file(out);
-    let out_conn = duckdb::Connection::open(out)
+    let mut out_conn = duckdb::Connection::open(out)
         .map_err(|e| ExecutionError::new_err(format!("Failed to create .duckpack: {}", e)))?;
 
-    let schemas_dir = p_dir.join("schemas");
-    if schemas_dir.exists() {
-        engine::execute_directory(&out_conn, &schemas_dir)
-            .map_err(|e| SchemaError::new_err(format!("Schema compilation error: {}", e)))?;
-    }
-    let tables_dir = p_dir.join("tables");
-    if tables_dir.exists() {
-        engine::execute_directory(&out_conn, &tables_dir)
-            .map_err(|e| SchemaError::new_err(format!("Table compilation error: {}", e)))?;
-    }
-    let views_dir = p_dir.join("views");
-    if views_dir.exists() {
-        engine::execute_directory(&out_conn, &views_dir)
-            .map_err(|e| SchemaError::new_err(format!("View compilation error: {}", e)))?;
-    }
-    let macros_dir = p_dir.join("macros");
-    if macros_dir.exists() {
-        engine::execute_directory(&out_conn, &macros_dir)
-            .map_err(|e| SchemaError::new_err(format!("Macro compilation error: {}", e)))?;
-    }
+    engine::compile_project_declarations(&mut out_conn, p_dir)
+        .map_err(|e| SchemaError::new_err(format!("Compilation error: {}", e)))?;
 
     Ok(())
 }
@@ -475,19 +504,8 @@ pub fn diff(
     env: Option<&str>,
 ) -> PyResult<DiffSummary> {
     let p_dir = PathBuf::from(project_dir);
-    let shadow_conn = engine::build_shadow_db(&p_dir)
+    let (_shadow_conn, shadow_snapshot) = schema_diff::CatalogSnapshot::from_project_dir(&p_dir)
         .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
-
-    let shadow_schemas = schema_diff::get_schemas(&shadow_conn, None)
-        .map_err(|e| SchemaError::new_err(format!("Error extracting shadow schemas: {}", e)))?;
-    let shadow_schema = schema_diff::get_schema(&shadow_conn, None)
-        .map_err(|e| SchemaError::new_err(format!("Error extracting shadow schema: {}", e)))?;
-    let shadow_views = schema_diff::get_views(&shadow_conn, None)
-        .map_err(|e| SchemaError::new_err(format!("Error extracting shadow views: {}", e)))?;
-    let shadow_macros = schema_diff::get_macros(&shadow_conn, None)
-        .map_err(|e| SchemaError::new_err(format!("Error extracting shadow macros: {}", e)))?;
-    let shadow_triggers = schema_diff::get_triggers(&shadow_conn, None)
-        .map_err(|e| SchemaError::new_err(format!("Error extracting shadow triggers: {}", e)))?;
 
     let explicit_db = target.and_then(|t| t.extract::<String>().ok());
     let explicit_catalog = database.or(catalog).map(|s| vec![s.to_string()]);
@@ -501,40 +519,29 @@ pub fn diff(
     );
     let req_catalog = spec.catalogs.first().cloned();
 
-    // Determine target connection
-    let (target_schemas, target_schema, target_views, target_macros, target_triggers) = if target.is_none() || explicit_db.is_some() {
-        let conn = spec.connect()
+    let target_snapshot = if target.is_none() || explicit_db.is_some() {
+        let mut conn = spec
+            .connect()
             .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
-        let active_cat = schema_diff::validate_target_catalog(&conn, req_catalog.as_deref(), false)
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-        (
-            schema_diff::get_schemas(&conn, Some(&active_cat)).map_err(|e| ExecutionError::new_err(e.to_string()))?,
-            schema_diff::get_schema(&conn, Some(&active_cat)).map_err(|e| ExecutionError::new_err(e.to_string()))?,
-            schema_diff::get_views(&conn, Some(&active_cat)).map_err(|e| ExecutionError::new_err(e.to_string()))?,
-            schema_diff::get_macros(&conn, Some(&active_cat)).map_err(|e| ExecutionError::new_err(e.to_string()))?,
-            schema_diff::get_triggers(&conn, Some(&active_cat)).map_err(|e| ExecutionError::new_err(e.to_string()))?,
-        )
+        let active_cat =
+            schema_diff::validate_target_catalog_exec(&mut conn, req_catalog.as_deref(), false)
+                .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+        schema_diff::CatalogSnapshot::introspect(&mut conn, Some(&active_cat))
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?
     } else {
-        // Live Python connection: introspect catalog directly
         let t = target.unwrap();
         let mut executor = PyDbExecutor::new(t.clone().unbind());
-        let active_cat = validate_py_target_catalog(&mut executor, req_catalog.as_deref(), false)?;
-        introspect_py_catalog(&mut executor, Some(&active_cat))?
+        let active_cat =
+            schema_diff::validate_target_catalog_exec(&mut executor, req_catalog.as_deref(), false)
+                .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+        schema_diff::CatalogSnapshot::introspect(&mut executor, Some(&active_cat))
+            .map_err(|e| ExecutionError::new_err(e.to_string()))?
     };
 
     let ignore_list = engine::load_ignore_rules(&p_dir);
-
-    let diff_result = schema_diff::compute_diff(
-        &shadow_schemas,
-        &target_schemas,
-        &shadow_schema,
-        &target_schema,
-        &shadow_views,
-        &target_views,
-        &shadow_macros,
-        &target_macros,
-        &shadow_triggers,
-        &target_triggers,
+    let diff_result = schema_diff::compute_diff_snapshots(
+        &shadow_snapshot,
+        &target_snapshot,
         &p_dir,
         &ignore_list,
     );
@@ -545,7 +552,10 @@ pub fn diff(
         .filter(|i| !i.ignored)
         .collect();
     let change_count = unignored_items.len();
-    let items = unignored_items.iter().map(|item| format!("{:?}: {}", item.item_type, item.obj_name)).collect();
+    let items = unignored_items
+        .iter()
+        .map(|item| format!("{:?}: {}", item.item_type, item.obj_name))
+        .collect();
 
     Ok(DiffSummary {
         has_changes: change_count > 0,
@@ -572,54 +582,33 @@ fn run_apply_tui(
     let mut active_catalog = schema_diff::validate_target_catalog(conn, catalog, true)
         .map_err(|e| ExecutionError::new_err(e.to_string()))?;
 
-    let mut status_msg = String::from("Ready. Press 'Enter' to Apply, 'r' to Refresh, 'b' to switch catalog, 'q' to Quit.");
+    let mut status_msg = String::from(
+        "Ready. Press 'Enter' to Apply, 'r' to Refresh, 'b' to switch catalog, 'q' to Quit.",
+    );
     let mut current_force_drop = force_drop;
     let mut inspect_data: Option<(String, Vec<String>, Vec<Vec<String>>, i64)> = None;
     let mut total_applied_count: usize = 0;
     let mut total_applied_items: Vec<String> = Vec::new();
 
     loop {
-        let shadow_conn = engine::build_shadow_db(project_dir)
-            .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
-
-        let shadow_schemas = schema_diff::get_schemas(&shadow_conn, None)
-            .map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let target_schemas = schema_diff::get_schemas(conn, Some(&active_catalog))
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-        let shadow_schema = schema_diff::get_schema(&shadow_conn, None)
-            .map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let target_schema = schema_diff::get_schema(conn, Some(&active_catalog))
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-        let shadow_views = schema_diff::get_views(&shadow_conn, None)
-            .map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let target_views = schema_diff::get_views(conn, Some(&active_catalog))
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-        let shadow_macros = schema_diff::get_macros(&shadow_conn, None)
-            .map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let target_macros = schema_diff::get_macros(conn, Some(&active_catalog))
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-        let shadow_triggers = schema_diff::get_triggers(&shadow_conn, None)
-            .map_err(|e| SchemaError::new_err(e.to_string()))?;
-        let target_triggers = schema_diff::get_triggers(conn, Some(&active_catalog))
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+        let (_shadow_conn, shadow_snapshot) =
+            schema_diff::CatalogSnapshot::from_project_dir(project_dir)
+                .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
+        let mut target_exec = conn;
+        let target_snapshot =
+            schema_diff::CatalogSnapshot::introspect(&mut target_exec, Some(&active_catalog))
+                .map_err(|e| ExecutionError::new_err(e.to_string()))?;
         let ignore_list = engine::load_ignore_rules(project_dir);
-
-        let mut diff_result = schema_diff::compute_diff(
-            &shadow_schemas,
-            &target_schemas,
-            &shadow_schema,
-            &target_schema,
-            &shadow_views,
-            &target_views,
-            &shadow_macros,
-            &target_macros,
-            &shadow_triggers,
-            &target_triggers,
+        let mut diff_result = schema_diff::compute_diff_snapshots(
+            &shadow_snapshot,
+            &target_snapshot,
             project_dir,
             &ignore_list,
         );
 
-        let display_target = if db_target.starts_with("quack:localhost:") || db_target.starts_with("quack:127.0.0.1:") {
+        let display_target = if db_target.starts_with("quack:localhost:")
+            || db_target.starts_with("quack:127.0.0.1:")
+        {
             format!("{} (Python In-Memory)", db_target)
         } else {
             db_target.to_string()
@@ -633,7 +622,8 @@ fn run_apply_tui(
             false,
             &inspect_data,
             &title,
-        ).map_err(|e| ExecutionError::new_err(format!("TUI error: {}", e)))?;
+        )
+        .map_err(|e| ExecutionError::new_err(format!("TUI error: {}", e)))?;
 
         match action {
             crate::tui::TuiAction::Quit => {
@@ -647,15 +637,25 @@ fn run_apply_tui(
                 let attached = schema_diff::list_attached_databases(conn).unwrap_or_default();
                 let writable_dbs: Vec<_> = attached
                     .into_iter()
-                    .filter(|d| !d.readonly && (d.db_type.eq_ignore_ascii_case("duckdb") || d.db_type.eq_ignore_ascii_case("quack")))
+                    .filter(|d| {
+                        !d.readonly
+                            && (d.db_type.eq_ignore_ascii_case("duckdb")
+                                || d.db_type.eq_ignore_ascii_case("quack"))
+                    })
                     .collect();
                 if writable_dbs.len() > 1 {
-                    let curr_idx = writable_dbs.iter().position(|d| d.name.eq_ignore_ascii_case(&active_catalog)).unwrap_or(0);
+                    let curr_idx = writable_dbs
+                        .iter()
+                        .position(|d| d.name.eq_ignore_ascii_case(&active_catalog))
+                        .unwrap_or(0);
                     let next_idx = (curr_idx + 1) % writable_dbs.len();
                     active_catalog = writable_dbs[next_idx].name.clone();
                     status_msg = format!("Switched target catalog to '{}'", active_catalog);
                 } else {
-                    status_msg = format!("Catalog '{}' is the only writable DuckDB database attached.", active_catalog);
+                    status_msg = format!(
+                        "Catalog '{}' is the only writable DuckDB database attached.",
+                        active_catalog
+                    );
                 }
                 continue;
             }
@@ -680,7 +680,9 @@ fn run_apply_tui(
             crate::tui::TuiAction::Inspect { obj_name } => {
                 let safe_obj = obj_name.replace('\'', "''");
                 let mut cols = Vec::new();
-                if let Ok(mut pragma_stmt) = conn.prepare(&format!("PRAGMA table_info('{}')", safe_obj)) {
+                if let Ok(mut pragma_stmt) =
+                    conn.prepare(&format!("PRAGMA table_info('{}')", safe_obj))
+                {
                     if let Ok(mut pragma_rows) = pragma_stmt.query([]) {
                         while let Ok(Some(row)) = pragma_rows.next() {
                             if let Ok(col_name) = row.get::<_, String>(1) {
@@ -691,10 +693,15 @@ fn run_apply_tui(
                 }
 
                 if cols.is_empty() {
-                    status_msg = format!("Cannot inspect '{}': Does not exist in target database yet.", obj_name);
+                    status_msg = format!(
+                        "Cannot inspect '{}': Does not exist in target database yet.",
+                        obj_name
+                    );
                 } else {
                     let mut row_count = 0;
-                    if let Ok(mut count_stmt) = conn.prepare(&format!("SELECT count(*) FROM \"{}\"", safe_obj)) {
+                    if let Ok(mut count_stmt) =
+                        conn.prepare(&format!("SELECT count(*) FROM \"{}\"", safe_obj))
+                    {
                         if let Ok(mut count_rows) = count_stmt.query([]) {
                             if let Ok(Some(row)) = count_rows.next() {
                                 row_count = row.get::<_, i64>(0).unwrap_or(0);
@@ -702,14 +709,22 @@ fn run_apply_tui(
                         }
                     }
 
-                    let cast_cols = cols.iter().map(|c| format!("CAST(\"{}\" AS VARCHAR)", c)).collect::<Vec<_>>().join(", ");
-                    if let Ok(mut stmt) = conn.prepare(&format!("SELECT {} FROM \"{}\" LIMIT 5", cast_cols, safe_obj)) {
+                    let cast_cols = cols
+                        .iter()
+                        .map(|c| format!("CAST(\"{}\" AS VARCHAR)", c))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if let Ok(mut stmt) = conn.prepare(&format!(
+                        "SELECT {} FROM \"{}\" LIMIT 5",
+                        cast_cols, safe_obj
+                    )) {
                         if let Ok(mut db_rows) = stmt.query([]) {
                             let mut rows = Vec::new();
                             while let Ok(Some(row)) = db_rows.next() {
                                 let mut str_row = Vec::new();
                                 for i in 0..cols.len() {
-                                    let val: String = row.get(i).unwrap_or_else(|_| "NULL".to_string());
+                                    let val: String =
+                                        row.get(i).unwrap_or_else(|_| "NULL".to_string());
                                     str_row.push(val);
                                 }
                                 rows.push(str_row);
@@ -725,37 +740,24 @@ fn run_apply_tui(
                 continue;
             }
             crate::tui::TuiAction::Explore => {
-                let _ = crate::ide::run_ide_loop(&mut terminal, conn, project_dir, db_target, false);
+                let _ =
+                    crate::ide::run_ide_loop(&mut terminal, conn, project_dir, db_target, false);
                 terminal.clear().ok();
                 continue;
             }
-            crate::tui::TuiAction::Pull { obj_name, item_type } => {
-                let sql = match item_type {
-                    crate::diff::DiffItemType::DropTable => {
-                        target_schema.get(&obj_name).map(|t| t.create_sql.clone())
-                    }
-                    crate::diff::DiffItemType::DropView => target_views.get(&obj_name).cloned(),
-                    crate::diff::DiffItemType::DropMacro => target_macros.get(&obj_name).cloned(),
-                    crate::diff::DiffItemType::DropTrigger => target_triggers.get(&obj_name).map(|t| t.sql.clone()),
-                    _ => None,
-                };
-                if let Some(sql) = sql {
-                    let mut path = project_dir.to_path_buf();
-                    match item_type {
-                        crate::diff::DiffItemType::DropTable => path.push("tables"),
-                        crate::diff::DiffItemType::DropView => path.push("views"),
-                        crate::diff::DiffItemType::DropMacro => path.push("macros"),
-                        crate::diff::DiffItemType::DropTrigger => path.push("triggers"),
-                        _ => {}
-                    }
-                    path.push(format!("{}.sql", obj_name));
-                    if let Err(e) = std::fs::write(&path, sql) {
-                        status_msg = format!("Error pulling '{}': {}", obj_name, e);
-                    } else {
-                        status_msg = format!("Successfully pulled '{}' back into local project!", obj_name);
-                    }
+            crate::tui::TuiAction::Pull {
+                obj_name,
+                item_type,
+            } => {
+                if let Err(e) =
+                    target_snapshot.pull_object_to_project(project_dir, &item_type, &obj_name)
+                {
+                    status_msg = format!("Error pulling '{}': {}", obj_name, e);
                 } else {
-                    status_msg = format!("Cannot pull '{}': Definition not found in remote DB.", obj_name);
+                    status_msg = format!(
+                        "Successfully pulled '{}' back into local project!",
+                        obj_name
+                    );
                 }
                 continue;
             }
@@ -787,7 +789,14 @@ fn run_apply_tui(
                     if db_path.exists() {
                         let _ = std::fs::copy(&db_path, &b_path);
                     }
-                    let apply_res = engine::apply_diff(conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
+                    let apply_res = engine::apply_diff(
+                        conn,
+                        &diff_result,
+                        current_force_drop,
+                        remote,
+                        project_dir,
+                        Some(&active_catalog),
+                    );
                     match apply_res {
                         Ok(_) => {
                             if b_path.exists() {
@@ -795,7 +804,10 @@ fn run_apply_tui(
                             }
                             total_applied_count += applied_count;
                             total_applied_items.extend(applied_items);
-                            status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
+                            status_msg = format!(
+                                "✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.",
+                                applied_count, active_catalog
+                            );
                             continue;
                         }
                         Err(e) => {
@@ -808,12 +820,22 @@ fn run_apply_tui(
                         }
                     }
                 } else {
-                    let apply_res = engine::apply_diff(conn, &diff_result, current_force_drop, remote, project_dir, Some(&active_catalog));
+                    let apply_res = engine::apply_diff(
+                        conn,
+                        &diff_result,
+                        current_force_drop,
+                        remote,
+                        project_dir,
+                        Some(&active_catalog),
+                    );
                     match apply_res {
                         Ok(_) => {
                             total_applied_count += applied_count;
                             total_applied_items.extend(applied_items);
-                            status_msg = format!("✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.", applied_count, active_catalog);
+                            status_msg = format!(
+                                "✓ Successfully applied {} change(s) to '{}'! Press 'b' to switch catalog, or 'q' to finish.",
+                                applied_count, active_catalog
+                            );
                             continue;
                         }
                         Err(e) => {
@@ -845,7 +867,10 @@ pub fn apply(
 ) -> PyResult<ApplyResult> {
     let p_dir = PathBuf::from(project_dir);
     if !p_dir.exists() {
-        return Err(SchemaError::new_err(format!("Project directory {} does not exist", p_dir.display())));
+        return Err(SchemaError::new_err(format!(
+            "Project directory {} does not exist",
+            p_dir.display()
+        )));
     }
 
     let explicit_db = target.and_then(|t| t.extract::<String>().ok());
@@ -859,10 +884,10 @@ pub fn apply(
         explicit_catalogs,
     );
     let req_catalogs = spec.catalogs.clone();
-    let ignore_list = engine::load_ignore_rules(&p_dir);
 
     if target.is_none() || explicit_db.is_some() {
-        let conn = spec.connect()
+        let mut conn = spec
+            .connect()
             .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
 
         if (!auto_approve || interactive) && is_interactive_terminal() {
@@ -876,7 +901,7 @@ pub fn apply(
         }
 
         let catalogs_to_apply = if req_catalogs.is_empty() {
-            let active = schema_diff::validate_target_catalog(&conn, None, true)
+            let active = schema_diff::validate_target_catalog_exec(&mut conn, None, true)
                 .map_err(|e| ExecutionError::new_err(e.to_string()))?;
             vec![active]
         } else {
@@ -887,49 +912,35 @@ pub fn apply(
         let mut total_applied_items = Vec::new();
 
         for target_cat in &catalogs_to_apply {
-            let active_catalog = schema_diff::validate_target_catalog(&conn, Some(target_cat), true)
-                .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-
-            let shadow_conn = engine::build_shadow_db(&p_dir)
-                .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
-
-            let shadow_schemas = schema_diff::get_schemas(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-            let target_schemas = schema_diff::get_schemas(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
-            let shadow_schema = schema_diff::get_schema(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-            let target_schema = schema_diff::get_schema(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
-            let shadow_views = schema_diff::get_views(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-            let target_views = schema_diff::get_views(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
-            let shadow_macros = schema_diff::get_macros(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-            let target_macros = schema_diff::get_macros(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
-            let shadow_triggers = schema_diff::get_triggers(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-            let target_triggers = schema_diff::get_triggers(&conn, Some(&active_catalog)).map_err(|e| ExecutionError::new_err(e.to_string()))?;
-
-            let diff_result = schema_diff::compute_diff(
-                &shadow_schemas,
-                &target_schemas,
-                &shadow_schema,
-                &target_schema,
-                &shadow_views,
-                &target_views,
-                &shadow_macros,
-                &target_macros,
-                &shadow_triggers,
-                &target_triggers,
-                &p_dir,
-                &ignore_list,
-            );
+            let active_catalog =
+                schema_diff::validate_target_catalog_exec(&mut conn, Some(target_cat), true)
+                    .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+            let diff_result = schema_diff::diff_project(&p_dir, &mut conn, Some(&active_catalog))
+                .map_err(|e| SchemaError::new_err(format!("Diff failed: {}", e)))?;
 
             let pending_items: Vec<_> = diff_result
                 .items
                 .iter()
-                .filter(|i| i.selected && !i.ignored)
+                .filter(|i| i.selected && !i.ignored && (!i.is_destructive() || force_drop))
                 .collect();
             if pending_items.is_empty() {
                 continue;
             }
 
-            engine::apply_diff(&conn, &diff_result, force_drop, remote, &p_dir, Some(&active_catalog))
-                .map_err(|e| ExecutionError::new_err(format!("Apply error for catalog '{}': {}", active_catalog, e)))?;
+            engine::apply_diff_with_executor(
+                &mut conn,
+                &diff_result,
+                force_drop,
+                remote,
+                &p_dir,
+                Some(&active_catalog),
+            )
+            .map_err(|e| {
+                ExecutionError::new_err(format!(
+                    "Apply error for catalog '{}': {}",
+                    active_catalog, e
+                ))
+            })?;
 
             for i in pending_items {
                 total_applied_items.push(i.obj_name.clone());
@@ -949,11 +960,15 @@ pub fn apply(
                 .getattr("execute")
                 .ok()
                 .and_then(|_| {
-                    target.call_method1("execute", ("PRAGMA database_list;",)).ok()
+                    target
+                        .call_method1("execute", ("PRAGMA database_list;",))
+                        .ok()
                 })
                 .and_then(|res| res.call_method0("fetchall").ok())
                 .and_then(|rows| {
-                    if let Ok(r) = rows.extract::<Vec<(Bound<'_, PyAny>, Bound<'_, PyAny>, String)>>() {
+                    if let Ok(r) =
+                        rows.extract::<Vec<(Bound<'_, PyAny>, Bound<'_, PyAny>, String)>>()
+                    {
                         r.into_iter().next().map(|t| t.2)
                     } else {
                         None
@@ -966,26 +981,35 @@ pub fn apply(
                     Ok(c) => (c, db_name),
                     Err(_) => {
                         let port = find_available_port();
+                        let ephem_token = engine::generate_random_hex_token();
                         let start_server_sql = format!(
-                            "INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:{}', token := 'duckpack_py');",
-                            port
+                            "INSTALL quack; LOAD quack; CALL quack_serve('quack:127.0.0.1:{}', token := '{}');",
+                            port, ephem_token
                         );
-                        if let Err(serve_err) = target.call_method1("execute", (start_server_sql,)) {
+                        if let Err(serve_err) = target.call_method1("execute", (start_server_sql,))
+                        {
                             return Err(ExecutionError::new_err(format!(
-                                "Unable to start local quack bridge: {}", serve_err
+                                "Unable to start local quack bridge: {}",
+                                serve_err
                             )));
                         }
-                        let server_uri = format!("quack:localhost:{}", port);
-                        let c = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
-                            .map_err(|e| ExecutionError::new_err(format!("Failed to attach to Python Quack bridge: {}", e)))?;
+                        let server_uri = format!("quack:127.0.0.1:{}", port);
+                        let c = engine::connect_target_db(&server_uri, Some(&ephem_token), false)
+                            .map_err(|e| {
+                                ExecutionError::new_err(format!(
+                                    "Failed to attach to Python Quack bridge: {}",
+                                    e
+                                ))
+                            })?;
                         (c, server_uri)
                     }
                 }
             } else {
                 let port = find_available_port();
+                let ephem_token = engine::generate_random_hex_token();
                 let start_server_sql = format!(
-                    "INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:{}', token := 'duckpack_py');",
-                    port
+                    "INSTALL quack; LOAD quack; CALL quack_serve('quack:127.0.0.1:{}', token := '{}');",
+                    port, ephem_token
                 );
                 if let Err(e) = target.call_method1("execute", (start_server_sql,)) {
                     return Err(ExecutionError::new_err(format!(
@@ -994,16 +1018,24 @@ pub fn apply(
                         e
                     )));
                 }
-                let server_uri = format!("quack:localhost:{}", port);
-                let c = engine::connect_target_db(&server_uri, Some("duckpack_py"), false)
-                    .map_err(|e| ExecutionError::new_err(format!("Failed to attach to Python in-memory DuckDB: {}", e)))?;
+                let server_uri = format!("quack:127.0.0.1:{}", port);
+                let c = engine::connect_target_db(&server_uri, Some(&ephem_token), false)
+                    .map_err(|e| {
+                        ExecutionError::new_err(format!(
+                            "Failed to attach to Python in-memory DuckDB: {}",
+                            e
+                        ))
+                    })?;
                 (c, server_uri)
             };
 
             let start_cat = req_catalogs.first().map(|s| s.as_str());
             let res = run_apply_tui(&conn, &p_dir, &active_db_target, force_drop, start_cat);
             if active_db_target.starts_with("quack:") {
-                let _ = target.call_method1("execute", (format!("CALL quack_stop('{}');", active_db_target),));
+                let _ = target.call_method1(
+                    "execute",
+                    (format!("CALL quack_stop('{}');", active_db_target),),
+                );
             }
             return res;
         } else if !auto_approve {
@@ -1015,7 +1047,8 @@ pub fn apply(
 
         let mut executor = PyDbExecutor::new(target.clone().unbind());
         let catalogs_to_apply = if req_catalogs.is_empty() {
-            let active = validate_py_target_catalog(&mut executor, None, true)?;
+            let active = schema_diff::validate_target_catalog_exec(&mut executor, None, true)
+                .map_err(|e| ExecutionError::new_err(e.to_string()))?;
             vec![active]
         } else {
             req_catalogs
@@ -1024,80 +1057,36 @@ pub fn apply(
         let mut total_applied_items = Vec::new();
 
         for target_cat in &catalogs_to_apply {
-            let active_catalog = validate_py_target_catalog(&mut executor, Some(target_cat), true)?;
-
-            let shadow_conn = engine::build_shadow_db(&p_dir)
-                .map_err(|e| SchemaError::new_err(format!("Shadow DB failed: {}", e)))?;
-
-            let shadow_schemas = schema_diff::get_schemas(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-            let shadow_schema = schema_diff::get_schema(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-            let shadow_views = schema_diff::get_views(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-            let shadow_macros = schema_diff::get_macros(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-            let shadow_triggers = schema_diff::get_triggers(&shadow_conn, None).map_err(|e| SchemaError::new_err(e.to_string()))?;
-
-            let (target_schemas, target_schema, target_views, target_macros, target_triggers) = introspect_py_catalog(&mut executor, Some(&active_catalog))?;
-
-            let diff_result = schema_diff::compute_diff(
-                &shadow_schemas,
-                &target_schemas,
-                &shadow_schema,
-                &target_schema,
-                &shadow_views,
-                &target_views,
-                &shadow_macros,
-                &target_macros,
-                &shadow_triggers,
-                &target_triggers,
-                &p_dir,
-                &ignore_list,
-            );
+            let active_catalog =
+                schema_diff::validate_target_catalog_exec(&mut executor, Some(target_cat), true)
+                    .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+            let diff_result =
+                schema_diff::diff_project(&p_dir, &mut executor, Some(&active_catalog))
+                    .map_err(|e| SchemaError::new_err(format!("Diff failed: {}", e)))?;
 
             let pending_items: Vec<_> = diff_result
                 .items
                 .iter()
-                .filter(|i| i.selected && !i.ignored)
+                .filter(|i| i.selected && !i.ignored && (!i.is_destructive() || force_drop))
                 .collect();
             if pending_items.is_empty() {
                 continue;
             }
 
-            let orig_cat: Option<String> = executor
-                .query_rows("SELECT current_database()")
-                .ok()
-                .and_then(|(_, r)| r.into_iter().next())
-                .and_then(|r| r.into_iter().next());
-            if let Some(ref orig) = orig_cat {
-                if !orig.eq_ignore_ascii_case(&active_catalog) {
-                    executor.execute(&format!("USE \"{}\";", active_catalog.replace('\"', "\"\"")))
-                        .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-                }
-            }
-
-            for item in &diff_result.items {
-                if !item.selected || item.ignored { continue; }
-                let is_drop = matches!(
-                    item.item_type,
-                    schema_diff::DiffItemType::DropTable
-                        | schema_diff::DiffItemType::DropColumn
-                        | schema_diff::DiffItemType::DropView
-                        | schema_diff::DiffItemType::DropMacro
-                        | schema_diff::DiffItemType::DropSchema
-                        | schema_diff::DiffItemType::RecreateTable
-                );
-                if is_drop && !force_drop {
-                    continue;
-                }
-                if !item.sql.trim().is_empty() {
-                    executor.execute(&item.sql)
-                        .map_err(|e| ExecutionError::new_err(format!("Failed applying {}: {}", item.obj_name, e)))?;
-                }
-            }
-
-            if let Some(ref orig) = orig_cat {
-                if !orig.eq_ignore_ascii_case(&active_catalog) {
-                    let _ = executor.execute(&format!("USE \"{}\";", orig.replace('\"', "\"\"")));
-                }
-            }
+            engine::apply_diff_with_executor(
+                &mut executor,
+                &diff_result,
+                force_drop,
+                false,
+                &p_dir,
+                Some(&active_catalog),
+            )
+            .map_err(|e| {
+                ExecutionError::new_err(format!(
+                    "Apply error for catalog '{}': {}",
+                    active_catalog, e
+                ))
+            })?;
 
             for i in pending_items {
                 total_applied_items.push(i.obj_name.clone());
@@ -1111,382 +1100,6 @@ pub fn apply(
             items: total_applied_items,
         })
     }
-}
-
-/// Validate target catalog against duckdb_databases() on Python connection.
-pub fn validate_py_target_catalog(
-    executor: &mut PyDbExecutor,
-    catalog: Option<&str>,
-    for_apply: bool,
-) -> PyResult<String> {
-    let (_, db_rows) = executor
-        .query_rows("SELECT database_name, type, readonly FROM duckdb_databases() WHERE internal = false")
-        .map_err(|e| ExecutionError::new_err(format!("Failed to list databases: {}", e)))?;
-
-    let target = match catalog {
-        Some(c) => c.to_string(),
-        None => {
-            let (_, curr) = executor
-                .query_rows("SELECT current_database()")
-                .map_err(|e| ExecutionError::new_err(format!("Failed to get current database: {}", e)))?;
-            curr.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or_else(|| "memory".to_string())
-        }
-    };
-
-    let mut found = None;
-    let mut available = Vec::new();
-    for row in &db_rows {
-        if row.len() >= 3 {
-            let name = &row[0];
-            let typ = &row[1];
-            let readonly = row[2].eq_ignore_ascii_case("true") || row[2] == "1";
-            available.push(name.clone());
-            if name.eq_ignore_ascii_case(&target) {
-                found = Some((name.clone(), typ.clone(), readonly));
-            }
-        }
-    }
-
-    if let Some((name, typ, readonly)) = found {
-        if for_apply {
-            if readonly {
-                return Err(ExecutionError::new_err(format!(
-                    "Cannot apply migrations to database '{}': attached in READ_ONLY mode.",
-                    name
-                )));
-            }
-            let typ_lower = typ.to_lowercase();
-            if typ_lower != "duckdb" && typ_lower != "quack" {
-                return Err(ExecutionError::new_err(format!(
-                    "Cannot apply declarative schema migrations to '{}' (engine type: {}). \
-                    DuckPack declarative schema management is designed specifically for DuckDB catalogs. \
-                    External attached engines are supported for querying and DML, but schema DDL is managed externally.",
-                    name, typ
-                )));
-            }
-        }
-        Ok(name)
-    } else if db_rows.is_empty() {
-        Ok(target)
-    } else {
-        Err(ExecutionError::new_err(format!(
-            "Attached database '{}' not found on connection. Available databases: {:?}",
-            target, available
-        )))
-    }
-}
-
-/// Helper to introspect tables, views, and macros from a PyDbExecutor for a specific catalog
-fn introspect_py_catalog(
-    executor: &mut PyDbExecutor,
-    catalog: Option<&str>,
-) -> PyResult<(
-    HashSet<String>,
-    std::collections::HashMap<String, schema_diff::TableSchema>,
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, schema_diff::TriggerSchema>,
-)> {
-    use std::collections::HashMap;
-
-    let target_cat = match catalog {
-        Some(c) => c.to_string(),
-        None => {
-            let (_, curr) = executor
-                .query_rows("SELECT current_database()")
-                .unwrap_or_default();
-            curr.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or_else(|| "memory".to_string())
-        }
-    };
-    let safe_cat = target_cat.replace('\'', "''");
-
-    // 1. Schemas
-    let schema_query = format!(
-        "{} SELECT full_schema_name FROM full_schemas WHERE database_name = '{}' AND full_schema_name NOT IN ('information_schema', 'pg_catalog', 'main') ORDER BY depth ASC",
-        schema_diff::FULL_SCHEMAS_CTE, safe_cat
-    );
-    let schema_res = executor.query_rows(&schema_query);
-    let schemas: HashSet<String> = if let Ok((_, schema_rows)) = schema_res {
-        schema_rows.into_iter().filter_map(|r| r.into_iter().next()).collect()
-    } else {
-        let fallback_schema_query = format!(
-            "SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND database_name = '{}' AND schema_name NOT IN ('information_schema', 'pg_catalog', 'main')",
-            safe_cat
-        );
-        let (_, schema_rows) = executor
-            .query_rows(&fallback_schema_query)
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-        schema_rows.into_iter().filter_map(|r| r.into_iter().next()).collect()
-    };
-
-    // 2. Tables
-    let table_query = format!(
-        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN t.table_name ELSE fs.full_schema_name || '.' || t.table_name END, COALESCE(t.sql, '') FROM duckdb_tables() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE t.internal = false AND t.database_name = '{}'",
-        schema_diff::FULL_SCHEMAS_CTE, safe_cat
-    );
-    let table_rows = if let Ok((_, rows)) = executor.query_rows(&table_query) {
-        rows
-    } else {
-        let fallback_table_query = format!(
-            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, COALESCE(sql, '') FROM duckdb_tables() WHERE internal = false AND database_name = '{}'",
-            safe_cat
-        );
-        executor
-            .query_rows(&fallback_table_query)
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?.1
-    };
-    let mut table_map = HashMap::new();
-    for row in table_rows {
-        if row.len() >= 2 {
-            table_map.insert(
-                row[0].clone(),
-                schema_diff::TableSchema {
-                    create_sql: row[1].clone(),
-                    columns: HashMap::new(),
-                    column_defaults: HashMap::new(),
-                    constraints: Vec::new(),
-                },
-            );
-        }
-    }
-
-    // 3. Columns
-    let col_query = format!(
-        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, c.column_name, c.data_type, c.column_default FROM duckdb_columns() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.internal = false AND c.database_name = '{}'",
-        schema_diff::FULL_SCHEMAS_CTE, safe_cat
-    );
-    let col_rows = if let Ok((_, rows)) = executor.query_rows(&col_query) {
-        rows
-    } else {
-        let fallback_col_query = format!(
-            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND database_name = '{}'",
-            safe_cat
-        );
-        executor
-            .query_rows(&fallback_col_query)
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?.1
-    };
-    for row in col_rows {
-        if row.len() >= 3 {
-            if let Some(t) = table_map.get_mut(&row[0]) {
-                t.columns.insert(row[1].clone(), row[2].clone());
-                if row.len() >= 4 {
-                    let def = &row[3];
-                    if !def.is_empty() && def != "NULL" {
-                        t.column_defaults.insert(row[1].clone(), def.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    // Check if target is an attached Quack database that needs remote introspect queries
-    let is_quack = if let Ok((_, db_rows)) = executor.query_rows(&format!("SELECT type FROM duckdb_databases() WHERE internal = false AND database_name = '{}'", safe_cat)) {
-        db_rows.into_iter().next().map(|r| r.get(0).map(|t| t.eq_ignore_ascii_case("quack")).unwrap_or(false)).unwrap_or(false)
-    } else {
-        false
-    };
-
-    if is_quack {
-        let tbl_sql = format!(
-            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, COALESCE(sql, '') FROM {}.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
-            safe_cat, safe_cat
-        );
-        if let Ok((_, q_tbls)) = executor.query_rows(&tbl_sql) {
-            for row in q_tbls {
-                if row.len() >= 2 {
-                    table_map.entry(row[0].clone()).or_insert_with(|| {
-                        schema_diff::TableSchema {
-                            create_sql: row[1].clone(),
-                            columns: HashMap::new(),
-                            column_defaults: HashMap::new(),
-                            constraints: Vec::new(),
-                        }
-                    });
-                }
-            }
-        }
-
-        let col_sql = format!(
-            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, column_name, data_type, column_default FROM {}.query('SELECT schema_name, table_name, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
-            safe_cat, safe_cat
-        );
-        if let Ok((_, q_cols)) = executor.query_rows(&col_sql) {
-            for row in q_cols {
-                if row.len() >= 3 {
-                    if let Some(t) = table_map.get_mut(&row[0]) {
-                        t.columns.insert(row[1].clone(), row[2].clone());
-                        if row.len() >= 4 {
-                            let def = &row[3];
-                            if !def.is_empty() && def != "NULL" {
-                                t.column_defaults.insert(row[1].clone(), def.clone());
-                            } else {
-                                t.column_defaults.remove(&row[1]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3b. Constraints
-    let constr_query = format!(
-        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, \
-         c.constraint_type, c.constraint_name, COALESCE(array_to_string(c.constraint_column_names, ','), ''), \
-         c.expression, c.referenced_table, COALESCE(array_to_string(c.referenced_column_names, ','), '') \
-         FROM duckdb_constraints() c \
-         JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name \
-         WHERE (c.database_name = '{}' OR c.database_name = 'target_db') AND c.constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
-        schema_diff::FULL_SCHEMAS_CTE, safe_cat
-    );
-    if let Ok((_, constr_rows)) = executor.query_rows(&constr_query) {
-        for row in constr_rows {
-            if row.len() >= 7 {
-                let table_name = &row[0];
-                if let Some(t) = table_map.get_mut(table_name) {
-                    let cols_str = &row[3];
-                    let ref_cols_str = &row[6];
-                    let cols: Vec<String> = if cols_str.is_empty() {
-                        Vec::new()
-                    } else {
-                        cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-                    };
-                    let ref_cols: Vec<String> = if ref_cols_str.is_empty() {
-                        Vec::new()
-                    } else {
-                        ref_cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-                    };
-                    t.constraints.push(schema_diff::ConstraintSchema {
-                        constraint_type: row[1].clone(),
-                        constraint_name: if row[2].is_empty() { None } else { Some(row[2].clone()) },
-                        columns: cols,
-                        expression: if row[4].is_empty() { None } else { Some(row[4].clone()) },
-                        referenced_table: if row[5].is_empty() { None } else { Some(row[5].clone()) },
-                        referenced_columns: ref_cols,
-                    });
-                }
-            }
-        }
-    }
-
-    if is_quack {
-        let q_constr_sql = format!(
-            "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
-             constraint_type, constraint_name, COALESCE(constraint_column_names, ''), \
-             expression, referenced_table, COALESCE(referenced_column_names, '') \
-             FROM {}.query('SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, '','') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (database_name = ''{}'' OR database_name = current_database())')",
-            safe_cat, safe_cat
-        );
-        if let Ok((_, q_constrs)) = executor.query_rows(&q_constr_sql) {
-            for row in q_constrs {
-                if row.len() >= 7 {
-                    let table_name = &row[0];
-                    if let Some(t) = table_map.get_mut(table_name) {
-                        let cols_str = &row[3];
-                        let ref_cols_str = &row[6];
-                        let cols: Vec<String> = if cols_str.is_empty() {
-                            Vec::new()
-                        } else {
-                            cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-                        };
-                        let ref_cols: Vec<String> = if ref_cols_str.is_empty() {
-                            Vec::new()
-                        } else {
-                            ref_cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-                        };
-                        let new_c = schema_diff::ConstraintSchema {
-                            constraint_type: row[1].clone(),
-                            constraint_name: if row[2].is_empty() { None } else { Some(row[2].clone()) },
-                            columns: cols,
-                            expression: if row[4].is_empty() { None } else { Some(row[4].clone()) },
-                            referenced_table: if row[5].is_empty() { None } else { Some(row[5].clone()) },
-                            referenced_columns: ref_cols,
-                        };
-                        if !t.constraints.iter().any(|c| c.matches(&new_c)) {
-                            t.constraints.push(new_c);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. Views
-    let view_query = format!(
-        "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN v.view_name ELSE fs.full_schema_name || '.' || v.view_name END, COALESCE(v.sql, '') FROM duckdb_views() v JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name WHERE v.internal = false AND v.database_name = '{}'",
-        schema_diff::FULL_SCHEMAS_CTE, safe_cat
-    );
-    let view_rows = if let Ok((_, rows)) = executor.query_rows(&view_query) {
-        rows
-    } else {
-        let fallback_view_query = format!(
-            "SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, COALESCE(sql, '') FROM duckdb_views() WHERE internal = false AND database_name = '{}'",
-            safe_cat
-        );
-        executor
-            .query_rows(&fallback_view_query)
-            .map_err(|e| ExecutionError::new_err(e.to_string()))?.1
-    };
-    let mut view_map = HashMap::new();
-    for row in view_rows {
-        if row.len() >= 2 {
-            view_map.insert(row[0].clone(), row[1].clone());
-        }
-    }
-
-    // 5. Macros
-    let macro_query = format!(
-        "SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END, macro_definition, CAST(parameters AS VARCHAR) FROM duckdb_functions() WHERE database_name = '{}' AND function_type = 'macro' AND internal = false",
-        safe_cat
-    );
-    let (_, macro_rows) = executor
-        .query_rows(&macro_query)
-        .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-    let mut macro_map = HashMap::new();
-    for row in macro_rows {
-        if row.len() >= 3 {
-            let params_clean = row[2].trim_matches(|c| c == '[' || c == ']');
-            let sql = format!("CREATE MACRO {}({}) AS {};", row[0], params_clean, row[1]);
-            macro_map.insert(row[0].clone(), sql);
-        }
-    }
-
-    // 6. Triggers
-    let trigger_query = format!(
-        "{} SELECT fs.full_schema_name, t.trigger_name, t.table_name, COALESCE(t.sql, '') \
-         FROM duckdb_triggers() t \
-         JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name \
-         WHERE t.database_name = '{}'",
-        schema_diff::FULL_SCHEMAS_CTE, safe_cat
-    );
-    let mut trigger_map = HashMap::new();
-    if let Ok((_, trigger_rows)) = executor.query_rows(&trigger_query) {
-        for row in trigger_rows {
-            if row.len() >= 4 {
-                let schema = row[0].clone();
-                let trg_name = row[1].clone();
-                let table = row[2].clone();
-                let sql = row[3].clone();
-                let key = if schema == "main" {
-                    trg_name.clone()
-                } else {
-                    format!("{}.{}", schema, trg_name)
-                };
-                trigger_map.insert(
-                    key,
-                    schema_diff::TriggerSchema {
-                        schema_name: schema,
-                        trigger_name: trg_name,
-                        table_name: table,
-                        sql,
-                    },
-                );
-            }
-        }
-    }
-
-    Ok((schemas, table_map, view_map, macro_map, trigger_map))
 }
 
 #[pyfunction]
@@ -1505,7 +1118,10 @@ pub fn stage_host_temp_tables(target: &Bound<'_, PyAny>) -> (Vec<String>, Vec<(S
 
     for t in &temp_tables {
         let safe_t = t.replace('\"', "\"\"");
-        let stage_sql = format!("CREATE OR REPLACE TABLE memory.\"__duckpack_temp_bridge_{}\" AS SELECT * FROM \"{}\";", safe_t, safe_t);
+        let stage_sql = format!(
+            "CREATE OR REPLACE TABLE memory.\"__duckpack_temp_bridge_{}\" AS SELECT * FROM \"{}\";",
+            safe_t, safe_t
+        );
         let _ = target.call_method1("execute", (stage_sql,));
     }
 
@@ -1521,7 +1137,10 @@ pub fn stage_host_temp_tables(target: &Bound<'_, PyAny>) -> (Vec<String>, Vec<(S
         for (vname, vsql) in &temp_views {
             let safe_vname = vname.replace('\'', "''");
             let safe_vsql = vsql.replace('\'', "''");
-            let ins_sql = format!("INSERT INTO memory.__duckpack_temp_views_registry VALUES ('{}', '{}');", safe_vname, safe_vsql);
+            let ins_sql = format!(
+                "INSERT INTO memory.__duckpack_temp_views_registry VALUES ('{}', '{}');",
+                safe_vname, safe_vsql
+            );
             let _ = target.call_method1("execute", (ins_sql,));
         }
     }
@@ -1581,7 +1200,10 @@ pub fn sync_back_host_temp_objects(target: &Bound<'_, PyAny>) {
 
     // 3. Restore views
     let views_to_sync: Vec<(String, String)> = target
-        .call_method1("execute", ("SELECT view_name, view_sql FROM memory.__duckpack_temp_views_sync_back;",))
+        .call_method1(
+            "execute",
+            ("SELECT view_name, view_sql FROM memory.__duckpack_temp_views_sync_back;",),
+        )
         .ok()
         .and_then(|res| res.call_method0("fetchall").ok())
         .and_then(|rows| rows.extract::<Vec<(String, String)>>().ok())
@@ -1590,7 +1212,10 @@ pub fn sync_back_host_temp_objects(target: &Bound<'_, PyAny>) {
     for (_vname, vsql) in views_to_sync {
         let _ = target.call_method1("execute", (vsql,));
     }
-    let _ = target.call_method1("execute", ("DROP TABLE IF EXISTS memory.__duckpack_temp_views_sync_back;",));
+    let _ = target.call_method1(
+        "execute",
+        ("DROP TABLE IF EXISTS memory.__duckpack_temp_views_sync_back;",),
+    );
 }
 
 fn connection_has_temp_objects(target: &Bound<'_, PyAny>) -> bool {
@@ -1610,8 +1235,6 @@ fn connection_has_temp_objects(target: &Bound<'_, PyAny>) -> bool {
             .unwrap_or(false)
 }
 
-
-
 /// Manages a local Quack network bridge for in-memory DuckDB connections or sessions with temporary objects.
 /// Handles two-way table/view staging, port allocation, server startup, and clean teardown.
 #[pyclass]
@@ -1627,13 +1250,12 @@ pub struct SessionBridge {
 impl SessionBridge {
     #[new]
     #[pyo3(signature = (target, token = None, port = None))]
-    pub fn new(
-        target: Bound<'_, PyAny>,
-        token: Option<&str>,
-        port: Option<u16>,
-    ) -> Self {
+    pub fn new(target: Bound<'_, PyAny>, token: Option<&str>, port: Option<u16>) -> Self {
         let resolved_port = port.unwrap_or_else(find_available_port);
-        let resolved_token = token.unwrap_or("duckpack_py").to_string();
+        let resolved_token = token
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string())
+            .unwrap_or_else(engine::generate_random_hex_token);
         let db_uri = format!("quack:127.0.0.1:{}", resolved_port);
         Self {
             target: target.unbind(),
@@ -1650,9 +1272,11 @@ impl SessionBridge {
         let target = self.target.bind(py);
         stage_host_temp_tables(target);
 
+        let safe_uri = self.db_uri.replace('\'', "''");
+        let safe_token = self.token.replace('\'', "''");
         let serve_sql = format!(
             "INSTALL quack; LOAD quack; CALL quack_serve('{}', token := '{}');",
-            self.db_uri, self.token
+            safe_uri, safe_token
         );
         if let Err(e) = target.call_method1("execute", (serve_sql,)) {
             return Err(ExecutionError::new_err(format!(
@@ -1675,7 +1299,8 @@ impl SessionBridge {
         let target = self.target.bind(py);
         sync_back_host_temp_objects(target);
 
-        let stop_sql = format!("CALL quack_stop('{}');", self.db_uri);
+        let safe_uri = self.db_uri.replace('\'', "''");
+        let stop_sql = format!("CALL quack_stop('{}');", safe_uri);
         let _ = target.call_method1("execute", (stop_sql,));
 
         self.is_active = false;
@@ -1724,7 +1349,6 @@ impl SessionBridge {
     }
 }
 
-
 /// Launch the interactive DuckPack IDE terminal UI against a target database.
 /// In non-terminal environments (such as Jupyter notebooks), prints a formatted database overview.
 #[pyfunction]
@@ -1761,13 +1385,15 @@ pub fn explore(
 
     if target.is_none() || explicit_db.is_some() {
         if !is_interactive_terminal() {
-            let conn = spec.connect()
+            let conn = spec
+                .connect()
                 .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
             return print_non_terminal_db(&conn, &spec.db, req_catalog.as_deref());
         }
 
-        let _guard = TerminalGuard::enter()
-            .map_err(|e| ExecutionError::new_err(format!("Failed to initialize terminal: {}", e)))?;
+        let _guard = TerminalGuard::enter().map_err(|e| {
+            ExecutionError::new_err(format!("Failed to initialize terminal: {}", e))
+        })?;
 
         let stdout = std::io::stdout();
         let backend = ratatui::backend::CrosstermBackend::new(stdout);
@@ -1799,8 +1425,9 @@ pub fn explore(
             return print_non_terminal_explorer(&mut executor, req_catalog.as_deref());
         }
 
-        let _guard = TerminalGuard::enter()
-            .map_err(|e| ExecutionError::new_err(format!("Failed to initialize terminal: {}", e)))?;
+        let _guard = TerminalGuard::enter().map_err(|e| {
+            ExecutionError::new_err(format!("Failed to initialize terminal: {}", e))
+        })?;
 
         let stdout = std::io::stdout();
         let backend = ratatui::backend::CrosstermBackend::new(stdout);
@@ -1808,16 +1435,20 @@ pub fn explore(
             .map_err(|e| ExecutionError::new_err(format!("Terminal backend error: {}", e)))?;
 
         if let Some(cat) = &req_catalog {
-            let _ = target.call_method1("execute", (format!("USE \"{}\";", cat.replace('\"', "\"\"")),));
+            let _ = target.call_method1(
+                "execute",
+                (format!("USE \"{}\";", cat.replace('\"', "\"\"")),),
+            );
         }
 
-        let mut bridge = SessionBridge::new(target.clone(), Some("duckpack_py"), None);
+        let mut bridge = SessionBridge::new(target.clone(), None, None);
+        let bridge_token = bridge.token();
         let active_db_target = bridge.start(py)?;
         let active_bridge: Option<SessionBridge> = Some(bridge);
 
         let is_bridge = true;
         let ide_res = py.allow_threads(|| -> anyhow::Result<()> {
-            let conn = engine::connect_target_db(&active_db_target, Some("duckpack_py"), true)?;
+            let conn = engine::connect_target_db(&active_db_target, Some(&bridge_token), true)?;
 
             if is_bridge {
                 engine::restore_quack_temp_bridge(&conn);
@@ -1827,7 +1458,13 @@ pub fn explore(
                 let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
             }
 
-            let loop_res = crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &active_db_target, is_bridge);
+            let loop_res = crate::ide::run_ide_loop(
+                &mut terminal,
+                &conn,
+                &p_dir,
+                &active_db_target,
+                is_bridge,
+            );
 
             if is_bridge {
                 engine::sync_back_quack_temp_bridge(&conn);
@@ -1893,6 +1530,9 @@ pub fn _duckpack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_target_config, m)?)?;
     m.add_function(wrap_pyfunction!(stage_host_temp_tables, m)?)?;
     m.add_function(wrap_pyfunction!(sync_back_host_temp_objects, m)?)?;
-    m.add("__duckdb_version__", crate::engine::embedded_duckdb_version())?;
+    m.add(
+        "__duckdb_version__",
+        crate::engine::embedded_duckdb_version(),
+    )?;
     Ok(())
 }
