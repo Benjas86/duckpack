@@ -3410,9 +3410,31 @@ impl ExitConfirmationModalState {
     }
 
     pub(crate) fn render(&self, f: &mut Frame, dirty_tab_count: usize) -> Rect {
-        let has_dirty_tabs = dirty_tab_count > 0;
-        let popup_width = 56.min(f.area().width.saturating_sub(4));
-        let popup_height = if has_dirty_tabs { 9 } else { 7 };
+        let warning_line = if dirty_tab_count == 0 {
+            None
+        } else if dirty_tab_count == 1 {
+            Some("⚠️ 1 tab has unsaved changes!".to_string())
+        } else {
+            Some(format!("⚠️ {} tabs have unsaved changes!", dirty_tab_count))
+        };
+        self.render_with_warning(
+            f,
+            " ⚠️ Exit DuckPack IDE ",
+            "Are you sure you want to exit DuckPack?",
+            warning_line.as_deref(),
+        )
+    }
+
+    pub(crate) fn render_with_warning(
+        &self,
+        f: &mut Frame,
+        title: &str,
+        question_str: &str,
+        warning_line: Option<&str>,
+    ) -> Rect {
+        let has_warning = warning_line.is_some();
+        let popup_width = 58.min(f.area().width.saturating_sub(4));
+        let popup_height = if has_warning { 9 } else { 7 };
         let popup_area = Rect {
             x: (f.area().width.saturating_sub(popup_width)) / 2,
             y: (f.area().height.saturating_sub(popup_height)) / 2,
@@ -3424,14 +3446,14 @@ impl ExitConfirmationModalState {
         let modal_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" ⚠️ Exit DuckPack IDE ")
+            .title(title)
             .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
         f.render_widget(modal_block.clone(), popup_area);
 
         let inner = modal_block.inner(popup_area);
         let exit_layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(if has_dirty_tabs {
+            .constraints(if has_warning {
                 vec![
                     Constraint::Length(1), // Question
                     Constraint::Length(1), // Warning
@@ -3447,24 +3469,19 @@ impl ExitConfirmationModalState {
             })
             .split(inner);
 
-        let question = Paragraph::new("Are you sure you want to exit DuckPack?")
+        let question = Paragraph::new(question_str)
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
         f.render_widget(question, exit_layout[0]);
 
-        if has_dirty_tabs {
-            let warning_text = if dirty_tab_count == 1 {
-                "⚠️ 1 tab has unsaved changes!".to_string()
-            } else {
-                format!("⚠️ {} tabs have unsaved changes!", dirty_tab_count)
-            };
+        if let Some(warning_text) = warning_line {
             let warning = Paragraph::new(warning_text)
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD));
             f.render_widget(warning, exit_layout[1]);
         }
 
-        let btn_idx = if has_dirty_tabs { 3 } else { 2 };
+        let btn_idx = if has_warning { 3 } else { 2 };
         let yes_style = if self.confirm_exit {
             Style::default()
                 .bg(Color::Red)
@@ -3614,8 +3631,8 @@ pub(crate) fn render_help_modal(f: &mut Frame) {
             Span::raw("Autocomplete"),
         ]),
         Line::from(vec![
-            Span::styled(" n / p     ", Style::default().fg(Color::Cyan)),
-            Span::raw("Next/Prev Page (in Results pane)"),
+            Span::styled(" n / p / l ", Style::default().fg(Color::Cyan)),
+            Span::raw("Next/Prev Page, 'l' to cycle Page Limit (500/2k/10k/50k/All)"),
         ]),
         Line::from(vec![
             Span::styled(" r / R     ", Style::default().fg(Color::Cyan)),

@@ -4,18 +4,23 @@ pub mod modals;
 
 pub use crate::catalog::*;
 pub use crate::query::*;
-pub(crate) use editor::{EditorTab, FocusPane, format_duckdb_value, generate_schema_visualizer};
+pub(crate) use editor::{
+    EditorTab, FocusPane, build_paginated_sql, format_duckdb_value, generate_schema_visualizer,
+};
+#[cfg(test)]
+pub(crate) use editor::extract_explicit_sql_limit;
 pub use editor::{
     calculate_status_height, get_clipboard_text, handle_sql_error_position, set_clipboard_text,
 };
 pub(crate) use explorer::{
     ExplorerMode, NodeType, ProjectCategory, compute_ide_diff_for_catalog, db_icon,
     get_git_branch_and_status, rebuild_explorer_nodes, rebuild_project_nodes,
+    render_explorer_node_line,
 };
 #[cfg(test)]
 pub(crate) use explorer::{
-    apply_ide_diff, compute_ide_diff, format_column_display, generate_asset_boilerplate,
-    get_asset_file_path,
+    ExplorerNode, apply_ide_diff, column_data_type_style, compute_ide_diff, format_column_display,
+    generate_asset_boilerplate, get_asset_file_path,
 };
 pub(crate) use modals::{
     AddBucketModalState, AttachModalState, DatabasePickerModalState, ExitConfirmationModalState,
@@ -302,21 +307,10 @@ pub fn run_ide_loop(
             // Explorer Pane
             let mut list_items = Vec::new();
             for item in &explorer_items {
-                let indent = "  ".repeat(item.level);
-                let expand_indicator = if item.is_expandable {
-                    if item.is_expanded {
-                        "▼ "
-                    } else {
-                        "▶ "
-                    }
-                } else {
-                    ""
-                };
-                let display_text = format!("{}{}{}", indent, expand_indicator, item.display)
-                    .chars()
-                    .skip(explorer_horizontal_scroll)
-                    .collect::<String>();
-                list_items.push(ListItem::new(display_text));
+                list_items.push(ListItem::new(render_explorer_node_line(
+                    item,
+                    explorer_horizontal_scroll,
+                )));
             }
 
             let explorer_border_style = if focus == FocusPane::Explorer {
@@ -536,9 +530,18 @@ pub fn run_ide_loop(
 
                 let row_info = if active_tab.is_paginated {
                     let offset = active_tab.pagination_offset;
-                    format!("Rows {} - {}", offset + 1, offset + total_rows)
+                    format!(
+                        "Rows {} - {} | Page Limit: {}",
+                        offset + 1,
+                        offset + total_rows,
+                        active_tab.pagination_limit_label()
+                    )
                 } else {
-                    format!("{} rows", total_rows)
+                    format!(
+                        "{} rows | Page Limit: {}",
+                        total_rows,
+                        active_tab.pagination_limit_label()
+                    )
                 };
 
                 let col_info = if total_cols > 0 {
@@ -550,9 +553,15 @@ pub fn run_ide_loop(
                 let title = format!(" Results ({}{}) ", row_info, col_info);
 
                 let nav_hint = if total_cols > visible_indices.len() {
-                    " ◄/► Scroll Cols (Shift+◄/► fast, Home/End) | [?] Help "
+                    format!(
+                        " ◄/► Scroll Cols | [n/p] Page | [l] Limit ({}) | [?] Help ",
+                        active_tab.pagination_limit_label()
+                    )
                 } else {
-                    " [?] Help "
+                    format!(
+                        " [n/p] Page | [l] Limit ({}) | [?] Help ",
+                        active_tab.pagination_limit_label()
+                    )
                 };
 
                 let results_block = Block::default()
@@ -1600,10 +1609,7 @@ pub fn run_ide_loop(
                                                 let quoted_db = quote_part(db_name);
 
                                                 let qualified_sql = if *is_temporary {
-                                                    format!(
-                                                        "SELECT * FROM {} LIMIT 500;",
-                                                        quoted_item
-                                                    )
+                                                    format!("SELECT * FROM {};", quoted_item)
                                                 } else if is_quack
                                                     && db_name != meta.active_database
                                                     && db_name != "memory"
@@ -1611,42 +1617,39 @@ pub fn run_ide_loop(
                                                 {
                                                     if schema_name == "main" {
                                                         format!(
-                                                            "-- @remote\nSELECT * FROM {}.{} LIMIT 500;",
+                                                            "-- @remote\nSELECT * FROM {}.{};",
                                                             quoted_db, quoted_item
                                                         )
                                                     } else {
                                                         format!(
-                                                            "-- @remote\nSELECT * FROM {}.{}.{} LIMIT 500;",
+                                                            "-- @remote\nSELECT * FROM {}.{}.{};",
                                                             quoted_db, quoted_schema, quoted_item
                                                         )
                                                     }
                                                 } else if meta.databases.len() > 1 {
                                                     if schema_name == "main" {
                                                         format!(
-                                                            "SELECT * FROM {}.{} LIMIT 500;",
+                                                            "SELECT * FROM {}.{};",
                                                             quoted_db, quoted_item
                                                         )
                                                     } else {
                                                         format!(
-                                                            "SELECT * FROM {}.{}.{} LIMIT 500;",
+                                                            "SELECT * FROM {}.{}.{};",
                                                             quoted_db, quoted_schema, quoted_item
                                                         )
                                                     }
                                                 } else if db_name == meta.active_database
                                                     && schema_name == "main"
                                                 {
-                                                    format!(
-                                                        "SELECT * FROM {} LIMIT 500;",
-                                                        quoted_item
-                                                    )
+                                                    format!("SELECT * FROM {};", quoted_item)
                                                 } else if schema_name == "main" {
                                                     format!(
-                                                        "SELECT * FROM {}.{} LIMIT 500;",
+                                                        "SELECT * FROM {}.{};",
                                                         quoted_db, quoted_item
                                                     )
                                                 } else {
                                                     format!(
-                                                        "SELECT * FROM {}.{}.{} LIMIT 500;",
+                                                        "SELECT * FROM {}.{}.{};",
                                                         quoted_db, quoted_schema, quoted_item
                                                     )
                                                 };
@@ -1679,10 +1682,8 @@ pub fn run_ide_loop(
                                                     "json" | "jsonl" | "ndjson" => "read_json",
                                                     _ => "read_parquet",
                                                 };
-                                                let query = format!(
-                                                    "SELECT * FROM {}('{}') LIMIT 500;",
-                                                    read_fn, path
-                                                );
+                                                let query =
+                                                    format!("SELECT * FROM {}('{}');", read_fn, path);
                                                 open_query_in_tabs(
                                                     &mut tabs,
                                                     &mut active_tab_index,
@@ -1989,7 +1990,9 @@ pub fn run_ide_loop(
                                 }
                             } else if key.code == KeyCode::PageDown {
                                 if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                    if active_tab.query_results.len() == active_tab.pagination_limit
+                                    if active_tab.pagination_limit > 0
+                                        && active_tab.query_results.len()
+                                            >= active_tab.pagination_limit
                                     {
                                         trigger_pagination = Some(1);
                                     }
@@ -2005,16 +2008,33 @@ pub fn run_ide_loop(
                             } else if key.code == KeyCode::Char('n')
                                 || key.code == KeyCode::Char('N')
                             {
-                                if active_tab.query_results.len() == active_tab.pagination_limit {
+                                if active_tab.pagination_limit > 0
+                                    && active_tab.query_results.len() >= active_tab.pagination_limit
+                                {
                                     trigger_pagination = Some(1);
                                 }
                             } else if key.code == KeyCode::Char('p')
                                 || key.code == KeyCode::Char('P')
                             {
-                                trigger_pagination = Some(-1);
+                                if active_tab.pagination_limit > 0 {
+                                    trigger_pagination = Some(-1);
+                                }
+                            } else if key.code == KeyCode::Char('l')
+                                || key.code == KeyCode::Char('L')
+                            {
+                                active_tab.cycle_pagination_limit();
+                                status_msg = format!(
+                                    "Results page limit set to {} rows",
+                                    active_tab.pagination_limit_label()
+                                );
+                                if active_tab.base_query.is_some() {
+                                    trigger_pagination = Some(0);
+                                }
                             } else if key.code == KeyCode::PageUp {
                                 if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                    trigger_pagination = Some(-1);
+                                    if active_tab.pagination_limit > 0 {
+                                        trigger_pagination = Some(-1);
+                                    }
                                 } else if let Some(selected) = active_tab.results_state.selected() {
                                     let new_sel = selected.saturating_sub(10);
                                     active_tab.results_state.select(Some(new_sel));
@@ -2170,10 +2190,14 @@ pub fn run_ide_loop(
 
             let query_to_execute = if let Some(dir) = trigger_pagination {
                 if let Some(bq) = &active_tab.base_query {
-                    let new_offset = (active_tab.pagination_offset as i64
-                        + (dir as i64 * active_tab.pagination_limit as i64))
-                        .max(0) as usize;
-                    active_tab.pagination_offset = new_offset;
+                    if dir == 0 {
+                        active_tab.pagination_offset = 0;
+                    } else {
+                        let new_offset = (active_tab.pagination_offset as i64
+                            + (dir as i64 * active_tab.pagination_limit as i64))
+                            .max(0) as usize;
+                        active_tab.pagination_offset = new_offset;
+                    }
                     bq.clone()
                 } else {
                     String::new()
@@ -2341,15 +2365,13 @@ pub fn run_ide_loop(
                     }
                 } else {
                     let final_query = if is_paginatable {
-                        active_tab.is_paginated = true;
-                        let clean_query = exec_query
-                            .trim()
-                            .strip_suffix(';')
-                            .unwrap_or(exec_query.trim());
-                        format!(
-                            "SELECT * FROM ({}) LIMIT {} OFFSET {}",
-                            clean_query, active_tab.pagination_limit, active_tab.pagination_offset
-                        )
+                        let (pag_sql, is_paginated) = build_paginated_sql(
+                            &exec_query,
+                            active_tab.pagination_limit,
+                            active_tab.pagination_offset,
+                        );
+                        active_tab.is_paginated = is_paginated;
+                        pag_sql
                     } else {
                         active_tab.is_paginated = false;
                         exec_query.clone()
@@ -2491,12 +2513,20 @@ pub fn run_ide_loop(
                                     .strip_suffix(';')
                                     .unwrap_or(query_to_execute.trim());
                                 let remote_sql = if is_paginatable {
-                                    format!(
-                                        "SELECT * FROM target_db.query('{}') LIMIT {} OFFSET {}",
-                                        clean_query.replace("'", "''"),
-                                        active_tab.pagination_limit,
-                                        active_tab.pagination_offset
-                                    )
+                                    let inner = format!(
+                                        "SELECT * FROM target_db.query('{}')",
+                                        clean_query.replace("'", "''")
+                                    );
+                                    if active_tab.is_paginated && active_tab.pagination_limit > 0 {
+                                        format!(
+                                            "{} LIMIT {} OFFSET {}",
+                                            inner,
+                                            active_tab.pagination_limit,
+                                            active_tab.pagination_offset
+                                        )
+                                    } else {
+                                        format!("{};", inner)
+                                    }
                                 } else {
                                     format!(
                                         "FROM target_db.query('{}');",
@@ -2877,7 +2907,7 @@ pub fn run_ide_loop(
                                     _ => "read_parquet",
                                 };
                                 let query =
-                                    format!("SELECT * FROM {}('{}') LIMIT 500;", read_fn, path);
+                                    format!("SELECT * FROM {}('{}');", read_fn, path);
                                 let fname = path.split('/').last().unwrap_or(&path).to_string();
                                 open_query_in_tabs(&mut tabs, &mut active_tab_index, query, None);
                                 focus = FocusPane::Editor;
@@ -4399,5 +4429,162 @@ mod tests {
         assert!(!tabs[0].is_untitled_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_pagination_page_sizes_and_explicit_sql_limit() {
+        let mut tab = EditorTab::new("memory".to_string());
+        assert_eq!(tab.pagination_limit, 2_000);
+        assert_eq!(tab.pagination_limit_label(), "2000");
+
+        tab.pagination_offset = 4_000;
+        assert_eq!(tab.cycle_pagination_limit(), 10_000);
+        assert_eq!(tab.pagination_offset, 0);
+        assert_eq!(tab.pagination_limit_label(), "10000");
+
+        assert_eq!(tab.cycle_pagination_limit(), 50_000);
+        assert_eq!(tab.pagination_limit_label(), "50000");
+
+        assert_eq!(tab.cycle_pagination_limit(), 0);
+        assert_eq!(tab.pagination_limit_label(), "All");
+
+        assert_eq!(tab.cycle_pagination_limit(), 500);
+        assert_eq!(tab.pagination_limit_label(), "500");
+
+        assert_eq!(tab.cycle_pagination_limit(), 2_000);
+
+        // Explicit SQL LIMIT detection
+        assert_eq!(
+            extract_explicit_sql_limit("SELECT * FROM range(5000) LIMIT 1500;"),
+            Some(1500)
+        );
+        assert_eq!(
+            extract_explicit_sql_limit("SELECT * FROM range(5000) limit 1200 offset 10"),
+            Some(1200)
+        );
+        assert_eq!(extract_explicit_sql_limit("SELECT * FROM users;"), None);
+
+        // build_paginated_sql honours explicit LIMIT > pagination_limit without truncating to 500
+        let (sql_explicit, is_pag_explicit) =
+            build_paginated_sql("SELECT * FROM range(5000) LIMIT 1500;", 500, 0);
+        assert_eq!(sql_explicit, "SELECT * FROM range(5000) LIMIT 1500");
+        assert!(!is_pag_explicit);
+
+        // Standard query wraps with pagination_limit and pagination_offset
+        let (sql_wrapped, is_pag_wrapped) = build_paginated_sql("SELECT * FROM users;", 2_000, 0);
+        assert_eq!(
+            sql_wrapped,
+            "SELECT * FROM (SELECT * FROM users) LIMIT 2000 OFFSET 0"
+        );
+        assert!(is_pag_wrapped);
+
+        // Unlimited page size (0) executes directly without LIMIT wrapper
+        let (sql_all, is_pag_all) = build_paginated_sql("SELECT * FROM users;", 0, 0);
+        assert_eq!(sql_all, "SELECT * FROM users");
+        assert!(!is_pag_all);
+    }
+
+    #[test]
+    fn test_explorer_column_data_type_colour_coding_and_scrolling() {
+        assert_eq!(
+            column_data_type_style("INTEGER").fg,
+            Some(Color::LightGreen)
+        );
+        assert_eq!(
+            column_data_type_style("DECIMAL(18, 2)").fg,
+            Some(Color::LightGreen)
+        );
+        assert_eq!(column_data_type_style("VARCHAR").fg, Some(Color::Yellow));
+        assert_eq!(column_data_type_style("UUID").fg, Some(Color::Yellow));
+        assert_eq!(
+            column_data_type_style("TIMESTAMP WITH TIME ZONE").fg,
+            Some(Color::LightMagenta)
+        );
+        assert_eq!(column_data_type_style("BOOLEAN").fg, Some(Color::Magenta));
+        let complex_style = column_data_type_style("STRUCT(a INT, b VARCHAR)");
+        assert_eq!(complex_style.fg, Some(Color::LightBlue));
+        assert!(complex_style.add_modifier.contains(Modifier::BOLD));
+
+        let col_node = ExplorerNode {
+            display: format_column_display(
+                "  ",
+                "user_id",
+                "INTEGER",
+                true,
+                true,
+                Some("users.id"),
+            ),
+            name: "user_id".to_string(),
+            node_type: NodeType::Column {
+                data_type: "INTEGER".to_string(),
+                is_pk: true,
+                is_fk: true,
+                fk_target: Some("users.id".to_string()),
+            },
+            level: 2,
+            is_expandable: false,
+            is_expanded: false,
+        };
+
+        let line = render_explorer_node_line(&col_node, 0);
+        let full_text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            full_text,
+            "      └─ 🔑🔗 user_id (INTEGER) [PK, FK -> users.id]"
+        );
+
+        let dt_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "INTEGER")
+            .expect("Expected styled INTEGER span");
+        assert_eq!(dt_span.style.fg, Some(Color::LightGreen));
+
+        let pk_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.starts_with("[PK"))
+            .expect("Expected styled [PK span");
+        assert_eq!(pk_span.style.fg, Some(Color::Yellow));
+        assert!(pk_span.style.add_modifier.contains(Modifier::BOLD));
+
+        let fk_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("FK -> users.id]"))
+            .expect("Expected styled FK span");
+        assert_eq!(fk_span.style.fg, Some(Color::Cyan));
+
+        // Verify horizontal scroll preserves characters and span styles after skipping 6 leading spaces
+        let scrolled_line = render_explorer_node_line(&col_node, 6);
+        let scrolled_text: String = scrolled_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            scrolled_text,
+            "└─ 🔑🔗 user_id (INTEGER) [PK, FK -> users.id]"
+        );
+    }
+
+    #[test]
+    fn test_exit_confirmation_modal_render_with_warning() {
+        let backend = ratatui::backend::TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut modal = ExitConfirmationModalState::new();
+        modal.open();
+
+        terminal
+            .draw(|f| {
+                let rect = modal.render_with_warning(
+                    f,
+                    " ⚠️ Exit DuckPack Diff Review ",
+                    "Are you sure you want to exit Diff Review?",
+                    Some("⚠️ 3 pending change(s) have not been applied!"),
+                );
+                assert_eq!(rect.height, 9);
+            })
+            .unwrap();
     }
 }

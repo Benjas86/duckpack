@@ -578,6 +578,8 @@ pub fn draw_and_handle_events(
     let mut show_ignored = false;
     let mut inspect_scroll: u16 = 0;
     let mut max_inspect_scroll: u16 = 0;
+    let mut exit_confirm_modal = crate::ide::ExitConfirmationModalState::new();
+    let mut current_exit_dialog_rect = ratatui::layout::Rect::default();
     if !diff.items.is_empty() {
         list_state.select(Some(0));
     }
@@ -970,6 +972,28 @@ pub fn draw_and_handle_events(
                 );
                 f.render_widget(help_paragraph, popup_area);
             }
+
+            if exit_confirm_modal.is_open {
+                let pending_count = diff
+                    .items
+                    .iter()
+                    .filter(|i| i.selected && !i.ignored && (!i.is_destructive() || force_drop))
+                    .count();
+                let warning_line = if pending_count > 0 {
+                    Some(format!(
+                        "⚠️ {} pending change(s) have not been applied!",
+                        pending_count
+                    ))
+                } else {
+                    None
+                };
+                current_exit_dialog_rect = exit_confirm_modal.render_with_warning(
+                    f,
+                    " ⚠️ Exit DuckPack Diff Review ",
+                    "Are you sure you want to exit Diff Review?",
+                    warning_line.as_deref(),
+                );
+            }
         })?;
 
         if draw_only {
@@ -978,6 +1002,13 @@ pub fn draw_and_handle_events(
 
         match event::read()? {
             Event::Key(key) => {
+                if exit_confirm_modal.is_open {
+                    match exit_confirm_modal.handle_key(key) {
+                        Some(true) => return Ok(TuiAction::Quit),
+                        Some(false) | None => continue,
+                    }
+                }
+
                 if inspect_data.is_some() {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
@@ -1005,7 +1036,7 @@ pub fn draw_and_handle_events(
                         if show_help {
                             show_help = false;
                         } else {
-                            return Ok(TuiAction::Quit);
+                            exit_confirm_modal.open();
                         }
                     }
                     KeyCode::Char('?') | KeyCode::Char('h') => {
@@ -1091,6 +1122,31 @@ pub fn draw_and_handle_events(
                 }
             }
             Event::Mouse(mouse_event) => {
+                if exit_confirm_modal.is_open {
+                    if mouse_event.kind == event::MouseEventKind::Down(event::MouseButton::Left) {
+                        if mouse_event.row == current_exit_dialog_rect.bottom().saturating_sub(2) {
+                            let center_x = current_exit_dialog_rect.left()
+                                + current_exit_dialog_rect.width / 2;
+                            if mouse_event.column >= current_exit_dialog_rect.left()
+                                && mouse_event.column < center_x
+                            {
+                                return Ok(TuiAction::Quit);
+                            } else if mouse_event.column >= center_x
+                                && mouse_event.column <= current_exit_dialog_rect.right()
+                            {
+                                exit_confirm_modal.close();
+                            }
+                        } else if mouse_event.row < current_exit_dialog_rect.top()
+                            || mouse_event.row >= current_exit_dialog_rect.bottom()
+                            || mouse_event.column < current_exit_dialog_rect.left()
+                            || mouse_event.column >= current_exit_dialog_rect.right()
+                        {
+                            exit_confirm_modal.close();
+                        }
+                    }
+                    continue;
+                }
+
                 if inspect_data.is_some() {
                     match mouse_event.kind {
                         event::MouseEventKind::ScrollDown => {

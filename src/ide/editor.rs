@@ -14,6 +14,50 @@ pub(crate) enum FocusPane {
     Results,
 }
 
+/// Standard page sizes supported in the IDE Results pane (`0` = Unlimited).
+pub(crate) const PAGINATION_PAGE_SIZES: &[usize] = &[500, 2_000, 10_000, 50_000, 0];
+
+/// Extracts an explicit trailing `LIMIT <N>` value from a SQL query if present.
+pub(crate) fn extract_explicit_sql_limit(sql: &str) -> Option<usize> {
+    let re = regex::Regex::new(r"(?i)\bLIMIT\s+(\d+)\s*(?:OFFSET\s+\d+\s*)?;?\s*$").ok()?;
+    let caps = re.captures(sql.trim())?;
+    caps.get(1)?.as_str().parse::<usize>().ok()
+}
+
+/// Wraps a paginatable SQL query in `SELECT * FROM (...) LIMIT <L> OFFSET <O>`,
+/// unless:
+/// - `pagination_limit == 0` ("All" / unlimited rows), or
+/// - `pagination_offset == 0` and the user's SQL already ends with an explicit `LIMIT <N>`
+///   where `<N>` exceeds `pagination_limit` (so an explicit `LIMIT 1000` is never truncated to a 500-row page).
+/// Returns `(sql_to_execute, is_paginated)`.
+pub(crate) fn build_paginated_sql(
+    raw_query: &str,
+    pagination_limit: usize,
+    pagination_offset: usize,
+) -> (String, bool) {
+    let clean_query = raw_query
+        .trim()
+        .strip_suffix(';')
+        .unwrap_or(raw_query.trim());
+    if pagination_limit == 0 {
+        return (clean_query.to_string(), false);
+    }
+    if pagination_offset == 0 {
+        if let Some(explicit_limit) = extract_explicit_sql_limit(clean_query) {
+            if explicit_limit > pagination_limit {
+                return (clean_query.to_string(), false);
+            }
+        }
+    }
+    (
+        format!(
+            "SELECT * FROM ({}) LIMIT {} OFFSET {}",
+            clean_query, pagination_limit, pagination_offset
+        ),
+        true,
+    )
+}
+
 /// Represents an individual open Query Tab within the IDE.
 /// Contains an isolated text area and its own dedicated query results and scrolling state.
 pub(crate) struct EditorTab<'a> {
@@ -45,9 +89,31 @@ impl<'a> EditorTab<'a> {
             results_state: ratatui::widgets::TableState::default(),
             base_query: None,
             pagination_offset: 0,
-            pagination_limit: 500,
+            pagination_limit: 2_000,
             is_paginated: false,
             target_database,
+        }
+    }
+
+    /// Cycles `pagination_limit` through `PAGINATION_PAGE_SIZES` (`500 -> 2000 -> 10000 -> 50000 -> Unlimited -> 500`)
+    /// and resets `pagination_offset` to `0`.
+    pub(crate) fn cycle_pagination_limit(&mut self) -> usize {
+        let curr_idx = PAGINATION_PAGE_SIZES
+            .iter()
+            .position(|&s| s == self.pagination_limit)
+            .unwrap_or(1);
+        let next_idx = (curr_idx + 1) % PAGINATION_PAGE_SIZES.len();
+        self.pagination_limit = PAGINATION_PAGE_SIZES[next_idx];
+        self.pagination_offset = 0;
+        self.pagination_limit
+    }
+
+    /// Formats the active page size label for display in the Results header/status bar.
+    pub(crate) fn pagination_limit_label(&self) -> String {
+        if self.pagination_limit == 0 {
+            "All".to_string()
+        } else {
+            self.pagination_limit.to_string()
         }
     }
 

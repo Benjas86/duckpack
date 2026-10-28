@@ -1,4 +1,8 @@
 use duckdb::Connection;
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -84,6 +88,195 @@ pub(crate) fn format_column_display(
     } else {
         format!("{}└─ {} ({})", indent, name, data_type)
     }
+}
+
+/// Returns the semantic highlight `Style` for a DuckDB column data type in the Explorer tree.
+pub(crate) fn column_data_type_style(data_type: &str) -> Style {
+    let upper = data_type.trim().to_uppercase();
+    let base = upper
+        .split(|c: char| c == '(' || c == '[' || c.is_whitespace())
+        .next()
+        .unwrap_or(&upper);
+
+    if upper.ends_with("[]")
+        || matches!(
+            base,
+            "LIST" | "ARRAY" | "STRUCT" | "MAP" | "UNION" | "JSON" | "VARIANT" | "GEOMETRY" | "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" | "BIT" | "BITSTRING"
+        )
+    {
+        Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD)
+    } else if matches!(
+        base,
+        "TINYINT"
+            | "INT1"
+            | "SMALLINT"
+            | "INT2"
+            | "SHORT"
+            | "INTEGER"
+            | "INT"
+            | "INT4"
+            | "SIGNED"
+            | "BIGINT"
+            | "INT8"
+            | "LONG"
+            | "HUGEINT"
+            | "UTINYINT"
+            | "USMALLINT"
+            | "UINTEGER"
+            | "UINT"
+            | "UBIGINT"
+            | "UHUGEINT"
+            | "FLOAT"
+            | "FLOAT4"
+            | "REAL"
+            | "DOUBLE"
+            | "FLOAT8"
+            | "DECIMAL"
+            | "NUMERIC"
+    ) {
+        Style::default().fg(Color::LightGreen)
+    } else if matches!(
+        base,
+        "VARCHAR" | "CHAR" | "BPCHAR" | "TEXT" | "STRING" | "UUID" | "ENUM"
+    ) {
+        Style::default().fg(Color::Yellow)
+    } else if matches!(
+        base,
+        "DATE"
+            | "TIME"
+            | "TIMETZ"
+            | "TIMESTAMP"
+            | "TIMESTAMPTZ"
+            | "TIMESTAMP_S"
+            | "TIMESTAMP_MS"
+            | "TIMESTAMP_NS"
+            | "INTERVAL"
+    ) {
+        Style::default().fg(Color::LightMagenta)
+    } else if matches!(base, "BOOLEAN" | "BOOL") {
+        Style::default().fg(Color::Magenta)
+    } else {
+        Style::default().fg(Color::Cyan)
+    }
+}
+
+///Slices a sequence of styled `Span`s horizontally by skipping `skip_chars` characters from the left.
+pub(crate) fn slice_spans_horizontally(
+    spans: Vec<Span<'static>>,
+    skip_chars: usize,
+) -> Line<'static> {
+    if skip_chars == 0 {
+        return Line::from(spans);
+    }
+    let mut remaining_skip = skip_chars;
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        let content_chars: Vec<char> = span.content.chars().collect();
+        if remaining_skip >= content_chars.len() {
+            remaining_skip -= content_chars.len();
+        } else if remaining_skip > 0 {
+            let sliced: String = content_chars[remaining_skip..].iter().collect();
+            remaining_skip = 0;
+            out.push(Span::styled(sliced, span.style));
+        } else {
+            out.push(span);
+        }
+    }
+    Line::from(out)
+}
+
+/// Renders an `ExplorerNode` into a styled Ratatui `Line`, applying semantic colour coding to column types and PK/FK badges.
+pub(crate) fn render_explorer_node_line(
+    item: &ExplorerNode,
+    horizontal_scroll: usize,
+) -> Line<'static> {
+    let indent = "  ".repeat(item.level);
+    let expand_indicator = if item.is_expandable {
+        if item.is_expanded {
+            "▼ "
+        } else {
+            "▶ "
+        }
+    } else {
+        ""
+    };
+
+    if let NodeType::Column {
+        ref data_type,
+        is_pk,
+        is_fk,
+        ref fk_target,
+    } = item.node_type
+    {
+        // Determine inner tree indent from `item.display` up to `└─ `
+        let tree_prefix = item
+            .display
+            .find("└─ ")
+            .map(|idx| &item.display[..idx])
+            .unwrap_or("");
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled(
+            format!("{}{}{}└─ ", indent, expand_indicator, tree_prefix),
+            Style::default().fg(Color::DarkGray),
+        ));
+        if is_pk && is_fk {
+            spans.push(Span::raw("🔑🔗 "));
+        } else if is_pk {
+            spans.push(Span::raw("🔑 "));
+        } else if is_fk {
+            spans.push(Span::raw("🔗 "));
+        }
+        spans.push(Span::styled(
+            format!("{} ", item.name),
+            if is_pk {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        ));
+        spans.push(Span::styled("(", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            data_type.clone(),
+            column_data_type_style(data_type),
+        ));
+        spans.push(Span::styled(")", Style::default().fg(Color::DarkGray)));
+
+        if is_pk && is_fk {
+            let target = fk_target.as_deref().unwrap_or("unknown");
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                "[PK, ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!("FK -> {}]", target),
+                Style::default().fg(Color::Cyan),
+            ));
+        } else if is_pk {
+            spans.push(Span::styled(
+                " [PK]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if is_fk {
+            let target = fk_target.as_deref().unwrap_or("unknown");
+            spans.push(Span::styled(
+                format!(" [FK -> {}]", target),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+
+        return slice_spans_horizontally(spans, horizontal_scroll);
+    }
+
+    let display_text = format!("{}{}{}", indent, expand_indicator, item.display)
+        .chars()
+        .skip(horizontal_scroll)
+        .collect::<String>();
+    Line::from(display_text)
 }
 
 /// Generates starting DDL boilerplate for newly scaffolded project assets.
