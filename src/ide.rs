@@ -2509,7 +2509,7 @@ pub fn run_ide_loop(
                 .block(Block::default().borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .title_top(Line::from(format!(" Target DB: {}{}{} ", ssh_prefix, db_path, version_badge)).alignment(Alignment::Right).style(Style::default().fg(Color::Cyan)))
-                    .title_top(Line::from(format!(" DuckPack v{} ", env!("CARGO_PKG_VERSION"))).alignment(Alignment::Center).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+                    .title_top(Line::from(format!(" DuckPack v{} ", crate::engine::duckpack_version())).alignment(Alignment::Center).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
                 );
             f.render_widget(top_header, main_chunks[0]);
 

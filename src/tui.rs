@@ -166,7 +166,7 @@ pub fn draw_and_handle_events(
                 .split(f.area());
 
             let top_header_text = vec![
-                Span::styled(format!(" DuckPack v{} - Diff Mode ", env!("CARGO_PKG_VERSION")), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" DuckPack v{} - Diff Mode ", crate::engine::duckpack_version()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             ];
             let top_header = Paragraph::new(Line::from(top_header_text))
                 .block(Block::default().borders(Borders::ALL)

@@ -219,6 +219,7 @@ def render_notebook_card(
         </div>
         """
 
+    from . import __version__
     title = "DuckPack Database Explorer" if mode == "explore" else "DuckPack Diff & Apply"
     action_desc = "launch the full-screen terminal IDE" if mode == "explore" else "review diffs and apply migrations interactively"
 
@@ -242,7 +243,7 @@ def render_notebook_card(
                     <div style="font-size: 12px; opacity: 0.7;">Dev Container / Notebook Environment</div>
                 </div>
             </div>
-            <span style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 12px;">v0.2.0</span>
+            <span style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 12px;">v{__version__}</span>
         </div>
 
         <div style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 6px; padding: 10px 14px; font-size: 12px; line-height: 1.5; margin-bottom: 14px; color: #bae6fd;">

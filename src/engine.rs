@@ -165,6 +165,12 @@ pub fn build_quack_attach_sql(db: &str, disable_ssl: bool) -> String {
     }
 }
 
+/// Returns the display version string of DuckPack (e.g. "0.2.1_dev1").
+/// Converts Cargo's SemVer pre-release hyphen separator (`0.2.1-dev1`) to an underscore (`0.2.1_dev1`).
+pub fn duckpack_version() -> String {
+    env!("CARGO_PKG_VERSION").replace('-', "_")
+}
+
 /// Returns the version string of the embedded DuckDB C++ engine (e.g. "v1.1.3").
 pub fn embedded_duckdb_version() -> String {
     Connection::open_in_memory()

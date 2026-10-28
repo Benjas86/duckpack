@@ -1530,6 +1530,7 @@ pub fn _duckpack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_target_config, m)?)?;
     m.add_function(wrap_pyfunction!(stage_host_temp_tables, m)?)?;
     m.add_function(wrap_pyfunction!(sync_back_host_temp_objects, m)?)?;
+    m.add("__version__", crate::engine::duckpack_version())?;
     m.add(
         "__duckdb_version__",
         crate::engine::embedded_duckdb_version(),

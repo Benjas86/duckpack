@@ -19,6 +19,7 @@ from ._duckpack import (
     init as _native_init,
     get_target_config as _native_get_target_config,
     SessionBridge,
+    __version__ as _native_version,
     __duckdb_version__,
 )
 from .runner import InteractionRunner
@@ -471,4 +472,4 @@ __all__ = [
     "__duckdb_version__",
 ]
 
-__version__ = "0.2.0"
+__version__ = _native_version

@@ -180,7 +180,8 @@ enum PythonCommands {
 fn main() -> Result<()> {
     panic::set_hook(Box::new(|info| { let bt = std::backtrace::Backtrace::force_capture(); let _ = std::fs::write("panic.log", format!("Panic: {:?}\n\n{}", info, bt)); }));
     let embedded_ver = duckpack::engine::embedded_duckdb_version();
-    let version_str: &'static str = Box::leak(format!("{} (DuckDB engine: {})", env!("CARGO_PKG_VERSION"), embedded_ver).into_boxed_str());
+    let dp_ver = duckpack::engine::duckpack_version();
+    let version_str: &'static str = Box::leak(format!("v{} (DuckDB engine: {})", dp_ver, embedded_ver).into_boxed_str());
     let matches = Cli::command().version(version_str).get_matches();
     let mut cli = Cli::from_arg_matches(&matches)?;
 
@@ -594,7 +595,8 @@ fn main() -> Result<()> {
             match command {
                 PythonCommands::Status => {
                     let embedded_ver = duckpack::engine::embedded_duckdb_version();
-                    println!("🦆 DuckPack CLI: v{}", env!("CARGO_PKG_VERSION"));
+                    let dp_ver = duckpack::engine::duckpack_version();
+                    println!("🦆 DuckPack CLI: v{}", dp_ver);
                     println!("   Embedded DuckDB engine: {}", embedded_ver);
                     println!("\nChecking active Python environment (python3)...");
 
