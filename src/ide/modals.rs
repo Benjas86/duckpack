@@ -364,33 +364,7 @@ impl InIdeDiffModalState {
                     .enumerate()
                     .map(|(pos, &real_idx)| {
                         let item = &diff.items[real_idx];
-                        let (badge, badge_style) = match item.item_type {
-                            crate::diff::DiffItemType::CreateTable
-                            | crate::diff::DiffItemType::CreateSchema
-                            | crate::diff::DiffItemType::CreateView
-                            | crate::diff::DiffItemType::CreateMacro
-                            | crate::diff::DiffItemType::CreateTrigger => {
-                                ("[+]", Style::default().fg(Color::Green))
-                            }
-                            crate::diff::DiffItemType::AlterTable
-                            | crate::diff::DiffItemType::AddConstraint
-                            | crate::diff::DiffItemType::RenameTable
-                            | crate::diff::DiffItemType::RenameColumn => {
-                                ("[~]", Style::default().fg(Color::Yellow))
-                            }
-                            crate::diff::DiffItemType::RecreateTable => (
-                                "[⚡]",
-                                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                            ),
-                            crate::diff::DiffItemType::DropTable
-                            | crate::diff::DiffItemType::DropSchema
-                            | crate::diff::DiffItemType::DropView
-                            | crate::diff::DiffItemType::DropMacro
-                            | crate::diff::DiffItemType::DropColumn
-                            | crate::diff::DiffItemType::DropTrigger => {
-                                ("[-]", Style::default().fg(Color::Red))
-                            }
-                        };
+                        let (badge, badge_style) = crate::tui::diff_item_compact_badge(&item.item_type);
                         let cursor = if pos == self.selected_index {
                             "▶ "
                         } else {

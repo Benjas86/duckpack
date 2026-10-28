@@ -14,8 +14,8 @@ pub(crate) use explorer::{
 };
 #[cfg(test)]
 pub(crate) use explorer::{
-    ExplorerNode, apply_ide_diff, apply_ide_diff_for_catalog, compute_ide_diff,
-    format_column_display, generate_asset_boilerplate, get_asset_file_path,
+    apply_ide_diff, compute_ide_diff, format_column_display, generate_asset_boilerplate,
+    get_asset_file_path,
 };
 pub(crate) use modals::{
     AddBucketModalState, AttachModalState, DatabasePickerModalState, ExitConfirmationModalState,
@@ -2896,6 +2896,7 @@ pub fn run_ide_loop(
 mod tests {
     use super::*;
     use duckdb::types::Value;
+    use std::collections::HashMap;
 
     #[test]
     fn test_format_duckdb_value() {
