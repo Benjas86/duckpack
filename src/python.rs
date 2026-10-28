@@ -601,7 +601,7 @@ fn run_apply_tui(
 #[pyfunction]
 #[pyo3(signature = (target = None, project_dir = ".", database = None, catalog = None, auto_approve = true, force_drop = false, interactive = false, quack_token = None, insecure = false, env = None))]
 pub fn apply(
-    _py: Python<'_>,
+    py: Python<'_>,
     target: Option<&Bound<'_, PyAny>>,
     project_dir: &str,
     database: Option<&str>,
@@ -724,67 +724,34 @@ pub fn apply(
                 })
                 .unwrap_or_else(|| ":memory:".to_string());
 
-            let (conn, active_db_target) = if !db_name.is_empty() && db_name != ":memory:" {
-                match engine::connect_target_db(&db_name, None, false) {
-                    Ok(c) => (c, db_name),
-                    Err(_) => {
-                        let port = find_available_port();
-                        let ephem_token = engine::generate_random_hex_token();
-                        let start_server_sql = format!(
-                            "INSTALL quack; LOAD quack; CALL quack_serve('quack:127.0.0.1:{}', token := '{}');",
-                            port, ephem_token
-                        );
-                        if let Err(serve_err) = target.call_method1("execute", (start_server_sql,))
-                        {
-                            return Err(ExecutionError::new_err(format!(
-                                "Unable to start local quack bridge: {}",
-                                serve_err
-                            )));
-                        }
-                        let server_uri = format!("quack:127.0.0.1:{}", port);
-                        let c = engine::connect_target_db(&server_uri, Some(&ephem_token), false)
-                            .map_err(|e| {
-                                ExecutionError::new_err(format!(
-                                    "Failed to attach to Python Quack bridge: {}",
-                                    e
-                                ))
-                            })?;
-                        (c, server_uri)
-                    }
-                }
+            let direct_conn = if !db_name.is_empty() && db_name != ":memory:" {
+                engine::connect_target_db(&db_name, None, false).ok()
             } else {
-                let port = find_available_port();
-                let ephem_token = engine::generate_random_hex_token();
-                let start_server_sql = format!(
-                    "INSTALL quack; LOAD quack; CALL quack_serve('quack:127.0.0.1:{}', token := '{}');",
-                    port, ephem_token
-                );
-                if let Err(e) = target.call_method1("execute", (start_server_sql,)) {
-                    return Err(ExecutionError::new_err(format!(
-                        "Unable to start local quack bridge for in-memory DuckDB connection: {}. \
-                        Tip: Ensure the 'quack' extension can be loaded.",
-                        e
-                    )));
-                }
-                let server_uri = format!("quack:127.0.0.1:{}", port);
-                let c = engine::connect_target_db(&server_uri, Some(&ephem_token), false)
-                    .map_err(|e| {
-                        ExecutionError::new_err(format!(
-                            "Failed to attach to Python in-memory DuckDB: {}",
-                            e
-                        ))
-                    })?;
-                (c, server_uri)
+                None
             };
 
             let start_cat = req_catalogs.first().map(|s| s.as_str());
-            let res = run_apply_tui(&conn, &p_dir, &active_db_target, force_drop, start_cat);
-            if active_db_target.starts_with("quack:") {
-                let _ = target.call_method1(
-                    "execute",
-                    (format!("CALL quack_stop('{}');", active_db_target),),
-                );
+            if let Some(conn) = direct_conn {
+                return run_apply_tui(&conn, &p_dir, &db_name, force_drop, start_cat);
             }
+
+            let mut bridge = SessionBridge::new(target.clone(), None, None);
+            let bridge_token = bridge.token();
+            let active_db_target = bridge.start(py)?;
+            let conn = engine::connect_target_db(&active_db_target, Some(&bridge_token), true)
+                .map_err(|e| {
+                    let _ = bridge.stop(py);
+                    ExecutionError::new_err(format!(
+                        "Failed to attach to Python Quack bridge: {}",
+                        e
+                    ))
+                })?;
+
+            engine::restore_quack_temp_bridge(&conn);
+            let res = run_apply_tui(&conn, &p_dir, &active_db_target, force_drop, start_cat);
+            engine::sync_back_quack_temp_bridge(&conn);
+            drop(conn);
+            let _ = bridge.stop(py);
             return res;
         } else if !auto_approve {
             return Err(ExecutionError::new_err(
@@ -1260,6 +1227,15 @@ pub fn get_target_config(
     Ok(dict.into())
 }
 
+/// Auto-discovers the nearest declarative DuckPack project directory starting from `start`.
+#[pyfunction]
+#[pyo3(signature = (start = "."))]
+pub fn discover_project_dir(start: &str) -> String {
+    engine::discover_project_dir(Path::new(start))
+        .to_string_lossy()
+        .to_string()
+}
+
 /// Python module definition
 #[pymodule]
 pub fn _duckpack(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1276,6 +1252,7 @@ pub fn _duckpack(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(init, m)?)?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(get_target_config, m)?)?;
+    m.add_function(wrap_pyfunction!(discover_project_dir, m)?)?;
     m.add_function(wrap_pyfunction!(stage_host_temp_tables, m)?)?;
     m.add_function(wrap_pyfunction!(sync_back_host_temp_objects, m)?)?;
     m.add("__version__", crate::engine::duckpack_version())?;

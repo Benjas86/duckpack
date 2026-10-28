@@ -124,6 +124,19 @@ pub fn is_remote(db: &str) -> bool {
     db.starts_with("md:") || db.starts_with("motherduck:")
 }
 
+/// Checks if a remote Quack database is attached as `target_db` on the given `DbExecutor`.
+pub fn is_quack_target_attached(exec: &mut dyn DbExecutor) -> bool {
+    exec.query_rows(
+        "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+    )
+    .ok()
+    .and_then(|(_, rows)| rows.into_iter().next())
+    .and_then(|r| r.into_iter().next())
+    .and_then(|v| v.parse::<i64>().ok())
+    .unwrap_or(0)
+        > 0
+}
+
 /// Determines if the provided quack connection URI targets the 0.0.0.0 local unspecified address.
 pub fn is_quack_zero_host(db: &str) -> bool {
     let stripped = db
@@ -717,13 +730,7 @@ pub fn apply_diff_with_executor(
     project_dir: &Path,
     catalog: Option<&str>,
 ) -> Result<()> {
-    let is_quack = exec
-        .query_rows("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')")
-        .ok()
-        .and_then(|(_, rows)| rows.into_iter().next())
-        .and_then(|r| r.into_iter().next())
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0) > 0;
+    let is_quack = is_quack_target_attached(exec);
 
     let orig_db: String = if is_quack {
         exec.query_rows("SELECT * FROM target_db.query('SELECT current_database()')")

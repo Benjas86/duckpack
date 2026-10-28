@@ -293,15 +293,7 @@ pub struct AttachedDatabase {
 }
 
 fn is_target_db_quack(exec: &mut dyn crate::engine::DbExecutor) -> bool {
-    exec.query_rows(
-        "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
-    )
-    .ok()
-    .and_then(|(_, rows)| rows.into_iter().next())
-    .and_then(|r| r.into_iter().next())
-    .and_then(|v| v.parse::<i64>().ok())
-    .unwrap_or(0)
-        > 0
+    crate::engine::is_quack_target_attached(exec)
 }
 
 fn detect_quack_alias(exec: &mut dyn crate::engine::DbExecutor, safe_cat: &str) -> Option<String> {
