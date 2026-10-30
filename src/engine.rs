@@ -1642,7 +1642,7 @@ pub fn load_ignore_rules(project_dir: &Path) -> Vec<String> {
 }
 
 /// Auto-discovers the active DuckPack project directory.
-/// If `start` contains `duckpack.toml`, `queries/`, `tables/`, or `schemas/`, it is returned.
+/// If `start` contains `duckpack.toml`, `queries/`, `tables/`, `schemas/`, or `sequences/`, it is returned.
 /// Otherwise, checks candidate subdirectories (e.g. `duckpack/`, `duckdb_project/`, `demo_project/`),
 /// and then checks parent directories.
 pub fn discover_project_dir(start: &Path) -> PathBuf {
@@ -1704,6 +1704,7 @@ fn is_project_root(path: &Path) -> bool {
         || path.join("queries").is_dir()
         || path.join("tables").is_dir()
         || path.join("schemas").is_dir()
+        || path.join("sequences").is_dir()
 }
 
 #[cfg(test)]
