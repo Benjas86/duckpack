@@ -7,6 +7,7 @@ Notebooks or VS Code Interactive.
 
 import os
 from pathlib import Path
+import shlex
 import shutil
 import socket
 import subprocess
@@ -142,25 +143,31 @@ def launch_terminal_window(
 
     if active_cat:
         cli_cmd.extend(["--database", active_cat])
-    if token_arg:
-        cli_cmd.extend(["--quack-token", token_arg])
     if insecure_arg:
         cli_cmd.append("--insecure")
     if env:
         cli_cmd.extend(["--env", env])
 
+    child_env = os.environ.copy()
+    if token_arg:
+        child_env["QUACK_TOKEN"] = str(token_arg)
+
     # 3. Launch the terminal emulator
     try:
         if sys.platform == "darwin":
-            cmd_str = " ".join(f'"{arg}"' for arg in cli_cmd)
-            script = f'tell application "Terminal" to do script "{cmd_str}"'
-            proc = subprocess.Popen(["osascript", "-e", script])
+            shell_parts = [shlex.quote(str(arg)) for arg in cli_cmd]
+            if token_arg:
+                shell_parts.insert(0, f"QUACK_TOKEN={shlex.quote(str(token_arg))}")
+            cmd_str = " ".join(shell_parts)
+            apple_escaped = cmd_str.replace("\\", "\\\\").replace('"', '\\"')
+            script = f'tell application "Terminal" to do script "{apple_escaped}"'
+            proc = subprocess.Popen(["osascript", "-e", script], env=child_env)
         elif sys.platform == "win32" and "wt.exe" in term_prefix:
-            proc = subprocess.Popen(term_prefix + cli_cmd)
+            proc = subprocess.Popen(term_prefix + cli_cmd, env=child_env)
         else:
             # Linux (Ghostty, Foot, Kitty, Alacritty, etc.)
             full_cmd = term_prefix + cli_cmd
-            proc = subprocess.Popen(full_cmd)
+            proc = subprocess.Popen(full_cmd, env=child_env)
 
         session_type = "Diff & Apply Screen" if mode == "apply" else "Terminal IDE"
         print(f"🦆 Launched DuckPack {session_type} in new window ({term_name})...")

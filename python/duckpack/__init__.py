@@ -18,7 +18,9 @@ from ._duckpack import (
     build as _native_build,
     init as _native_init,
     get_target_config as _native_get_target_config,
+    discover_project_dir as _native_discover_project_dir,
     SessionBridge,
+    __version__ as _native_version,
     __duckdb_version__,
 )
 from .runner import InteractionRunner
@@ -29,45 +31,8 @@ def _is_db_conn(obj):
 
 
 def _discover_project_dir(start="."):
-    """Auto-discovers the nearest declarative DuckPack project directory."""
-    try:
-        start_path = Path(start).resolve()
-    except Exception:
-        return start
-
-    def is_proj(p):
-        return (
-            (p / "duckpack.toml").exists()
-            or (p / "queries").is_dir()
-            or (p / "tables").is_dir()
-            or (p / "schemas").is_dir()
-        )
-
-    if is_proj(start_path):
-        return str(start_path)
-
-    # 1. Candidate subdirectories
-    for cand in ["cli", "duckpack", "duckdb_project", "duckdb", "project", "demo_project"]:
-        sub = start_path / cand
-        if sub.is_dir() and is_proj(sub):
-            return str(sub)
-
-    # 2. Check parent directories up to filesystem root
-    curr = start_path.parent
-    while curr and curr != curr.parent:
-        if is_proj(curr):
-            return str(curr)
-        curr = curr.parent
-
-    # 3. Check sibling directories under parent (e.g. from 0.2.0/python to 0.2.0/cli)
-    parent = start_path.parent
-    if parent and parent != start_path:
-        for cand in ["cli", "duckpack", "duckdb_project", "duckdb", "project", "demo_project"]:
-            sib = parent / cand
-            if sib.is_dir() and is_proj(sib):
-                return str(sib)
-
-    return start
+    """Auto-discovers the nearest declarative DuckPack project directory via the native Rust engine."""
+    return _native_discover_project_dir(str(start))
 
 
 def _normalize_session_args(target, project_dir, database, catalog):
@@ -471,4 +436,4 @@ __all__ = [
     "__duckdb_version__",
 ]
 
-__version__ = "0.2.0"
+__version__ = _native_version

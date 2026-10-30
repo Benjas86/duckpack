@@ -4,7 +4,9 @@ Provides rich, interactive rendering and terminal instructions for
 Jupyter Notebooks, VS Code Interactive Window, and Dev Containers.
 """
 
+import html
 import os
+import shlex
 import socket
 import sys
 from pathlib import Path
@@ -49,7 +51,8 @@ def stop_server() -> bool:
                 if target is not None and db_uri:
                     from ._duckpack import sync_back_host_temp_objects
                     sync_back_host_temp_objects(target)
-                    target.execute(f"CALL quack_stop('{db_uri}');")
+                    safe_uri = str(db_uri).replace("'", "''")
+                    target.execute(f"CALL quack_stop('{safe_uri}');")
             return True
         except Exception as e:
             print(f"[DuckPack] Warning: Failed to stop background Quack server cleanly: {e}")
@@ -147,36 +150,41 @@ def render_notebook_card(
     # Build the terminal command
     cmd_parts = ["duckpack", mode]
     if project_dir and project_dir != ".":
-        cmd_parts.extend(["-p", project_dir])
+        cmd_parts.extend(["-p", str(project_dir)])
     if db_arg:
-        cmd_parts.extend(["-d", db_arg])
+        cmd_parts.extend(["-d", str(db_arg)])
     if active_cat:
-        cmd_parts.extend(["--database", active_cat])
+        cmd_parts.extend(["--database", str(active_cat)])
     if token_arg:
-        cmd_parts.extend(["--quack-token", token_arg])
+        cmd_parts.extend(["--quack-token", str(token_arg)])
     if insecure or is_in_memory_bridge:
         cmd_parts.append("--insecure")
     if env:
-        cmd_parts.extend(["-e", env])
+        cmd_parts.extend(["-e", str(env)])
     if mode == "apply":
         cmd_parts.append("--interactive")
         if force_drop:
             cmd_parts.append("--force-drop")
 
-    terminal_cmd = " ".join(cmd_parts)
-    safe_cmd_attr = terminal_cmd.replace("'", "\\'").replace('"', '&quot;')
+    terminal_cmd = " ".join(shlex.quote(part) for part in cmd_parts)
+    escaped_terminal_cmd = html.escape(terminal_cmd, quote=True)
+    safe_cmd_attr = html.escape(terminal_cmd.replace("\\", "\\\\").replace("'", "\\'"), quote=True)
 
     # Introspect tables for preview
     tables = introspect_schema_summary(target)
     table_rows_html = ""
     if tables:
         for t in tables:
+            t_name = html.escape(str(t["name"]), quote=True)
+            t_schema = html.escape(str(t["schema"]), quote=True)
+            t_cols = html.escape(str(t["columns"]), quote=True)
+            t_rows = html.escape(str(t["rows"]), quote=True)
             table_rows_html += f"""
             <tr style="border-bottom: 1px solid rgba(255,255,255,0.06);">
-                <td style="padding: 6px 10px; font-weight: 500;">{t['name']}</td>
-                <td style="padding: 6px 10px; opacity: 0.7;">{t['schema']}</td>
-                <td style="padding: 6px 10px; text-align: right; font-family: monospace;">{t['columns']}</td>
-                <td style="padding: 6px 10px; text-align: right; font-family: monospace;">{t['rows']}</td>
+                <td style="padding: 6px 10px; font-weight: 500;">{t_name}</td>
+                <td style="padding: 6px 10px; opacity: 0.7;">{t_schema}</td>
+                <td style="padding: 6px 10px; text-align: right; font-family: monospace;">{t_cols}</td>
+                <td style="padding: 6px 10px; text-align: right; font-family: monospace;">{t_rows}</td>
             </tr>
             """
         preview_table_html = f"""
@@ -201,15 +209,17 @@ def render_notebook_card(
 
     bridge_status_html = ""
     if is_in_memory_bridge:
+        safe_db_arg = html.escape(str(db_arg), quote=True)
         bridge_status_html = f"""
         <div style="display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 11px; opacity: 0.8;">
             <span style="display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #10b981;"></span>
-            <span>Live Python session bridged on <code>{db_arg}</code></span>
+            <span>Live Python session bridged on <code>{safe_db_arg}</code></span>
             <span>•</span>
             <span>Stop with <code>duckpack.stop_server()</code></span>
         </div>
         """
 
+    from . import __version__
     title = "DuckPack Database Explorer" if mode == "explore" else "DuckPack Diff & Apply"
     action_desc = "launch the full-screen terminal IDE" if mode == "explore" else "review diffs and apply migrations interactively"
 
@@ -233,7 +243,7 @@ def render_notebook_card(
                     <div style="font-size: 12px; opacity: 0.7;">Dev Container / Notebook Environment</div>
                 </div>
             </div>
-            <span style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 12px;">v0.2.0</span>
+            <span style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 12px;">v{__version__}</span>
         </div>
 
         <div style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 6px; padding: 10px 14px; font-size: 12px; line-height: 1.5; margin-bottom: 14px; color: #bae6fd;">
@@ -242,7 +252,7 @@ def render_notebook_card(
 
         <div>
             <div style="display: flex; align-items: center; justify-content: space-between; background: var(--vscode-terminal-background, #0d1117); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; padding: 10px 14px;">
-                <code style="font-family: var(--vscode-editor-font-family, monospace); font-size: 12.5px; color: #38bdf8; word-break: break-all; user-select: all;">$ {terminal_cmd}</code>
+                <code style="font-family: var(--vscode-editor-font-family, monospace); font-size: 12.5px; color: #38bdf8; word-break: break-all; user-select: all;">$ {escaped_terminal_cmd}</code>
                 <button onclick="navigator.clipboard.writeText('{safe_cmd_attr}').then(() => {{ this.innerText = '✓ Copied!'; setTimeout(() => this.innerText = '📋 Copy', 2000); }})" style="
                     background: rgba(255, 255, 255, 0.08);
                     border: 1px solid rgba(255, 255, 255, 0.16);

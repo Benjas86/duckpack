@@ -4,7 +4,7 @@ import pytest
 import duckpack
 
 def test_duckpack_version_and_exports():
-    assert duckpack.__version__ == "0.2.0"
+    assert duckpack.__version__ == "0.2.1"
     assert hasattr(duckpack, "explore")
     assert hasattr(duckpack, "apply")
     assert hasattr(duckpack, "diff")
@@ -443,7 +443,7 @@ def test_cli_version_and_subcommands(capsys, monkeypatch):
         main()
     assert exc.value.code == 0
     captured = capsys.readouterr()
-    assert "duckpack 0.2.0" in captured.out
+    assert f"duckpack {duckpack.__version__}" in captured.out
 
 
 def test_env_profile_with_base_env(tmp_path):
