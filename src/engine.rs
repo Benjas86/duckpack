@@ -300,7 +300,7 @@ pub fn ensure_extension_loaded(conn: &Connection, ext_name: &str) -> Result<()> 
         let info_filename = format!("{}.duckdb_extension.info", ext_name);
 
         let mut candidate_folders = Vec::new();
-        if !hash_str.is_empty() {
+        if !hash_str.is_empty() && hash_str != "v2.0.0" {
             candidate_folders.push(base_ext_dir.join(hash_str).join(platform));
         }
         candidate_folders.push(base_ext_dir.join(&release_tag).join(platform));
@@ -311,8 +311,17 @@ pub fn ensure_extension_loaded(conn: &Connection, ext_name: &str) -> Result<()> 
         for folder in &candidate_folders {
             let candidate_file = folder.join(&target_filename);
             if candidate_file.exists() {
-                // If present in v2.0.0 or release folder, sync it to the dev hash directory as well
-                if !hash_str.is_empty() {
+                // If a corrupted or 0-byte file exists from an interrupted download, purge it
+                if let Ok(meta) = candidate_file.metadata() {
+                    if meta.len() < 512 {
+                        let _ = fs::remove_file(&candidate_file);
+                        let _ = fs::remove_file(folder.join(&info_filename));
+                        continue;
+                    }
+                }
+
+                // If present in v2.0.0 or release folder, sync it to the dev hash directory if distinct
+                if !hash_str.is_empty() && hash_str != "v2.0.0" {
                     let dest_dir = base_ext_dir.join(hash_str).join(platform);
                     if folder != &dest_dir {
                         let _ = fs::create_dir_all(&dest_dir);
@@ -362,30 +371,43 @@ pub fn ensure_extension_loaded(conn: &Connection, ext_name: &str) -> Result<()> 
         let install_res = conn
             .execute(&format!("FORCE INSTALL '{}';", cdn_url), [])
             .or_else(|_| conn.execute(&format!("INSTALL '{}';", cdn_url), []));
+
         if install_res.is_ok() {
-            // Replicate the downloaded extension to the dev hash folder immediately before loading
+            // Verify if the extension file on disk was installed and is not 0 bytes
+            let mut valid_file_found = false;
             if let Ok(home) = std::env::var("HOME") {
                 let base_ext_dir = PathBuf::from(&home).join(".duckdb").join("extensions");
                 let target_filename = format!("{}.duckdb_extension", ext_name);
                 let info_filename = format!("{}.duckdb_extension.info", ext_name);
 
-                if !hash_str.is_empty() {
-                    let dest_dir = base_ext_dir.join(hash_str).join(platform);
-                    let _ = fs::create_dir_all(&dest_dir);
+                for ver in &versions {
+                    let ext_file = base_ext_dir.join(ver).join(platform).join(&target_filename);
+                    if ext_file.exists() {
+                        if ext_file.metadata().map(|m| m.len()).unwrap_or(0) >= 512 {
+                            valid_file_found = true;
 
-                    for ver in &versions {
-                        let src_dir = base_ext_dir.join(ver).join(platform);
-                        let src_file = src_dir.join(&target_filename);
-                        if src_file.exists() {
-                            let _ = fs::copy(&src_file, dest_dir.join(&target_filename));
-                            let src_info = src_dir.join(&info_filename);
-                            if src_info.exists() {
-                                let _ = fs::copy(&src_info, dest_dir.join(&info_filename));
+                            // Only replicate if destination directory is distinct from source
+                            if !hash_str.is_empty() && hash_str != "v2.0.0" && hash_str != ver.as_str() {
+                                let dest_dir = base_ext_dir.join(hash_str).join(platform);
+                                let _ = fs::create_dir_all(&dest_dir);
+                                let _ = fs::copy(&ext_file, dest_dir.join(&target_filename));
+                                let src_info = base_ext_dir.join(ver).join(platform).join(&info_filename);
+                                if src_info.exists() {
+                                    let _ = fs::copy(&src_info, dest_dir.join(&info_filename));
+                                }
                             }
                             break;
+                        } else {
+                            // File is corrupted or 0-byte (e.g. 404 response): delete it immediately
+                            let _ = fs::remove_file(&ext_file);
+                            let _ = fs::remove_file(base_ext_dir.join(ver).join(platform).join(&info_filename));
                         }
                     }
                 }
+            }
+
+            if !valid_file_found {
+                continue;
             }
 
             // Load via standard name, then fallback to direct path
@@ -397,13 +419,13 @@ pub fn ensure_extension_loaded(conn: &Connection, ext_name: &str) -> Result<()> 
                         let target_filename = format!("{}.duckdb_extension", ext_name);
 
                         let mut paths = Vec::new();
-                        if !hash_str.is_empty() {
+                        if !hash_str.is_empty() && hash_str != "v2.0.0" {
                             paths.push(base_ext_dir.join(hash_str).join(platform).join(&target_filename));
                         }
                         paths.push(base_ext_dir.join("v2.0.0").join(platform).join(&target_filename));
 
                         for p in &paths {
-                            if p.exists() {
+                            if p.exists() && p.metadata().map(|m| m.len()).unwrap_or(0) >= 512 {
                                 let sql = format!("LOAD '{}';", p.to_string_lossy().replace('\'', "''"));
                                 if conn.execute(&sql, []).is_ok() {
                                     return Ok(0);
@@ -1671,6 +1693,11 @@ mod tests {
 
     #[test]
     fn test_load_quack_extension() {
+        let test_home = std::env::current_dir().unwrap().join("target").join("test_home");
+        let _ = std::fs::remove_dir_all(&test_home);
+        std::fs::create_dir_all(&test_home).unwrap();
+        unsafe { std::env::set_var("HOME", &test_home); }
+
         let conn = open_duckdb_connection().unwrap();
         let res = load_quack_extension(&conn);
         if res.is_ok() {
