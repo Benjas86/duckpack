@@ -61,7 +61,7 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
   - [Directory Layout](#directory-layout)
   - [Configuration (`duckpack.toml`)](#configuration-duckpacktoml)
   - [Environment Variables (`.env`)](#environment-variables-env)
-  - [Ignoring Tables (`.duckdbignore`)](#ignoring-tables-duckdbignore)
+  - [Ignoring Assets & Scripts (`.duckpackignore`)](#ignoring-assets--scripts-duckpackignore)
 - [📦 DuckPacks (`.duckpack`) for CI/CD](#-duckpacks-duckpack-for-cicd)
 - [NOTE](#note)
 
@@ -831,7 +831,7 @@ my_project/
 │   └── post-deploy/       # Raw SQL executed AFTER migrations are applied
 ├── duckpack.toml          # Multi-environment targets configuration
 ├── .env                   # Environment variables for ${VAR} template substitution
-└── .duckdbignore          # Ignore patterns for tables/views
+├── .duckpackignore        # Ignore patterns for tables, views, sequences, triggers, and deployment scripts
 ```
 
 ### DuckDB v2.0 Authoring Guidelines
@@ -912,15 +912,26 @@ CREATE TABLE ${ENV}_customers_${REGION} (
 ```
 DuckPack loads `.env` (or `.env.<profile>` when using `--env <profile>`) and interpolates variables via regex before compiling.
 
-### Ignoring Tables (`.duckdbignore`)
+### Ignoring Assets & Scripts (`.duckpackignore`)
 
-Specify glob patterns for tables or views that DuckPack should ignore during schema diffs:
+Specify glob patterns for tables, views, sequences, triggers, or file paths from any directory (including `scripts/pre-deploy` and `scripts/post-deploy`) that DuckPack should ignore:
 ```
-# Ignore ephemeral tables and temp backups
+# Ignore ephemeral tables, backups, or schemas
 temp_*
 *_backup
 scratch.*
+
+# Ignore one-time deployment scripts after their initial run
+scripts/pre-deploy/01_one_time_seed.sql
+scripts/post-deploy/02_cleanup_staging.sql
+
+# Ignore an entire directory or wildcard paths
+archive/
+scripts/post-deploy/legacy_*
 ```
+
+> [!TIP]
+> **One-Time Deploy Scripts**: Place bootstrap or one-off data migration scripts in `scripts/pre-deploy/` or `scripts/post-deploy/` during your initial release. Once executed, add the file name or relative path (e.g. `01_one_time_seed.sql` or `scripts/pre-deploy/01_one_time_seed.sql`) to `.duckpackignore` so DuckPack safely bypasses it on subsequent deploys. DuckPack automatically supports legacy `.duckdbignore` and `.duckignore` filenames as fallbacks.
 
 ---
 

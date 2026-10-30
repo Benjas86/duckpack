@@ -818,9 +818,11 @@ pub fn apply_diff_with_executor(
             Ok(())
         };
 
+        let ignore_rules = load_ignore_rules(project_dir);
+
         let pre_deploy_dir = project_dir.join("scripts").join("pre-deploy");
         if pre_deploy_dir.exists() {
-            execute_directory_custom(&pre_deploy_dir, &mut execute_sql)?;
+            execute_directory_filtered(&pre_deploy_dir, project_dir, &ignore_rules, &mut execute_sql)?;
         }
 
         let mut views_to_apply = Vec::new();
@@ -924,7 +926,7 @@ pub fn apply_diff_with_executor(
 
         let post_deploy_dir = project_dir.join("scripts").join("post-deploy");
         if post_deploy_dir.exists() {
-            execute_directory_custom(&post_deploy_dir, &mut execute_sql)?;
+            execute_directory_filtered(&post_deploy_dir, project_dir, &ignore_rules, &mut execute_sql)?;
         }
 
         Ok(())
@@ -1462,7 +1464,7 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
 - `scripts/`: Contains `pre-deploy` and `post-deploy` scripts.
 - `duckpack.toml`: Project configuration and targets.
 - `.env`: Environment variables for template interpolation. Write `${VAR_NAME}` in your SQL, and the engine will dynamically replace it!
-- `.duckpackignore`: Specifies tables or views to ignore during diffing (wildcards supported).
+- `.duckpackignore`: Specifies tables, views, sequences, triggers, or file paths from any directory (including `scripts/pre-deploy` and `scripts/post-deploy`) to ignore during compilation and deployment (wildcards supported).
 "#;
         fs::write(&readme_path, readme_content).with_context(|| "Failed to write README.md")?;
         println!("Created documentation file: {}", readme_path.display());
@@ -1483,11 +1485,15 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
 
     let ignore_path = project_dir.join(".duckpackignore");
     if !ignore_path.exists() {
-        let ignore_content = r#"# Specify tables, views, or triggers to ignore during diffing (wildcards supported).
-# Example:
+        let ignore_content = r#"# Specify tables, views, sequences, triggers, or file paths from any directory to ignore.
+# Wildcards (* and ?) and relative directory paths are supported.
+# Examples:
 # temp_*
 # *_backup
 # scratch_*
+# scripts/pre-deploy/01_one_time_seed.sql
+# scripts/post-deploy/*
+# archive/
 "#;
         fs::write(&ignore_path, ignore_content)
             .with_context(|| "Failed to write .duckpackignore")?;
@@ -1506,12 +1512,13 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
 }
 
 /// Compiles all declarative SQL directories (`schemas`, `types`, `sequences`, `macros`, `tables`, `views`, `triggers`)
-/// against any `DbExecutor` in dependency-safe topological order with retry.
+/// against any `DbExecutor` in dependency-safe topological order with retry, filtering out files matched by `.duckpackignore`.
 pub fn compile_project_declarations(exec: &mut dyn DbExecutor, project_dir: &Path) -> Result<()> {
+    let ignore_rules = load_ignore_rules(project_dir);
     for dir_name in ["schemas", "types", "sequences", "macros", "tables", "views", "triggers"] {
         let dir = project_dir.join(dir_name);
         if dir.exists() {
-            execute_directory_custom(&dir, |sql| exec.execute_batch(sql))?;
+            execute_directory_filtered(&dir, project_dir, &ignore_rules, |sql| exec.execute_batch(sql))?;
         }
     }
     Ok(())
@@ -1530,8 +1537,17 @@ pub fn build_shadow_db(project_dir: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn collect_sql_files_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+/// Recursively collects `.sql` files, filtering out any files or subdirectories matched by `ignore_rules`.
+pub fn collect_sql_files_filtered(
+    dir: &Path,
+    project_dir: &Path,
+    ignore_rules: &[String],
+    out: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
     if !dir.exists() {
+        return Ok(());
+    }
+    if is_file_ignored(dir, project_dir, ignore_rules) {
         return Ok(());
     }
     let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
@@ -1539,22 +1555,51 @@ fn collect_sql_files_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) ->
     for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            collect_sql_files_recursive(&path, out)?;
+            if !is_file_ignored(&path, project_dir, ignore_rules) {
+                collect_sql_files_filtered(&path, project_dir, ignore_rules, out)?;
+            }
         } else if path.is_file() && path.extension().unwrap_or_default() == "sql" {
-            out.push(path);
+            if !is_file_ignored(&path, project_dir, ignore_rules) {
+                out.push(path);
+            }
         }
     }
     Ok(())
 }
 
+/// Helper to collect all SQL files in `dir` respecting project `.duckpackignore`.
+pub fn collect_sql_files_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    let project_dir = discover_project_dir(dir);
+    let ignore_rules = load_ignore_rules(&project_dir);
+    collect_sql_files_filtered(dir, &project_dir, &ignore_rules, out)
+}
+
 /// A helper utility to iterate over a directory of `.sql` files and execute them using a custom executor function.
+/// Respects ignore rules from `.duckpackignore`, `.duckdbignore`, or `.duckignore`.
 /// Recursively scans subdirectories to support nested schemas and modular structures.
 pub fn execute_directory_custom<F>(dir: &Path, exec_fn: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<()>,
 {
+    let project_dir = discover_project_dir(dir);
+    let ignore_rules = load_ignore_rules(&project_dir);
+    execute_directory_filtered(dir, &project_dir, &ignore_rules, exec_fn)
+}
+
+/// A helper utility to iterate over a directory of `.sql` files and execute them using a custom executor function,
+/// filtering out any files or subdirectories matched by `ignore_rules`.
+/// Recursively scans subdirectories to support nested schemas and modular structures.
+pub fn execute_directory_filtered<F>(
+    dir: &Path,
+    project_dir: &Path,
+    ignore_rules: &[String],
+    exec_fn: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let mut files = Vec::new();
-    collect_sql_files_recursive(dir, &mut files)?;
+    collect_sql_files_filtered(dir, project_dir, ignore_rules, &mut files)?;
     let mut pending_sqls = Vec::new();
     for path in files {
         pending_sqls.push(diff::read_sql_with_env(&path)?);
@@ -1639,6 +1684,178 @@ pub fn load_ignore_rules(project_dir: &Path) -> Vec<String> {
         }
     }
     rules
+}
+
+/// Matches a string against a simple glob pattern where `*` matches 0 or more characters
+/// and `?` matches any single character.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == text || pattern == "*" {
+        return true;
+    }
+    let mut regex_str = String::with_capacity(pattern.len() * 2 + 2);
+    regex_str.push('^');
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                }
+                regex_str.push_str(".*");
+            }
+            '?' => regex_str.push('.'),
+            '.' | '(' | ')' | '+' | '|' | '^' | '$' | '@' | '%' | '{' | '}' | '[' | ']' | '\\' => {
+                regex_str.push('\\');
+                regex_str.push(c);
+            }
+            other => regex_str.push(other),
+        }
+    }
+    regex_str.push('$');
+    regex::Regex::new(&regex_str)
+        .map(|re| re.is_match(text))
+        .unwrap_or(false)
+}
+
+/// Checks whether a file or directory path matches any ignore rule from `.duckpackignore`
+/// (or `.duckdbignore` / `.duckignore`). Supports relative paths from any directory (e.g. `scripts/pre-deploy/seed.sql`),
+/// path suffixes (`pre-deploy/seed.sql`), filenames (`seed.sql`), file stems (`seed`),
+/// directory paths (with trailing slash `scripts/pre-deploy/`), and wildcards (`*`, `?`).
+pub fn is_file_ignored(file_path: &Path, project_dir: &Path, rules: &[String]) -> bool {
+    if rules.is_empty() {
+        return false;
+    }
+
+    let norm_path_str = file_path.to_string_lossy().replace('\\', "/");
+    let norm_proj_str = project_dir.to_string_lossy().replace('\\', "/");
+
+    // Compute relative path string
+    let rel_str = if norm_path_str.starts_with(&norm_proj_str) {
+        let stripped = &norm_path_str[norm_proj_str.len()..];
+        stripped.trim_start_matches('/').to_string()
+    } else {
+        match file_path.strip_prefix(project_dir) {
+            Ok(p) => p.to_string_lossy().replace('\\', "/"),
+            Err(_) => norm_path_str.clone(),
+        }
+    };
+
+    let file_name = file_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let file_stem = file_path
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    for raw_rule in rules {
+        let pattern = raw_rule.trim();
+        if pattern.is_empty() || pattern.starts_with('#') {
+            continue;
+        }
+        let pattern = pattern.replace('\\', "/");
+        let pattern = pattern.strip_prefix("./").unwrap_or(&pattern);
+        let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+
+        if pattern.is_empty() {
+            continue;
+        }
+
+        // 1. Directory pattern (ending in /)
+        if pattern.ends_with('/') {
+            let dir_prefix = pattern.trim_end_matches('/');
+            if rel_str == dir_prefix
+                || rel_str.starts_with(pattern)
+                || rel_str.starts_with(&format!("{}/", dir_prefix))
+                || rel_str.ends_with(&format!("/{}", dir_prefix))
+                || rel_str.contains(&format!("/{}/", dir_prefix))
+            {
+                return true;
+            }
+        }
+
+        // 2. Pattern containing / (path-specific)
+        if pattern.contains('/') {
+            if rel_str == pattern {
+                return true;
+            }
+            if glob_match(pattern, &rel_str) {
+                return true;
+            }
+            // Suffix match (e.g. pattern "pre-deploy/01.sql" matching "scripts/pre-deploy/01.sql")
+            if rel_str.ends_with(&format!("/{}", pattern)) {
+                return true;
+            }
+            // Suffix glob match (e.g. pattern "pre-deploy/*" matching "scripts/pre-deploy/01.sql")
+            if glob_match(&format!("*/{}", pattern), &rel_str) {
+                return true;
+            }
+        } else {
+            // 3. Pattern without / (matches filename, file stem, or direct glob)
+            if file_name == pattern || file_stem == pattern {
+                return true;
+            }
+            if glob_match(pattern, &file_name) {
+                return true;
+            }
+            if glob_match(pattern, &file_stem) {
+                return true;
+            }
+            if glob_match(pattern, &rel_str) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Checks whether a database catalog object (table, view, macro, sequence, trigger)
+/// matches any ignore pattern from `.duckpackignore`. Supports direct names, unqualified names,
+/// wildcards (`*`, `?`), and path-like rules (e.g. `tables/users.sql` or `sequences/my_seq.sql`).
+pub fn is_object_ignored(obj_name: &str, rules: &[String]) -> bool {
+    if rules.is_empty() {
+        return false;
+    }
+    let unqual_name = obj_name.split('.').last().unwrap_or(obj_name);
+
+    for raw_rule in rules {
+        let pattern = raw_rule.trim();
+        if pattern.is_empty() || pattern.starts_with('#') {
+            continue;
+        }
+        let pattern = pattern.replace('\\', "/");
+        let pattern = pattern.strip_prefix("./").unwrap_or(&pattern);
+        let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+
+        if pattern.is_empty() {
+            continue;
+        }
+
+        // Direct match or glob on full qualified name or unqualified name
+        if obj_name == pattern || unqual_name == pattern {
+            return true;
+        }
+        if glob_match(pattern, obj_name) || glob_match(pattern, unqual_name) {
+            return true;
+        }
+
+        // If pattern contains a path separator (e.g. "tables/users.sql", "tables/users")
+        if pattern.contains('/') {
+            let p = Path::new(pattern);
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                if !stem.is_empty()
+                    && (stem == obj_name
+                        || stem == unqual_name
+                        || glob_match(stem, obj_name)
+                        || glob_match(stem, unqual_name))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Auto-discovers the active DuckPack project directory.
@@ -2050,6 +2267,159 @@ token_env = "TEST_RESOLVER_PROD_TOKEN"
                 "raw_data".to_string()
             ]
         );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("temp_*", "temp_users"));
+        assert!(!glob_match("temp_*", "users_temp"));
+        assert!(glob_match("*_backup", "users_backup"));
+        assert!(glob_match("scripts/pre-deploy/*", "scripts/pre-deploy/01_once.sql"));
+        assert!(!glob_match("scripts/pre-deploy/*", "scripts/post-deploy/01_once.sql"));
+        assert!(glob_match("01_once.sql", "01_once.sql"));
+        assert!(!glob_match("01_once.sql", "02_once.sql"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*.sql", "test.sql"));
+        assert!(!glob_match("*.sql", "test.csv"));
+    }
+
+    #[test]
+    fn test_is_file_ignored_various_patterns() {
+        let temp_dir = std::path::PathBuf::from("/mock/project");
+
+        // 1. Direct filename
+        let rules = vec!["01_seed_once.sql".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/pre-deploy/01_seed_once.sql"), &temp_dir, &rules));
+        assert!(is_file_ignored(&temp_dir.join("scripts/post-deploy/01_seed_once.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("scripts/pre-deploy/02_normal.sql"), &temp_dir, &rules));
+
+        // 2. Relative path from project root
+        let rules = vec!["scripts/pre-deploy/01_seed_once.sql".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/pre-deploy/01_seed_once.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("scripts/post-deploy/01_seed_once.sql"), &temp_dir, &rules));
+
+        // 3. Subpath / suffix match
+        let rules = vec!["pre-deploy/01_seed_once.sql".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/pre-deploy/01_seed_once.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("scripts/post-deploy/01_seed_once.sql"), &temp_dir, &rules));
+
+        // 4. Directory pattern with trailing slash
+        let rules = vec!["scripts/post-deploy/".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/post-deploy/01_cleanup.sql"), &temp_dir, &rules));
+        assert!(is_file_ignored(&temp_dir.join("scripts/post-deploy/nested/deep.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("scripts/pre-deploy/01_seed.sql"), &temp_dir, &rules));
+
+        // 5. Wildcard path patterns
+        let rules = vec!["scripts/pre-deploy/*".to_string(), "tables/staging_*".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/pre-deploy/any.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("scripts/post-deploy/any.sql"), &temp_dir, &rules));
+        assert!(is_file_ignored(&temp_dir.join("tables/staging_users.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("tables/users.sql"), &temp_dir, &rules));
+
+        // 6. Leading slash and ./ stripping
+        let rules = vec!["/scripts/pre-deploy/run.sql".to_string(), "./tables/old.sql".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/pre-deploy/run.sql"), &temp_dir, &rules));
+        assert!(is_file_ignored(&temp_dir.join("tables/old.sql"), &temp_dir, &rules));
+    }
+
+    #[test]
+    fn test_is_object_ignored() {
+        let rules = vec![
+            "temp_*".to_string(),
+            "*_backup".to_string(),
+            "tables/legacy.sql".to_string(),
+            "core.secret_table".to_string(),
+            "sequences/custom_seq.sql".to_string(),
+        ];
+
+        // Wildcard prefix / suffix
+        assert!(is_object_ignored("temp_users", &rules));
+        assert!(is_object_ignored("orders_backup", &rules));
+        assert!(!is_object_ignored("normal_users", &rules));
+
+        // File-path rule matching object stem
+        assert!(is_object_ignored("legacy", &rules));
+        assert!(is_object_ignored("custom_seq", &rules));
+
+        // Qualified and unqualified matching
+        assert!(is_object_ignored("core.secret_table", &rules));
+        let rules_unqual = vec!["secret_table".to_string()];
+        assert!(is_object_ignored("secret_table", &rules_unqual));
+        assert!(is_object_ignored("core.secret_table", &rules_unqual));
+    }
+
+    #[test]
+    fn test_pre_and_post_deploy_ignore_execution() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_deploy_ignore_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pre_dir = temp_dir.join("scripts").join("pre-deploy");
+        let post_dir = temp_dir.join("scripts").join("post-deploy");
+        std::fs::create_dir_all(&pre_dir).unwrap();
+        std::fs::create_dir_all(&post_dir).unwrap();
+
+        // Pre-deploy scripts: one to run once then ignore, one always active
+        std::fs::write(
+            pre_dir.join("01_seed_once.sql"),
+            "CREATE TABLE should_not_exist (id INT);",
+        )
+        .unwrap();
+        std::fs::write(
+            pre_dir.join("02_always_active.sql"),
+            "CREATE TABLE active_pre (id INT);",
+        )
+        .unwrap();
+
+        // Post-deploy scripts
+        std::fs::write(
+            post_dir.join("99_post_ignored.sql"),
+            "CREATE TABLE post_should_not_exist (id INT);",
+        )
+        .unwrap();
+        std::fs::write(
+            post_dir.join("99_post_active.sql"),
+            "CREATE TABLE active_post (id INT);",
+        )
+        .unwrap();
+
+        // .duckpackignore ignores the one-time script and the post-deploy script
+        let ignore_content = "scripts/pre-deploy/01_seed_once.sql\n99_post_ignored.sql\n";
+        std::fs::write(temp_dir.join(".duckpackignore"), ignore_content).unwrap();
+
+        let mut target_conn = Connection::open_in_memory().unwrap();
+        let diff = crate::diff::DiffResult { items: Vec::new() };
+
+        // Apply diff with executor
+        let res = apply_diff_with_executor(
+            &mut target_conn,
+            &diff,
+            false,
+            false,
+            &temp_dir,
+            None,
+        );
+        assert!(res.is_ok());
+
+        // Verify ignored scripts were NOT executed
+        let pre_ignored_exists = target_conn
+            .execute_batch("SELECT * FROM should_not_exist")
+            .is_ok();
+        assert!(!pre_ignored_exists, "01_seed_once.sql was supposed to be ignored!");
+
+        let post_ignored_exists = target_conn
+            .execute_batch("SELECT * FROM post_should_not_exist")
+            .is_ok();
+        assert!(!post_ignored_exists, "99_post_ignored.sql was supposed to be ignored!");
+
+        // Verify active scripts WERE executed
+        assert!(target_conn.execute_batch("SELECT * FROM active_pre").is_ok());
+        assert!(target_conn.execute_batch("SELECT * FROM active_post").is_ok());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -537,7 +537,13 @@ pub(crate) fn rebuild_project_nodes(
     }
 
     // Config files
-    let config_candidates = ["duckpack.toml", ".env", ".duckdbignore"];
+    let config_candidates = [
+        "duckpack.toml",
+        ".env",
+        ".duckpackignore",
+        ".duckdbignore",
+        ".duckignore",
+    ];
     for c in &config_candidates {
         let p = project_dir.join(c);
         if p.exists() {

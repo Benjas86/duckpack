@@ -1339,14 +1339,7 @@ pub fn compute_diff(
     let mut diff = DiffResult { items: Vec::new() };
 
     let is_ignored = |name: &str| -> bool {
-        ignore_list.iter().any(|pattern| {
-            if pattern.ends_with('*') {
-                let prefix = &pattern[..pattern.len() - 1];
-                name.starts_with(prefix)
-            } else {
-                name == pattern
-            }
-        })
+        crate::engine::is_object_ignored(name, ignore_list)
     };
 
     let mut created_tables = Vec::new();
