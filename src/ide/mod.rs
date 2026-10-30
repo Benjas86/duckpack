@@ -166,6 +166,7 @@ pub fn run_ide_loop(
     let (mut git_branch, mut git_status) = get_git_branch_and_status(project_dir);
     let mut expanded_project_groups: HashSet<String> = vec![
         "proj:schemas",
+        "proj:sequences",
         "proj:tables",
         "proj:views",
         "proj:macros",
@@ -1479,14 +1480,17 @@ pub fn run_ide_loop(
                                                         ProjectCategory::Trigger => {
                                                             new_asset_modal.category_index = 3
                                                         }
-                                                        ProjectCategory::Schema => {
+                                                        ProjectCategory::Sequence => {
                                                             new_asset_modal.category_index = 4
                                                         }
-                                                        ProjectCategory::Query => {
+                                                        ProjectCategory::Schema => {
                                                             new_asset_modal.category_index = 5
                                                         }
-                                                        ProjectCategory::Seed => {
+                                                        ProjectCategory::Query => {
                                                             new_asset_modal.category_index = 6
+                                                        }
+                                                        ProjectCategory::Seed => {
+                                                            new_asset_modal.category_index = 7
                                                         }
                                                         _ => {}
                                                     }
@@ -3639,14 +3643,18 @@ mod tests {
         assert_eq!(modal.category_label(), "Trigger");
 
         modal.category_index = 4;
+        assert_eq!(modal.current_category(), ProjectCategory::Sequence);
+        assert_eq!(modal.category_label(), "Sequence");
+
+        modal.category_index = 5;
         assert_eq!(modal.current_category(), ProjectCategory::Schema);
         assert_eq!(modal.category_label(), "Schema");
 
-        modal.category_index = 5;
+        modal.category_index = 6;
         assert_eq!(modal.current_category(), ProjectCategory::Query);
         assert_eq!(modal.category_label(), "Query");
 
-        modal.category_index = 6;
+        modal.category_index = 7;
         assert_eq!(modal.current_category(), ProjectCategory::Seed);
         assert_eq!(modal.category_label(), "Seed");
     }
@@ -3666,6 +3674,9 @@ mod tests {
         let trigger_sql = generate_asset_boilerplate(ProjectCategory::Trigger, "trg_audit");
         assert!(trigger_sql.contains("CREATE OR REPLACE TRIGGER trg_audit"));
         assert!(trigger_sql.contains("FOR EACH ROW"));
+
+        let seq_sql = generate_asset_boilerplate(ProjectCategory::Sequence, "order_seq");
+        assert!(seq_sql.contains("CREATE SEQUENCE IF NOT EXISTS order_seq"));
 
         let schema_sql = generate_asset_boilerplate(ProjectCategory::Schema, "analytics");
         assert!(schema_sql.contains("CREATE SCHEMA IF NOT EXISTS analytics"));
@@ -3699,6 +3710,10 @@ mod tests {
         assert_eq!(
             get_asset_file_path(&root, ProjectCategory::Trigger, "orders_audit"),
             root.join("triggers").join("orders_audit.sql")
+        );
+        assert_eq!(
+            get_asset_file_path(&root, ProjectCategory::Sequence, "orders_seq"),
+            root.join("sequences").join("orders_seq.sql")
         );
         assert_eq!(
             get_asset_file_path(&root, ProjectCategory::Query, "analysis"),

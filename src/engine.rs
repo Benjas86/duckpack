@@ -842,6 +842,20 @@ pub fn apply_diff_with_executor(
             execute_sqls_with_retry_custom(schemas_to_apply, &mut execute_sql)?;
         }
 
+        // 2. Create sequences before tables/macros
+        let mut sequences_to_apply = Vec::new();
+        for item in &diff.items {
+            if !item.selected || item.ignored {
+                continue;
+            }
+            if item.item_type == diff::DiffItemType::CreateSequence {
+                sequences_to_apply.push(item.sql.clone());
+            }
+        }
+        if !sequences_to_apply.is_empty() {
+            execute_sqls_with_retry_custom(sequences_to_apply, &mut execute_sql)?;
+        }
+
         let mut structure_to_apply = Vec::new();
         for item in &diff.items {
             if !item.selected || item.ignored {
@@ -865,7 +879,8 @@ pub fn apply_diff_with_executor(
                 | diff::DiffItemType::DropColumn
                 | diff::DiffItemType::DropView
                 | diff::DiffItemType::DropMacro
-                | diff::DiffItemType::DropTrigger => {
+                | diff::DiffItemType::DropTrigger
+                | diff::DiffItemType::DropSequence => {
                     if force_drop {
                         drops_to_apply.push(item.sql.clone());
                     }
@@ -881,7 +896,7 @@ pub fn apply_diff_with_executor(
                 diff::DiffItemType::CreateTrigger => {
                     triggers_to_apply.push(item.sql.clone());
                 }
-                diff::DiffItemType::CreateSchema => {} // handled above
+                diff::DiffItemType::CreateSchema | diff::DiffItemType::CreateSequence => {} // handled above
             }
         }
 
@@ -1375,6 +1390,8 @@ impl TargetResolver {
 pub fn init_project(project_dir: &Path) -> Result<()> {
     let dirs = [
         "schemas",
+        "types",
+        "sequences",
         "tables",
         "views",
         "macros",
@@ -1434,6 +1451,8 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
 ## Project Structure
 
 - `schemas/`: Contains `CREATE SCHEMA` statements. Schemas deleted from this folder will be dropped **CASCADE** on the target DB!
+- `types/`: Contains `CREATE TYPE` statements (enums, custom data types).
+- `sequences/`: Contains `CREATE SEQUENCE` statements (compiled before tables to support `DEFAULT nextval('...')`).
 - `tables/`: Contains `CREATE TABLE` statements (one per file). Subdirectories supported for nested schemas.
 - `views/`: Contains `CREATE VIEW` statements (engine auto-forces `OR REPLACE`).
 - `macros/`: Contains `CREATE MACRO` statements.
@@ -1486,10 +1505,10 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
     Ok(())
 }
 
-/// Compiles all declarative SQL directories (`schemas`, `macros`, `tables`, `views`, `triggers`)
+/// Compiles all declarative SQL directories (`schemas`, `types`, `sequences`, `macros`, `tables`, `views`, `triggers`)
 /// against any `DbExecutor` in dependency-safe topological order with retry.
 pub fn compile_project_declarations(exec: &mut dyn DbExecutor, project_dir: &Path) -> Result<()> {
-    for dir_name in ["schemas", "macros", "tables", "views", "triggers"] {
+    for dir_name in ["schemas", "types", "sequences", "macros", "tables", "views", "triggers"] {
         let dir = project_dir.join(dir_name);
         if dir.exists() {
             execute_directory_custom(&dir, |sql| exec.execute_batch(sql))?;

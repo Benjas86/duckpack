@@ -23,6 +23,7 @@ pub(crate) enum ProjectCategory {
     View,
     Macro,
     Trigger,
+    Sequence,
     Query,
     Seed,
     Config,
@@ -299,6 +300,10 @@ pub(crate) fn generate_asset_boilerplate(category: ProjectCategory, name: &str) 
             "-- Trigger: {}\nCREATE OR REPLACE TRIGGER {}\nAFTER INSERT ON <target_table>\nFOR EACH ROW\nEXECUTE FUNCTION <func_name>();\n",
             clean, clean
         ),
+        ProjectCategory::Sequence => format!(
+            "-- Sequence: {}\nCREATE SEQUENCE IF NOT EXISTS {} START 1;\n",
+            clean, clean
+        ),
         ProjectCategory::Schema => format!(
             "-- Schema: {}\nCREATE SCHEMA IF NOT EXISTS {};\n",
             clean, clean
@@ -337,6 +342,7 @@ pub(crate) fn get_asset_file_path(project_dir: &Path, category: ProjectCategory,
     }
     let sub = match category {
         ProjectCategory::Schema => "schemas",
+        ProjectCategory::Sequence => "sequences",
         ProjectCategory::Table => "tables",
         ProjectCategory::View => "views",
         ProjectCategory::Macro => "macros",
@@ -480,6 +486,7 @@ pub(crate) fn rebuild_project_nodes(
 
     let categories: &[(&str, &str, &str, Option<&str>, ProjectCategory)] = &[
         ("schemas", "proj:schemas", "📁 Schemas", Some("sql"), ProjectCategory::Schema),
+        ("sequences", "proj:sequences", "🔢 Sequences", Some("sql"), ProjectCategory::Sequence),
         ("tables", "proj:tables", "📦 Tables", Some("sql"), ProjectCategory::Table),
         ("views", "proj:views", "👁️ Views", Some("sql"), ProjectCategory::View),
         ("macros", "proj:macros", "🔧 Macros", Some("sql"), ProjectCategory::Macro),

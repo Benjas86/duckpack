@@ -51,8 +51,9 @@ impl NewAssetModalState {
             1 => ProjectCategory::View,
             2 => ProjectCategory::Macro,
             3 => ProjectCategory::Trigger,
-            4 => ProjectCategory::Schema,
-            5 => ProjectCategory::Query,
+            4 => ProjectCategory::Sequence,
+            5 => ProjectCategory::Schema,
+            6 => ProjectCategory::Query,
             _ => ProjectCategory::Seed,
         }
     }
@@ -63,8 +64,9 @@ impl NewAssetModalState {
             1 => "View",
             2 => "Macro",
             3 => "Trigger",
-            4 => "Schema",
-            5 => "Query",
+            4 => "Sequence",
+            5 => "Schema",
+            6 => "Query",
             _ => "Seed",
         }
     }
@@ -211,14 +213,14 @@ impl NewAssetModalState {
             && (key.code == KeyCode::Left || key.code == KeyCode::Char('h'))
         {
             self.category_index = if self.category_index == 0 {
-                6
+                7
             } else {
                 self.category_index - 1
             };
         } else if self.active_field == 0
             && (key.code == KeyCode::Right || key.code == KeyCode::Char('l'))
         {
-            self.category_index = (self.category_index + 1) % 7;
+            self.category_index = (self.category_index + 1) % 8;
         } else if self.active_field >= 2
             && (key.code == KeyCode::Left || key.code == KeyCode::Right)
         {
