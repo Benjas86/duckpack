@@ -120,10 +120,6 @@ pub fn run_ide_loop(
         None
     };
 
-    // Eagerly ensure fundamental cloud and analytical extensions (httpfs, parquet) are loaded
-    let _ = crate::engine::ensure_extension_loaded(conn, "httpfs");
-    let _ = crate::engine::ensure_extension_loaded(conn, "parquet");
-
     let mut meta = load_explorer_metadata(conn, project_dir, is_quack);
     let mut tabs: Vec<EditorTab> = vec![EditorTab::new(meta.active_database.clone())];
     let mut active_tab_index: usize = 0;
