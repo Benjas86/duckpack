@@ -4099,6 +4099,23 @@ mod tests {
         let (conn_str_no_ssl, _) = modal.build_connection_target().unwrap();
         assert!(conn_str_no_ssl.contains("Encrypt=no"));
 
+        // Test MSSQL with Windows Authentication / Trusted Connection
+        modal.trusted_connection = true;
+        let (trusted_conn, _) = modal.build_connection_target().unwrap();
+        assert!(trusted_conn.contains("Trusted_Connection=yes"));
+        assert!(!trusted_conn.contains("User Id="));
+        assert!(!trusted_conn.contains("Password="));
+
+        // Test toggling Windows Auth via Space
+        modal.active_field = 8;
+        modal.toggle_active(); // toggles off
+        assert!(!modal.trusted_connection);
+        assert_eq!(modal.username, "sa");
+
+        modal.toggle_active(); // toggles back on
+        assert!(modal.trusted_connection);
+        assert_eq!(modal.username, "");
+
         // Test Postgres URI building
         modal.reset();
         modal.set_provider(4);

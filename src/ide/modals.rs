@@ -648,6 +648,7 @@ pub(crate) struct AttachModalState {
     pub(crate) read_only: bool,
     pub(crate) disable_ssl: bool,
     pub(crate) insecure: bool,
+    pub(crate) trusted_connection: bool,
     pub(crate) active_field: usize,
     pub(crate) error_msg: Option<String>,
 }
@@ -668,6 +669,7 @@ impl AttachModalState {
             read_only: false,
             disable_ssl: false,
             insecure: false,
+            trusted_connection: false,
             active_field: 1,
             error_msg: None,
         };
@@ -689,6 +691,7 @@ impl AttachModalState {
         self.read_only = false;
         self.disable_ssl = false;
         self.insecure = false;
+        self.trusted_connection = false;
         self.active_field = 1;
         self.error_msg = None;
         self.set_provider(0);
@@ -720,8 +723,14 @@ impl AttachModalState {
                 if is_default_port {
                     self.port = "1433".to_string();
                 }
-                if is_default_user {
-                    self.username = "sa".to_string();
+                if cfg!(target_os = "windows") {
+                    self.trusted_connection = true;
+                    self.username.clear();
+                } else {
+                    self.trusted_connection = false;
+                    if is_default_user {
+                        self.username = "sa".to_string();
+                    }
                 }
                 if !self.alias_is_custom {
                     self.alias = if !self.database.is_empty() {
@@ -806,7 +815,9 @@ impl AttachModalState {
 
     pub(crate) fn field_count(&self) -> usize {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::MSSQL {
+            13
+        } else if p.is_relational() {
             12
         } else if p.is_quack() {
             10
@@ -820,7 +831,9 @@ impl AttachModalState {
     #[allow(dead_code)]
     pub(crate) fn is_submit(&self) -> bool {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::MSSQL {
+            self.active_field == 11
+        } else if p.is_relational() {
             self.active_field == 10
         } else if p.is_quack() {
             self.active_field == 8
@@ -833,7 +846,9 @@ impl AttachModalState {
 
     pub(crate) fn is_cancel(&self) -> bool {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::MSSQL {
+            self.active_field == 12
+        } else if p.is_relational() {
             self.active_field == 11
         } else if p.is_quack() {
             self.active_field == 9
@@ -846,7 +861,9 @@ impl AttachModalState {
 
     pub(crate) fn is_toggle_field(&self) -> bool {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::MSSQL {
+            (7..=10).contains(&self.active_field)
+        } else if p.is_relational() {
             (7..=9).contains(&self.active_field)
         } else if p.is_quack() {
             (5..=7).contains(&self.active_field)
@@ -859,7 +876,24 @@ impl AttachModalState {
 
     pub(crate) fn toggle_active(&mut self) {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::MSSQL {
+            match self.active_field {
+                7 => self.read_only = !self.read_only,
+                8 => {
+                    self.trusted_connection = !self.trusted_connection;
+                    if self.trusted_connection {
+                        if self.username == "sa" {
+                            self.username.clear();
+                        }
+                    } else if self.username.is_empty() {
+                        self.username = "sa".to_string();
+                    }
+                }
+                9 => self.disable_ssl = !self.disable_ssl,
+                10 => self.insecure = !self.insecure,
+                _ => {}
+            }
+        } else if p.is_relational() {
             match self.active_field {
                 7 => self.read_only = !self.read_only,
                 8 => self.disable_ssl = !self.disable_ssl,
@@ -905,6 +939,22 @@ impl AttachModalState {
                 self.provider_index - 1
             };
             self.set_provider(prev);
+        } else if p == AttachProvider::MSSQL {
+            match self.active_field {
+                1 => self.active_field = 2,
+                2 => self.active_field = 1,
+                3 => self.active_field = 4,
+                4 => self.active_field = 3,
+                5 => self.active_field = 6,
+                6 => self.active_field = 5,
+                7 => self.active_field = 10,
+                8 => self.active_field = 7,
+                9 => self.active_field = 8,
+                10 => self.active_field = 9,
+                11 => self.active_field = 12,
+                12 => self.active_field = 11,
+                _ => {}
+            }
         } else if p.is_relational() {
             match self.active_field {
                 1 => self.active_field = 2,
@@ -955,6 +1005,22 @@ impl AttachModalState {
         if self.active_field == 0 {
             let next = (self.provider_index + 1) % 7;
             self.set_provider(next);
+        } else if p == AttachProvider::MSSQL {
+            match self.active_field {
+                1 => self.active_field = 2,
+                2 => self.active_field = 1,
+                3 => self.active_field = 4,
+                4 => self.active_field = 3,
+                5 => self.active_field = 6,
+                6 => self.active_field = 5,
+                7 => self.active_field = 8,
+                8 => self.active_field = 9,
+                9 => self.active_field = 10,
+                10 => self.active_field = 7,
+                11 => self.active_field = 12,
+                12 => self.active_field = 11,
+                _ => {}
+            }
         } else if p.is_relational() {
             match self.active_field {
                 1 => self.active_field = 2,
@@ -1002,7 +1068,17 @@ impl AttachModalState {
 
     pub(crate) fn nav_down(&mut self) {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::MSSQL {
+            self.active_field = match self.active_field {
+                0 => 1,
+                1 | 2 => 3,
+                3 | 4 => 5,
+                5 | 6 => 7,
+                7..=10 => 11,
+                11 | 12 => 0,
+                _ => 0,
+            };
+        } else if p.is_relational() {
             self.active_field = match self.active_field {
                 0 => 1,
                 1 | 2 => 3,
@@ -1044,7 +1120,17 @@ impl AttachModalState {
 
     pub(crate) fn nav_up(&mut self) {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::MSSQL {
+            self.active_field = match self.active_field {
+                0 => 11,
+                1 | 2 => 0,
+                3 | 4 => 1,
+                5 | 6 => 3,
+                7..=10 => 5,
+                11 | 12 => 7,
+                _ => 0,
+            };
+        } else if p.is_relational() {
             self.active_field = match self.active_field {
                 0 => 10,
                 1 | 2 => 0,
@@ -1265,17 +1351,31 @@ impl AttachModalState {
                 {
                     conn_str.push_str(&format!(";Database={}", self.database.trim()));
                 }
-                if !self.username.trim().is_empty()
-                    && !conn_str.to_lowercase().contains("user id=")
-                    && !conn_str.to_lowercase().contains("uid=")
-                {
-                    conn_str.push_str(&format!(";User Id={}", self.username.trim()));
-                }
-                if !self.password.trim().is_empty()
-                    && !conn_str.to_lowercase().contains("password=")
-                    && !conn_str.to_lowercase().contains("pwd=")
-                {
-                    conn_str.push_str(&format!(";Password={}", self.password.trim()));
+                let use_trusted = self.trusted_connection
+                    || (cfg!(target_os = "windows")
+                        && self.username.trim().is_empty()
+                        && self.password.trim().is_empty());
+
+                if use_trusted {
+                    if !conn_str.to_lowercase().contains("trusted_connection=")
+                        && !conn_str.to_lowercase().contains("integrated security=")
+                        && !conn_str.to_lowercase().contains("authenticator=")
+                    {
+                        conn_str.push_str(";Trusted_Connection=yes");
+                    }
+                } else {
+                    if !self.username.trim().is_empty()
+                        && !conn_str.to_lowercase().contains("user id=")
+                        && !conn_str.to_lowercase().contains("uid=")
+                    {
+                        conn_str.push_str(&format!(";User Id={}", self.username.trim()));
+                    }
+                    if !self.password.trim().is_empty()
+                        && !conn_str.to_lowercase().contains("password=")
+                        && !conn_str.to_lowercase().contains("pwd=")
+                    {
+                        conn_str.push_str(&format!(";Password={}", self.password.trim()));
+                    }
                 }
                 if (self.insecure
                     || conn_str.contains("localhost")
@@ -1586,6 +1686,7 @@ impl AttachModalState {
             f.render_widget(p3, db_user_cols[0]);
 
             let user_title = match self.provider() {
+                AttachProvider::MSSQL if self.trusted_connection => " User ID (Windows Auth Active) ",
                 AttachProvider::MSSQL => " User ID (e.g. sa) ",
                 AttachProvider::PostgreSQL => " Username (e.g. postgres) ",
                 _ => " Username (e.g. root) ",
@@ -1619,6 +1720,11 @@ impl AttachModalState {
                 Style::default().fg(Color::DarkGray)
             };
             let masked_pass = "*".repeat(self.password.len());
+            let pass_title = if self.provider() == AttachProvider::MSSQL && self.trusted_connection {
+                " Password (Not Required for Windows Auth) "
+            } else {
+                " Password (Masked) "
+            };
             let p5 = Paragraph::new(format!(
                 "{}{}",
                 masked_pass,
@@ -1628,7 +1734,7 @@ impl AttachModalState {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .title(" Password (Masked) ")
+                    .title(pass_title)
                     .border_style(f5_style),
             );
             f.render_widget(p5, pass_alias_cols[0]);
@@ -1652,55 +1758,124 @@ impl AttachModalState {
             );
             f.render_widget(p6, pass_alias_cols[1]);
 
-            let toggle_cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(34),
-                ])
-                .split(field_layout[4]);
-            let f7_style = if self.active_field == 7 {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            f.render_widget(
-                Paragraph::new(format!(
-                    "  [{}] Read-Only",
-                    if self.read_only { "X" } else { " " }
-                ))
-                .style(f7_style),
-                toggle_cols[0],
-            );
+            let is_mssql = self.provider() == AttachProvider::MSSQL;
+            if is_mssql {
+                let toggle_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(24),
+                        Constraint::Percentage(28),
+                        Constraint::Percentage(24),
+                        Constraint::Percentage(24),
+                    ])
+                    .split(field_layout[4]);
 
-            let f8_style = if self.active_field == 8 {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            f.render_widget(
-                Paragraph::new(format!(
-                    "  [{}] Disable SSL",
-                    if self.disable_ssl { "X" } else { " " }
-                ))
-                .style(f8_style),
-                toggle_cols[1],
-            );
+                let f7_style = if self.active_field == 7 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Read-Only",
+                        if self.read_only { "X" } else { " " }
+                    ))
+                    .style(f7_style),
+                    toggle_cols[0],
+                );
 
-            let f9_style = if self.active_field == 9 {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                let f8_style = if self.active_field == 8 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Windows Auth",
+                        if self.trusted_connection { "X" } else { " " }
+                    ))
+                    .style(f8_style),
+                    toggle_cols[1],
+                );
+
+                let f9_style = if self.active_field == 9 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Disable SSL",
+                        if self.disable_ssl { "X" } else { " " }
+                    ))
+                    .style(f9_style),
+                    toggle_cols[2],
+                );
+
+                let f10_style = if self.active_field == 10 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Trust Cert",
+                        if self.insecure { "X" } else { " " }
+                    ))
+                    .style(f10_style),
+                    toggle_cols[3],
+                );
             } else {
-                Style::default().fg(Color::White)
-            };
-            f.render_widget(
-                Paragraph::new(format!(
-                    "  [{}] Insecure / Trust",
-                    if self.insecure { "X" } else { " " }
-                ))
-                .style(f9_style),
-                toggle_cols[2],
-            );
+                let toggle_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(33),
+                        Constraint::Percentage(33),
+                        Constraint::Percentage(34),
+                    ])
+                    .split(field_layout[4]);
+                let f7_style = if self.active_field == 7 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Read-Only",
+                        if self.read_only { "X" } else { " " }
+                    ))
+                    .style(f7_style),
+                    toggle_cols[0],
+                );
+
+                let f8_style = if self.active_field == 8 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Disable SSL",
+                        if self.disable_ssl { "X" } else { " " }
+                    ))
+                    .style(f8_style),
+                    toggle_cols[1],
+                );
+
+                let f9_style = if self.active_field == 9 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Insecure / Trust",
+                        if self.insecure { "X" } else { " " }
+                    ))
+                    .style(f9_style),
+                    toggle_cols[2],
+                );
+            }
 
             if let Some(ref err) = self.error_msg {
                 f.render_widget(
@@ -1720,7 +1895,9 @@ impl AttachModalState {
                 );
             }
 
-            let attach_btn_style = if self.active_field == 10 {
+            let attach_btn_style = if (is_mssql && self.active_field == 11)
+                || (!is_mssql && self.active_field == 10)
+            {
                 Style::default()
                     .bg(Color::Cyan)
                     .fg(Color::Black)
@@ -1728,7 +1905,9 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::Cyan)
             };
-            let cancel_btn_style = if self.active_field == 11 {
+            let cancel_btn_style = if (is_mssql && self.active_field == 12)
+                || (!is_mssql && self.active_field == 11)
+            {
                 Style::default()
                     .bg(Color::Red)
                     .fg(Color::White)

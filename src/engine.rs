@@ -517,6 +517,38 @@ pub fn connect_target_db(
         // while local temporary tables and session tables created in main/memory resolve seamlessly.
         let _ = conn.execute("SET search_path = 'target_db.main,main';", []);
         Ok(conn)
+    } else if db.starts_with("mssql:") {
+        let conn = open_duckdb_connection()
+            .with_context(|| "Failed to open in-memory DB for MSSQL ATTACH")?;
+        ensure_extension_loaded(&conn, "mssql")
+            .with_context(|| "Failed to install/load mssql extension")?;
+        let conn_str = db.strip_prefix("mssql:").unwrap_or(db);
+        let mut final_conn_str = conn_str.to_string();
+        if cfg!(target_os = "windows")
+            && !final_conn_str.to_lowercase().contains("trusted_connection=")
+            && !final_conn_str.to_lowercase().contains("integrated security=")
+            && !final_conn_str.to_lowercase().contains("authenticator=")
+            && !final_conn_str.to_lowercase().contains("user id=")
+            && !final_conn_str.to_lowercase().contains("uid=")
+        {
+            final_conn_str.push_str(";Trusted_Connection=yes");
+        }
+        let safe_conn_str = final_conn_str.replace('\'', "''");
+        let attach_res = conn.execute(
+            &format!("ATTACH '{}' AS target_db (TYPE MSSQL);", safe_conn_str),
+            [],
+        );
+        if let Err(e) = attach_res {
+            return Err(anyhow::anyhow!(
+                "Failed to attach MSSQL database '{}': {}",
+                db,
+                e
+            ));
+        }
+        if conn.execute("CONNECT target_db;", []).is_err() {
+            let _ = conn.execute("USE target_db;", []);
+        }
+        Ok(conn)
     } else if is_remote(db) {
         let conn = open_duckdb_connection()
             .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
@@ -966,21 +998,87 @@ pub struct ResolvedTargetConfig {
 fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
     let mut cfg = ResolvedTargetConfig::default();
 
-    if let Some(db_val) = tbl
-        .get("db")
-        .or_else(|| tbl.get("default_db"))
-        .and_then(|v| v.as_str())
-    {
-        cfg.db = Some(db_val.to_string());
-    } else if let Some(host_val) = tbl.get("host").and_then(|v| v.as_str()) {
-        let clean_host = host_val
-            .strip_prefix("quack://")
-            .or_else(|| host_val.strip_prefix("quack:"))
-            .unwrap_or(host_val);
-        if let Some(port_val) = tbl.get("port").and_then(|v| v.as_integer()) {
-            cfg.db = Some(format!("quack:{}:{}", clean_host, port_val));
-        } else {
-            cfg.db = Some(format!("quack:{}", clean_host));
+    let provider = tbl
+        .get("provider")
+        .or_else(|| tbl.get("type"))
+        .and_then(|v| v.as_str());
+
+    if let Some(prov) = provider {
+        if prov.eq_ignore_ascii_case("mssql") {
+            let server = tbl
+                .get("server")
+                .or_else(|| tbl.get("host"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("localhost");
+            let port = tbl.get("port").and_then(|v| v.as_integer()).unwrap_or(1433);
+            let mut conn_str = format!("mssql:Server={},{}", server, port);
+            if let Some(db_name) = tbl
+                .get("database")
+                .or_else(|| tbl.get("db"))
+                .and_then(|v| v.as_str())
+            {
+                conn_str.push_str(&format!(";Database={}", db_name));
+            }
+            let is_trusted = tbl
+                .get("trusted_connection")
+                .or_else(|| tbl.get("windows_auth"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(cfg!(target_os = "windows"));
+
+            if is_trusted {
+                conn_str.push_str(";Trusted_Connection=yes");
+            } else {
+                if let Some(user) = tbl
+                    .get("username")
+                    .or_else(|| tbl.get("user"))
+                    .or_else(|| tbl.get("user_id"))
+                    .and_then(|v| v.as_str())
+                {
+                    conn_str.push_str(&format!(";User Id={}", user));
+                }
+                if let Some(pass) = tbl.get("password").and_then(|v| v.as_str()) {
+                    conn_str.push_str(&format!(";Password={}", pass));
+                }
+            }
+            if tbl
+                .get("insecure")
+                .or_else(|| tbl.get("trust_server_certificate"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || server == "localhost"
+                || server == "127.0.0.1"
+            {
+                conn_str.push_str(";TrustServerCertificate=yes");
+            }
+            if tbl
+                .get("disable_ssl")
+                .or_else(|| tbl.get("no_encrypt"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                conn_str.push_str(";Encrypt=no");
+            }
+            cfg.db = Some(conn_str);
+        }
+    }
+
+    if cfg.db.is_none() {
+        if let Some(db_val) = tbl
+            .get("db")
+            .or_else(|| tbl.get("default_db"))
+            .and_then(|v| v.as_str())
+        {
+            cfg.db = Some(db_val.to_string());
+        } else if let Some(host_val) = tbl.get("host").and_then(|v| v.as_str()) {
+            let clean_host = host_val
+                .strip_prefix("quack://")
+                .or_else(|| host_val.strip_prefix("quack:"))
+                .unwrap_or(host_val);
+            if let Some(port_val) = tbl.get("port").and_then(|v| v.as_integer()) {
+                cfg.db = Some(format!("quack:{}:{}", clean_host, port_val));
+            } else {
+                cfg.db = Some(format!("quack:{}", clean_host));
+            }
         }
     }
 
@@ -2091,6 +2189,54 @@ token_env = "PROD_TOKEN"
         assert_eq!(prod_cfg.catalogs, vec!["prod_cat".to_string()]);
         assert_eq!(prod_cfg.insecure, Some(false));
         assert_eq!(prod_cfg.token_env.as_deref(), Some("PROD_TOKEN"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_target_config_mssql_windows_auth() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "duckpack_mssql_cfg_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let toml_content = r#"
+[target]
+provider = "mssql"
+server = "sqlserver.corp.local"
+database = "FinanceDB"
+trusted_connection = true
+
+[env.sql_auth]
+provider = "mssql"
+server = "sqlserver.corp.local"
+database = "FinanceDB"
+trusted_connection = false
+username = "finance_app"
+password = "AppPassword123"
+"#;
+        std::fs::write(temp_dir.join("duckpack.toml"), toml_content).unwrap();
+
+        let cfg = resolve_target_config(&temp_dir, None);
+        assert!(cfg.db.is_some());
+        let db_str = cfg.db.unwrap();
+        assert!(db_str.starts_with("mssql:Server=sqlserver.corp.local,1433"));
+        assert!(db_str.contains(";Database=FinanceDB"));
+        assert!(db_str.contains(";Trusted_Connection=yes"));
+        assert!(!db_str.contains("User Id="));
+        assert!(!db_str.contains("Password="));
+
+        let sql_cfg = resolve_target_config(&temp_dir, Some("sql_auth"));
+        assert!(sql_cfg.db.is_some());
+        let sql_db = sql_cfg.db.unwrap();
+        assert!(sql_db.starts_with("mssql:Server=sqlserver.corp.local,1433"));
+        assert!(sql_db.contains(";Database=FinanceDB"));
+        assert!(!sql_db.contains("Trusted_Connection=yes"));
+        assert!(sql_db.contains(";User Id=finance_app"));
+        assert!(sql_db.contains(";Password=AppPassword123"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
