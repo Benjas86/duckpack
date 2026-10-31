@@ -4106,6 +4106,16 @@ mod tests {
         let (file_dl_target, _) = modal.build_connection_target().unwrap();
         assert_eq!(file_dl_target, "ducklake:lake_meta.ducklake");
 
+        // Test DuckLake with Quack metadata catalog (e.g. quack:localhost:9494)
+        modal.host = "quack:localhost:9494".to_string();
+        let (quack_dl_target, _) = modal.build_connection_target().unwrap();
+        assert_eq!(quack_dl_target, "ducklake:quack:localhost:9494");
+
+        modal.host = "10.0.0.5".to_string();
+        modal.port = "9494".to_string();
+        let (port_dl_target, _) = modal.build_connection_target().unwrap();
+        assert_eq!(port_dl_target, "ducklake:quack:10.0.0.5:9494");
+
         modal.reset();
         modal.set_provider(6);
 

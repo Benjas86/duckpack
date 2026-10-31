@@ -1468,13 +1468,31 @@ impl AttachModalState {
                     return Err("Catalog source / host cannot be empty for DuckLake.".to_string());
                 }
                 let host_raw = self.host.trim();
-                let mut cat = if host_raw.contains(':')
+                let mut cat = if host_raw.starts_with("quack:") || host_raw.starts_with("quack://") {
+                    let stripped = host_raw
+                        .strip_prefix("quack://")
+                        .or_else(|| host_raw.strip_prefix("quack:"))
+                        .unwrap_or(host_raw);
+                    let endpoint = if stripped.contains(':') {
+                        stripped.to_string()
+                    } else {
+                        let port = if self.port.trim().is_empty() {
+                            "9494"
+                        } else {
+                            self.port.trim()
+                        };
+                        format!("{}:{}", stripped, port)
+                    };
+                    format!("quack:{}", endpoint)
+                } else if host_raw.contains(':')
                     || host_raw.contains('=')
                     || host_raw.ends_with(".ducklake")
                     || host_raw.ends_with(".duckdb")
                     || host_raw.ends_with(".db")
                 {
                     host_raw.to_string()
+                } else if self.port.trim() == "9494" {
+                    format!("quack:{}:9494", host_raw)
                 } else {
                     let port = if self.port.trim().is_empty() {
                         "5432"
@@ -2873,6 +2891,8 @@ impl AttachModalState {
                                             crate::engine::ensure_extension_loaded(conn, "postgres")
                                         } else if safe_path.contains("sqlite") {
                                             crate::engine::ensure_extension_loaded(conn, "sqlite")
+                                        } else if safe_path.contains("quack") {
+                                            crate::engine::load_quack_extension(conn)
                                         } else {
                                             Ok(())
                                         }
@@ -2923,7 +2943,9 @@ impl AttachModalState {
                                     [],
                                 );
                             }
-                            if provider == AttachProvider::Quack && !self.password.trim().is_empty()
+                            if (provider == AttachProvider::Quack
+                                || (provider == AttachProvider::DuckLake && safe_path.contains("quack")))
+                                && !self.password.trim().is_empty()
                             {
                                 let safe_token = self.password.trim().replace('\'', "''");
                                 let _ = conn.execute(

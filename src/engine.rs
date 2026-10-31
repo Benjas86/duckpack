@@ -562,6 +562,17 @@ pub fn connect_target_db(
             ensure_extension_loaded(&conn, "sqlite")
                 .with_context(|| "Failed to install/load sqlite extension for DuckLake catalog")?;
         }
+        if db.contains("quack") {
+            load_quack_extension(&conn)
+                .with_context(|| "Failed to install/load quack extension for DuckLake catalog")?;
+            if let Some(token) = resolve_quack_token(quack_token, None) {
+                let safe_token = token.replace('\'', "''");
+                let _ = conn.execute(
+                    &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
+                    [],
+                );
+            }
+        }
         if db.contains("s3://") || db.contains("http://") || db.contains("https://") {
             ensure_extension_loaded(&conn, "httpfs")
                 .with_context(|| "Failed to install/load httpfs extension for DuckLake storage")?;

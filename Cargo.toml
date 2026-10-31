@@ -1,6 +1,6 @@
 [package]
 name = "duckpack"
-version = "0.2.3-dev4"
+version = "0.2.3-dev5"
 edition = "2024"
 
 [lib]

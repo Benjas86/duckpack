@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "duckpack"
-version = "0.2.3.dev4"
+version = "0.2.3.dev5"
 description = "Declarative schema management, interactive terminal IDE, and in-memory inspection for DuckDB"
 readme = "README.md"
 authors = [{ name = "Benjamen Terry", email = "benjamenjterry@gmail.com" }]
