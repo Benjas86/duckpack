@@ -596,6 +596,7 @@ pub(crate) enum AttachProvider {
     PostgreSQL,
     MySQL,
     MSSQL,
+    DuckLake,
 }
 
 impl AttachProvider {
@@ -608,6 +609,7 @@ impl AttachProvider {
             AttachProvider::PostgreSQL => "PostgreSQL",
             AttachProvider::MySQL => "MySQL",
             AttachProvider::MSSQL => "SQL Server / MSSQL (Community)",
+            AttachProvider::DuckLake => "DuckLake (Lakehouse / S3)",
         }
     }
 
@@ -616,6 +618,10 @@ impl AttachProvider {
             self,
             AttachProvider::PostgreSQL | AttachProvider::MySQL | AttachProvider::MSSQL
         )
+    }
+
+    pub(crate) fn is_ducklake(&self) -> bool {
+        matches!(self, AttachProvider::DuckLake)
     }
 
     pub(crate) fn is_quack(&self) -> bool {
@@ -636,7 +642,7 @@ impl AttachProvider {
 #[derive(Clone, Debug)]
 pub(crate) struct AttachModalState {
     pub(crate) is_open: bool,
-    pub(crate) provider_index: usize, // 0: DuckDB, 1: Quack, 2: MotherDuck, 3: SQLite, 4: PostgreSQL, 5: MySQL, 6: MSSQL
+    pub(crate) provider_index: usize, // 0: DuckDB, 1: Quack, 2: MotherDuck, 3: SQLite, 4: PostgreSQL, 5: MySQL, 6: MSSQL, 7: DuckLake
     pub(crate) path: String,          // For DuckDB / SQLite file path, MotherDuck DB name
     pub(crate) host: String,          // Host / Server (localhost, etc.)
     pub(crate) port: String,          // Port (1433, 5432, 3306, 9494)
@@ -645,6 +651,7 @@ pub(crate) struct AttachModalState {
     pub(crate) password: String,      // Password / Auth Token (Masked)
     pub(crate) alias: String,         // Catalog alias
     pub(crate) alias_is_custom: bool,
+    pub(crate) data_path: String,     // DuckLake Parquet / storage DATA_PATH (e.g. s3://bucket/data/)
     pub(crate) read_only: bool,
     pub(crate) disable_ssl: bool,
     pub(crate) insecure: bool,
@@ -666,6 +673,7 @@ impl AttachModalState {
             password: String::new(),
             alias: String::new(),
             alias_is_custom: false,
+            data_path: String::new(),
             read_only: false,
             disable_ssl: false,
             insecure: false,
@@ -688,6 +696,7 @@ impl AttachModalState {
         self.password.clear();
         self.alias.clear();
         self.alias_is_custom = false;
+        self.data_path.clear();
         self.read_only = false;
         self.disable_ssl = false;
         self.insecure = false;
@@ -705,17 +714,38 @@ impl AttachModalState {
             4 => AttachProvider::PostgreSQL,
             5 => AttachProvider::MySQL,
             6 => AttachProvider::MSSQL,
+            7 => AttachProvider::DuckLake,
             _ => AttachProvider::DuckDB,
         }
     }
 
     pub(crate) fn set_provider(&mut self, idx: usize) {
-        self.provider_index = idx % 7;
+        self.provider_index = idx % 8;
         self.error_msg = None;
         let is_default_port = matches!(self.port.as_str(), "" | "1433" | "5432" | "3306" | "9494");
-        let is_default_user = matches!(self.username.as_str(), "" | "sa" | "postgres" | "root");
+        let is_default_user = matches!(self.username.as_str(), "" | "sa" | "postgres" | "root" | "lakehouse");
 
         match self.provider() {
+            AttachProvider::DuckLake => {
+                if self.host.is_empty() {
+                    self.host = "localhost".to_string();
+                }
+                if is_default_port {
+                    self.port = "5432".to_string();
+                }
+                if is_default_user {
+                    self.username = "lakehouse".to_string();
+                }
+                if self.database.is_empty() {
+                    self.database = "ducklake".to_string();
+                }
+                if self.data_path.is_empty() {
+                    self.data_path = "s3://ducklake/data/".to_string();
+                }
+                if !self.alias_is_custom {
+                    self.alias = "my_lakehouse".to_string();
+                }
+            }
             AttachProvider::MSSQL => {
                 if self.host.is_empty() {
                     self.host = "localhost".to_string();
@@ -817,6 +847,8 @@ impl AttachModalState {
         let p = self.provider();
         if p == AttachProvider::MSSQL {
             13
+        } else if p == AttachProvider::DuckLake {
+            11
         } else if p.is_relational() {
             12
         } else if p.is_quack() {
@@ -833,6 +865,8 @@ impl AttachModalState {
         let p = self.provider();
         if p == AttachProvider::MSSQL {
             self.active_field == 11
+        } else if p == AttachProvider::DuckLake {
+            self.active_field == 9
         } else if p.is_relational() {
             self.active_field == 10
         } else if p.is_quack() {
@@ -848,6 +882,8 @@ impl AttachModalState {
         let p = self.provider();
         if p == AttachProvider::MSSQL {
             self.active_field == 12
+        } else if p == AttachProvider::DuckLake {
+            self.active_field == 10
         } else if p.is_relational() {
             self.active_field == 11
         } else if p.is_quack() {
@@ -863,6 +899,8 @@ impl AttachModalState {
         let p = self.provider();
         if p == AttachProvider::MSSQL {
             (7..=10).contains(&self.active_field)
+        } else if p == AttachProvider::DuckLake {
+            self.active_field == 8
         } else if p.is_relational() {
             (7..=9).contains(&self.active_field)
         } else if p.is_quack() {
@@ -876,7 +914,11 @@ impl AttachModalState {
 
     pub(crate) fn toggle_active(&mut self) {
         let p = self.provider();
-        if p == AttachProvider::MSSQL {
+        if p == AttachProvider::DuckLake {
+            if self.active_field == 8 {
+                self.read_only = !self.read_only;
+            }
+        } else if p == AttachProvider::MSSQL {
             match self.active_field {
                 7 => self.read_only = !self.read_only,
                 8 => {
@@ -934,11 +976,23 @@ impl AttachModalState {
         let p = self.provider();
         if self.active_field == 0 {
             let prev = if self.provider_index == 0 {
-                6
+                7
             } else {
                 self.provider_index - 1
             };
             self.set_provider(prev);
+        } else if p == AttachProvider::DuckLake {
+            match self.active_field {
+                1 => self.active_field = 2,
+                2 => self.active_field = 1,
+                3 => self.active_field = 4,
+                4 => self.active_field = 3,
+                5 => self.active_field = 6,
+                6 => self.active_field = 5,
+                9 => self.active_field = 10,
+                10 => self.active_field = 9,
+                _ => {}
+            }
         } else if p == AttachProvider::MSSQL {
             match self.active_field {
                 1 => self.active_field = 2,
@@ -1003,8 +1057,20 @@ impl AttachModalState {
     pub(crate) fn nav_right(&mut self) {
         let p = self.provider();
         if self.active_field == 0 {
-            let next = (self.provider_index + 1) % 7;
+            let next = (self.provider_index + 1) % 8;
             self.set_provider(next);
+        } else if p == AttachProvider::DuckLake {
+            match self.active_field {
+                1 => self.active_field = 2,
+                2 => self.active_field = 1,
+                3 => self.active_field = 4,
+                4 => self.active_field = 3,
+                5 => self.active_field = 6,
+                6 => self.active_field = 5,
+                9 => self.active_field = 10,
+                10 => self.active_field = 9,
+                _ => {}
+            }
         } else if p == AttachProvider::MSSQL {
             match self.active_field {
                 1 => self.active_field = 2,
@@ -1068,7 +1134,18 @@ impl AttachModalState {
 
     pub(crate) fn nav_down(&mut self) {
         let p = self.provider();
-        if p == AttachProvider::MSSQL {
+        if p == AttachProvider::DuckLake {
+            self.active_field = match self.active_field {
+                0 => 1,
+                1 | 2 => 3,
+                3 | 4 => 5,
+                5 | 6 => 7,
+                7 => 8,
+                8 => 9,
+                9 | 10 => 0,
+                _ => 0,
+            };
+        } else if p == AttachProvider::MSSQL {
             self.active_field = match self.active_field {
                 0 => 1,
                 1 | 2 => 3,
@@ -1120,7 +1197,18 @@ impl AttachModalState {
 
     pub(crate) fn nav_up(&mut self) {
         let p = self.provider();
-        if p == AttachProvider::MSSQL {
+        if p == AttachProvider::DuckLake {
+            self.active_field = match self.active_field {
+                0 => 9,
+                1 | 2 => 0,
+                3 | 4 => 1,
+                5 | 6 => 3,
+                7 => 5,
+                8 => 7,
+                9 | 10 => 8,
+                _ => 0,
+            };
+        } else if p == AttachProvider::MSSQL {
             self.active_field = match self.active_field {
                 0 => 11,
                 1 | 2 => 0,
@@ -1172,7 +1260,25 @@ impl AttachModalState {
 
     pub(crate) fn handle_char(&mut self, c: char) {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::DuckLake {
+            match self.active_field {
+                1 => self.host.push(c),
+                2 => {
+                    if c.is_ascii_digit() {
+                        self.port.push(c);
+                    }
+                }
+                3 => self.database.push(c),
+                4 => self.username.push(c),
+                5 => self.password.push(c),
+                6 => {
+                    self.alias.push(c);
+                    self.alias_is_custom = true;
+                }
+                7 => self.data_path.push(c),
+                _ => {}
+            }
+        } else if p.is_relational() {
             match self.active_field {
                 1 => self.host.push(c),
                 2 => {
@@ -1247,7 +1353,33 @@ impl AttachModalState {
 
     pub(crate) fn handle_backspace(&mut self) {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::DuckLake {
+            match self.active_field {
+                1 => {
+                    self.host.pop();
+                }
+                2 => {
+                    self.port.pop();
+                }
+                3 => {
+                    self.database.pop();
+                }
+                4 => {
+                    self.username.pop();
+                }
+                5 => {
+                    self.password.pop();
+                }
+                6 => {
+                    self.alias.pop();
+                    self.alias_is_custom = true;
+                }
+                7 => {
+                    self.data_path.pop();
+                }
+                _ => {}
+            }
+        } else if p.is_relational() {
             match self.active_field {
                 1 => {
                     self.host.pop();
@@ -1331,6 +1463,51 @@ impl AttachModalState {
     pub(crate) fn build_connection_target(&self) -> std::result::Result<(String, String), String> {
         let provider = self.provider();
         match provider {
+            AttachProvider::DuckLake => {
+                if self.host.trim().is_empty() {
+                    return Err("Catalog source / host cannot be empty for DuckLake.".to_string());
+                }
+                let host_raw = self.host.trim();
+                let mut cat = if host_raw.contains(':')
+                    || host_raw.contains('=')
+                    || host_raw.ends_with(".ducklake")
+                    || host_raw.ends_with(".duckdb")
+                    || host_raw.ends_with(".db")
+                {
+                    host_raw.to_string()
+                } else {
+                    let port = if self.port.trim().is_empty() {
+                        "5432"
+                    } else {
+                        self.port.trim()
+                    };
+                    let db = if self.database.trim().is_empty() {
+                        "ducklake"
+                    } else {
+                        self.database.trim()
+                    };
+                    let mut s = format!("postgres:host={} port={} dbname={}", host_raw, port, db);
+                    if !self.username.trim().is_empty() {
+                        s.push_str(&format!(" user={}", self.username.trim()));
+                    }
+                    if !self.password.trim().is_empty() {
+                        s.push_str(&format!(" password={}", self.password.trim()));
+                    }
+                    s
+                };
+
+                if !cat.starts_with("ducklake:") {
+                    cat = format!("ducklake:{}", cat);
+                }
+
+                let alias = if self.alias.trim().is_empty() {
+                    "my_lakehouse".to_string()
+                } else {
+                    self.alias.trim().to_string()
+                };
+
+                Ok((cat.replace('\'', "''"), alias))
+            }
             AttachProvider::MSSQL => {
                 if self.host.trim().is_empty() {
                     return Err("Host / Server address cannot be empty for MSSQL.".to_string());
@@ -1569,7 +1746,10 @@ impl AttachModalState {
         let popup_width = 76.min(f.area().width.saturating_sub(4));
         let err_lines = if self.error_msg.is_some() { 4 } else { 2 };
         let is_relational = self.provider().is_relational();
-        let popup_height = if is_relational {
+        let is_ducklake = self.provider().is_ducklake();
+        let popup_height = if is_ducklake {
+            (22 + err_lines).min(f.area().height.saturating_sub(2))
+        } else if is_relational {
             (19 + err_lines).min(f.area().height.saturating_sub(2))
         } else {
             (16 + err_lines).min(f.area().height.saturating_sub(2))
@@ -1591,7 +1771,249 @@ impl AttachModalState {
 
         let inner_area = modal_block.inner(popup_area);
 
-        if is_relational {
+        if is_ducklake {
+            let field_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),         // 0: Provider
+                    Constraint::Length(3),         // 1: Host & Port
+                    Constraint::Length(3),         // 2: Database & Username
+                    Constraint::Length(3),         // 3: Password & Alias
+                    Constraint::Length(3),         // 4: Storage DATA_PATH
+                    Constraint::Length(2),         // 5: Read-Only toggle & S3 tip
+                    Constraint::Length(err_lines), // 6: Error/hint
+                    Constraint::Length(3),         // 7: Buttons
+                ])
+                .split(inner_area);
+
+            let f0_style = if self.active_field == 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let prov_label = format!("  ◄ [ {} ] ►   (◄ / ► to switch)", self.provider().name());
+            let p0 = Paragraph::new(prov_label).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Database Provider Preset ")
+                    .border_style(f0_style),
+            );
+            f.render_widget(p0, field_layout[0]);
+
+            let host_port_cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+                .split(field_layout[1]);
+            let f1_style = if self.active_field == 1 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let p1 = Paragraph::new(format!(
+                "{}{}",
+                self.host,
+                if self.active_field == 1 { "█" } else { "" }
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Catalog Host / DSN / File (e.g. localhost or lake.ducklake) ")
+                    .border_style(f1_style),
+            );
+            f.render_widget(p1, host_port_cols[0]);
+
+            let f2_style = if self.active_field == 2 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let p2 = Paragraph::new(format!(
+                "{}{}",
+                self.port,
+                if self.active_field == 2 { "█" } else { "" }
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Port ")
+                    .border_style(f2_style),
+            );
+            f.render_widget(p2, host_port_cols[1]);
+
+            let db_user_cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(field_layout[2]);
+            let f3_style = if self.active_field == 3 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let p3 = Paragraph::new(format!(
+                "{}{}",
+                self.database,
+                if self.active_field == 3 { "█" } else { "" }
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Metadata Database Name (e.g. ducklake) ")
+                    .border_style(f3_style),
+            );
+            f.render_widget(p3, db_user_cols[0]);
+
+            let f4_style = if self.active_field == 4 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let p4 = Paragraph::new(format!(
+                "{}{}",
+                self.username,
+                if self.active_field == 4 { "█" } else { "" }
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Username (e.g. lakehouse) ")
+                    .border_style(f4_style),
+            );
+            f.render_widget(p4, db_user_cols[1]);
+
+            let pass_alias_cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(field_layout[3]);
+            let f5_style = if self.active_field == 5 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let masked_pass = "*".repeat(self.password.len());
+            let p5 = Paragraph::new(format!(
+                "{}{}",
+                masked_pass,
+                if self.active_field == 5 { "█" } else { "" }
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Password (Masked) ")
+                    .border_style(f5_style),
+            );
+            f.render_widget(p5, pass_alias_cols[0]);
+
+            let f6_style = if self.active_field == 6 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let p6 = Paragraph::new(format!(
+                "{}{}",
+                self.alias,
+                if self.active_field == 6 { "█" } else { "" }
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Lakehouse Catalog Alias ")
+                    .border_style(f6_style),
+            );
+            f.render_widget(p6, pass_alias_cols[1]);
+
+            let f7_style = if self.active_field == 7 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let p7 = Paragraph::new(format!(
+                "{}{}",
+                self.data_path,
+                if self.active_field == 7 { "█" } else { "" }
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Storage DATA_PATH (e.g. s3://bucket/data/ or /local/path/) ")
+                    .border_style(f7_style),
+            );
+            f.render_widget(p7, field_layout[4]);
+
+            let toggle_cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
+                .split(field_layout[5]);
+            let f8_style = if self.active_field == 8 {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            f.render_widget(
+                Paragraph::new(format!(
+                    "  [{}] Read-Only",
+                    if self.read_only { "X" } else { " " }
+                ))
+                .style(f8_style),
+                toggle_cols[0],
+            );
+            f.render_widget(
+                Paragraph::new("💡 S3/RustFS Tip: Use Ctrl+X beforehand in IDE to configure S3 / RustFS secrets")
+                    .style(Style::default().fg(Color::DarkGray)),
+                toggle_cols[1],
+            );
+
+            if let Some(ref err) = self.error_msg {
+                f.render_widget(
+                    Paragraph::new(format!(" ⚠️ {}", err))
+                        .style(Style::default().fg(Color::LightRed))
+                        .wrap(Wrap { trim: true }),
+                    field_layout[6],
+                );
+            } else {
+                f.render_widget(
+                    Paragraph::new(
+                        "  Tab/Arrows: Navigate | Space: Toggle | Enter: Attach | Esc: Cancel",
+                    )
+                    .style(Style::default().fg(Color::DarkGray))
+                    .wrap(Wrap { trim: true }),
+                    field_layout[6],
+                );
+            }
+
+            let attach_btn_style = if self.active_field == 9 {
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let cancel_btn_style = if self.active_field == 10 {
+                Style::default()
+                    .bg(Color::Red)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let buttons = Line::from(vec![
+                Span::styled(" [ 🌊 Attach Lakehouse ] ", attach_btn_style),
+                Span::raw("    "),
+                Span::styled(" [ Cancel ] ", cancel_btn_style),
+            ]);
+            f.render_widget(
+                Paragraph::new(buttons).alignment(Alignment::Center),
+                field_layout[7],
+            );
+        } else if is_relational {
             let field_layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -2444,6 +2866,28 @@ impl AttachModalState {
                     Ok((safe_path, alias)) => {
                         let provider = self.provider();
                         let ext_res = match provider {
+                            AttachProvider::DuckLake => {
+                                crate::engine::ensure_extension_loaded(conn, "ducklake")
+                                    .and_then(|_| {
+                                        if safe_path.contains("postgres") {
+                                            crate::engine::ensure_extension_loaded(conn, "postgres")
+                                        } else if safe_path.contains("sqlite") {
+                                            crate::engine::ensure_extension_loaded(conn, "sqlite")
+                                        } else {
+                                            Ok(())
+                                        }
+                                    })
+                                    .and_then(|_| {
+                                        if self.data_path.starts_with("s3://")
+                                            || self.data_path.starts_with("http://")
+                                            || self.data_path.starts_with("https://")
+                                        {
+                                            crate::engine::ensure_extension_loaded(conn, "httpfs")
+                                        } else {
+                                            Ok(())
+                                        }
+                                    })
+                            }
                             AttachProvider::SQLite => {
                                 crate::engine::ensure_extension_loaded(conn, "sqlite")
                             }
@@ -2491,6 +2935,14 @@ impl AttachModalState {
                             let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, alias);
                             let mut opts = Vec::new();
                             match provider {
+                                AttachProvider::DuckLake => {
+                                    if !self.data_path.trim().is_empty() {
+                                        opts.push(format!(
+                                            "DATA_PATH '{}'",
+                                            self.data_path.trim().replace('\'', "''")
+                                        ));
+                                    }
+                                }
                                 AttachProvider::SQLite => opts.push("TYPE SQLITE".to_string()),
                                 AttachProvider::PostgreSQL => {
                                     opts.push("TYPE POSTGRES".to_string())

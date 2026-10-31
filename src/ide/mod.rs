@@ -101,7 +101,7 @@ pub fn run_ide_loop(
     quack_disable_ssl: bool,
 ) -> Result<()> {
     let is_quack = db_path.starts_with("quack:");
-    let is_remote_db = is_quack || db_path.starts_with("md:") || db_path.starts_with("motherduck:");
+    let is_remote_db = is_quack || db_path.starts_with("md:") || db_path.starts_with("motherduck:") || db_path.starts_with("ducklake:");
 
     let local_duckdb_version: String = conn
         .query_row("SELECT version();", [], |r| r.get(0))
@@ -4083,6 +4083,32 @@ mod tests {
         assert_eq!(modal.port, "1433");
         assert_eq!(modal.username, "sa");
 
+        modal.set_provider(7);
+        assert_eq!(modal.provider(), AttachProvider::DuckLake);
+        assert_eq!(modal.host, "localhost");
+        assert_eq!(modal.port, "5432");
+        assert_eq!(modal.username, "lakehouse");
+        assert_eq!(modal.database, "ducklake");
+        assert_eq!(modal.data_path, "s3://ducklake/data/");
+        assert_eq!(modal.alias, "my_lakehouse");
+
+        // Test DuckLake with Postgres metadata catalog building
+        modal.password = "lakepass".to_string();
+        let (dl_target, dl_alias) = modal.build_connection_target().unwrap();
+        assert_eq!(dl_alias, "my_lakehouse");
+        assert_eq!(
+            dl_target,
+            "ducklake:postgres:host=localhost port=5432 dbname=ducklake user=lakehouse password=lakepass"
+        );
+
+        // Test DuckLake with custom file-based catalog
+        modal.host = "lake_meta.ducklake".to_string();
+        let (file_dl_target, _) = modal.build_connection_target().unwrap();
+        assert_eq!(file_dl_target, "ducklake:lake_meta.ducklake");
+
+        modal.reset();
+        modal.set_provider(6);
+
         // Test MSSQL Connection String building
         modal.database = "mydb".to_string();
         modal.alias = "mssql_db".to_string();
@@ -4368,6 +4394,7 @@ mod tests {
         assert!(!tab.is_dirty);
         assert!(tab.active_file.is_none());
 
+        assert_eq!(db_icon("ducklake"), "🌊");
         assert_eq!(db_icon("sqlite"), "🗃️");
         assert_eq!(db_icon("postgres"), "🔌");
         assert_eq!(db_icon("postgresql"), "🔌");

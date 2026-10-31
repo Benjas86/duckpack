@@ -549,6 +549,48 @@ pub fn connect_target_db(
             let _ = conn.execute("USE target_db;", []);
         }
         Ok(conn)
+    } else if db.starts_with("ducklake:") {
+        let conn = open_duckdb_connection()
+            .with_context(|| "Failed to open in-memory DB for DuckLake ATTACH")?;
+        ensure_extension_loaded(&conn, "ducklake")
+            .with_context(|| "Failed to install/load ducklake extension")?;
+        if db.contains("postgres") {
+            ensure_extension_loaded(&conn, "postgres")
+                .with_context(|| "Failed to install/load postgres extension for DuckLake catalog")?;
+        }
+        if db.contains("sqlite") {
+            ensure_extension_loaded(&conn, "sqlite")
+                .with_context(|| "Failed to install/load sqlite extension for DuckLake catalog")?;
+        }
+        if db.contains("s3://") || db.contains("http://") || db.contains("https://") {
+            ensure_extension_loaded(&conn, "httpfs")
+                .with_context(|| "Failed to install/load httpfs extension for DuckLake storage")?;
+        }
+
+        let (target_path, options) = if let Some(idx) = db.find(" (") {
+            let (target, opts) = db.split_at(idx);
+            (target.trim(), opts.trim())
+        } else {
+            (db.trim(), "")
+        };
+        let safe_target = target_path.replace('\'', "''");
+        let attach_sql = if options.is_empty() {
+            format!("ATTACH '{}' AS target_db;", safe_target)
+        } else {
+            format!("ATTACH '{}' AS target_db {};", safe_target, options)
+        };
+        let attach_res = conn.execute(&attach_sql, []);
+        if let Err(e) = attach_res {
+            return Err(anyhow::anyhow!(
+                "Failed to attach DuckLake lakehouse '{}': {}",
+                db,
+                e
+            ));
+        }
+        if conn.execute("CONNECT target_db;", []).is_err() {
+            let _ = conn.execute("USE target_db;", []);
+        }
+        Ok(conn)
     } else if is_remote(db) {
         let conn = open_duckdb_connection()
             .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
@@ -1059,6 +1101,54 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
                 conn_str.push_str(";Encrypt=no");
             }
             cfg.db = Some(conn_str);
+        } else if prov.eq_ignore_ascii_case("ducklake") {
+            let catalog_explicit = tbl.get("catalog").and_then(|v| v.as_str());
+            let data_path = tbl
+                .get("data_path")
+                .or_else(|| tbl.get("storage"))
+                .or_else(|| tbl.get("path"))
+                .and_then(|v| v.as_str());
+
+            let mut catalog_target = if let Some(cat) = catalog_explicit {
+                cat.to_string()
+            } else if let Some(server) = tbl
+                .get("server")
+                .or_else(|| tbl.get("host"))
+                .and_then(|v| v.as_str())
+            {
+                let port = tbl.get("port").and_then(|v| v.as_integer()).unwrap_or(5432);
+                let dbname = tbl
+                    .get("dbname")
+                    .or_else(|| tbl.get("database"))
+                    .or_else(|| tbl.get("db"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ducklake");
+                let mut pg_cat = format!("postgres:host={} port={} dbname={}", server, port, dbname);
+                if let Some(u) = tbl
+                    .get("username")
+                    .or_else(|| tbl.get("user"))
+                    .and_then(|v| v.as_str())
+                {
+                    pg_cat.push_str(&format!(" user={}", u));
+                }
+                if let Some(p) = tbl.get("password").and_then(|v| v.as_str()) {
+                    pg_cat.push_str(&format!(" password={}", p));
+                }
+                pg_cat
+            } else if let Some(db_val) = tbl.get("database").or_else(|| tbl.get("db")).and_then(|v| v.as_str()) {
+                db_val.to_string()
+            } else {
+                "ducklake".to_string()
+            };
+
+            if !catalog_target.starts_with("ducklake:") {
+                catalog_target = format!("ducklake:{}", catalog_target);
+            }
+
+            if let Some(dp) = data_path {
+                catalog_target.push_str(&format!(" (DATA_PATH '{}')", dp));
+            }
+            cfg.db = Some(catalog_target);
         }
     }
 
@@ -2237,6 +2327,49 @@ password = "AppPassword123"
         assert!(!sql_db.contains("Trusted_Connection=yes"));
         assert!(sql_db.contains(";User Id=finance_app"));
         assert!(sql_db.contains(";Password=AppPassword123"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_target_config_ducklake() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "duckpack_ducklake_cfg_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let toml_content = r#"
+[target]
+provider = "ducklake"
+server = "postgres.lake.local"
+port = 5432
+database = "lake_metadata"
+username = "lake_user"
+password = "LakePassword"
+data_path = "s3://my-lake-bucket/data/"
+
+[env.local_lake]
+provider = "ducklake"
+catalog = "metadata.ducklake"
+data_path = "./parquet_data/"
+"#;
+        std::fs::write(temp_dir.join("duckpack.toml"), toml_content).unwrap();
+
+        let cfg = resolve_target_config(&temp_dir, None);
+        assert!(cfg.db.is_some());
+        let db_str = cfg.db.unwrap();
+        assert!(db_str.starts_with("ducklake:postgres:host=postgres.lake.local port=5432 dbname=lake_metadata"));
+        assert!(db_str.contains("user=lake_user"));
+        assert!(db_str.contains("password=LakePassword"));
+        assert!(db_str.contains("(DATA_PATH 's3://my-lake-bucket/data/')"));
+
+        let local_cfg = resolve_target_config(&temp_dir, Some("local_lake"));
+        assert!(local_cfg.db.is_some());
+        let local_db = local_cfg.db.unwrap();
+        assert_eq!(local_db, "ducklake:metadata.ducklake (DATA_PATH './parquet_data/')");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

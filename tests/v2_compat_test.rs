@@ -1,7 +1,7 @@
 use anyhow::Result;
 use duckdb::Connection;
 use duckpack::diff::{
-    compute_diff, get_macros, get_schema, get_schemas, get_triggers, get_views,
+    compute_diff, get_macros, get_schema, get_schemas, get_sequences, get_triggers, get_views,
     ConstraintSchema, DiffItemType,
 };
 use duckpack::engine::{apply_diff, build_shadow_db};
@@ -57,9 +57,12 @@ fn test_duckdb_v2_compat_end_to_end() -> Result<()> {
         "Must discover trg_user_audit trigger"
     );
 
+    let shadow_sequences = get_sequences(&shadow_conn, None)?;
+
     // 3. Compute diff against a fresh, empty target database
     let target_conn = Connection::open_in_memory()?;
     let target_schemas = get_schemas(&target_conn, None)?;
+    let target_sequences = get_sequences(&target_conn, None)?;
     let target_tables = get_schema(&target_conn, None)?;
     let target_views = get_views(&target_conn, None)?;
     let target_macros = get_macros(&target_conn, None)?;
@@ -68,6 +71,8 @@ fn test_duckdb_v2_compat_end_to_end() -> Result<()> {
     let diff = compute_diff(
         &shadow_schemas,
         &target_schemas,
+        &shadow_sequences,
+        &target_sequences,
         &shadow_tables,
         &target_tables,
         &shadow_views,
@@ -138,12 +143,15 @@ fn test_duckdb_v2_compat_end_to_end() -> Result<()> {
 
     // Current target state after initial apply
     let current_target_schemas = get_schemas(&target_conn, None)?;
+    let current_target_sequences = get_sequences(&target_conn, None)?;
     let current_target_tables = get_schema(&target_conn, None)?;
     let current_target_triggers = get_triggers(&target_conn, None)?;
 
     let mod_diff = compute_diff(
         &shadow_schemas,
         &current_target_schemas,
+        &shadow_sequences,
+        &current_target_sequences,
         &updated_shadow_tables,
         &current_target_tables,
         &shadow_views,
@@ -194,6 +202,8 @@ fn test_duckdb_v2_compat_end_to_end() -> Result<()> {
     let view_diff = compute_diff(
         &shadow_schemas,
         &current_target_schemas,
+        &shadow_sequences,
+        &current_target_sequences,
         &updated_shadow_tables,
         &updated_shadow_tables,
         &updated_views,

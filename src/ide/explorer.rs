@@ -63,6 +63,7 @@ pub(crate) struct ExplorerNode {
 /// Formats the database provider icon based on database type.
 pub(crate) fn db_icon(db_type: &str) -> &'static str {
     match db_type.to_lowercase().as_str() {
+        "ducklake" => "🌊",
         "sqlite" => "🗃️",
         "postgres" | "postgresql" | "mysql" | "mssql" => "🔌",
         _ => "📁",
