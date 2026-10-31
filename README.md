@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="duckpack_logo.png" width="400" alt="DuckPack Logo" />
+  <img src="https://raw.githubusercontent.com/Benjas86/duckpack/main/duckpack_logo.png" width="400" alt="DuckPack Logo" />
 </p>
 
 <p align="center">
