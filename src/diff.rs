@@ -1161,6 +1161,27 @@ pub fn get_sequences_exec(
     Ok(sequences)
 }
 
+/// Normalizes a sequence SQL definition for drift comparison by stripping out the runtime
+/// `START <number>` or `START WITH <number>` clause and consolidating whitespace.
+/// In DuckDB, `duckdb_sequences().sql` synthesizes `START <next_counter>` representing the live
+/// runtime counter state. When comparing declarative project files to a live database, this dynamic
+/// advancement must not be flagged as schema drift.
+pub fn normalize_sequence_sql(sql: &str) -> String {
+    static RE_START: OnceLock<Regex> = OnceLock::new();
+    let re_start = RE_START.get_or_init(|| Regex::new(r"(?i)\bSTART(?:\s+WITH)?\s+-?\d+\b").unwrap());
+
+    static RE_WS: OnceLock<Regex> = OnceLock::new();
+    let re_ws = RE_WS.get_or_init(|| Regex::new(r"\s+").unwrap());
+
+    let without_start = re_start.replace_all(sql, "");
+    re_ws
+        .replace_all(&without_start, " ")
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string()
+}
+
 /// Extracts all trigger definitions from a DuckDB connection for a specific catalog.
 pub fn get_triggers(
     conn: &Connection,
@@ -1401,7 +1422,11 @@ pub fn compute_diff(
     // 2. Sequences (before tables/macros)
     for (name, shadow_def) in shadow_sequences {
         let target_def = target_sequences.get(name);
-        if target_def.is_none() || target_def != Some(shadow_def) {
+        let is_different = match target_def {
+            None => true,
+            Some(t_sql) => normalize_sequence_sql(shadow_def) != normalize_sequence_sql(t_sql),
+        };
+        if is_different {
             let ignored = is_ignored(name);
             diff.items.push(DiffItem {
                 item_type: DiffItemType::CreateSequence,
@@ -3170,7 +3195,21 @@ mod tests {
             .unwrap();
         assert_eq!(val2, 105, "Sequence increment by 5 should yield 105");
 
-        // 5. Verify reverse pull (pull_object_to_project) for sequence
+        // 5. Verify live sequence counter advancement on target DB does NOT trigger false schema drift
+        let target_snapshot2 = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        let diff2 = compute_diff_snapshots(&shadow_snapshot, &target_snapshot2, &temp_dir, &[]);
+        let sequence_diffs = diff2
+            .items
+            .iter()
+            .filter(|i| i.obj_name == "core.external_metric_id_seq")
+            .collect::<Vec<_>>();
+        assert!(
+            sequence_diffs.is_empty(),
+            "Live sequence advancement (START 110 vs project START 100) must NOT trigger schema drift, but got: {:?}",
+            sequence_diffs
+        );
+
+        // 6. Verify reverse pull (pull_object_to_project) for sequence
         let pull_target = std::env::temp_dir().join(format!(
             "dp_seq_pull_{}",
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
@@ -3188,5 +3227,85 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         let _ = std::fs::remove_dir_all(&pull_target);
+    }
+
+    #[test]
+    fn test_normalize_sequence_sql() {
+        let shadow = "CREATE SEQUENCE IF NOT EXISTS \"id_seq\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 4 NO CYCLE;";
+        let target = "CREATE SEQUENCE IF NOT EXISTS \"id_seq\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 6 NO CYCLE;";
+        assert_eq!(normalize_sequence_sql(shadow), normalize_sequence_sql(target));
+
+        let start_with = "CREATE SEQUENCE IF NOT EXISTS \"id_seq\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 100 NO CYCLE;";
+        assert_eq!(normalize_sequence_sql(shadow), normalize_sequence_sql(start_with));
+
+        let diff_inc = "CREATE SEQUENCE IF NOT EXISTS \"id_seq\" INCREMENT BY 5 MINVALUE 1 MAXVALUE 9223372036854775807 START 4 NO CYCLE;";
+        assert_ne!(normalize_sequence_sql(shadow), normalize_sequence_sql(diff_inc));
+
+        let diff_cycle = "CREATE SEQUENCE IF NOT EXISTS \"id_seq\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 4 CYCLE;";
+        assert_ne!(normalize_sequence_sql(shadow), normalize_sequence_sql(diff_cycle));
+    }
+
+    #[test]
+    fn test_sequence_runtime_advancement_no_drift() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_seq_drift_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("sequences")).unwrap();
+
+        // Exact user case: CREATE SEQUENCE IF NOT EXISTS id_seq START 4
+        std::fs::write(
+            temp_dir.join("sequences").join("id_seq.sql"),
+            "CREATE SEQUENCE IF NOT EXISTS id_seq START 4;",
+        )
+        .unwrap();
+
+        let (_shadow_conn, shadow_snapshot) = CatalogSnapshot::from_project_dir(&temp_dir).unwrap();
+        assert!(shadow_snapshot.sequences.contains_key("id_seq"));
+
+        // 1. Initial diff against empty database -> must emit CreateSequence
+        let mut target_conn = Connection::open_in_memory().unwrap();
+        let target_snapshot = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        let diff = compute_diff_snapshots(&shadow_snapshot, &target_snapshot, &temp_dir, &[]);
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::CreateSequence);
+        assert_eq!(diff.items[0].obj_name, "id_seq");
+
+        // 2. Apply to target
+        crate::engine::apply_diff(&target_conn, &diff, false, false, &temp_dir, None).unwrap();
+
+        // 3. Increment sequence on target database via nextval
+        let v1: i64 = target_conn
+            .query_row("SELECT nextval('id_seq');", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v1, 4);
+        let v2: i64 = target_conn
+            .query_row("SELECT nextval('id_seq');", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v2, 5);
+
+        // Target counter has advanced (nextval will now return 6; duckdb_sequences().sql has START 6)
+        // 4. Introspect target again and compute diff against project (which declared START 4)
+        let target_snapshot2 = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        let diff2 = compute_diff_snapshots(&shadow_snapshot, &target_snapshot2, &temp_dir, &[]);
+
+        // 5. Must NOT see any diff! Zero items!
+        assert!(
+            diff2.items.is_empty(),
+            "Expected 0 diff items when target sequence increments at runtime, but got: {:?}",
+            diff2.items.iter().map(|i| (&i.item_type, &i.obj_name, &i.sql)).collect::<Vec<_>>()
+        );
+
+        // 6. Applying empty diff must be safe and not alter sequence counter
+        crate::engine::apply_diff(&target_conn, &diff2, false, false, &temp_dir, None).unwrap();
+        let v3: i64 = target_conn
+            .query_row("SELECT nextval('id_seq');", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v3, 6, "Sequence counter should continue advancing uninterrupted");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
