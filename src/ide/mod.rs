@@ -4227,11 +4227,28 @@ mod tests {
         modal.handle_backspace();
         assert_eq!(modal.host, "10.");
 
-        // Test Navigation
-        modal.active_field = 1;
-        modal.nav_right();
+        // Test Navigation & Text Cursor Editing
+        modal.active_field = 1; // Host field ("10.")
+        assert_eq!(modal.cursor_pos, 3);
+        let conn = Connection::open_in_memory().unwrap();
+        // Left arrow moves cursor left
+        modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(modal.cursor_pos, 2);
+        // Insert character '9' at cursor (between '0' and '.') -> "109."
+        modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('9'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(modal.host, "109.");
+        assert_eq!(modal.cursor_pos, 3);
+
+        // Tab and BackTab field navigation
+        modal.next_field();
         assert_eq!(modal.active_field, 2); // To Port
-        modal.nav_left();
+        modal.prev_field();
         assert_eq!(modal.active_field, 1); // Back to Host
         modal.nav_down();
         assert_eq!(modal.active_field, 3); // Down to Database Name
@@ -4667,5 +4684,250 @@ mod tests {
                 assert_eq!(rect.height, 9);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_render_text_with_cursor_and_helpers() {
+        use crate::ide::modals::{
+            delete_char_at_cursor, delete_char_before_cursor, insert_char_at_cursor,
+            render_text_with_cursor,
+        };
+
+        let mut s = "hello".to_string();
+        let mut cur = 2; // between 'e' and 'l'
+        insert_char_at_cursor(&mut s, &mut cur, 'X');
+        assert_eq!(s, "heXllo");
+        assert_eq!(cur, 3);
+
+        delete_char_before_cursor(&mut s, &mut cur);
+        assert_eq!(s, "hello");
+        assert_eq!(cur, 2);
+
+        delete_char_at_cursor(&mut s, cur);
+        assert_eq!(s, "helo"); // deleted first 'l'
+        assert_eq!(cur, 2);
+
+        // Rendering tests
+        let line_end = render_text_with_cursor("abc", 3, true, false);
+        assert_eq!(line_end.spans.len(), 2);
+        assert_eq!(line_end.spans[0].content, "abc");
+        assert_eq!(line_end.spans[1].content, "█");
+
+        let line_mid = render_text_with_cursor("abc", 1, true, false);
+        assert_eq!(line_mid.spans.len(), 3);
+        assert_eq!(line_mid.spans[0].content, "a");
+        assert_eq!(line_mid.spans[1].content, "b"); // cursor under 'b'
+        assert_eq!(line_mid.spans[2].content, "c");
+
+        let line_masked = render_text_with_cursor("secret", 6, true, true);
+        assert_eq!(line_masked.spans[0].content, "******");
+        assert_eq!(line_masked.spans[1].content, "█");
+
+        let line_inactive = render_text_with_cursor("text", 2, false, false);
+        assert_eq!(line_inactive.spans.len(), 1);
+        assert_eq!(line_inactive.spans[0].content, "text");
+    }
+
+    #[test]
+    fn test_all_modals_cursor_navigation_and_editing() {
+        let conn = Connection::open_in_memory().unwrap();
+        let pdir = std::path::Path::new(".");
+
+        // 1. NewAssetModalState
+        let mut asset_modal = NewAssetModalState::new();
+        asset_modal.category_index = 0; // SQL Table
+        asset_modal.active_field = 1; // Name field
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('u'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('s'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.name, "usr");
+        assert_eq!(asset_modal.cursor_pos, 3);
+
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.cursor_pos, 2);
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('e'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.name, "user");
+        assert_eq!(asset_modal.cursor_pos, 3);
+
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Home, crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.cursor_pos, 0);
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Delete, crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.name, "ser");
+        assert_eq!(asset_modal.cursor_pos, 0);
+
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::End, crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.cursor_pos, 3);
+
+        // 2. AddBucketModalState
+        let mut bucket_modal = AddBucketModalState::new();
+        let mut exp_groups = HashSet::new();
+        bucket_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('a'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+            &mut exp_groups,
+        );
+        bucket_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('c'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+            &mut exp_groups,
+        );
+        bucket_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            pdir,
+            &mut exp_groups,
+        );
+        bucket_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+            &mut exp_groups,
+        );
+        assert_eq!(bucket_modal.uri, "abc");
+
+        // 3. SecretModalState
+        let mut sec_modal = SecretModalState::new();
+        sec_modal.name.clear();
+        sec_modal.sync_cursor_to_end();
+        sec_modal.active_field = 1; // Secret Name
+        sec_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('m'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+            pdir,
+        );
+        sec_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('y'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+            pdir,
+        );
+        assert_eq!(sec_modal.name, "my");
+        sec_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            &conn,
+            pdir,
+        );
+        assert_eq!(sec_modal.cursor_pos, 1);
+        sec_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('_'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+            pdir,
+        );
+        assert_eq!(sec_modal.name, "m_y");
+
+        // 4. AttachModalState
+        let mut attach_modal = AttachModalState::new();
+        attach_modal.set_provider(7); // DuckLake
+        assert_eq!(attach_modal.provider(), AttachProvider::DuckLake);
+        assert_eq!(attach_modal.ducklake_backend, DuckLakeBackend::Quack);
+
+        // Backend switching on field 1
+        attach_modal.active_field = 1;
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Right, crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(attach_modal.ducklake_backend, DuckLakeBackend::PostgreSQL);
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(attach_modal.ducklake_backend, DuckLakeBackend::Quack);
+
+        // DATA_PATH text editing on Quack DuckLake (field 6)
+        attach_modal.active_field = 6;
+        attach_modal.data_path.clear();
+        attach_modal.sync_cursor_to_end();
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('s'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('3'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(attach_modal.data_path, "s3");
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Home, crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(attach_modal.cursor_pos, 0);
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('/'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(attach_modal.data_path, "/s3");
+    }
+
+    #[test]
+    fn test_ducklake_modal_render_height_and_2d_nav() {
+        let backend = ratatui::backend::TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut modal = AttachModalState::new();
+        modal.is_open = true;
+        modal.set_provider(7); // DuckLake Quack
+
+        terminal
+            .draw(|f| {
+                modal.render(f);
+            })
+            .unwrap();
+
+        // 2D navigation Quack:
+        // 0 (Provider) down -> 2 (Host)
+        modal.active_field = 0;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 2);
+
+        // 1 (Backend) down -> 3 (Port)
+        modal.active_field = 1;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 3);
+
+        // 2 (Host) down -> 4 (Password)
+        modal.active_field = 2;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 4);
+
+        // 3 (Port) down -> 5 (Alias)
+        modal.active_field = 3;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 5);
+
+        // 4 or 5 down -> 6 (DATA_PATH)
+        modal.active_field = 4;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 6);
+
+        // 6 down -> 7 (Read-Only)
+        modal.active_field = 6;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 7);
+
+        // 7 down -> 8 (Submit)
+        modal.active_field = 7;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 8);
     }
 }
