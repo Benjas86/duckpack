@@ -638,12 +638,51 @@ impl AttachProvider {
     }
 }
 
+/// Supported metadata catalog backends for DuckLake.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DuckLakeBackend {
+    Quack,
+    PostgreSQL,
+    LocalFile,
+    SQLite,
+}
+
+impl DuckLakeBackend {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            DuckLakeBackend::Quack => "Remote Quack Server",
+            DuckLakeBackend::PostgreSQL => "PostgreSQL Catalog",
+            DuckLakeBackend::LocalFile => "Local File (.ducklake / DuckDB)",
+            DuckLakeBackend::SQLite => "SQLite Catalog (.db)",
+        }
+    }
+
+    pub(crate) fn next(&self) -> Self {
+        match self {
+            DuckLakeBackend::Quack => DuckLakeBackend::PostgreSQL,
+            DuckLakeBackend::PostgreSQL => DuckLakeBackend::LocalFile,
+            DuckLakeBackend::LocalFile => DuckLakeBackend::SQLite,
+            DuckLakeBackend::SQLite => DuckLakeBackend::Quack,
+        }
+    }
+
+    pub(crate) fn prev(&self) -> Self {
+        match self {
+            DuckLakeBackend::Quack => DuckLakeBackend::SQLite,
+            DuckLakeBackend::PostgreSQL => DuckLakeBackend::Quack,
+            DuckLakeBackend::LocalFile => DuckLakeBackend::PostgreSQL,
+            DuckLakeBackend::SQLite => DuckLakeBackend::LocalFile,
+        }
+    }
+}
+
 /// State for the Attach Database modal dialog (Ctrl+A).
 #[derive(Clone, Debug)]
 pub(crate) struct AttachModalState {
     pub(crate) is_open: bool,
     pub(crate) provider_index: usize, // 0: DuckDB, 1: Quack, 2: MotherDuck, 3: SQLite, 4: PostgreSQL, 5: MySQL, 6: MSSQL, 7: DuckLake
-    pub(crate) path: String,          // For DuckDB / SQLite file path, MotherDuck DB name
+    pub(crate) ducklake_backend: DuckLakeBackend, // Quack, PostgreSQL, LocalFile, SQLite
+    pub(crate) path: String,          // For DuckDB / SQLite / DuckLake file path, MotherDuck DB name
     pub(crate) host: String,          // Host / Server (localhost, etc.)
     pub(crate) port: String,          // Port (1433, 5432, 3306, 9494)
     pub(crate) database: String,      // Database name (mydb, postgres, etc.)
@@ -665,6 +704,7 @@ impl AttachModalState {
         let mut s = Self {
             is_open: false,
             provider_index: 0,
+            ducklake_backend: DuckLakeBackend::Quack,
             path: String::new(),
             host: String::new(),
             port: String::new(),
@@ -688,6 +728,7 @@ impl AttachModalState {
     pub(crate) fn reset(&mut self) {
         self.is_open = true;
         self.provider_index = 0;
+        self.ducklake_backend = DuckLakeBackend::Quack;
         self.path.clear();
         self.host.clear();
         self.port.clear();
@@ -719,15 +760,25 @@ impl AttachModalState {
         }
     }
 
-    pub(crate) fn set_provider(&mut self, idx: usize) {
-        self.provider_index = idx % 8;
+    pub(crate) fn set_ducklake_backend(&mut self, backend: DuckLakeBackend) {
+        self.ducklake_backend = backend;
         self.error_msg = None;
         let is_default_port = matches!(self.port.as_str(), "" | "1433" | "5432" | "3306" | "9494");
         let is_default_user = matches!(self.username.as_str(), "" | "sa" | "postgres" | "root" | "lakehouse");
+        let is_default_host = matches!(self.host.as_str(), "" | "localhost");
+        let is_default_path = matches!(self.path.as_str(), "" | "metadata.ducklake" | "metadata.db" | "data.duckdb");
 
-        match self.provider() {
-            AttachProvider::DuckLake => {
-                if self.host.is_empty() {
+        match backend {
+            DuckLakeBackend::Quack => {
+                if is_default_host {
+                    self.host = "localhost".to_string();
+                }
+                if is_default_port {
+                    self.port = "9494".to_string();
+                }
+            }
+            DuckLakeBackend::PostgreSQL => {
+                if is_default_host {
                     self.host = "localhost".to_string();
                 }
                 if is_default_port {
@@ -739,12 +790,39 @@ impl AttachModalState {
                 if self.database.is_empty() {
                     self.database = "ducklake".to_string();
                 }
-                if self.data_path.is_empty() {
-                    self.data_path = "s3://ducklake/data/".to_string();
+            }
+            DuckLakeBackend::LocalFile => {
+                if is_default_path {
+                    self.path = "metadata.ducklake".to_string();
                 }
-                if !self.alias_is_custom {
-                    self.alias = "my_lakehouse".to_string();
+            }
+            DuckLakeBackend::SQLite => {
+                if is_default_path {
+                    self.path = "metadata.db".to_string();
                 }
+            }
+        }
+        if self.data_path.is_empty() {
+            self.data_path = "s3://ducklake/data/".to_string();
+        }
+        if !self.alias_is_custom {
+            self.alias = "my_lakehouse".to_string();
+        }
+        let total = self.field_count();
+        if self.active_field >= total {
+            self.active_field = 1;
+        }
+    }
+
+    pub(crate) fn set_provider(&mut self, idx: usize) {
+        self.provider_index = idx % 8;
+        self.error_msg = None;
+        let is_default_port = matches!(self.port.as_str(), "" | "1433" | "5432" | "3306" | "9494");
+        let is_default_user = matches!(self.username.as_str(), "" | "sa" | "postgres" | "root" | "lakehouse");
+
+        match self.provider() {
+            AttachProvider::DuckLake => {
+                self.set_ducklake_backend(self.ducklake_backend);
             }
             AttachProvider::MSSQL => {
                 if self.host.is_empty() {
@@ -848,7 +926,11 @@ impl AttachModalState {
         if p == AttachProvider::MSSQL {
             13
         } else if p == AttachProvider::DuckLake {
-            11
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => 10,
+                DuckLakeBackend::PostgreSQL => 12,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 8,
+            }
         } else if p.is_relational() {
             12
         } else if p.is_quack() {
@@ -866,7 +948,11 @@ impl AttachModalState {
         if p == AttachProvider::MSSQL {
             self.active_field == 11
         } else if p == AttachProvider::DuckLake {
-            self.active_field == 9
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => self.active_field == 8,
+                DuckLakeBackend::PostgreSQL => self.active_field == 10,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => self.active_field == 6,
+            }
         } else if p.is_relational() {
             self.active_field == 10
         } else if p.is_quack() {
@@ -883,7 +969,11 @@ impl AttachModalState {
         if p == AttachProvider::MSSQL {
             self.active_field == 12
         } else if p == AttachProvider::DuckLake {
-            self.active_field == 10
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => self.active_field == 9,
+                DuckLakeBackend::PostgreSQL => self.active_field == 11,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => self.active_field == 7,
+            }
         } else if p.is_relational() {
             self.active_field == 11
         } else if p.is_quack() {
@@ -900,7 +990,15 @@ impl AttachModalState {
         if p == AttachProvider::MSSQL {
             (7..=10).contains(&self.active_field)
         } else if p == AttachProvider::DuckLake {
-            self.active_field == 8
+            if self.active_field == 1 {
+                true
+            } else {
+                match self.ducklake_backend {
+                    DuckLakeBackend::Quack => self.active_field == 7,
+                    DuckLakeBackend::PostgreSQL => self.active_field == 9,
+                    DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => self.active_field == 5,
+                }
+            }
         } else if p.is_relational() {
             (7..=9).contains(&self.active_field)
         } else if p.is_quack() {
@@ -915,8 +1013,17 @@ impl AttachModalState {
     pub(crate) fn toggle_active(&mut self) {
         let p = self.provider();
         if p == AttachProvider::DuckLake {
-            if self.active_field == 8 {
-                self.read_only = !self.read_only;
+            if self.active_field == 1 {
+                self.set_ducklake_backend(self.ducklake_backend.next());
+            } else {
+                let ro_field = match self.ducklake_backend {
+                    DuckLakeBackend::Quack => 7,
+                    DuckLakeBackend::PostgreSQL => 9,
+                    DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 5,
+                };
+                if self.active_field == ro_field {
+                    self.read_only = !self.read_only;
+                }
             }
         } else if p == AttachProvider::MSSQL {
             match self.active_field {
@@ -982,16 +1089,38 @@ impl AttachModalState {
             };
             self.set_provider(prev);
         } else if p == AttachProvider::DuckLake {
-            match self.active_field {
-                1 => self.active_field = 2,
-                2 => self.active_field = 1,
-                3 => self.active_field = 4,
-                4 => self.active_field = 3,
-                5 => self.active_field = 6,
-                6 => self.active_field = 5,
-                9 => self.active_field = 10,
-                10 => self.active_field = 9,
-                _ => {}
+            if self.active_field == 1 {
+                self.set_ducklake_backend(self.ducklake_backend.prev());
+            } else {
+                match self.ducklake_backend {
+                    DuckLakeBackend::Quack => match self.active_field {
+                        2 => self.active_field = 3,
+                        3 => self.active_field = 2,
+                        4 => self.active_field = 5,
+                        5 => self.active_field = 4,
+                        8 => self.active_field = 9,
+                        9 => self.active_field = 8,
+                        _ => {}
+                    },
+                    DuckLakeBackend::PostgreSQL => match self.active_field {
+                        2 => self.active_field = 3,
+                        3 => self.active_field = 2,
+                        4 => self.active_field = 5,
+                        5 => self.active_field = 4,
+                        6 => self.active_field = 7,
+                        7 => self.active_field = 6,
+                        10 => self.active_field = 11,
+                        11 => self.active_field = 10,
+                        _ => {}
+                    },
+                    DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => match self.active_field {
+                        2 => self.active_field = 3,
+                        3 => self.active_field = 2,
+                        6 => self.active_field = 7,
+                        7 => self.active_field = 6,
+                        _ => {}
+                    },
+                }
             }
         } else if p == AttachProvider::MSSQL {
             match self.active_field {
@@ -1060,16 +1189,38 @@ impl AttachModalState {
             let next = (self.provider_index + 1) % 8;
             self.set_provider(next);
         } else if p == AttachProvider::DuckLake {
-            match self.active_field {
-                1 => self.active_field = 2,
-                2 => self.active_field = 1,
-                3 => self.active_field = 4,
-                4 => self.active_field = 3,
-                5 => self.active_field = 6,
-                6 => self.active_field = 5,
-                9 => self.active_field = 10,
-                10 => self.active_field = 9,
-                _ => {}
+            if self.active_field == 1 {
+                self.set_ducklake_backend(self.ducklake_backend.next());
+            } else {
+                match self.ducklake_backend {
+                    DuckLakeBackend::Quack => match self.active_field {
+                        2 => self.active_field = 3,
+                        3 => self.active_field = 2,
+                        4 => self.active_field = 5,
+                        5 => self.active_field = 4,
+                        8 => self.active_field = 9,
+                        9 => self.active_field = 8,
+                        _ => {}
+                    },
+                    DuckLakeBackend::PostgreSQL => match self.active_field {
+                        2 => self.active_field = 3,
+                        3 => self.active_field = 2,
+                        4 => self.active_field = 5,
+                        5 => self.active_field = 4,
+                        6 => self.active_field = 7,
+                        7 => self.active_field = 6,
+                        10 => self.active_field = 11,
+                        11 => self.active_field = 10,
+                        _ => {}
+                    },
+                    DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => match self.active_field {
+                        2 => self.active_field = 3,
+                        3 => self.active_field = 2,
+                        6 => self.active_field = 7,
+                        7 => self.active_field = 6,
+                        _ => {}
+                    },
+                }
             }
         } else if p == AttachProvider::MSSQL {
             match self.active_field {
@@ -1135,15 +1286,37 @@ impl AttachModalState {
     pub(crate) fn nav_down(&mut self) {
         let p = self.provider();
         if p == AttachProvider::DuckLake {
-            self.active_field = match self.active_field {
-                0 => 1,
-                1 | 2 => 3,
-                3 | 4 => 5,
-                5 | 6 => 7,
-                7 => 8,
-                8 => 9,
-                9 | 10 => 0,
-                _ => 0,
+            self.active_field = match self.ducklake_backend {
+                DuckLakeBackend::Quack => match self.active_field {
+                    0 => 1,
+                    1 => 2,
+                    2 | 3 => 4,
+                    4 | 5 => 6,
+                    6 => 7,
+                    7 => 8,
+                    8 | 9 => 0,
+                    _ => 0,
+                },
+                DuckLakeBackend::PostgreSQL => match self.active_field {
+                    0 => 1,
+                    1 => 2,
+                    2 | 3 => 4,
+                    4 | 5 => 6,
+                    6 | 7 => 8,
+                    8 => 9,
+                    9 => 10,
+                    10 | 11 => 0,
+                    _ => 0,
+                },
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => match self.active_field {
+                    0 => 1,
+                    1 => 2,
+                    2 | 3 => 4,
+                    4 => 5,
+                    5 => 6,
+                    6 | 7 => 0,
+                    _ => 0,
+                },
             };
         } else if p == AttachProvider::MSSQL {
             self.active_field = match self.active_field {
@@ -1198,15 +1371,37 @@ impl AttachModalState {
     pub(crate) fn nav_up(&mut self) {
         let p = self.provider();
         if p == AttachProvider::DuckLake {
-            self.active_field = match self.active_field {
-                0 => 9,
-                1 | 2 => 0,
-                3 | 4 => 1,
-                5 | 6 => 3,
-                7 => 5,
-                8 => 7,
-                9 | 10 => 8,
-                _ => 0,
+            self.active_field = match self.ducklake_backend {
+                DuckLakeBackend::Quack => match self.active_field {
+                    0 => 8,
+                    1 => 0,
+                    2 | 3 => 1,
+                    4 | 5 => 2,
+                    6 => 4,
+                    7 => 6,
+                    8 | 9 => 7,
+                    _ => 0,
+                },
+                DuckLakeBackend::PostgreSQL => match self.active_field {
+                    0 => 10,
+                    1 => 0,
+                    2 | 3 => 1,
+                    4 | 5 => 2,
+                    6 | 7 => 4,
+                    8 => 6,
+                    9 => 8,
+                    10 | 11 => 9,
+                    _ => 0,
+                },
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => match self.active_field {
+                    0 => 6,
+                    1 => 0,
+                    2 | 3 => 1,
+                    4 => 2,
+                    5 => 4,
+                    6 | 7 => 5,
+                    _ => 0,
+                },
             };
         } else if p == AttachProvider::MSSQL {
             self.active_field = match self.active_field {
@@ -1261,22 +1456,59 @@ impl AttachModalState {
     pub(crate) fn handle_char(&mut self, c: char) {
         let p = self.provider();
         if p == AttachProvider::DuckLake {
-            match self.active_field {
-                1 => self.host.push(c),
-                2 => {
-                    if c.is_ascii_digit() {
-                        self.port.push(c);
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => match self.active_field {
+                    2 => self.host.push(c),
+                    3 => {
+                        if c.is_ascii_digit() {
+                            self.port.push(c);
+                        }
                     }
-                }
-                3 => self.database.push(c),
-                4 => self.username.push(c),
-                5 => self.password.push(c),
-                6 => {
-                    self.alias.push(c);
-                    self.alias_is_custom = true;
-                }
-                7 => self.data_path.push(c),
-                _ => {}
+                    4 => self.password.push(c),
+                    5 => {
+                        self.alias.push(c);
+                        self.alias_is_custom = true;
+                    }
+                    6 => self.data_path.push(c),
+                    _ => {}
+                },
+                DuckLakeBackend::PostgreSQL => match self.active_field {
+                    2 => self.host.push(c),
+                    3 => {
+                        if c.is_ascii_digit() {
+                            self.port.push(c);
+                        }
+                    }
+                    4 => self.database.push(c),
+                    5 => self.username.push(c),
+                    6 => self.password.push(c),
+                    7 => {
+                        self.alias.push(c);
+                        self.alias_is_custom = true;
+                    }
+                    8 => self.data_path.push(c),
+                    _ => {}
+                },
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => match self.active_field {
+                    2 => {
+                        self.path.push(c);
+                        if !self.alias_is_custom {
+                            let stem = Path::new(&self.path)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("");
+                            if !stem.is_empty() {
+                                self.alias = stem.to_string();
+                            }
+                        }
+                    }
+                    3 => {
+                        self.alias.push(c);
+                        self.alias_is_custom = true;
+                    }
+                    4 => self.data_path.push(c),
+                    _ => {}
+                },
             }
         } else if p.is_relational() {
             match self.active_field {
@@ -1354,30 +1586,73 @@ impl AttachModalState {
     pub(crate) fn handle_backspace(&mut self) {
         let p = self.provider();
         if p == AttachProvider::DuckLake {
-            match self.active_field {
-                1 => {
-                    self.host.pop();
-                }
-                2 => {
-                    self.port.pop();
-                }
-                3 => {
-                    self.database.pop();
-                }
-                4 => {
-                    self.username.pop();
-                }
-                5 => {
-                    self.password.pop();
-                }
-                6 => {
-                    self.alias.pop();
-                    self.alias_is_custom = true;
-                }
-                7 => {
-                    self.data_path.pop();
-                }
-                _ => {}
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => match self.active_field {
+                    2 => {
+                        self.host.pop();
+                    }
+                    3 => {
+                        self.port.pop();
+                    }
+                    4 => {
+                        self.password.pop();
+                    }
+                    5 => {
+                        self.alias.pop();
+                        self.alias_is_custom = true;
+                    }
+                    6 => {
+                        self.data_path.pop();
+                    }
+                    _ => {}
+                },
+                DuckLakeBackend::PostgreSQL => match self.active_field {
+                    2 => {
+                        self.host.pop();
+                    }
+                    3 => {
+                        self.port.pop();
+                    }
+                    4 => {
+                        self.database.pop();
+                    }
+                    5 => {
+                        self.username.pop();
+                    }
+                    6 => {
+                        self.password.pop();
+                    }
+                    7 => {
+                        self.alias.pop();
+                        self.alias_is_custom = true;
+                    }
+                    8 => {
+                        self.data_path.pop();
+                    }
+                    _ => {}
+                },
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => match self.active_field {
+                    2 => {
+                        self.path.pop();
+                        if !self.alias_is_custom {
+                            let stem = Path::new(&self.path)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("");
+                            if !stem.is_empty() {
+                                self.alias = stem.to_string();
+                            }
+                        }
+                    }
+                    3 => {
+                        self.alias.pop();
+                        self.alias_is_custom = true;
+                    }
+                    4 => {
+                        self.data_path.pop();
+                    }
+                    _ => {}
+                },
             }
         } else if p.is_relational() {
             match self.active_field {
@@ -1464,59 +1739,80 @@ impl AttachModalState {
         let provider = self.provider();
         match provider {
             AttachProvider::DuckLake => {
-                if self.host.trim().is_empty() {
-                    return Err("Catalog source / host cannot be empty for DuckLake.".to_string());
-                }
-                let host_raw = self.host.trim();
-                let mut cat = if host_raw.starts_with("quack:") || host_raw.starts_with("quack://") {
-                    let stripped = host_raw
-                        .strip_prefix("quack://")
-                        .or_else(|| host_raw.strip_prefix("quack:"))
-                        .unwrap_or(host_raw);
-                    let endpoint = if stripped.contains(':') {
-                        stripped.to_string()
-                    } else {
-                        let port = if self.port.trim().is_empty() {
-                            "9494"
+                let cat = match self.ducklake_backend {
+                    DuckLakeBackend::Quack => {
+                        if self.host.trim().is_empty() {
+                            return Err("Catalog host cannot be empty for DuckLake Quack backend.".to_string());
+                        }
+                        let host_raw = self.host.trim();
+                        let stripped = host_raw
+                            .strip_prefix("quack://")
+                            .or_else(|| host_raw.strip_prefix("quack:"))
+                            .unwrap_or(host_raw);
+                        let endpoint = if stripped.contains(':') {
+                            stripped.to_string()
                         } else {
-                            self.port.trim()
+                            let port = if self.port.trim().is_empty() {
+                                "9494"
+                            } else {
+                                self.port.trim()
+                            };
+                            format!("{}:{}", stripped, port)
                         };
-                        format!("{}:{}", stripped, port)
-                    };
-                    format!("quack:{}", endpoint)
-                } else if host_raw.contains(':')
-                    || host_raw.contains('=')
-                    || host_raw.ends_with(".ducklake")
-                    || host_raw.ends_with(".duckdb")
-                    || host_raw.ends_with(".db")
-                {
-                    host_raw.to_string()
-                } else if self.port.trim() == "9494" {
-                    format!("quack:{}:9494", host_raw)
-                } else {
-                    let port = if self.port.trim().is_empty() {
-                        "5432"
-                    } else {
-                        self.port.trim()
-                    };
-                    let db = if self.database.trim().is_empty() {
-                        "ducklake"
-                    } else {
-                        self.database.trim()
-                    };
-                    let mut s = format!("postgres:host={} port={} dbname={}", host_raw, port, db);
-                    if !self.username.trim().is_empty() {
-                        s.push_str(&format!(" user={}", self.username.trim()));
+                        format!("quack:{}", endpoint)
                     }
-                    if !self.password.trim().is_empty() {
-                        s.push_str(&format!(" password={}", self.password.trim()));
+                    DuckLakeBackend::PostgreSQL => {
+                        if self.host.trim().is_empty() {
+                            return Err("Catalog host cannot be empty for DuckLake PostgreSQL backend.".to_string());
+                        }
+                        let host_raw = self.host.trim();
+                        if host_raw.starts_with("postgres:") || host_raw.starts_with("postgresql:") {
+                            host_raw.to_string()
+                        } else {
+                            let port = if self.port.trim().is_empty() {
+                                "5432"
+                            } else {
+                                self.port.trim()
+                            };
+                            let db = if self.database.trim().is_empty() {
+                                "ducklake"
+                            } else {
+                                self.database.trim()
+                            };
+                            let mut s = format!("postgres:host={} port={} dbname={}", host_raw, port, db);
+                            if !self.username.trim().is_empty() {
+                                s.push_str(&format!(" user={}", self.username.trim()));
+                            }
+                            if !self.password.trim().is_empty() {
+                                s.push_str(&format!(" password={}", self.password.trim()));
+                            }
+                            s
+                        }
                     }
-                    s
+                    DuckLakeBackend::LocalFile => {
+                        if self.path.trim().is_empty() {
+                            return Err("Metadata file path cannot be empty for DuckLake Local File backend.".to_string());
+                        }
+                        self.path.trim().to_string()
+                    }
+                    DuckLakeBackend::SQLite => {
+                        if self.path.trim().is_empty() {
+                            return Err("SQLite metadata database path cannot be empty for DuckLake SQLite backend.".to_string());
+                        }
+                        let p = self.path.trim();
+                        if p.starts_with("sqlite:") {
+                            p.to_string()
+                        } else {
+                            format!("sqlite:{}", p)
+                        }
+                    }
                 };
 
-                if !cat.starts_with("ducklake:") {
-                    cat = format!("ducklake:{}", cat);
-                }
+                let target = if cat.starts_with("ducklake:") {
+                    cat
+                } else {
+                    format!("ducklake:{}", cat)
+                };
 
                 let alias = if self.alias.trim().is_empty() {
                     "my_lakehouse".to_string()
@@ -1524,7 +1820,7 @@ impl AttachModalState {
                     self.alias.trim().to_string()
                 };
 
-                Ok((cat.replace('\'', "''"), alias))
+                Ok((target.replace('\'', "''"), alias))
             }
             AttachProvider::MSSQL => {
                 if self.host.trim().is_empty() {
@@ -1766,7 +2062,12 @@ impl AttachModalState {
         let is_relational = self.provider().is_relational();
         let is_ducklake = self.provider().is_ducklake();
         let popup_height = if is_ducklake {
-            (22 + err_lines).min(f.area().height.saturating_sub(2))
+            let base = match self.ducklake_backend {
+                DuckLakeBackend::Quack => 20,
+                DuckLakeBackend::PostgreSQL => 23,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 17,
+            };
+            (base + err_lines).min(f.area().height.saturating_sub(2))
         } else if is_relational {
             (19 + err_lines).min(f.area().height.saturating_sub(2))
         } else {
@@ -1790,20 +2091,58 @@ impl AttachModalState {
         let inner_area = modal_block.inner(popup_area);
 
         if is_ducklake {
-            let field_layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),         // 0: Provider
-                    Constraint::Length(3),         // 1: Host & Port
-                    Constraint::Length(3),         // 2: Database & Username
-                    Constraint::Length(3),         // 3: Password & Alias
-                    Constraint::Length(3),         // 4: Storage DATA_PATH
-                    Constraint::Length(2),         // 5: Read-Only toggle & S3 tip
-                    Constraint::Length(err_lines), // 6: Error/hint
-                    Constraint::Length(3),         // 7: Buttons
-                ])
-                .split(inner_area);
+            let (field_layout, submit_idx, cancel_idx, ro_idx, data_path_idx) = match self.ducklake_backend {
+                DuckLakeBackend::Quack => {
+                    let layout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3),         // 0: Provider Preset
+                            Constraint::Length(3),         // 1: Backend Picker
+                            Constraint::Length(3),         // 2: Host & Port
+                            Constraint::Length(3),         // 3: Password / Token & Alias
+                            Constraint::Length(3),         // 4: Storage DATA_PATH
+                            Constraint::Length(2),         // 5: Read-Only toggle & S3 tip
+                            Constraint::Length(err_lines), // 6: Error/hint
+                            Constraint::Length(3),         // 7: Buttons
+                        ])
+                        .split(inner_area);
+                    (layout, 8, 9, 7, 6)
+                }
+                DuckLakeBackend::PostgreSQL => {
+                    let layout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3),         // 0: Provider Preset
+                            Constraint::Length(3),         // 1: Backend Picker
+                            Constraint::Length(3),         // 2: Host & Port
+                            Constraint::Length(3),         // 3: Database & Username
+                            Constraint::Length(3),         // 4: Password & Alias
+                            Constraint::Length(3),         // 5: Storage DATA_PATH
+                            Constraint::Length(2),         // 6: Read-Only toggle & S3 tip
+                            Constraint::Length(err_lines), // 7: Error/hint
+                            Constraint::Length(3),         // 8: Buttons
+                        ])
+                        .split(inner_area);
+                    (layout, 10, 11, 9, 8)
+                }
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => {
+                    let layout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3),         // 0: Provider Preset
+                            Constraint::Length(3),         // 1: Backend Picker
+                            Constraint::Length(3),         // 2: File Path & Alias
+                            Constraint::Length(3),         // 3: Storage DATA_PATH
+                            Constraint::Length(2),         // 4: Read-Only toggle & S3 tip
+                            Constraint::Length(err_lines), // 5: Error/hint
+                            Constraint::Length(3),         // 6: Buttons
+                        ])
+                        .split(inner_area);
+                    (layout, 6, 7, 5, 4)
+                }
+            };
 
+            // 0: Provider Preset
             let f0_style = if self.active_field == 0 {
                 Style::default().fg(Color::Yellow)
             } else {
@@ -1819,157 +2158,324 @@ impl AttachModalState {
             );
             f.render_widget(p0, field_layout[0]);
 
-            let host_port_cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
-                .split(field_layout[1]);
+            // 1: DuckLake Backend Picker
             let f1_style = if self.active_field == 1 {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p1 = Paragraph::new(format!(
-                "{}{}",
-                self.host,
-                if self.active_field == 1 { "█" } else { "" }
-            ))
-            .block(
+            let backend_label = format!("  ◄ [ {} ] ►   (◄ / ► or Space to switch)", self.ducklake_backend.name());
+            let p1 = Paragraph::new(backend_label).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .title(" Catalog Host / DSN / File (e.g. localhost or lake.ducklake) ")
+                    .title(" Catalog Metadata Backend (◄ / ► to switch) ")
                     .border_style(f1_style),
             );
-            f.render_widget(p1, host_port_cols[0]);
+            f.render_widget(p1, field_layout[1]);
 
-            let f2_style = if self.active_field == 2 {
+            // Backend specific rows
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => {
+                    let host_port_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+                        .split(field_layout[2]);
+                    let f2_style = if self.active_field == 2 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p2 = Paragraph::new(format!(
+                        "{}{}",
+                        self.host,
+                        if self.active_field == 2 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Quack Catalog Host / Server (e.g. localhost) ")
+                            .border_style(f2_style),
+                    );
+                    f.render_widget(p2, host_port_cols[0]);
+
+                    let f3_style = if self.active_field == 3 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p3 = Paragraph::new(format!(
+                        "{}{}",
+                        self.port,
+                        if self.active_field == 3 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Port (9494) ")
+                            .border_style(f3_style),
+                    );
+                    f.render_widget(p3, host_port_cols[1]);
+
+                    let pass_alias_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(field_layout[3]);
+                    let f4_style = if self.active_field == 4 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let masked_pass = "*".repeat(self.password.len());
+                    let p4 = Paragraph::new(format!(
+                        "{}{}",
+                        masked_pass,
+                        if self.active_field == 4 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Quack Auth Token / Password (Masked) ")
+                            .border_style(f4_style),
+                    );
+                    f.render_widget(p4, pass_alias_cols[0]);
+
+                    let f5_style = if self.active_field == 5 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p5 = Paragraph::new(format!(
+                        "{}{}",
+                        self.alias,
+                        if self.active_field == 5 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Lakehouse Catalog Alias ")
+                            .border_style(f5_style),
+                    );
+                    f.render_widget(p5, pass_alias_cols[1]);
+                }
+                DuckLakeBackend::PostgreSQL => {
+                    let host_port_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+                        .split(field_layout[2]);
+                    let f2_style = if self.active_field == 2 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p2 = Paragraph::new(format!(
+                        "{}{}",
+                        self.host,
+                        if self.active_field == 2 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" PostgreSQL Catalog Host (e.g. localhost) ")
+                            .border_style(f2_style),
+                    );
+                    f.render_widget(p2, host_port_cols[0]);
+
+                    let f3_style = if self.active_field == 3 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p3 = Paragraph::new(format!(
+                        "{}{}",
+                        self.port,
+                        if self.active_field == 3 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Port (5432) ")
+                            .border_style(f3_style),
+                    );
+                    f.render_widget(p3, host_port_cols[1]);
+
+                    let db_user_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(field_layout[3]);
+                    let f4_style = if self.active_field == 4 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p4 = Paragraph::new(format!(
+                        "{}{}",
+                        self.database,
+                        if self.active_field == 4 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Metadata Database Name (e.g. ducklake) ")
+                            .border_style(f4_style),
+                    );
+                    f.render_widget(p4, db_user_cols[0]);
+
+                    let f5_style = if self.active_field == 5 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p5 = Paragraph::new(format!(
+                        "{}{}",
+                        self.username,
+                        if self.active_field == 5 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Username (e.g. lakehouse) ")
+                            .border_style(f5_style),
+                    );
+                    f.render_widget(p5, db_user_cols[1]);
+
+                    let pass_alias_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(field_layout[4]);
+                    let f6_style = if self.active_field == 6 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let masked_pass = "*".repeat(self.password.len());
+                    let p6 = Paragraph::new(format!(
+                        "{}{}",
+                        masked_pass,
+                        if self.active_field == 6 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Password (Masked) ")
+                            .border_style(f6_style),
+                    );
+                    f.render_widget(p6, pass_alias_cols[0]);
+
+                    let f7_style = if self.active_field == 7 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p7 = Paragraph::new(format!(
+                        "{}{}",
+                        self.alias,
+                        if self.active_field == 7 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Lakehouse Catalog Alias ")
+                            .border_style(f7_style),
+                    );
+                    f.render_widget(p7, pass_alias_cols[1]);
+                }
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => {
+                    let path_alias_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                        .split(field_layout[2]);
+                    let f2_style = if self.active_field == 2 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let title = if self.ducklake_backend == DuckLakeBackend::LocalFile {
+                        " Catalog Metadata File (e.g. metadata.ducklake) "
+                    } else {
+                        " SQLite Catalog Database (e.g. metadata.db) "
+                    };
+                    let p2 = Paragraph::new(format!(
+                        "{}{}",
+                        self.path,
+                        if self.active_field == 2 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(title)
+                            .border_style(f2_style),
+                    );
+                    f.render_widget(p2, path_alias_cols[0]);
+
+                    let f3_style = if self.active_field == 3 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p3 = Paragraph::new(format!(
+                        "{}{}",
+                        self.alias,
+                        if self.active_field == 3 { "█" } else { "" }
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Lakehouse Catalog Alias ")
+                            .border_style(f3_style),
+                    );
+                    f.render_widget(p3, path_alias_cols[1]);
+                }
+            }
+
+            // DATA_PATH layout slot
+            let data_path_slot = match self.ducklake_backend {
+                DuckLakeBackend::Quack => 4,
+                DuckLakeBackend::PostgreSQL => 5,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 3,
+            };
+            let dp_style = if self.active_field == data_path_idx {
                 Style::default().fg(Color::Yellow)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p2 = Paragraph::new(format!(
-                "{}{}",
-                self.port,
-                if self.active_field == 2 { "█" } else { "" }
-            ))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(" Port ")
-                    .border_style(f2_style),
-            );
-            f.render_widget(p2, host_port_cols[1]);
-
-            let db_user_cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(field_layout[2]);
-            let f3_style = if self.active_field == 3 {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let p3 = Paragraph::new(format!(
-                "{}{}",
-                self.database,
-                if self.active_field == 3 { "█" } else { "" }
-            ))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(" Metadata Database Name (e.g. ducklake) ")
-                    .border_style(f3_style),
-            );
-            f.render_widget(p3, db_user_cols[0]);
-
-            let f4_style = if self.active_field == 4 {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let p4 = Paragraph::new(format!(
-                "{}{}",
-                self.username,
-                if self.active_field == 4 { "█" } else { "" }
-            ))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(" Username (e.g. lakehouse) ")
-                    .border_style(f4_style),
-            );
-            f.render_widget(p4, db_user_cols[1]);
-
-            let pass_alias_cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(field_layout[3]);
-            let f5_style = if self.active_field == 5 {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let masked_pass = "*".repeat(self.password.len());
-            let p5 = Paragraph::new(format!(
-                "{}{}",
-                masked_pass,
-                if self.active_field == 5 { "█" } else { "" }
-            ))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(" Password (Masked) ")
-                    .border_style(f5_style),
-            );
-            f.render_widget(p5, pass_alias_cols[0]);
-
-            let f6_style = if self.active_field == 6 {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let p6 = Paragraph::new(format!(
-                "{}{}",
-                self.alias,
-                if self.active_field == 6 { "█" } else { "" }
-            ))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(" Lakehouse Catalog Alias ")
-                    .border_style(f6_style),
-            );
-            f.render_widget(p6, pass_alias_cols[1]);
-
-            let f7_style = if self.active_field == 7 {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let p7 = Paragraph::new(format!(
+            let dp_widget = Paragraph::new(format!(
                 "{}{}",
                 self.data_path,
-                if self.active_field == 7 { "█" } else { "" }
+                if self.active_field == data_path_idx { "█" } else { "" }
             ))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .title(" Storage DATA_PATH (e.g. s3://bucket/data/ or /local/path/) ")
-                    .border_style(f7_style),
+                    .border_style(dp_style),
             );
-            f.render_widget(p7, field_layout[4]);
+            f.render_widget(dp_widget, field_layout[data_path_slot]);
 
+            // Read-Only & Tip layout slot
+            let ro_slot = match self.ducklake_backend {
+                DuckLakeBackend::Quack => 5,
+                DuckLakeBackend::PostgreSQL => 6,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 4,
+            };
             let toggle_cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
-                .split(field_layout[5]);
-            let f8_style = if self.active_field == 8 {
+                .split(field_layout[ro_slot]);
+            let ro_style = if self.active_field == ro_idx {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
@@ -1979,7 +2485,7 @@ impl AttachModalState {
                     "  [{}] Read-Only",
                     if self.read_only { "X" } else { " " }
                 ))
-                .style(f8_style),
+                .style(ro_style),
                 toggle_cols[0],
             );
             f.render_widget(
@@ -1988,12 +2494,18 @@ impl AttachModalState {
                 toggle_cols[1],
             );
 
+            // Error / Help layout slot
+            let err_slot = match self.ducklake_backend {
+                DuckLakeBackend::Quack => 6,
+                DuckLakeBackend::PostgreSQL => 7,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 5,
+            };
             if let Some(ref err) = self.error_msg {
                 f.render_widget(
                     Paragraph::new(format!(" ⚠️ {}", err))
                         .style(Style::default().fg(Color::LightRed))
                         .wrap(Wrap { trim: true }),
-                    field_layout[6],
+                    field_layout[err_slot],
                 );
             } else {
                 f.render_widget(
@@ -2002,11 +2514,17 @@ impl AttachModalState {
                     )
                     .style(Style::default().fg(Color::DarkGray))
                     .wrap(Wrap { trim: true }),
-                    field_layout[6],
+                    field_layout[err_slot],
                 );
             }
 
-            let attach_btn_style = if self.active_field == 9 {
+            // Buttons layout slot
+            let btn_slot = match self.ducklake_backend {
+                DuckLakeBackend::Quack => 7,
+                DuckLakeBackend::PostgreSQL => 8,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 6,
+            };
+            let attach_btn_style = if self.active_field == submit_idx {
                 Style::default()
                     .bg(Color::Cyan)
                     .fg(Color::Black)
@@ -2014,7 +2532,7 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::Cyan)
             };
-            let cancel_btn_style = if self.active_field == 10 {
+            let cancel_btn_style = if self.active_field == cancel_idx {
                 Style::default()
                     .bg(Color::Red)
                     .fg(Color::White)
@@ -2029,7 +2547,7 @@ impl AttachModalState {
             ]);
             f.render_widget(
                 Paragraph::new(buttons).alignment(Alignment::Center),
-                field_layout[7],
+                field_layout[btn_slot],
             );
         } else if is_relational {
             let field_layout = Layout::default()
@@ -2862,11 +3380,15 @@ impl AttachModalState {
         } else if key.code == KeyCode::Up {
             self.nav_up();
         } else if key.code == KeyCode::Left
-            || (self.active_field == 0 && key.code == KeyCode::Char('h'))
+            || ((self.active_field == 0
+                || (self.provider() == AttachProvider::DuckLake && self.active_field == 1))
+                && key.code == KeyCode::Char('h'))
         {
             self.nav_left();
         } else if key.code == KeyCode::Right
-            || (self.active_field == 0 && key.code == KeyCode::Char('l'))
+            || ((self.active_field == 0
+                || (self.provider() == AttachProvider::DuckLake && self.active_field == 1))
+                && key.code == KeyCode::Char('l'))
         {
             self.nav_right();
         } else if key.code == KeyCode::Char(' ') && self.is_toggle_field() {

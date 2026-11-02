@@ -1113,6 +1113,10 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
             }
             cfg.db = Some(conn_str);
         } else if prov.eq_ignore_ascii_case("ducklake") {
+            let backend = tbl
+                .get("backend")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_ascii_lowercase());
             let catalog_explicit = tbl.get("catalog").and_then(|v| v.as_str());
             let data_path = tbl
                 .get("data_path")
@@ -1122,30 +1126,74 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
 
             let mut catalog_target = if let Some(cat) = catalog_explicit {
                 cat.to_string()
+            } else if backend.as_deref() == Some("quack") {
+                let server = tbl
+                    .get("server")
+                    .or_else(|| tbl.get("host"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("localhost");
+                let port = tbl.get("port").and_then(|v| v.as_integer()).unwrap_or(9494);
+                let clean_server = server
+                    .strip_prefix("quack://")
+                    .or_else(|| server.strip_prefix("quack:"))
+                    .unwrap_or(server);
+                format!("quack:{}:{}", clean_server, port)
+            } else if backend.as_deref() == Some("sqlite") {
+                let file_path = tbl
+                    .get("database")
+                    .or_else(|| tbl.get("file"))
+                    .or_else(|| tbl.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("metadata.db");
+                if file_path.starts_with("sqlite:") {
+                    file_path.to_string()
+                } else {
+                    format!("sqlite:{}", file_path)
+                }
+            } else if backend.as_deref() == Some("file") || backend.as_deref() == Some("duckdb") {
+                let file_path = tbl
+                    .get("database")
+                    .or_else(|| tbl.get("file"))
+                    .or_else(|| tbl.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("metadata.ducklake");
+                file_path.to_string()
             } else if let Some(server) = tbl
                 .get("server")
                 .or_else(|| tbl.get("host"))
                 .and_then(|v| v.as_str())
             {
-                let port = tbl.get("port").and_then(|v| v.as_integer()).unwrap_or(5432);
-                let dbname = tbl
-                    .get("dbname")
-                    .or_else(|| tbl.get("database"))
-                    .or_else(|| tbl.get("db"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ducklake");
-                let mut pg_cat = format!("postgres:host={} port={} dbname={}", server, port, dbname);
-                if let Some(u) = tbl
-                    .get("username")
-                    .or_else(|| tbl.get("user"))
-                    .and_then(|v| v.as_str())
-                {
-                    pg_cat.push_str(&format!(" user={}", u));
+                let is_quack = server.starts_with("quack:")
+                    || server.starts_with("quack://")
+                    || tbl.get("port").and_then(|v| v.as_integer()) == Some(9494);
+                if is_quack {
+                    let port = tbl.get("port").and_then(|v| v.as_integer()).unwrap_or(9494);
+                    let clean = server
+                        .strip_prefix("quack://")
+                        .or_else(|| server.strip_prefix("quack:"))
+                        .unwrap_or(server);
+                    format!("quack:{}:{}", clean, port)
+                } else {
+                    let port = tbl.get("port").and_then(|v| v.as_integer()).unwrap_or(5432);
+                    let dbname = tbl
+                        .get("dbname")
+                        .or_else(|| tbl.get("database"))
+                        .or_else(|| tbl.get("db"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ducklake");
+                    let mut pg_cat = format!("postgres:host={} port={} dbname={}", server, port, dbname);
+                    if let Some(u) = tbl
+                        .get("username")
+                        .or_else(|| tbl.get("user"))
+                        .and_then(|v| v.as_str())
+                    {
+                        pg_cat.push_str(&format!(" user={}", u));
+                    }
+                    if let Some(p) = tbl.get("password").and_then(|v| v.as_str()) {
+                        pg_cat.push_str(&format!(" password={}", p));
+                    }
+                    pg_cat
                 }
-                if let Some(p) = tbl.get("password").and_then(|v| v.as_str()) {
-                    pg_cat.push_str(&format!(" password={}", p));
-                }
-                pg_cat
             } else if let Some(db_val) = tbl.get("database").or_else(|| tbl.get("db")).and_then(|v| v.as_str()) {
                 db_val.to_string()
             } else {
@@ -2366,6 +2414,19 @@ data_path = "s3://my-lake-bucket/data/"
 provider = "ducklake"
 catalog = "metadata.ducklake"
 data_path = "./parquet_data/"
+
+[env.quack_lake]
+provider = "ducklake"
+backend = "quack"
+server = "quack.lake.local"
+port = 9494
+data_path = "s3://quack-lake/data/"
+
+[env.sqlite_lake]
+provider = "ducklake"
+backend = "sqlite"
+database = "custom_meta.db"
+data_path = "/lake/data/"
 "#;
         std::fs::write(temp_dir.join("duckpack.toml"), toml_content).unwrap();
 
@@ -2381,6 +2442,16 @@ data_path = "./parquet_data/"
         assert!(local_cfg.db.is_some());
         let local_db = local_cfg.db.unwrap();
         assert_eq!(local_db, "ducklake:metadata.ducklake (DATA_PATH './parquet_data/')");
+
+        let quack_cfg = resolve_target_config(&temp_dir, Some("quack_lake"));
+        assert!(quack_cfg.db.is_some());
+        let quack_db = quack_cfg.db.unwrap();
+        assert_eq!(quack_db, "ducklake:quack:quack.lake.local:9494 (DATA_PATH 's3://quack-lake/data/')");
+
+        let sqlite_cfg = resolve_target_config(&temp_dir, Some("sqlite_lake"));
+        assert!(sqlite_cfg.db.is_some());
+        let sqlite_db = sqlite_cfg.db.unwrap();
+        assert_eq!(sqlite_db, "ducklake:sqlite:custom_meta.db (DATA_PATH '/lake/data/')");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

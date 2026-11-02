@@ -28,7 +28,7 @@ pub(crate) use modals::{
     render_help_modal, render_schema_visualizer_modal,
 };
 #[cfg(test)]
-pub(crate) use modals::{AttachProvider, CloudProvider};
+pub(crate) use modals::{AttachProvider, CloudProvider, DuckLakeBackend};
 
 use anyhow::Result;
 use duckdb::Connection;
@@ -4085,14 +4085,25 @@ mod tests {
 
         modal.set_provider(7);
         assert_eq!(modal.provider(), AttachProvider::DuckLake);
+        assert_eq!(modal.ducklake_backend, DuckLakeBackend::Quack);
         assert_eq!(modal.host, "localhost");
+        assert_eq!(modal.port, "9494");
+        assert_eq!(modal.data_path, "s3://ducklake/data/");
+        assert_eq!(modal.alias, "my_lakehouse");
+        assert_eq!(modal.field_count(), 10);
+
+        // Test DuckLake with Quack metadata catalog (default)
+        let (quack_dl_target, quack_alias) = modal.build_connection_target().unwrap();
+        assert_eq!(quack_alias, "my_lakehouse");
+        assert_eq!(quack_dl_target, "ducklake:quack:localhost:9494");
+
+        // Switch to PostgreSQL metadata catalog
+        modal.set_ducklake_backend(DuckLakeBackend::PostgreSQL);
         assert_eq!(modal.port, "5432");
         assert_eq!(modal.username, "lakehouse");
         assert_eq!(modal.database, "ducklake");
-        assert_eq!(modal.data_path, "s3://ducklake/data/");
-        assert_eq!(modal.alias, "my_lakehouse");
+        assert_eq!(modal.field_count(), 12);
 
-        // Test DuckLake with Postgres metadata catalog building
         modal.password = "lakepass".to_string();
         let (dl_target, dl_alias) = modal.build_connection_target().unwrap();
         assert_eq!(dl_alias, "my_lakehouse");
@@ -4101,20 +4112,25 @@ mod tests {
             "ducklake:postgres:host=localhost port=5432 dbname=ducklake user=lakehouse password=lakepass"
         );
 
-        // Test DuckLake with custom file-based catalog
-        modal.host = "lake_meta.ducklake".to_string();
+        // Switch to LocalFile backend
+        modal.set_ducklake_backend(DuckLakeBackend::LocalFile);
+        assert_eq!(modal.path, "metadata.ducklake");
+        assert_eq!(modal.field_count(), 8);
         let (file_dl_target, _) = modal.build_connection_target().unwrap();
-        assert_eq!(file_dl_target, "ducklake:lake_meta.ducklake");
+        assert_eq!(file_dl_target, "ducklake:metadata.ducklake");
 
-        // Test DuckLake with Quack metadata catalog (e.g. quack:localhost:9494)
-        modal.host = "quack:localhost:9494".to_string();
-        let (quack_dl_target, _) = modal.build_connection_target().unwrap();
-        assert_eq!(quack_dl_target, "ducklake:quack:localhost:9494");
+        // Switch to SQLite backend
+        modal.set_ducklake_backend(DuckLakeBackend::SQLite);
+        assert_eq!(modal.path, "metadata.db");
+        assert_eq!(modal.field_count(), 8);
+        let (sqlite_dl_target, _) = modal.build_connection_target().unwrap();
+        assert_eq!(sqlite_dl_target, "ducklake:sqlite:metadata.db");
 
-        modal.host = "10.0.0.5".to_string();
-        modal.port = "9494".to_string();
-        let (port_dl_target, _) = modal.build_connection_target().unwrap();
-        assert_eq!(port_dl_target, "ducklake:quack:10.0.0.5:9494");
+        // Test cycling via toggle_active on field 1
+        modal.active_field = 1;
+        modal.toggle_active();
+        assert_eq!(modal.ducklake_backend, DuckLakeBackend::Quack);
+        assert_eq!(modal.field_count(), 10);
 
         modal.reset();
         modal.set_provider(6);
