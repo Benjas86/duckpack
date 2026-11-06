@@ -940,6 +940,9 @@ impl AttachModalState {
                 if is_default_port {
                     self.port = "9494".to_string();
                 }
+                if self.host == "localhost" || self.host == "127.0.0.1" || self.host == "0.0.0.0" {
+                    self.disable_ssl = true;
+                }
             }
             DuckLakeBackend::PostgreSQL => {
                 if is_default_host {
@@ -1093,7 +1096,7 @@ impl AttachModalState {
             13
         } else if p == AttachProvider::DuckLake {
             match self.ducklake_backend {
-                DuckLakeBackend::Quack => 10,
+                DuckLakeBackend::Quack => 11,
                 DuckLakeBackend::PostgreSQL => 12,
                 DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 8,
             }
@@ -1114,7 +1117,7 @@ impl AttachModalState {
             11
         } else if p == AttachProvider::DuckLake {
             match self.ducklake_backend {
-                DuckLakeBackend::Quack => 8,
+                DuckLakeBackend::Quack => 9,
                 DuckLakeBackend::PostgreSQL => 10,
                 DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 6,
             }
@@ -1135,7 +1138,7 @@ impl AttachModalState {
             12
         } else if p == AttachProvider::DuckLake {
             match self.ducklake_backend {
-                DuckLakeBackend::Quack => 9,
+                DuckLakeBackend::Quack => 10,
                 DuckLakeBackend::PostgreSQL => 11,
                 DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 7,
             }
@@ -1168,7 +1171,7 @@ impl AttachModalState {
                 true
             } else {
                 match self.ducklake_backend {
-                    DuckLakeBackend::Quack => self.active_field == 7,
+                    DuckLakeBackend::Quack => matches!(self.active_field, 7 | 8),
                     DuckLakeBackend::PostgreSQL => self.active_field == 9,
                     DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => self.active_field == 5,
                 }
@@ -1399,13 +1402,22 @@ impl AttachModalState {
             if self.active_field == 1 {
                 self.set_ducklake_backend(self.ducklake_backend.next());
             } else {
-                let ro_field = match self.ducklake_backend {
-                    DuckLakeBackend::Quack => 7,
-                    DuckLakeBackend::PostgreSQL => 9,
-                    DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 5,
-                };
-                if self.active_field == ro_field {
-                    self.read_only = !self.read_only;
+                match self.ducklake_backend {
+                    DuckLakeBackend::Quack => match self.active_field {
+                        7 => self.read_only = !self.read_only,
+                        8 => self.disable_ssl = !self.disable_ssl,
+                        _ => {}
+                    },
+                    DuckLakeBackend::PostgreSQL => {
+                        if self.active_field == 9 {
+                            self.read_only = !self.read_only;
+                        }
+                    }
+                    DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => {
+                        if self.active_field == 5 {
+                            self.read_only = !self.read_only;
+                        }
+                    }
                 }
             }
         } else if p == AttachProvider::MSSQL {
@@ -1474,6 +1486,11 @@ impl AttachModalState {
             self.set_provider(prev);
         } else if self.provider() == AttachProvider::DuckLake && self.active_field == 1 {
             self.set_ducklake_backend(self.ducklake_backend.prev());
+        } else if self.provider() == AttachProvider::DuckLake
+            && self.ducklake_backend == DuckLakeBackend::Quack
+            && matches!(self.active_field, 7 | 8)
+        {
+            self.active_field = if self.active_field == 7 { 8 } else { 7 };
         } else if self.is_cancel() {
             self.active_field = self.submit_index();
         } else if self.is_submit() {
@@ -1489,6 +1506,11 @@ impl AttachModalState {
             self.set_provider(next);
         } else if self.provider() == AttachProvider::DuckLake && self.active_field == 1 {
             self.set_ducklake_backend(self.ducklake_backend.next());
+        } else if self.provider() == AttachProvider::DuckLake
+            && self.ducklake_backend == DuckLakeBackend::Quack
+            && matches!(self.active_field, 7 | 8)
+        {
+            self.active_field = if self.active_field == 7 { 8 } else { 7 };
         } else if self.is_submit() {
             self.active_field = self.cancel_index();
         } else if self.is_cancel() {
@@ -1509,8 +1531,9 @@ impl AttachModalState {
                     3 => 5,
                     4 | 5 => 6,
                     6 => 7,
-                    7 => 8,
-                    8 | 9 => 0,
+                    7 => 9,
+                    8 => 10,
+                    9 | 10 => 0,
                     _ => 0,
                 },
                 DuckLakeBackend::PostgreSQL => match self.active_field {
@@ -1592,15 +1615,16 @@ impl AttachModalState {
         if p == AttachProvider::DuckLake {
             self.active_field = match self.ducklake_backend {
                 DuckLakeBackend::Quack => match self.active_field {
-                    0 => 8,
-                    1 => 9,
+                    0 => 9,
+                    1 => 10,
                     2 => 0,
                     3 => 1,
                     4 => 2,
                     5 => 3,
                     6 => 4,
-                    7 => 6,
-                    8 | 9 => 7,
+                    7 | 8 => 6,
+                    9 => 7,
+                    10 => 8,
                     _ => 0,
                 },
                 DuckLakeBackend::PostgreSQL => match self.active_field {
@@ -1964,12 +1988,12 @@ impl AttachModalState {
                             Constraint::Length(3),         // 1: Host & Port
                             Constraint::Length(3),         // 2: Password / Token & Alias
                             Constraint::Length(3),         // 3: Storage DATA_PATH
-                            Constraint::Length(2),         // 4: Read-Only toggle & S3 tip
+                            Constraint::Length(2),         // 4: Read-Only, Disable SSL toggles & S3 tip
                             Constraint::Length(err_lines), // 5: Error/hint
                             Constraint::Length(3),         // 6: Buttons
                         ])
                         .split(inner_area);
-                    (layout, 8, 9, 7, 6)
+                    (layout, 9, 10, 7, 6)
                 }
                 DuckLakeBackend::PostgreSQL => {
                     let layout = Layout::default()
@@ -2341,34 +2365,76 @@ impl AttachModalState {
             );
             f.render_widget(dp_widget, field_layout[data_path_slot]);
 
-            // Read-Only & Tip layout slot
+            // Read-Only, Disable SSL & Tip layout slot
             let ro_slot = match self.ducklake_backend {
                 DuckLakeBackend::Quack => 4,
                 DuckLakeBackend::PostgreSQL => 5,
                 DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 3,
             };
-            let toggle_cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
-                .split(field_layout[ro_slot]);
-            let ro_style = if self.active_field == ro_idx {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            if self.ducklake_backend == DuckLakeBackend::Quack {
+                let toggle_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(22),
+                        Constraint::Percentage(24),
+                        Constraint::Percentage(54),
+                    ])
+                    .split(field_layout[ro_slot]);
+                let ro_style = if self.active_field == ro_idx {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Read-Only",
+                        if self.read_only { "X" } else { " " }
+                    ))
+                    .style(ro_style),
+                    toggle_cols[0],
+                );
+                let ssl_style = if self.active_field == 8 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "[{}] Disable SSL",
+                        if self.disable_ssl { "X" } else { " " }
+                    ))
+                    .style(ssl_style),
+                    toggle_cols[1],
+                );
+                f.render_widget(
+                    Paragraph::new("💡 Ctrl+X: S3 / RustFS secrets")
+                        .style(Style::default().fg(Color::DarkGray)),
+                    toggle_cols[2],
+                );
             } else {
-                Style::default().fg(Color::White)
-            };
-            f.render_widget(
-                Paragraph::new(format!(
-                    "  [{}] Read-Only",
-                    if self.read_only { "X" } else { " " }
-                ))
-                .style(ro_style),
-                toggle_cols[0],
-            );
-            f.render_widget(
-                Paragraph::new("💡 S3/RustFS Tip: Use Ctrl+X beforehand in IDE to configure S3 / RustFS secrets")
-                    .style(Style::default().fg(Color::DarkGray)),
-                toggle_cols[1],
-            );
+                let toggle_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
+                    .split(field_layout[ro_slot]);
+                let ro_style = if self.active_field == ro_idx {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Read-Only",
+                        if self.read_only { "X" } else { " " }
+                    ))
+                    .style(ro_style),
+                    toggle_cols[0],
+                );
+                f.render_widget(
+                    Paragraph::new("💡 S3/RustFS Tip: Use Ctrl+X beforehand in IDE to configure S3 / RustFS secrets")
+                        .style(Style::default().fg(Color::DarkGray)),
+                    toggle_cols[1],
+                );
+            }
 
             // Error / Help layout slot
             let err_slot = match self.ducklake_backend {
@@ -3328,6 +3394,17 @@ impl AttachModalState {
                                     "DATA_PATH '{}'",
                                     self.data_path.trim().replace('\'', "''")
                                 ));
+                            }
+                            if self.ducklake_backend == DuckLakeBackend::Quack {
+                                let quack_dsn = safe_path
+                                    .strip_prefix("ducklake:")
+                                    .unwrap_or(&safe_path);
+                                if self.disable_ssl
+                                    || self.insecure
+                                    || crate::engine::should_disable_quack_ssl(quack_dsn, false)
+                                {
+                                    opts.push("METADATA_PARAMETERS MAP {'DISABLE_SSL': true}".to_string());
+                                }
                             }
                         }
                         AttachProvider::SQLite => opts.push("TYPE SQLITE".to_string()),

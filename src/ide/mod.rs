@@ -4024,7 +4024,8 @@ mod tests {
         assert_eq!(modal.port, "9494");
         assert_eq!(modal.data_path, "s3://ducklake/data/");
         assert_eq!(modal.alias, "my_lakehouse");
-        assert_eq!(modal.field_count(), 10);
+        assert!(modal.disable_ssl);
+        assert_eq!(modal.field_count(), 11);
 
         // Test DuckLake with Quack metadata catalog (default)
         let (quack_dl_target, quack_alias) = modal.build_connection_target().unwrap();
@@ -4064,7 +4065,7 @@ mod tests {
         modal.active_field = 1;
         modal.toggle_active();
         assert_eq!(modal.ducklake_backend, DuckLakeBackend::Quack);
-        assert_eq!(modal.field_count(), 10);
+        assert_eq!(modal.field_count(), 11);
 
         modal.reset();
         modal.set_provider(6);
@@ -4859,10 +4860,19 @@ mod tests {
         modal.nav_down();
         assert_eq!(modal.active_field, 7);
 
-        // 7 down -> 8 (Submit)
+        // 7 right -> 8 (Disable SSL)
+        modal.nav_right();
+        assert_eq!(modal.active_field, 8);
+        assert!(modal.disable_ssl);
+        modal.toggle_active();
+        assert!(!modal.disable_ssl);
+        modal.toggle_active();
+        assert!(modal.disable_ssl);
+
+        // 7 down -> 9 (Submit)
         modal.active_field = 7;
         modal.nav_down();
-        assert_eq!(modal.active_field, 8);
+        assert_eq!(modal.active_field, 9);
     }
 
     #[test]

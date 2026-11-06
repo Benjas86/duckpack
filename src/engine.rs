@@ -567,10 +567,26 @@ pub fn connect_target_db(
             None,
         )?;
         let safe_target = target_path.replace('\'', "''");
-        let attach_sql = if options.is_empty() {
+        let mut opts_str = options.to_string();
+        if safe_target.contains("quack:") {
+            let quack_dsn = safe_target
+                .strip_prefix("ducklake:")
+                .unwrap_or(&safe_target);
+            if should_disable_quack_ssl(quack_dsn, quack_disable_ssl)
+                && !opts_str.to_lowercase().contains("metadata_parameters")
+            {
+                if opts_str.is_empty() {
+                    opts_str = "(METADATA_PARAMETERS MAP {'DISABLE_SSL': true})".to_string();
+                } else if opts_str.ends_with(')') {
+                    opts_str.pop();
+                    opts_str.push_str(", METADATA_PARAMETERS MAP {'DISABLE_SSL': true})");
+                }
+            }
+        }
+        let attach_sql = if opts_str.is_empty() {
             format!("ATTACH '{}' AS target_db;", safe_target)
         } else {
-            format!("ATTACH '{}' AS target_db {};", safe_target, options)
+            format!("ATTACH '{}' AS target_db {};", safe_target, opts_str)
         };
         let attach_res = conn.execute(&attach_sql, []);
         if let Err(e) = attach_res {
