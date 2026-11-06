@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::catalog::{DatabaseInfo, ExplorerMetadata};
 use crate::ide::explorer::{
     apply_ide_diff_for_catalog, db_icon, generate_asset_boilerplate, get_asset_file_path,
-    ProjectCategory,
+    ExplorerNode, NodeType, ProjectCategory,
 };
 
 /// Inserts a character into a string at the unicode character position `*cursor`,
@@ -112,7 +112,7 @@ pub(crate) fn render_text_with_cursor(
 #[derive(Clone, Debug)]
 pub(crate) struct NewAssetModalState {
     pub(crate) is_open: bool,
-    pub(crate) category_index: usize, // 0: Table, 1: View, 2: Macro, 3: Trigger, 4: Schema, 5: Query, 6: Seed
+    pub(crate) category_index: usize, // 0: Table, 1: View, 2: Macro, 3: Trigger, 4: Sequence, 5: Schema, 6: Query, 7: Seed
     pub(crate) name: String,
     pub(crate) cursor_pos: usize,
     pub(crate) active_field: usize, // 0: category, 1: name, 2: create, 3: cancel
@@ -138,6 +138,57 @@ impl NewAssetModalState {
         self.cursor_pos = 0;
         self.active_field = 1;
         self.error_msg = None;
+    }
+
+    pub(crate) fn set_category(&mut self, category: ProjectCategory) {
+        match category {
+            ProjectCategory::Table => self.category_index = 0,
+            ProjectCategory::View => self.category_index = 1,
+            ProjectCategory::Macro => self.category_index = 2,
+            ProjectCategory::Trigger => self.category_index = 3,
+            ProjectCategory::Sequence => self.category_index = 4,
+            ProjectCategory::Schema => self.category_index = 5,
+            ProjectCategory::Query => self.category_index = 6,
+            ProjectCategory::Seed => self.category_index = 7,
+            ProjectCategory::Config => {}
+        }
+    }
+
+    pub(crate) fn open_for_group_name(&mut self, group_name: &str) {
+        self.reset();
+        if group_name.contains("tables") {
+            self.set_category(ProjectCategory::Table);
+        } else if group_name.contains("views") {
+            self.set_category(ProjectCategory::View);
+        } else if group_name.contains("macros") {
+            self.set_category(ProjectCategory::Macro);
+        } else if group_name.contains("triggers") {
+            self.set_category(ProjectCategory::Trigger);
+        } else if group_name.contains("sequences") {
+            self.set_category(ProjectCategory::Sequence);
+        } else if group_name.contains("schemas") {
+            self.set_category(ProjectCategory::Schema);
+        } else if group_name.contains("queries") {
+            self.set_category(ProjectCategory::Query);
+        } else if group_name.contains("seeds") {
+            self.set_category(ProjectCategory::Seed);
+        }
+    }
+
+    pub(crate) fn open_for_node(&mut self, node: Option<&ExplorerNode>) {
+        self.reset();
+        if let Some(n) = node {
+            match &n.node_type {
+                NodeType::Group => self.open_for_group_name(&n.name),
+                NodeType::ProjectFile { category, .. } => self.set_category(*category),
+                NodeType::Table { .. } => self.set_category(ProjectCategory::Table),
+                NodeType::View { .. } => self.set_category(ProjectCategory::View),
+                NodeType::Macro => self.set_category(ProjectCategory::Macro),
+                NodeType::Trigger { .. } => self.set_category(ProjectCategory::Trigger),
+                NodeType::Query => self.set_category(ProjectCategory::Query),
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn current_category(&self) -> ProjectCategory {
@@ -1670,145 +1721,42 @@ impl AttachModalState {
         let provider = self.provider();
         match provider {
             AttachProvider::DuckLake => {
-                let cat = match self.ducklake_backend {
-                    DuckLakeBackend::Quack => {
-                        if self.host.trim().is_empty() {
-                            return Err("Catalog host cannot be empty for DuckLake Quack backend.".to_string());
-                        }
-                        let host_raw = self.host.trim();
-                        let stripped = host_raw
-                            .strip_prefix("quack://")
-                            .or_else(|| host_raw.strip_prefix("quack:"))
-                            .unwrap_or(host_raw);
-                        let endpoint = if stripped.contains(':') {
-                            stripped.to_string()
-                        } else {
-                            let port = if self.port.trim().is_empty() {
-                                "9494"
-                            } else {
-                                self.port.trim()
-                            };
-                            format!("{}:{}", stripped, port)
-                        };
-                        format!("quack:{}", endpoint)
-                    }
-                    DuckLakeBackend::PostgreSQL => {
-                        if self.host.trim().is_empty() {
-                            return Err("Catalog host cannot be empty for DuckLake PostgreSQL backend.".to_string());
-                        }
-                        let host_raw = self.host.trim();
-                        if host_raw.starts_with("postgres:") || host_raw.starts_with("postgresql:") {
-                            host_raw.to_string()
-                        } else {
-                            let port = if self.port.trim().is_empty() {
-                                "5432"
-                            } else {
-                                self.port.trim()
-                            };
-                            let db = if self.database.trim().is_empty() {
-                                "ducklake"
-                            } else {
-                                self.database.trim()
-                            };
-                            let mut s = format!("postgres:host={} port={} dbname={}", host_raw, port, db);
-                            if !self.username.trim().is_empty() {
-                                s.push_str(&format!(" user={}", self.username.trim()));
-                            }
-                            if !self.password.trim().is_empty() {
-                                s.push_str(&format!(" password={}", self.password.trim()));
-                            }
-                            s
-                        }
-                    }
-                    DuckLakeBackend::LocalFile => {
-                        if self.path.trim().is_empty() {
-                            return Err("Metadata file path cannot be empty for DuckLake Local File backend.".to_string());
-                        }
-                        self.path.trim().to_string()
-                    }
-                    DuckLakeBackend::SQLite => {
-                        if self.path.trim().is_empty() {
-                            return Err("SQLite metadata database path cannot be empty for DuckLake SQLite backend.".to_string());
-                        }
-                        let p = self.path.trim();
-                        if p.starts_with("sqlite:") {
-                            p.to_string()
-                        } else {
-                            format!("sqlite:{}", p)
-                        }
-                    }
+                let backend_str = match self.ducklake_backend {
+                    DuckLakeBackend::Quack => "quack",
+                    DuckLakeBackend::PostgreSQL => "postgres",
+                    DuckLakeBackend::LocalFile => "file",
+                    DuckLakeBackend::SQLite => "sqlite",
                 };
-
-                let target = if cat.starts_with("ducklake:") {
-                    cat
-                } else {
-                    format!("ducklake:{}", cat)
-                };
-
+                let target = crate::engine::format_ducklake_target(
+                    backend_str,
+                    &self.host,
+                    &self.port,
+                    &self.database,
+                    &self.username,
+                    &self.password,
+                    &self.path,
+                )?;
                 let alias = if self.alias.trim().is_empty() {
                     "my_lakehouse".to_string()
                 } else {
                     self.alias.trim().to_string()
                 };
-
                 Ok((target.replace('\'', "''"), alias))
             }
             AttachProvider::MSSQL => {
                 if self.host.trim().is_empty() {
                     return Err("Host / Server address cannot be empty for MSSQL.".to_string());
                 }
-                let host_raw = self.host.trim();
-                let mut conn_str = if host_raw.contains('=') {
-                    host_raw.to_string()
-                } else {
-                    let port = if self.port.trim().is_empty() {
-                        "1433"
-                    } else {
-                        self.port.trim()
-                    };
-                    format!("Server={},{}", host_raw, port)
-                };
-                if !self.database.trim().is_empty()
-                    && !conn_str.to_lowercase().contains("database=")
-                {
-                    conn_str.push_str(&format!(";Database={}", self.database.trim()));
-                }
-                let use_trusted = self.trusted_connection
-                    || (cfg!(target_os = "windows")
-                        && self.username.trim().is_empty()
-                        && self.password.trim().is_empty());
-
-                if use_trusted {
-                    if !conn_str.to_lowercase().contains("trusted_connection=")
-                        && !conn_str.to_lowercase().contains("integrated security=")
-                        && !conn_str.to_lowercase().contains("authenticator=")
-                    {
-                        conn_str.push_str(";Trusted_Connection=yes");
-                    }
-                } else {
-                    if !self.username.trim().is_empty()
-                        && !conn_str.to_lowercase().contains("user id=")
-                        && !conn_str.to_lowercase().contains("uid=")
-                    {
-                        conn_str.push_str(&format!(";User Id={}", self.username.trim()));
-                    }
-                    if !self.password.trim().is_empty()
-                        && !conn_str.to_lowercase().contains("password=")
-                        && !conn_str.to_lowercase().contains("pwd=")
-                    {
-                        conn_str.push_str(&format!(";Password={}", self.password.trim()));
-                    }
-                }
-                if (self.insecure
-                    || conn_str.contains("localhost")
-                    || conn_str.contains("127.0.0.1"))
-                    && !conn_str.to_lowercase().contains("trustservercertificate=")
-                {
-                    conn_str.push_str(";TrustServerCertificate=yes");
-                }
-                if self.disable_ssl && !conn_str.to_lowercase().contains("encrypt=") {
-                    conn_str.push_str(";Encrypt=no");
-                }
+                let conn_str = crate::engine::format_mssql_connection_string(
+                    &self.host,
+                    &self.port,
+                    &self.database,
+                    &self.username,
+                    &self.password,
+                    self.trusted_connection,
+                    self.insecure,
+                    self.disable_ssl,
+                );
                 let alias = if self.alias.trim().is_empty() {
                     if !self.database.trim().is_empty() {
                         self.database.trim().to_string()
@@ -1930,22 +1878,7 @@ impl AttachModalState {
                 if self.host.trim().is_empty() {
                     return Err("Host / Server cannot be empty for Remote Quack.".to_string());
                 }
-                let host_raw = self.host.trim();
-                let stripped = host_raw
-                    .strip_prefix("quack://")
-                    .or_else(|| host_raw.strip_prefix("quack:"))
-                    .unwrap_or(host_raw);
-                let endpoint = if stripped.contains(':') {
-                    stripped.to_string()
-                } else {
-                    let port = if self.port.trim().is_empty() {
-                        "9494"
-                    } else {
-                        self.port.trim()
-                    };
-                    format!("{}:{}", stripped, port)
-                };
-                let target = format!("quack:{}", endpoint);
+                let target = crate::engine::format_quack_endpoint(&self.host, &self.port);
                 let alias = if self.alias.trim().is_empty() {
                     "quack_remote".to_string()
                 } else {
@@ -3330,28 +3263,18 @@ impl AttachModalState {
                 let provider = self.provider();
                 let ext_res = match provider {
                     AttachProvider::DuckLake => {
-                        crate::engine::ensure_extension_loaded(conn, "ducklake")
-                            .and_then(|_| {
-                                if safe_path.contains("postgres") {
-                                    crate::engine::ensure_extension_loaded(conn, "postgres")
-                                } else if safe_path.contains("sqlite") {
-                                    crate::engine::ensure_extension_loaded(conn, "sqlite")
-                                } else if safe_path.contains("quack") {
-                                    crate::engine::load_quack_extension(conn)
-                                } else {
-                                    Ok(())
-                                }
-                            })
-                            .and_then(|_| {
-                                if self.data_path.starts_with("s3://")
-                                    || self.data_path.starts_with("http://")
-                                    || self.data_path.starts_with("https://")
-                                {
-                                    crate::engine::ensure_extension_loaded(conn, "httpfs")
-                                } else {
-                                    Ok(())
-                                }
-                            })
+                        let opt_token = if self.password.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.password.trim())
+                        };
+                        crate::engine::prepare_ducklake_connection(
+                            conn,
+                            &safe_path,
+                            &self.data_path,
+                            opt_token,
+                            None,
+                        )
                     }
                     AttachProvider::SQLite => {
                         crate::engine::ensure_extension_loaded(conn, "sqlite")
@@ -3388,10 +3311,7 @@ impl AttachModalState {
                             [],
                         );
                     }
-                    if (provider == AttachProvider::Quack
-                        || (provider == AttachProvider::DuckLake && safe_path.contains("quack")))
-                        && !self.password.trim().is_empty()
-                    {
+                    if provider == AttachProvider::Quack && !self.password.trim().is_empty() {
                         let safe_token = self.password.trim().replace('\'', "''");
                         let _ = conn.execute(
                             &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
@@ -3997,43 +3917,18 @@ impl SecretModalState {
                 self.save_to_env = !self.save_to_env;
             } else {
                 let safe_name = self.name.trim().replace("'", "''");
-                let safe_key = self.key_id.trim().replace("'", "''");
-                let safe_secret = self.secret_key.trim().replace("'", "''");
-                let safe_region = self.region.trim().replace("'", "''");
-                let safe_endpoint = self.endpoint.trim().replace("'", "''");
 
                 if safe_name.is_empty() {
                     self.error_msg = Some("Secret name cannot be empty.".to_string());
                 } else {
                     let _ = conn.execute("INSTALL httpfs; LOAD httpfs;", []);
-                    let mut clauses = vec!["TYPE S3".to_string()];
-                    if !safe_key.is_empty() {
-                        clauses.push(format!("KEY_ID '{}'", safe_key));
-                    }
-                    if !safe_secret.is_empty() {
-                        clauses.push(format!("SECRET '{}'", safe_secret));
-                    }
-                    if !safe_region.is_empty() {
-                        clauses.push(format!("REGION '{}'", safe_region));
-                    }
-                    let mut use_ssl = self.use_ssl;
-                    if !safe_endpoint.is_empty() {
-                        let clean_ep = safe_endpoint
-                            .trim_start_matches("http://")
-                            .trim_start_matches("https://")
-                            .trim_end_matches('/');
-                        clauses.push(format!("ENDPOINT '{}'", clean_ep));
-                        clauses.push("URL_STYLE 'path'".to_string());
-                        if safe_endpoint.starts_with("http://")
-                            || clean_ep.starts_with("localhost")
-                            || clean_ep.starts_with("127.0.0.1")
-                        {
-                            use_ssl = false;
-                        }
-                    }
-                    clauses.push(format!("USE_SSL {}", use_ssl));
-
-                    let secret_body = clauses.join(", ");
+                    let secret_body = crate::engine::build_s3_secret_body(
+                        &self.key_id,
+                        &self.secret_key,
+                        &self.region,
+                        &self.endpoint,
+                        self.use_ssl,
+                    );
                     let persistent_sql = format!(
                         "CREATE OR REPLACE PERSISTENT SECRET {} ({});",
                         safe_name, secret_body

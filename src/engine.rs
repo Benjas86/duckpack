@@ -552,38 +552,20 @@ pub fn connect_target_db(
     } else if db.starts_with("ducklake:") {
         let conn = open_duckdb_connection()
             .with_context(|| "Failed to open in-memory DB for DuckLake ATTACH")?;
-        ensure_extension_loaded(&conn, "ducklake")
-            .with_context(|| "Failed to install/load ducklake extension")?;
-        if db.contains("postgres") {
-            ensure_extension_loaded(&conn, "postgres")
-                .with_context(|| "Failed to install/load postgres extension for DuckLake catalog")?;
-        }
-        if db.contains("sqlite") {
-            ensure_extension_loaded(&conn, "sqlite")
-                .with_context(|| "Failed to install/load sqlite extension for DuckLake catalog")?;
-        }
-        if db.contains("quack") {
-            load_quack_extension(&conn)
-                .with_context(|| "Failed to install/load quack extension for DuckLake catalog")?;
-            if let Some(token) = resolve_quack_token(quack_token, None) {
-                let safe_token = token.replace('\'', "''");
-                let _ = conn.execute(
-                    &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
-                    [],
-                );
-            }
-        }
-        if db.contains("s3://") || db.contains("http://") || db.contains("https://") {
-            ensure_extension_loaded(&conn, "httpfs")
-                .with_context(|| "Failed to install/load httpfs extension for DuckLake storage")?;
-        }
-
         let (target_path, options) = if let Some(idx) = db.find(" (") {
             let (target, opts) = db.split_at(idx);
             (target.trim(), opts.trim())
         } else {
             (db.trim(), "")
         };
+        let resolved_token = resolve_quack_token(quack_token, None);
+        prepare_ducklake_connection(
+            &conn,
+            target_path,
+            options,
+            resolved_token.as_deref(),
+            None,
+        )?;
         let safe_target = target_path.replace('\'', "''");
         let attach_sql = if options.is_empty() {
             format!("ATTACH '{}' AS target_db;", safe_target)
@@ -913,6 +895,7 @@ pub fn apply_diff_with_executor(
         let mut views_to_apply = Vec::new();
         let mut triggers_to_apply = Vec::new();
         let mut drops_to_apply = Vec::new();
+        let mut drop_sequences = Vec::new();
         let mut drop_schemas = Vec::new();
 
         // 1. Create schemas first
@@ -966,10 +949,14 @@ pub fn apply_diff_with_executor(
                 | diff::DiffItemType::DropColumn
                 | diff::DiffItemType::DropView
                 | diff::DiffItemType::DropMacro
-                | diff::DiffItemType::DropTrigger
-                | diff::DiffItemType::DropSequence => {
+                | diff::DiffItemType::DropTrigger => {
                     if force_drop {
                         drops_to_apply.push(item.sql.clone());
+                    }
+                }
+                diff::DiffItemType::DropSequence => {
+                    if force_drop {
+                        drop_sequences.push(item.sql.clone());
                     }
                 }
                 diff::DiffItemType::DropSchema => {
@@ -1001,9 +988,12 @@ pub fn apply_diff_with_executor(
             execute_sqls_with_retry_custom(triggers_to_apply, &mut execute_sql)?;
         }
 
-        // 5. Drops
+        // 5. Drops (tables/columns/views/macros/triggers first, then sequences, then schemas)
         for drop_sql in drops_to_apply {
             let _ = execute_sql(&drop_sql); // Ignore errors if already dropped by cascade
+        }
+        for drop_sql in drop_sequences {
+            let _ = execute_sql(&drop_sql);
         }
         for drop_sql in drop_schemas {
             let _ = execute_sql(&drop_sql);
@@ -1048,6 +1038,321 @@ pub struct ResolvedTargetConfig {
     pub insecure: Option<bool>,
 }
 
+/// Formats a normalized `quack:<host>:<port>` connection endpoint.
+pub fn format_quack_endpoint(host_raw: &str, port_raw: &str) -> String {
+    let trimmed = host_raw.trim();
+    let stripped = trimmed
+        .strip_prefix("quack://")
+        .or_else(|| trimmed.strip_prefix("quack:"))
+        .unwrap_or(trimmed);
+    let endpoint = if stripped.contains(':') {
+        stripped.to_string()
+    } else {
+        let port = if port_raw.trim().is_empty() {
+            "9494"
+        } else {
+            port_raw.trim()
+        };
+        format!("{}:{}", stripped, port)
+    };
+    format!("quack:{}", endpoint)
+}
+
+/// Formats an MSSQL ADO.NET connection string (without the `mssql:` prefix) from individual fields.
+#[allow(clippy::too_many_arguments)]
+pub fn format_mssql_connection_string(
+    host_raw: &str,
+    port_raw: &str,
+    database: &str,
+    username: &str,
+    password: &str,
+    trusted_connection: bool,
+    insecure: bool,
+    disable_ssl: bool,
+) -> String {
+    let host_trimmed = host_raw.trim();
+    let mut conn_str = if host_trimmed.contains('=') {
+        host_trimmed.to_string()
+    } else {
+        let port = if port_raw.trim().is_empty() {
+            "1433"
+        } else {
+            port_raw.trim()
+        };
+        format!("Server={},{}", host_trimmed, port)
+    };
+    if !database.trim().is_empty() && !conn_str.to_lowercase().contains("database=") {
+        conn_str.push_str(&format!(";Database={}", database.trim()));
+    }
+    let use_trusted = trusted_connection
+        || (cfg!(target_os = "windows")
+            && username.trim().is_empty()
+            && password.trim().is_empty());
+
+    if use_trusted {
+        let lower = conn_str.to_lowercase();
+        if !lower.contains("trusted_connection=")
+            && !lower.contains("integrated security=")
+            && !lower.contains("authenticator=")
+        {
+            conn_str.push_str(";Trusted_Connection=yes");
+        }
+    } else {
+        let lower = conn_str.to_lowercase();
+        if !username.trim().is_empty()
+            && !lower.contains("user id=")
+            && !lower.contains("uid=")
+        {
+            conn_str.push_str(&format!(";User Id={}", username.trim()));
+        }
+        if !password.trim().is_empty()
+            && !lower.contains("password=")
+            && !lower.contains("pwd=")
+        {
+            conn_str.push_str(&format!(";Password={}", password.trim()));
+        }
+    }
+    if (insecure || conn_str.contains("localhost") || conn_str.contains("127.0.0.1"))
+        && !conn_str.to_lowercase().contains("trustservercertificate=")
+    {
+        conn_str.push_str(";TrustServerCertificate=yes");
+    }
+    if disable_ssl && !conn_str.to_lowercase().contains("encrypt=") {
+        conn_str.push_str(";Encrypt=no");
+    }
+    conn_str
+}
+
+/// Formats a normalized `ducklake:<catalog_dsn>` target string for the selected metadata backend.
+pub fn format_ducklake_target(
+    backend: &str,
+    host: &str,
+    port: &str,
+    database: &str,
+    username: &str,
+    password: &str,
+    path: &str,
+) -> std::result::Result<String, String> {
+    let cat = match backend.to_ascii_lowercase().as_str() {
+        "quack" => {
+            if host.trim().is_empty() {
+                return Err("Catalog host cannot be empty for DuckLake Quack backend.".to_string());
+            }
+            format_quack_endpoint(host, port)
+        }
+        "postgres" | "postgresql" => {
+            if host.trim().is_empty() {
+                return Err(
+                    "Catalog host cannot be empty for DuckLake PostgreSQL backend.".to_string(),
+                );
+            }
+            let host_raw = host.trim();
+            if host_raw.starts_with("postgres:") || host_raw.starts_with("postgresql:") {
+                host_raw.to_string()
+            } else {
+                let p = if port.trim().is_empty() {
+                    "5432"
+                } else {
+                    port.trim()
+                };
+                let db = if database.trim().is_empty() {
+                    "ducklake"
+                } else {
+                    database.trim()
+                };
+                let mut s = format!("postgres:host={} port={} dbname={}", host_raw, p, db);
+                if !username.trim().is_empty() {
+                    s.push_str(&format!(" user={}", username.trim()));
+                }
+                if !password.trim().is_empty() {
+                    s.push_str(&format!(" password={}", password.trim()));
+                }
+                s
+            }
+        }
+        "file" | "duckdb" | "local" => {
+            if path.trim().is_empty() {
+                return Err(
+                    "Metadata file path cannot be empty for DuckLake Local File backend."
+                        .to_string(),
+                );
+            }
+            path.trim().to_string()
+        }
+        "sqlite" => {
+            if path.trim().is_empty() {
+                return Err(
+                    "SQLite metadata database path cannot be empty for DuckLake SQLite backend."
+                        .to_string(),
+                );
+            }
+            let p = path.trim();
+            if p.starts_with("sqlite:") {
+                p.to_string()
+            } else {
+                format!("sqlite:{}", p)
+            }
+        }
+        other => other.to_string(),
+    };
+
+    if cat.starts_with("ducklake:") {
+        Ok(cat)
+    } else {
+        Ok(format!("ducklake:{}", cat))
+    }
+}
+
+/// Builds the inner `TYPE S3, KEY_ID ..., SECRET ..., REGION ..., ENDPOINT ..., URL_STYLE 'path', USE_SSL ...`
+/// body for `CREATE SECRET (...)` in DuckDB.
+pub fn build_s3_secret_body(
+    key_id: &str,
+    secret_key: &str,
+    region: &str,
+    endpoint: &str,
+    use_ssl_default: bool,
+) -> String {
+    let safe_key = key_id.trim().replace('\'', "''");
+    let safe_secret = secret_key.trim().replace('\'', "''");
+    let safe_region = region.trim().replace('\'', "''");
+    let safe_endpoint = endpoint.trim().replace('\'', "''");
+
+    let mut clauses = vec!["TYPE S3".to_string()];
+    if !safe_key.is_empty() {
+        clauses.push(format!("KEY_ID '{}'", safe_key));
+    }
+    if !safe_secret.is_empty() {
+        clauses.push(format!("SECRET '{}'", safe_secret));
+    }
+    if !safe_region.is_empty() {
+        clauses.push(format!("REGION '{}'", safe_region));
+    }
+    let mut use_ssl = use_ssl_default;
+    if !safe_endpoint.is_empty() {
+        let clean_ep = safe_endpoint
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/');
+        clauses.push(format!("ENDPOINT '{}'", clean_ep));
+        clauses.push("URL_STYLE 'path'".to_string());
+        if safe_endpoint.starts_with("http://")
+            || clean_ep.starts_with("localhost")
+            || clean_ep.starts_with("127.0.0.1")
+        {
+            use_ssl = false;
+        }
+    }
+    clauses.push(format!("USE_SSL {}", use_ssl));
+    clauses.join(", ")
+}
+
+/// Checks if an S3 secret is already registered in `conn`; if not, inspects process env vars and `.env`
+/// in `project_dir` (defaulting to current working directory) for `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+/// `AWS_REGION`, and `AWS_ENDPOINT` and auto-registers a session S3 secret.
+pub fn ensure_s3_secret_from_env(conn: &Connection, project_dir: Option<&Path>) {
+    let existing_s3_secrets: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_secrets() WHERE lower(type) = 's3'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if existing_s3_secrets > 0 {
+        return;
+    }
+
+    let dir = project_dir.unwrap_or_else(|| Path::new("."));
+    let env_path = dir.join(".env");
+    let mut file_vars = std::collections::HashMap::new();
+    if env_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&env_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    file_vars.insert(
+                        k.trim().to_string(),
+                        v.trim().trim_matches('"').trim_matches('\'').to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    let get_var = |key: &str| -> String {
+        std::env::var(key)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| file_vars.get(key).cloned().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_default()
+    };
+
+    let key_id = get_var("AWS_ACCESS_KEY_ID");
+    let secret_key = get_var("AWS_SECRET_ACCESS_KEY");
+    let mut region = get_var("AWS_REGION");
+    if region.is_empty() {
+        region = get_var("AWS_DEFAULT_REGION");
+    }
+    let endpoint = get_var("AWS_ENDPOINT");
+
+    if key_id.is_empty() && secret_key.is_empty() && endpoint.is_empty() {
+        return;
+    }
+    if region.is_empty() {
+        region = "us-east-1".to_string();
+    }
+
+    let secret_body = build_s3_secret_body(&key_id, &secret_key, &region, &endpoint, true);
+    let sql = format!("CREATE OR REPLACE SECRET s3_env_auto ({});", secret_body);
+    let _ = conn.execute(&sql, []);
+}
+
+/// Installs and loads the required DuckLake extensions (`ducklake`, plus `postgres`/`sqlite`/`quack`
+/// and `httpfs` when S3/HTTP storage paths are used) and binds Quack / S3 secrets on `conn`.
+pub fn prepare_ducklake_connection(
+    conn: &Connection,
+    target_dsn: &str,
+    data_path_or_opts: &str,
+    quack_token: Option<&str>,
+    project_dir: Option<&Path>,
+) -> Result<()> {
+    ensure_extension_loaded(conn, "ducklake")
+        .with_context(|| "Failed to install/load ducklake extension")?;
+    if target_dsn.contains("postgres") {
+        ensure_extension_loaded(conn, "postgres")
+            .with_context(|| "Failed to install/load postgres extension for DuckLake catalog")?;
+    }
+    if target_dsn.contains("sqlite") {
+        ensure_extension_loaded(conn, "sqlite")
+            .with_context(|| "Failed to install/load sqlite extension for DuckLake catalog")?;
+    }
+    if target_dsn.contains("quack") {
+        load_quack_extension(conn)
+            .with_context(|| "Failed to install/load quack extension for DuckLake catalog")?;
+        if let Some(token) = quack_token.filter(|t| !t.trim().is_empty()) {
+            let safe_token = token.trim().replace('\'', "''");
+            let _ = conn.execute(
+                &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
+                [],
+            );
+        }
+    }
+    if target_dsn.contains("s3://")
+        || target_dsn.contains("http://")
+        || target_dsn.contains("https://")
+        || data_path_or_opts.contains("s3://")
+        || data_path_or_opts.contains("http://")
+        || data_path_or_opts.contains("https://")
+    {
+        ensure_extension_loaded(conn, "httpfs")
+            .with_context(|| "Failed to install/load httpfs extension for DuckLake storage")?;
+        ensure_s3_secret_from_env(conn, project_dir);
+    }
+    Ok(())
+}
+
 fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
     let mut cfg = ResolvedTargetConfig::default();
 
@@ -1063,55 +1368,50 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
                 .or_else(|| tbl.get("host"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("localhost");
-            let port = tbl.get("port").and_then(|v| v.as_integer()).unwrap_or(1433);
-            let mut conn_str = format!("mssql:Server={},{}", server, port);
-            if let Some(db_name) = tbl
+            let port = tbl
+                .get("port")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(1433)
+                .to_string();
+            let db_name = tbl
                 .get("database")
                 .or_else(|| tbl.get("db"))
                 .and_then(|v| v.as_str())
-            {
-                conn_str.push_str(&format!(";Database={}", db_name));
-            }
+                .unwrap_or("");
             let is_trusted = tbl
                 .get("trusted_connection")
                 .or_else(|| tbl.get("windows_auth"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(cfg!(target_os = "windows"));
-
-            if is_trusted {
-                conn_str.push_str(";Trusted_Connection=yes");
-            } else {
-                if let Some(user) = tbl
-                    .get("username")
-                    .or_else(|| tbl.get("user"))
-                    .or_else(|| tbl.get("user_id"))
-                    .and_then(|v| v.as_str())
-                {
-                    conn_str.push_str(&format!(";User Id={}", user));
-                }
-                if let Some(pass) = tbl.get("password").and_then(|v| v.as_str()) {
-                    conn_str.push_str(&format!(";Password={}", pass));
-                }
-            }
-            if tbl
+            let user = tbl
+                .get("username")
+                .or_else(|| tbl.get("user"))
+                .or_else(|| tbl.get("user_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let pass = tbl.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            let insecure = tbl
                 .get("insecure")
                 .or_else(|| tbl.get("trust_server_certificate"))
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-                || server == "localhost"
-                || server == "127.0.0.1"
-            {
-                conn_str.push_str(";TrustServerCertificate=yes");
-            }
-            if tbl
+                .unwrap_or(false);
+            let disable_ssl = tbl
                 .get("disable_ssl")
                 .or_else(|| tbl.get("no_encrypt"))
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                conn_str.push_str(";Encrypt=no");
-            }
-            cfg.db = Some(conn_str);
+                .unwrap_or(false);
+
+            let conn_str = format_mssql_connection_string(
+                server,
+                &port,
+                db_name,
+                user,
+                pass,
+                is_trusted,
+                insecure,
+                disable_ssl,
+            );
+            cfg.db = Some(format!("mssql:{}", conn_str));
         } else if prov.eq_ignore_ascii_case("ducklake") {
             let backend = tbl
                 .get("backend")
@@ -1125,19 +1425,24 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
                 .and_then(|v| v.as_str());
 
             let mut catalog_target = if let Some(cat) = catalog_explicit {
-                cat.to_string()
+                if cat.starts_with("ducklake:") {
+                    cat.to_string()
+                } else {
+                    format!("ducklake:{}", cat)
+                }
             } else if backend.as_deref() == Some("quack") {
                 let server = tbl
                     .get("server")
                     .or_else(|| tbl.get("host"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("localhost");
-                let port = tbl.get("port").and_then(|v| v.as_integer()).unwrap_or(9494);
-                let clean_server = server
-                    .strip_prefix("quack://")
-                    .or_else(|| server.strip_prefix("quack:"))
-                    .unwrap_or(server);
-                format!("quack:{}:{}", clean_server, port)
+                let port = tbl
+                    .get("port")
+                    .and_then(|v| v.as_integer())
+                    .unwrap_or(9494)
+                    .to_string();
+                format_ducklake_target("quack", server, &port, "", "", "", "")
+                    .unwrap_or_else(|_| "ducklake:quack:localhost:9494".to_string())
             } else if backend.as_deref() == Some("sqlite") {
                 let file_path = tbl
                     .get("database")
@@ -1145,11 +1450,8 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
                     .or_else(|| tbl.get("path"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("metadata.db");
-                if file_path.starts_with("sqlite:") {
-                    file_path.to_string()
-                } else {
-                    format!("sqlite:{}", file_path)
-                }
+                format_ducklake_target("sqlite", "", "", "", "", "", file_path)
+                    .unwrap_or_else(|_| "ducklake:sqlite:metadata.db".to_string())
             } else if backend.as_deref() == Some("file") || backend.as_deref() == Some("duckdb") {
                 let file_path = tbl
                     .get("database")
@@ -1157,7 +1459,8 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
                     .or_else(|| tbl.get("path"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("metadata.ducklake");
-                file_path.to_string()
+                format_ducklake_target("file", "", "", "", "", "", file_path)
+                    .unwrap_or_else(|_| "ducklake:metadata.ducklake".to_string())
             } else if let Some(server) = tbl
                 .get("server")
                 .or_else(|| tbl.get("host"))
@@ -1167,42 +1470,43 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
                     || server.starts_with("quack://")
                     || tbl.get("port").and_then(|v| v.as_integer()) == Some(9494);
                 if is_quack {
-                    let port = tbl.get("port").and_then(|v| v.as_integer()).unwrap_or(9494);
-                    let clean = server
-                        .strip_prefix("quack://")
-                        .or_else(|| server.strip_prefix("quack:"))
-                        .unwrap_or(server);
-                    format!("quack:{}:{}", clean, port)
+                    let port = tbl
+                        .get("port")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(9494)
+                        .to_string();
+                    format_ducklake_target("quack", server, &port, "", "", "", "")
+                        .unwrap_or_else(|_| "ducklake:quack:localhost:9494".to_string())
                 } else {
-                    let port = tbl.get("port").and_then(|v| v.as_integer()).unwrap_or(5432);
+                    let port = tbl
+                        .get("port")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(5432)
+                        .to_string();
                     let dbname = tbl
                         .get("dbname")
                         .or_else(|| tbl.get("database"))
                         .or_else(|| tbl.get("db"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("ducklake");
-                    let mut pg_cat = format!("postgres:host={} port={} dbname={}", server, port, dbname);
-                    if let Some(u) = tbl
+                    let u = tbl
                         .get("username")
                         .or_else(|| tbl.get("user"))
                         .and_then(|v| v.as_str())
-                    {
-                        pg_cat.push_str(&format!(" user={}", u));
-                    }
-                    if let Some(p) = tbl.get("password").and_then(|v| v.as_str()) {
-                        pg_cat.push_str(&format!(" password={}", p));
-                    }
-                    pg_cat
+                        .unwrap_or("");
+                    let p = tbl.get("password").and_then(|v| v.as_str()).unwrap_or("");
+                    format_ducklake_target("postgres", server, &port, dbname, u, p, "")
+                        .unwrap_or_else(|_| "ducklake:postgres:host=localhost port=5432 dbname=ducklake".to_string())
                 }
-            } else if let Some(db_val) = tbl.get("database").or_else(|| tbl.get("db")).and_then(|v| v.as_str()) {
-                db_val.to_string()
+            } else if let Some(db_val) = tbl
+                .get("database")
+                .or_else(|| tbl.get("db"))
+                .and_then(|v| v.as_str())
+            {
+                format!("ducklake:{}", db_val.trim_start_matches("ducklake:"))
             } else {
-                "ducklake".to_string()
+                "ducklake:ducklake".to_string()
             };
-
-            if !catalog_target.starts_with("ducklake:") {
-                catalog_target = format!("ducklake:{}", catalog_target);
-            }
 
             if let Some(dp) = data_path {
                 catalog_target.push_str(&format!(" (DATA_PATH '{}')", dp));
@@ -1231,7 +1535,19 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
         }
     }
 
-    if let Some(val) = tbl.get("database").or_else(|| tbl.get("catalog")) {
+    let is_provider_with_dsn_database = provider
+        .map(|p| p.eq_ignore_ascii_case("ducklake") || p.eq_ignore_ascii_case("mssql"))
+        .unwrap_or(false);
+
+    let catalog_val = if is_provider_with_dsn_database {
+        tbl.get("catalogs")
+    } else {
+        tbl.get("catalogs")
+            .or_else(|| tbl.get("database"))
+            .or_else(|| tbl.get("catalog"))
+    };
+
+    if let Some(val) = catalog_val {
         if let Some(s) = val.as_str() {
             cfg.catalogs = vec![s.to_string()];
         } else if let Some(arr) = val.as_array() {
@@ -2885,6 +3201,75 @@ token_env = "TEST_RESOLVER_PROD_TOKEN"
             let mode = std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "Expected .env mode 0600, got {:o}", mode);
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_ducklake_and_mssql_catalogs_not_polluted_by_dsn_database() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_dl_cat_clean_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let toml_content = r#"
+[env.dl_file]
+provider = "ducklake"
+backend = "file"
+database = "my_meta.ducklake"
+data_path = "./lake_data/"
+
+[env.dl_pg]
+provider = "ducklake"
+host = "localhost"
+database = "lake_metadata"
+catalogs = ["custom_cat"]
+
+[env.mssql_srv]
+provider = "mssql"
+host = "localhost"
+database = "FinanceDB"
+"#;
+        std::fs::write(temp_dir.join("duckpack.toml"), toml_content).unwrap();
+
+        let dl_file_cfg = resolve_target_config(&temp_dir, Some("dl_file"));
+        assert_eq!(
+            dl_file_cfg.db.as_deref(),
+            Some("ducklake:my_meta.ducklake (DATA_PATH './lake_data/')")
+        );
+        assert!(
+            dl_file_cfg.catalogs.is_empty(),
+            "DuckLake file database key must not pollute cfg.catalogs, got: {:?}",
+            dl_file_cfg.catalogs
+        );
+
+        let dl_pg_cfg = resolve_target_config(&temp_dir, Some("dl_pg"));
+        assert_eq!(dl_pg_cfg.catalogs, vec!["custom_cat".to_string()]);
+
+        let mssql_cfg = resolve_target_config(&temp_dir, Some("mssql_srv"));
+        assert!(
+            mssql_cfg.catalogs.is_empty(),
+            "MSSQL database key must not pollute cfg.catalogs, got: {:?}",
+            mssql_cfg.catalogs
+        );
+
+        let body = build_s3_secret_body(
+            "minioadmin",
+            "miniosecret",
+            "us-east-1",
+            "http://localhost:9000/",
+            true,
+        );
+        assert!(body.contains("TYPE S3"));
+        assert!(body.contains("KEY_ID 'minioadmin'"));
+        assert!(body.contains("SECRET 'miniosecret'"));
+        assert!(body.contains("ENDPOINT 'localhost:9000'"));
+        assert!(body.contains("URL_STYLE 'path'"));
+        assert!(body.contains("USE_SSL false"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

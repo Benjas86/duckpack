@@ -13,13 +13,13 @@ pub use editor::{
     calculate_status_height, get_clipboard_text, handle_sql_error_position, set_clipboard_text,
 };
 pub(crate) use explorer::{
-    ExplorerMode, NodeType, ProjectCategory, compute_ide_diff_for_catalog, db_icon,
+    ExplorerMode, NodeType, compute_ide_diff_for_catalog, db_icon,
     get_git_branch_and_status, rebuild_explorer_nodes, rebuild_project_nodes,
     render_explorer_node_line,
 };
 #[cfg(test)]
 pub(crate) use explorer::{
-    ExplorerNode, apply_ide_diff, column_data_type_style, compute_ide_diff, format_column_display,
+    ExplorerNode, ProjectCategory, apply_ide_diff, column_data_type_style, compute_ide_diff, format_column_display,
     generate_asset_boilerplate, get_asset_file_path,
 };
 pub(crate) use modals::{
@@ -1444,61 +1444,10 @@ pub fn run_ide_loop(
                                 || key.code == KeyCode::Char('n')
                             {
                                 if explorer_mode == ExplorerMode::Project {
-                                    new_asset_modal.reset();
-                                    if let Some(selected) = explorer_state.selected() {
-                                        if selected < explorer_items.len() {
-                                            match &explorer_items[selected].node_type {
-                                                NodeType::Group => {
-                                                    let name = &explorer_items[selected].name;
-                                                    if name.contains("tables") {
-                                                        new_asset_modal.category_index = 0;
-                                                    } else if name.contains("views") {
-                                                        new_asset_modal.category_index = 1;
-                                                    } else if name.contains("macros") {
-                                                        new_asset_modal.category_index = 2;
-                                                    } else if name.contains("triggers") {
-                                                        new_asset_modal.category_index = 3;
-                                                    } else if name.contains("schemas") {
-                                                        new_asset_modal.category_index = 4;
-                                                    } else if name.contains("queries") {
-                                                        new_asset_modal.category_index = 5;
-                                                    } else if name.contains("seeds") {
-                                                        new_asset_modal.category_index = 6;
-                                                    }
-                                                }
-                                                NodeType::ProjectFile { category, .. } => {
-                                                    match category {
-                                                        ProjectCategory::Table => {
-                                                            new_asset_modal.category_index = 0
-                                                        }
-                                                        ProjectCategory::View => {
-                                                            new_asset_modal.category_index = 1
-                                                        }
-                                                        ProjectCategory::Macro => {
-                                                            new_asset_modal.category_index = 2
-                                                        }
-                                                        ProjectCategory::Trigger => {
-                                                            new_asset_modal.category_index = 3
-                                                        }
-                                                        ProjectCategory::Sequence => {
-                                                            new_asset_modal.category_index = 4
-                                                        }
-                                                        ProjectCategory::Schema => {
-                                                            new_asset_modal.category_index = 5
-                                                        }
-                                                        ProjectCategory::Query => {
-                                                            new_asset_modal.category_index = 6
-                                                        }
-                                                        ProjectCategory::Seed => {
-                                                            new_asset_modal.category_index = 7
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
+                                    let selected_node = explorer_state
+                                        .selected()
+                                        .and_then(|idx| explorer_items.get(idx));
+                                    new_asset_modal.open_for_node(selected_node);
                                 } else if let Some(selected) = explorer_state.selected() {
                                     if selected < explorer_items.len() {
                                         match &explorer_items[selected].node_type {
@@ -2738,22 +2687,7 @@ pub fn run_ide_loop(
                         NodeType::Group => {
                             if explorer_mode == ExplorerMode::Project {
                                 if item_name.ends_with(":empty") {
-                                    new_asset_modal.reset();
-                                    if item_name.contains("tables") {
-                                        new_asset_modal.category_index = 0;
-                                    } else if item_name.contains("views") {
-                                        new_asset_modal.category_index = 1;
-                                    } else if item_name.contains("macros") {
-                                        new_asset_modal.category_index = 2;
-                                    } else if item_name.contains("triggers") {
-                                        new_asset_modal.category_index = 3;
-                                    } else if item_name.contains("schemas") {
-                                        new_asset_modal.category_index = 4;
-                                    } else if item_name.contains("queries") {
-                                        new_asset_modal.category_index = 5;
-                                    } else if item_name.contains("seeds") {
-                                        new_asset_modal.category_index = 6;
-                                    }
+                                    new_asset_modal.open_for_group_name(&item_name);
                                 } else {
                                     if expanded_project_groups.contains(&item_name) {
                                         expanded_project_groups.remove(&item_name);
@@ -4929,5 +4863,43 @@ mod tests {
         modal.active_field = 7;
         modal.nav_down();
         assert_eq!(modal.active_field, 8);
+    }
+
+    #[test]
+    fn test_new_asset_modal_open_for_group_and_node_categories() {
+        let mut modal = NewAssetModalState::new();
+        let cases = [
+            ("group:tables", 0, ProjectCategory::Table, "Table"),
+            ("group:views", 1, ProjectCategory::View, "View"),
+            ("group:macros", 2, ProjectCategory::Macro, "Macro"),
+            ("group:triggers", 3, ProjectCategory::Trigger, "Trigger"),
+            ("group:sequences", 4, ProjectCategory::Sequence, "Sequence"),
+            ("group:schemas:empty", 5, ProjectCategory::Schema, "Schema"),
+            ("group:queries:empty", 6, ProjectCategory::Query, "Query"),
+            ("group:seeds:empty", 7, ProjectCategory::Seed, "Seed"),
+        ];
+
+        for (group_name, expected_idx, expected_cat, expected_label) in cases {
+            modal.open_for_group_name(group_name);
+            assert!(modal.is_open);
+            assert_eq!(modal.category_index, expected_idx, "Failed for group {}", group_name);
+            assert_eq!(modal.current_category(), expected_cat);
+            assert_eq!(modal.category_label(), expected_label);
+
+            let file_node = ExplorerNode {
+                name: "test.sql".to_string(),
+                display: "test.sql".to_string(),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::ProjectFile {
+                    path: PathBuf::from("test.sql"),
+                    category: expected_cat,
+                },
+            };
+            modal.open_for_node(Some(&file_node));
+            assert_eq!(modal.category_index, expected_idx);
+            assert_eq!(modal.current_category(), expected_cat);
+        }
     }
 }
