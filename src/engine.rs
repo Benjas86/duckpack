@@ -268,6 +268,14 @@ pub fn get_duckdb_version_info(conn: &Connection) -> (String, Option<String>) {
 /// (e.g. ~/.duckdb/extensions/v2.0.0 vs dev commit hashes) and automatically installing
 /// from the official release CDN repository if DuckDB's internal autoload returns HTTP 404.
 pub fn ensure_extension_loaded(conn: &Connection, ext_name: &str) -> Result<()> {
+    let res = ensure_extension_loaded_inner(conn, ext_name);
+    if res.is_ok() && ext_name.eq_ignore_ascii_case("mssql") {
+        let _ = conn.execute("SET mssql_exec_invalidate_cache = true;", []);
+    }
+    res
+}
+
+fn ensure_extension_loaded_inner(conn: &Connection, ext_name: &str) -> Result<()> {
     // 1. Try standard LOAD <ext>;
     if conn.execute_batch(&format!("LOAD {};", ext_name)).is_ok() {
         return Ok(());

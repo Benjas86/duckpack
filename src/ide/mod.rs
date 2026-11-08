@@ -2404,6 +2404,11 @@ pub fn run_ide_loop(
                                         status_msg = "⚠️ Applied LOCALLY on DuckPack! Use '-- @remote' at top of query to apply to remote Quack.".to_string();
                                     } else {
                                         if is_catalog_mutation {
+                                            refresh_attached_catalog(
+                                                conn,
+                                                db_path,
+                                                quack_disable_ssl,
+                                            );
                                             trigger_explorer_refresh = true;
                                         }
                                         status_msg = format!(
