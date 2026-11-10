@@ -3385,7 +3385,8 @@ impl AttachModalState {
                         );
                     }
 
-                    let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, alias);
+                    let quoted_alias = format!("\"{}\"", alias.replace('"', "\"\""));
+                    let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, quoted_alias);
                     let mut opts = Vec::new();
                     match provider {
                         AttachProvider::DuckLake => {
@@ -3437,7 +3438,10 @@ impl AttachModalState {
                             return Some(alias);
                         }
                         Err(e) => {
-                            self.error_msg = Some(format!("Attach Error: {}", e));
+                            self.error_msg = Some(format!(
+                                "Attach Error: {}",
+                                crate::engine::redact_connection_credentials(&e.to_string())
+                            ));
                         }
                     }
                 }
@@ -3993,10 +3997,18 @@ impl SecretModalState {
             } else if self.active_field == 8 {
                 self.save_to_env = !self.save_to_env;
             } else {
-                let safe_name = self.name.trim().replace("'", "''");
+                let safe_name = self.name.trim();
 
                 if safe_name.is_empty() {
                     self.error_msg = Some("Secret name cannot be empty.".to_string());
+                } else if !safe_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    self.error_msg = Some(
+                        "Secret name must contain only alphanumeric characters and underscores."
+                            .to_string(),
+                    );
                 } else {
                     let _ = conn.execute("INSTALL httpfs; LOAD httpfs;", []);
                     let secret_body = crate::engine::build_s3_secret_body(

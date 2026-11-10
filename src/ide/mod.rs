@@ -2421,18 +2421,33 @@ pub fn run_ide_loop(
                                     let timestamp = chrono::Local::now()
                                         .format("%Y-%m-%d %H:%M:%S")
                                         .to_string();
+                                    let sanitized_query =
+                                        if crate::engine::should_redact_sql_history(
+                                            &query_to_execute,
+                                        ) {
+                                            crate::engine::redact_connection_credentials(
+                                                query_to_execute.trim(),
+                                            )
+                                        } else {
+                                            query_to_execute.trim().to_string()
+                                        };
                                     let history_entry = format!(
                                         "-- Executed at {} (Took {:.2?})\n{};\n\n",
-                                        timestamp,
-                                        elapsed,
-                                        query_to_execute.trim()
+                                        timestamp, elapsed, sanitized_query
                                     );
                                     use std::io::Write;
                                     if let Ok(mut f) = std::fs::OpenOptions::new()
                                         .create(true)
                                         .append(true)
-                                        .open(history_path)
+                                        .open(&history_path)
                                     {
+                                        #[cfg(unix)]
+                                        {
+                                            use std::os::unix::fs::PermissionsExt;
+                                            let _ = f.set_permissions(
+                                                std::fs::Permissions::from_mode(0o600),
+                                            );
+                                        }
                                         let _ = f.write_all(history_entry.as_bytes());
                                     }
                                 }
@@ -2550,18 +2565,33 @@ pub fn run_ide_loop(
                                                 let timestamp = chrono::Local::now()
                                                     .format("%Y-%m-%d %H:%M:%S")
                                                     .to_string();
+                                                let sanitized_query =
+                                                    if crate::engine::should_redact_sql_history(
+                                                        &query_to_execute,
+                                                    ) {
+                                                        crate::engine::redact_connection_credentials(
+                                                            query_to_execute.trim(),
+                                                        )
+                                                    } else {
+                                                        query_to_execute.trim().to_string()
+                                                    };
                                                 let history_entry = format!(
                                                     "-- Executed at {} (Took {:.2?})\n{};\n\n",
-                                                    timestamp,
-                                                    elapsed,
-                                                    query_to_execute.trim()
+                                                    timestamp, elapsed, sanitized_query
                                                 );
                                                 use std::io::Write;
                                                 if let Ok(mut f) = std::fs::OpenOptions::new()
                                                     .create(true)
                                                     .append(true)
-                                                    .open(history_path)
+                                                    .open(&history_path)
                                                 {
+                                                    #[cfg(unix)]
+                                                    {
+                                                        use std::os::unix::fs::PermissionsExt;
+                                                        let _ = f.set_permissions(
+                                                            std::fs::Permissions::from_mode(0o600),
+                                                        );
+                                                    }
                                                     let _ = f.write_all(history_entry.as_bytes());
                                                 }
                                             }

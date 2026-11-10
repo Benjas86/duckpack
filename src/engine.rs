@@ -469,6 +469,50 @@ pub fn load_quack_extension(conn: &Connection) -> Result<()> {
     ensure_extension_loaded(conn, "quack")
 }
 
+/// Redacts sensitive credentials (`Password=...`, `Pwd=...`, `password=...`, `SECRET '...'`,
+/// `TOKEN '...'`, and `scheme://user:password@host`) from connection strings, SQL statements, or error messages.
+pub fn redact_connection_credentials(input: &str) -> String {
+    static ADO_PASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static LIBPQ_PASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static URI_PASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SQL_SECRET_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+    let ado_re = ADO_PASS_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(password|pwd)\s*=\s*(\{[^}]*\}|[^;'\s)]+)").unwrap()
+    });
+    let libpq_re = LIBPQ_PASS_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(password)\s*=\s*('(?:\\'|[^'])*'|[^\s';)]+)").unwrap()
+    });
+    let uri_re = URI_PASS_RE
+        .get_or_init(|| regex::Regex::new(r"([a-zA-Z0-9+.-]+://[^:/@\s]+):([^@\s]+)@").unwrap());
+    let sql_sec_re = SQL_SECRET_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b(SECRET|TOKEN|motherduck_token)\s*(=|\s+)\s*'([^']|'')*'",
+        )
+        .unwrap()
+    });
+
+    let s = ado_re.replace_all(input, "$1=***");
+    let s = libpq_re.replace_all(&s, "$1=***");
+    let s = uri_re.replace_all(&s, "$1:***@");
+    sql_sec_re.replace_all(&s, "$1$2'***'").into_owned()
+}
+
+/// Returns `true` if a SQL statement contains secret definitions or inline credentials
+/// that should be redacted before writing to `.history.sql`.
+pub fn should_redact_sql_history(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    lower.contains("create secret")
+        || lower.contains("create persistent secret")
+        || lower.contains("create or replace secret")
+        || lower.contains("create or replace persistent secret")
+        || lower.contains("motherduck_token")
+        || lower.contains("password=")
+        || lower.contains("pwd=")
+        || lower.contains("secret '")
+        || lower.contains("token '")
+}
+
 /// Connects to the target DuckDB database (local, motherduck remote, or quack remote).
 pub fn connect_target_db(
     db: &str,
@@ -549,8 +593,8 @@ pub fn connect_target_db(
         if let Err(e) = attach_res {
             return Err(anyhow::anyhow!(
                 "Failed to attach MSSQL database '{}': {}",
-                db,
-                e
+                redact_connection_credentials(db),
+                redact_connection_credentials(&e.to_string())
             ));
         }
         if conn.execute("CONNECT target_db;", []).is_err() {
@@ -600,8 +644,8 @@ pub fn connect_target_db(
         if let Err(e) = attach_res {
             return Err(anyhow::anyhow!(
                 "Failed to attach DuckLake lakehouse '{}': {}",
-                db,
-                e
+                redact_connection_credentials(db),
+                redact_connection_credentials(&e.to_string())
             ));
         }
         if conn.execute("CONNECT target_db;", []).is_err() {
@@ -616,8 +660,8 @@ pub fn connect_target_db(
         if let Err(e) = attach_res {
             return Err(anyhow::anyhow!(
                 "Failed to attach remote database '{}': {}",
-                db,
-                e
+                redact_connection_credentials(db),
+                redact_connection_credentials(&e.to_string())
             ));
         }
         if conn.execute("CONNECT target_db;", []).is_err() {
@@ -1082,6 +1126,24 @@ pub fn format_quack_endpoint(host_raw: &str, port_raw: &str) -> String {
     format!("quack:{}", endpoint)
 }
 
+fn escape_ado_value(val: &str) -> String {
+    let trimmed = val.trim();
+    if trimmed.contains(';') || trimmed.contains('{') || trimmed.contains('}') {
+        format!("{{{}}}", trimmed.replace('}', "}}"))
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn escape_libpq_value(val: &str) -> String {
+    let trimmed = val.trim();
+    if trimmed.chars().any(|c| c.is_whitespace()) || trimmed.contains('\'') || trimmed.contains('\\') {
+        format!("'{}'", trimmed.replace('\\', "\\\\").replace('\'', "\\'"))
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Formats an MSSQL ADO.NET connection string (without the `mssql:` prefix) from individual fields.
 #[allow(clippy::too_many_arguments)]
 pub fn format_mssql_connection_string(
@@ -1103,10 +1165,10 @@ pub fn format_mssql_connection_string(
         } else {
             port_raw.trim()
         };
-        format!("Server={},{}", host_trimmed, port)
+        format!("Server={},{}", escape_ado_value(host_trimmed), port)
     };
     if !database.trim().is_empty() && !conn_str.to_lowercase().contains("database=") {
-        conn_str.push_str(&format!(";Database={}", database.trim()));
+        conn_str.push_str(&format!(";Database={}", escape_ado_value(database)));
     }
     let use_trusted = trusted_connection
         || (cfg!(target_os = "windows")
@@ -1127,13 +1189,13 @@ pub fn format_mssql_connection_string(
             && !lower.contains("user id=")
             && !lower.contains("uid=")
         {
-            conn_str.push_str(&format!(";User Id={}", username.trim()));
+            conn_str.push_str(&format!(";User Id={}", escape_ado_value(username)));
         }
         if !password.trim().is_empty()
             && !lower.contains("password=")
             && !lower.contains("pwd=")
         {
-            conn_str.push_str(&format!(";Password={}", password.trim()));
+            conn_str.push_str(&format!(";Password={}", escape_ado_value(password)));
         }
     }
     if (insecure || conn_str.contains("localhost") || conn_str.contains("127.0.0.1"))
@@ -1180,16 +1242,21 @@ pub fn format_ducklake_target(
                     port.trim()
                 };
                 let db = if database.trim().is_empty() {
-                    "ducklake"
+                    "ducklake".to_string()
                 } else {
-                    database.trim()
+                    escape_libpq_value(database)
                 };
-                let mut s = format!("postgres:host={} port={} dbname={}", host_raw, p, db);
+                let mut s = format!(
+                    "postgres:host={} port={} dbname={}",
+                    escape_libpq_value(host_raw),
+                    p,
+                    db
+                );
                 if !username.trim().is_empty() {
-                    s.push_str(&format!(" user={}", username.trim()));
+                    s.push_str(&format!(" user={}", escape_libpq_value(username)));
                 }
                 if !password.trim().is_empty() {
-                    s.push_str(&format!(" password={}", password.trim()));
+                    s.push_str(&format!(" password={}", escape_libpq_value(password)));
                 }
                 s
             }
@@ -3296,5 +3363,56 @@ database = "FinanceDB"
         assert!(body.contains("USE_SSL false"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_security_credential_redaction_and_dsn_escaping() {
+        let mssql_dsn = format_mssql_connection_string(
+            "sql.internal",
+            "1433",
+            "analytics",
+            "sa",
+            "pa;ss}word",
+            false,
+            true,
+            false,
+        );
+        assert!(
+            mssql_dsn.contains("Password={pa;ss}}word}"),
+            "Expected ADO.NET brace escaping for semicolon/brace in password, got: {}",
+            mssql_dsn
+        );
+        let redacted_mssql = redact_connection_credentials(&mssql_dsn);
+        assert!(!redacted_mssql.contains("pa;ss"));
+        assert!(redacted_mssql.contains("Password=***"));
+
+        let pg_dsn = format_ducklake_target(
+            "postgres",
+            "pg.internal",
+            "5432",
+            "lake_meta",
+            "pguser",
+            "my secret'pass",
+            "",
+        )
+        .unwrap();
+        assert!(
+            pg_dsn.contains("password='my secret\\'pass'"),
+            "Expected libpq single-quote escaping for password with spaces/quotes, got: {}",
+            pg_dsn
+        );
+        let redacted_pg = redact_connection_credentials(&pg_dsn);
+        assert!(!redacted_pg.contains("secret"));
+        assert!(redacted_pg.contains("password=***"));
+
+        let uri = "postgres://admin:super_secret_123@db.example.com:5432/prod";
+        let redacted_uri = redact_connection_credentials(uri);
+        assert_eq!(redacted_uri, "postgres://admin:***@db.example.com:5432/prod");
+
+        let sql = "CREATE SECRET (TYPE S3, KEY_ID 'AKIA123', SECRET 'top_secret_val', TOKEN 'tok_abc');";
+        assert!(should_redact_sql_history(sql));
+        let redacted_sql = redact_connection_credentials(sql);
+        assert!(!redacted_sql.contains("top_secret_val"));
+        assert!(!redacted_sql.contains("tok_abc"));
     }
 }
