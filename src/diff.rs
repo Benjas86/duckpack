@@ -115,6 +115,8 @@ pub struct TableSchema {
 pub enum DiffItemType {
     CreateSchema,
     DropSchema,
+    CreateSequence,
+    DropSequence,
     CreateTable,
     AlterTable,
     DropTable,
@@ -137,6 +139,7 @@ impl DiffItemType {
         matches!(
             self,
             DiffItemType::DropSchema
+                | DiffItemType::DropSequence
                 | DiffItemType::DropTable
                 | DiffItemType::DropColumn
                 | DiffItemType::DropView
@@ -160,6 +163,7 @@ pub struct TriggerSchema {
 #[derive(Debug, Clone, Default)]
 pub struct CatalogSnapshot {
     pub schemas: std::collections::HashSet<String>,
+    pub sequences: HashMap<String, String>,
     pub tables: HashMap<String, TableSchema>,
     pub views: HashMap<String, String>,
     pub macros: HashMap<String, String>,
@@ -189,7 +193,7 @@ pub fn validate_safe_project_filename(name: &str) -> Result<()> {
 }
 
 impl CatalogSnapshot {
-    /// Introspects all declarative schema objects (schemas, tables, views, macros, triggers)
+    /// Introspects all declarative schema objects (schemas, sequences, tables, views, macros, triggers)
     /// from any `DbExecutor` adapter for the specified catalog.
     pub fn introspect(
         exec: &mut dyn crate::engine::DbExecutor,
@@ -197,6 +201,7 @@ impl CatalogSnapshot {
     ) -> Result<Self> {
         Ok(Self {
             schemas: get_schemas_exec(exec, catalog)?,
+            sequences: get_sequences_exec(exec, catalog)?,
             tables: get_schema_exec(exec, catalog)?,
             views: get_views_exec(exec, catalog)?,
             macros: get_macros_exec(exec, catalog)?,
@@ -221,6 +226,7 @@ impl CatalogSnapshot {
     ) -> Result<std::path::PathBuf> {
         validate_safe_project_filename(obj_name)?;
         let (subdir, sql) = match item_type {
+            DiffItemType::DropSequence => ("sequences", self.sequences.get(obj_name).cloned()),
             DiffItemType::DropTable => (
                 "tables",
                 self.tables.get(obj_name).map(|t| t.create_sql.clone()),
@@ -1048,6 +1054,128 @@ pub fn get_schemas_exec(
     Ok(schemas)
 }
 
+/// Extracts all sequence definitions from a DuckDB connection for a specific catalog.
+pub fn get_sequences(
+    conn: &Connection,
+    catalog: Option<&str>,
+) -> Result<HashMap<String, String>> {
+    let mut exec = conn;
+    get_sequences_exec(&mut exec, catalog)
+}
+
+pub fn get_sequences_exec(
+    exec: &mut dyn crate::engine::DbExecutor,
+    catalog: Option<&str>,
+) -> Result<HashMap<String, String>> {
+    let target_cat = match catalog {
+        Some(c) => c.to_string(),
+        None => current_database_exec(exec),
+    };
+    let safe_cat = target_cat.replace('\'', "''");
+    let quack_alias = detect_quack_alias(exec, &safe_cat);
+    let mut sequences = HashMap::new();
+
+    let sql = format!(
+        "{} SELECT fs.full_schema_name, s.sequence_name, COALESCE(s.sql, '') \
+         FROM duckdb_sequences() s \
+         JOIN full_schemas fs ON s.schema_oid = fs.oid AND s.database_name = fs.database_name \
+         WHERE s.temporary = false AND s.database_name = '{}'",
+        FULL_SCHEMAS_CTE, safe_cat
+    );
+    let seq_rows = if let Ok((_, rows)) = exec.query_rows(&sql) {
+        Some(rows)
+    } else {
+        let fallback_sql = format!(
+            "SELECT schema_name, sequence_name, COALESCE(sql, '') \
+             FROM duckdb_sequences() WHERE temporary = false AND database_name = '{}'",
+            safe_cat
+        );
+        exec.query_rows(&fallback_sql).ok().map(|(_, r)| r)
+    };
+    if let Some(rows) = seq_rows {
+        parse_sequence_rows(rows, &mut sequences);
+    }
+
+    if sequences.is_empty() {
+        let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let q_sql = format!(
+            "SELECT fs.full_schema_name, s.sequence_name, COALESCE(s.sql, '') \
+             FROM {}.query('{} SELECT fs.full_schema_name, s.sequence_name, s.sql FROM duckdb_sequences() s JOIN full_schemas fs ON s.schema_oid = fs.oid AND s.database_name = fs.database_name WHERE s.temporary = false AND (s.database_name = ''{}'' OR s.database_name = current_database())')",
+            q_alias,
+            FULL_SCHEMAS_CTE.replace('\'', "''"),
+            safe_cat
+        );
+        let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
+            Some(rows)
+        } else {
+            let fallback_q_sql = format!(
+                "SELECT schema_name, sequence_name, COALESCE(sql, '') \
+                 FROM {}.query('SELECT schema_name, sequence_name, sql FROM duckdb_sequences() WHERE temporary = false AND (database_name = ''{}'' OR database_name = current_database())')",
+                q_alias, safe_cat
+            );
+            exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
+        };
+        if let Some(rows) = q_rows {
+            parse_sequence_rows(rows, &mut sequences);
+        }
+    }
+
+    Ok(sequences)
+}
+
+fn sequence_prefix_regex() -> &'static Regex {
+    static SEQ_PREFIX_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    SEQ_PREFIX_RE.get_or_init(|| {
+        Regex::new(r"(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?SEQUENCE\s+(?:IF\s+NOT\s+EXISTS\s+)?[^\s(]+").unwrap()
+    })
+}
+
+fn parse_sequence_rows(rows: Vec<Vec<String>>, sequences: &mut HashMap<String, String>) {
+    let seq_re = sequence_prefix_regex();
+    for row in rows {
+        if row.len() >= 3 {
+            let schema = row[0].clone();
+            let seq_name = row[1].clone();
+            let raw_sql = row[2].clone();
+            let key = if schema == "main" {
+                seq_name.clone()
+            } else {
+                format!("{}.{}", schema, seq_name)
+            };
+            let quoted_obj = quote_qualified_identifier(&key);
+            let formatted_sql = if !raw_sql.trim().is_empty() {
+                seq_re
+                    .replace(&raw_sql, format!("CREATE SEQUENCE IF NOT EXISTS {}", quoted_obj))
+                    .to_string()
+            } else {
+                format!("CREATE SEQUENCE IF NOT EXISTS {};", quoted_obj)
+            };
+            sequences.insert(key, formatted_sql);
+        }
+    }
+}
+
+/// Normalizes a sequence SQL definition for drift comparison by stripping out the runtime
+/// `START <number>` or `START WITH <number>` clause and consolidating whitespace.
+/// In DuckDB, `duckdb_sequences().sql` synthesizes `START <next_counter>` representing the live
+/// runtime counter state. When comparing declarative project files to a live database, this dynamic
+/// advancement must not be flagged as schema drift.
+pub fn normalize_sequence_sql(sql: &str) -> String {
+    static RE_START: OnceLock<Regex> = OnceLock::new();
+    let re_start = RE_START.get_or_init(|| Regex::new(r"(?i)\bSTART(?:\s+WITH)?\s+-?\d+\b").unwrap());
+
+    static RE_WS: OnceLock<Regex> = OnceLock::new();
+    let re_ws = RE_WS.get_or_init(|| Regex::new(r"\s+").unwrap());
+
+    let without_start = re_start.replace_all(sql, "");
+    re_ws
+        .replace_all(&without_start, " ")
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string()
+}
+
 /// Extracts all trigger definitions from a DuckDB connection for a specific catalog.
 pub fn get_triggers(
     conn: &Connection,
@@ -1169,6 +1297,8 @@ pub fn compute_diff_snapshots(
     compute_diff(
         &shadow.schemas,
         &target.schemas,
+        &shadow.sequences,
+        &target.sequences,
         &shadow.tables,
         &target.tables,
         &shadow.views,
@@ -1208,6 +1338,8 @@ pub fn diff_project(
 pub fn compute_diff(
     shadow_schemas: &std::collections::HashSet<String>,
     target_schemas: &std::collections::HashSet<String>,
+    shadow_sequences: &HashMap<String, String>,
+    target_sequences: &HashMap<String, String>,
     shadow: &HashMap<String, TableSchema>,
     target: &HashMap<String, TableSchema>,
     shadow_views: &HashMap<String, String>,
@@ -1222,14 +1354,7 @@ pub fn compute_diff(
     let mut diff = DiffResult { items: Vec::new() };
 
     let is_ignored = |name: &str| -> bool {
-        ignore_list.iter().any(|pattern| {
-            if pattern.ends_with('*') {
-                let prefix = &pattern[..pattern.len() - 1];
-                name.starts_with(prefix)
-            } else {
-                name == pattern
-            }
-        })
+        crate::engine::is_object_ignored(name, ignore_list)
     };
 
     let mut created_tables = Vec::new();
@@ -1286,6 +1411,36 @@ pub fn compute_diff(
             locked: false,
             ignored: false,
         });
+    }
+
+    // 2. Sequences (before tables/macros)
+    for (name, shadow_def) in shadow_sequences {
+        let target_def = target_sequences.get(name);
+        let is_different = match target_def {
+            None => true,
+            Some(t_sql) => normalize_sequence_sql(shadow_def) != normalize_sequence_sql(t_sql),
+        };
+        if is_different {
+            let ignored = is_ignored(name);
+            let sql_to_run = if target_def.is_some() {
+                let quoted_obj = quote_qualified_identifier(name);
+                sequence_prefix_regex()
+                    .replace(shadow_def, format!("CREATE OR REPLACE SEQUENCE {}", quoted_obj))
+                    .to_string()
+            } else {
+                shadow_def.clone()
+            };
+            diff.items.push(DiffItem {
+                item_type: DiffItemType::CreateSequence,
+                obj_name: name.clone(),
+                sql: sql_to_run,
+                old_def: target_def.cloned(),
+                new_def: Some(shadow_def.clone()),
+                selected: !ignored,
+                locked: false,
+                ignored,
+            });
+        }
     }
 
     for (table_name, shadow_table) in shadow.iter() {
@@ -1812,6 +1967,23 @@ pub fn compute_diff(
         }
     }
 
+    for (name, target_def) in target_sequences {
+        if !shadow_sequences.contains_key(name) {
+            let ignored = is_ignored(name);
+            let quoted_name = quote_qualified_identifier(name);
+            diff.items.push(DiffItem {
+                item_type: DiffItemType::DropSequence,
+                obj_name: name.clone(),
+                sql: format!("DROP SEQUENCE IF EXISTS {};", quoted_name),
+                old_def: Some(target_def.clone()),
+                new_def: Some(String::new()),
+                selected: !ignored,
+                locked: false,
+                ignored,
+            });
+        }
+    }
+
     diff
 }
 
@@ -1844,6 +2016,8 @@ mod tests {
         let diff = compute_diff(
             &shadow_schemas,
             &target_schemas,
+            &HashMap::new(),
+            &HashMap::new(),
             &shadow,
             &target,
             &HashMap::new(),
@@ -1882,6 +2056,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &shadow_triggers,
             &target_triggers,
             &std::path::PathBuf::new(),
@@ -1901,6 +2077,8 @@ mod tests {
         let diff2 = compute_diff(
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -2081,6 +2259,8 @@ mod tests {
         let diff = compute_diff(
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &shadow,
             &target,
             &HashMap::new(),
@@ -2152,6 +2332,8 @@ mod tests {
         let diff = compute_diff(
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &shadow,
             &target,
             &HashMap::new(),
@@ -2219,6 +2401,8 @@ mod tests {
         let diff = compute_diff(
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &shadow,
             &target,
             &HashMap::new(),
@@ -2295,6 +2479,8 @@ mod tests {
         let diff = compute_diff(
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &shadow,
             &target,
             &HashMap::new(),
@@ -2371,6 +2557,8 @@ mod tests {
         let diff = compute_diff(
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &shadow,
             &target,
             &HashMap::new(),
@@ -2440,6 +2628,8 @@ mod tests {
         let diff = compute_diff(
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &shadow,
             &target,
             &HashMap::new(),
@@ -2486,6 +2676,8 @@ mod tests {
         let diff = compute_diff(
             &schemas,
             &empty_target_schemas,
+            &HashMap::new(),
+            &HashMap::new(),
             &tables,
             &HashMap::new(),
             &HashMap::new(),
@@ -2520,6 +2712,8 @@ mod tests {
         let drop_diff = compute_diff(
             &empty_shadow_schemas,
             &schemas,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &tables,
             &HashMap::new(),
@@ -2639,6 +2833,8 @@ mod tests {
             &target_schemas,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             &shadow_views,
             &target_views,
             &HashMap::new(),
@@ -2718,6 +2914,8 @@ mod tests {
         let diff = compute_diff(
             &shadow_schemas,
             &target_schemas,
+            &HashMap::new(),
+            &HashMap::new(),
             &shadow,
             &target,
             &HashMap::new(),
@@ -2878,6 +3076,326 @@ mod tests {
         assert!(validate_safe_project_filename("..").is_err());
         assert!(validate_safe_project_filename("a\\b").is_err());
         assert!(validate_safe_project_filename("valid_schema.valid_table").is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_duckdb_sequence_syntax() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Test CREATE SEQUENCE IF NOT EXISTS
+        let res1 = conn.execute_batch("CREATE SEQUENCE IF NOT EXISTS seq1 START 1;");
+        assert!(res1.is_ok());
+
+        // Test CREATE OR REPLACE SEQUENCE
+        let res2 = conn.execute_batch("CREATE OR REPLACE SEQUENCE seq1 START 10;");
+        assert!(res2.is_ok());
+
+        // Test schema qualified
+        conn.execute_batch("CREATE SCHEMA finance;").unwrap();
+        let res_schema = conn.execute_batch("CREATE OR REPLACE SEQUENCE finance.seq2 START 5;");
+        assert!(res_schema.is_ok());
+
+        // Test DROP SEQUENCE
+        let res3 = conn.execute_batch("DROP SEQUENCE IF EXISTS seq1;");
+        assert!(res3.is_ok());
+
+        let res4 = conn.execute_batch("DROP SEQUENCE IF EXISTS finance.seq2;");
+        assert!(res4.is_ok());
+    }
+
+    #[test]
+    fn test_declarative_sequences_diff_and_apply_with_table_default() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_sequence_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("schemas")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("sequences")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("tables")).unwrap();
+
+        std::fs::write(
+            temp_dir.join("schemas").join("core.sql"),
+            "CREATE SCHEMA IF NOT EXISTS core;",
+        )
+        .unwrap();
+
+        std::fs::write(
+            temp_dir.join("sequences").join("external_metric_id_seq.sql"),
+            "CREATE SEQUENCE IF NOT EXISTS core.external_metric_id_seq START 100 INCREMENT BY 5;",
+        )
+        .unwrap();
+
+        std::fs::write(
+            temp_dir.join("tables").join("metrics.sql"),
+            "CREATE TABLE core.metrics (id BIGINT DEFAULT nextval('core.external_metric_id_seq'), name VARCHAR);",
+        )
+        .unwrap();
+
+        // 1. Shadow DB compilation - verify it compiles without the "Sequence does not exist" error!
+        let (_shadow_conn, shadow_snapshot) = CatalogSnapshot::from_project_dir(&temp_dir).unwrap();
+        assert!(
+            shadow_snapshot
+                .sequences
+                .contains_key("core.external_metric_id_seq"),
+            "Shadow DB must capture sequences"
+        );
+        assert!(
+            shadow_snapshot.tables.contains_key("core.metrics"),
+            "Shadow DB must compile tables that depend on sequences"
+        );
+
+        // 2. Diff against fresh target database
+        let mut target_conn = Connection::open_in_memory().unwrap();
+        let target_snapshot = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        let diff = compute_diff_snapshots(&shadow_snapshot, &target_snapshot, &temp_dir, &[]);
+
+        let has_create_schema = diff
+            .items
+            .iter()
+            .any(|i| i.item_type == DiffItemType::CreateSchema && i.obj_name == "core");
+        let has_create_seq = diff.items.iter().any(|i| {
+            i.item_type == DiffItemType::CreateSequence && i.obj_name == "core.external_metric_id_seq"
+        });
+        let has_create_tbl = diff
+            .items
+            .iter()
+            .any(|i| i.item_type == DiffItemType::CreateTable && i.obj_name == "core.metrics");
+
+        assert!(has_create_schema, "Must emit CreateSchema for core");
+        assert!(has_create_seq, "Must emit CreateSequence for core.external_metric_id_seq");
+        assert!(has_create_tbl, "Must emit CreateTable for core.metrics");
+
+        // 3. Apply diff to target
+        let apply_res = crate::engine::apply_diff(
+            &target_conn,
+            &diff,
+            false,
+            false,
+            &temp_dir,
+            None,
+        );
+        assert!(apply_res.is_ok(), "Apply diff failed: {:?}", apply_res.err());
+
+        // 4. Verify insertion in target DB increments sequence properly
+        target_conn
+            .execute_batch("INSERT INTO core.metrics (name) VALUES ('cpu_load');")
+            .unwrap();
+        let val: i64 = target_conn
+            .query_row("SELECT id FROM core.metrics WHERE name = 'cpu_load'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, 100, "Sequence initial start value should be 100");
+
+        target_conn
+            .execute_batch("INSERT INTO core.metrics (name) VALUES ('memory_usage');")
+            .unwrap();
+        let val2: i64 = target_conn
+            .query_row("SELECT id FROM core.metrics WHERE name = 'memory_usage'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val2, 105, "Sequence increment by 5 should yield 105");
+
+        // 5. Verify live sequence counter advancement on target DB does NOT trigger false schema drift
+        let target_snapshot2 = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        let diff2 = compute_diff_snapshots(&shadow_snapshot, &target_snapshot2, &temp_dir, &[]);
+        let sequence_diffs = diff2
+            .items
+            .iter()
+            .filter(|i| i.obj_name == "core.external_metric_id_seq")
+            .collect::<Vec<_>>();
+        assert!(
+            sequence_diffs.is_empty(),
+            "Live sequence advancement (START 110 vs project START 100) must NOT trigger schema drift, but got: {:?}",
+            sequence_diffs
+        );
+
+        // 6. Verify reverse pull (pull_object_to_project) for sequence
+        let pull_target = std::env::temp_dir().join(format!(
+            "dp_seq_pull_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let pulled_path = shadow_snapshot
+            .pull_object_to_project(
+                &pull_target,
+                &DiffItemType::DropSequence,
+                "core.external_metric_id_seq",
+            )
+            .unwrap();
+        assert!(pulled_path.exists());
+        let pulled_content = std::fs::read_to_string(&pulled_path).unwrap();
+        assert!(pulled_content.contains("CREATE SEQUENCE IF NOT EXISTS \"core\".\"external_metric_id_seq\""));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&pull_target);
+    }
+
+    #[test]
+    fn test_normalize_sequence_sql() {
+        let shadow = "CREATE SEQUENCE IF NOT EXISTS \"id_seq\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 4 NO CYCLE;";
+        let target = "CREATE SEQUENCE IF NOT EXISTS \"id_seq\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 6 NO CYCLE;";
+        assert_eq!(normalize_sequence_sql(shadow), normalize_sequence_sql(target));
+
+        let start_with = "CREATE SEQUENCE IF NOT EXISTS \"id_seq\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 100 NO CYCLE;";
+        assert_eq!(normalize_sequence_sql(shadow), normalize_sequence_sql(start_with));
+
+        let diff_inc = "CREATE SEQUENCE IF NOT EXISTS \"id_seq\" INCREMENT BY 5 MINVALUE 1 MAXVALUE 9223372036854775807 START 4 NO CYCLE;";
+        assert_ne!(normalize_sequence_sql(shadow), normalize_sequence_sql(diff_inc));
+
+        let diff_cycle = "CREATE SEQUENCE IF NOT EXISTS \"id_seq\" INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 4 CYCLE;";
+        assert_ne!(normalize_sequence_sql(shadow), normalize_sequence_sql(diff_cycle));
+    }
+
+    #[test]
+    fn test_sequence_runtime_advancement_no_drift() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_seq_drift_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("sequences")).unwrap();
+
+        // Exact user case: CREATE SEQUENCE IF NOT EXISTS id_seq START 4
+        std::fs::write(
+            temp_dir.join("sequences").join("id_seq.sql"),
+            "CREATE SEQUENCE IF NOT EXISTS id_seq START 4;",
+        )
+        .unwrap();
+
+        let (_shadow_conn, shadow_snapshot) = CatalogSnapshot::from_project_dir(&temp_dir).unwrap();
+        assert!(shadow_snapshot.sequences.contains_key("id_seq"));
+
+        // 1. Initial diff against empty database -> must emit CreateSequence
+        let mut target_conn = Connection::open_in_memory().unwrap();
+        let target_snapshot = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        let diff = compute_diff_snapshots(&shadow_snapshot, &target_snapshot, &temp_dir, &[]);
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::CreateSequence);
+        assert_eq!(diff.items[0].obj_name, "id_seq");
+
+        // 2. Apply to target
+        crate::engine::apply_diff(&target_conn, &diff, false, false, &temp_dir, None).unwrap();
+
+        // 3. Increment sequence on target database via nextval
+        let v1: i64 = target_conn
+            .query_row("SELECT nextval('id_seq');", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v1, 4);
+        let v2: i64 = target_conn
+            .query_row("SELECT nextval('id_seq');", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v2, 5);
+
+        // Target counter has advanced (nextval will now return 6; duckdb_sequences().sql has START 6)
+        // 4. Introspect target again and compute diff against project (which declared START 4)
+        let target_snapshot2 = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        let diff2 = compute_diff_snapshots(&shadow_snapshot, &target_snapshot2, &temp_dir, &[]);
+
+        // 5. Must NOT see any diff! Zero items!
+        assert!(
+            diff2.items.is_empty(),
+            "Expected 0 diff items when target sequence increments at runtime, but got: {:?}",
+            diff2.items.iter().map(|i| (&i.item_type, &i.obj_name, &i.sql)).collect::<Vec<_>>()
+        );
+
+        // 6. Applying empty diff must be safe and not alter sequence counter
+        crate::engine::apply_diff(&target_conn, &diff2, false, false, &temp_dir, None).unwrap();
+        let v3: i64 = target_conn
+            .query_row("SELECT nextval('id_seq');", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v3, 6, "Sequence counter should continue advancing uninterrupted");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sequence_modified_options_and_drop_ordering() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_seq_mod_drop_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("sequences")).unwrap();
+        std::fs::create_dir_all(temp_dir.join("tables")).unwrap();
+
+        std::fs::write(
+            temp_dir.join("sequences").join("order_seq.sql"),
+            "CREATE SEQUENCE IF NOT EXISTS order_seq INCREMENT BY 1 START 1;",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("sequences").join("standalone_seq.sql"),
+            "CREATE SEQUENCE IF NOT EXISTS standalone_seq INCREMENT BY 1 START 1;",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("tables").join("orders.sql"),
+            "CREATE TABLE orders (id BIGINT DEFAULT nextval('order_seq'), note VARCHAR);",
+        )
+        .unwrap();
+
+        let mut target_conn = Connection::open_in_memory().unwrap();
+        let (_shadow_conn, shadow_snap1) = CatalogSnapshot::from_project_dir(&temp_dir).unwrap();
+        let target_snap1 = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        let diff1 = compute_diff_snapshots(&shadow_snap1, &target_snap1, &temp_dir, &[]);
+        crate::engine::apply_diff(&target_conn, &diff1, false, false, &temp_dir, None).unwrap();
+
+        // Modify standalone_seq INCREMENT BY 1 -> INCREMENT BY 10
+        std::fs::write(
+            temp_dir.join("sequences").join("standalone_seq.sql"),
+            "CREATE SEQUENCE IF NOT EXISTS standalone_seq INCREMENT BY 10 START 1;",
+        )
+        .unwrap();
+        let (_shadow_conn2, shadow_snap2) = CatalogSnapshot::from_project_dir(&temp_dir).unwrap();
+        let target_snap2 = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        let diff2 = compute_diff_snapshots(&shadow_snap2, &target_snap2, &temp_dir, &[]);
+        assert_eq!(diff2.items.len(), 1);
+        assert_eq!(diff2.items[0].item_type, DiffItemType::CreateSequence);
+        assert!(
+            diff2.items[0].sql.contains("CREATE OR REPLACE SEQUENCE"),
+            "Modified sequence SQL must use CREATE OR REPLACE SEQUENCE, got: {}",
+            diff2.items[0].sql
+        );
+        crate::engine::apply_diff(&target_conn, &diff2, false, false, &temp_dir, None).unwrap();
+
+        // After applying modified sequence, re-diff should be empty
+        let target_snap3 = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        let diff3 = compute_diff_snapshots(&shadow_snap2, &target_snap3, &temp_dir, &[]);
+        assert!(diff3.items.is_empty());
+
+        // Now remove both table and order_seq from project -> DropTable must come before DropSequence
+        std::fs::remove_file(temp_dir.join("tables").join("orders.sql")).unwrap();
+        std::fs::remove_file(temp_dir.join("sequences").join("order_seq.sql")).unwrap();
+        std::fs::remove_file(temp_dir.join("sequences").join("standalone_seq.sql")).unwrap();
+        let (_shadow_conn4, shadow_snap4) = CatalogSnapshot::from_project_dir(&temp_dir).unwrap();
+        let diff4 = compute_diff_snapshots(&shadow_snap4, &target_snap3, &temp_dir, &[]);
+        let drop_table_pos = diff4
+            .items
+            .iter()
+            .position(|i| i.item_type == DiffItemType::DropTable)
+            .expect("Expected DropTable item");
+        let drop_seq_pos = diff4
+            .items
+            .iter()
+            .position(|i| i.item_type == DiffItemType::DropSequence)
+            .expect("Expected DropSequence item");
+        assert!(
+            drop_table_pos < drop_seq_pos,
+            "DropTable (idx {}) must precede DropSequence (idx {})",
+            drop_table_pos,
+            drop_seq_pos
+        );
+
+        // Apply with force_drop = true -> must succeed without dependency error
+        crate::engine::apply_diff(&target_conn, &diff4, true, false, &temp_dir, None).unwrap();
+        let target_snap5 = CatalogSnapshot::introspect(&mut target_conn, None).unwrap();
+        assert!(target_snap5.tables.is_empty());
+        assert!(target_snap5.sequences.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

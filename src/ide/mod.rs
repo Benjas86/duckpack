@@ -13,13 +13,13 @@ pub use editor::{
     calculate_status_height, get_clipboard_text, handle_sql_error_position, set_clipboard_text,
 };
 pub(crate) use explorer::{
-    ExplorerMode, NodeType, ProjectCategory, compute_ide_diff_for_catalog, db_icon,
+    ExplorerMode, NodeType, compute_ide_diff_for_catalog, db_icon,
     get_git_branch_and_status, rebuild_explorer_nodes, rebuild_project_nodes,
     render_explorer_node_line,
 };
 #[cfg(test)]
 pub(crate) use explorer::{
-    ExplorerNode, apply_ide_diff, column_data_type_style, compute_ide_diff, format_column_display,
+    ExplorerNode, ProjectCategory, apply_ide_diff, column_data_type_style, compute_ide_diff, format_column_display,
     generate_asset_boilerplate, get_asset_file_path,
 };
 pub(crate) use modals::{
@@ -28,7 +28,7 @@ pub(crate) use modals::{
     render_help_modal, render_schema_visualizer_modal,
 };
 #[cfg(test)]
-pub(crate) use modals::{AttachProvider, CloudProvider};
+pub(crate) use modals::{AttachProvider, CloudProvider, DuckLakeBackend};
 
 use anyhow::Result;
 use duckdb::Connection;
@@ -101,7 +101,7 @@ pub fn run_ide_loop(
     quack_disable_ssl: bool,
 ) -> Result<()> {
     let is_quack = db_path.starts_with("quack:");
-    let is_remote_db = is_quack || db_path.starts_with("md:") || db_path.starts_with("motherduck:");
+    let is_remote_db = is_quack || db_path.starts_with("md:") || db_path.starts_with("motherduck:") || db_path.starts_with("ducklake:");
 
     let local_duckdb_version: String = conn
         .query_row("SELECT version();", [], |r| r.get(0))
@@ -166,6 +166,7 @@ pub fn run_ide_loop(
     let (mut git_branch, mut git_status) = get_git_branch_and_status(project_dir);
     let mut expanded_project_groups: HashSet<String> = vec![
         "proj:schemas",
+        "proj:sequences",
         "proj:tables",
         "proj:views",
         "proj:macros",
@@ -1443,58 +1444,10 @@ pub fn run_ide_loop(
                                 || key.code == KeyCode::Char('n')
                             {
                                 if explorer_mode == ExplorerMode::Project {
-                                    new_asset_modal.reset();
-                                    if let Some(selected) = explorer_state.selected() {
-                                        if selected < explorer_items.len() {
-                                            match &explorer_items[selected].node_type {
-                                                NodeType::Group => {
-                                                    let name = &explorer_items[selected].name;
-                                                    if name.contains("tables") {
-                                                        new_asset_modal.category_index = 0;
-                                                    } else if name.contains("views") {
-                                                        new_asset_modal.category_index = 1;
-                                                    } else if name.contains("macros") {
-                                                        new_asset_modal.category_index = 2;
-                                                    } else if name.contains("triggers") {
-                                                        new_asset_modal.category_index = 3;
-                                                    } else if name.contains("schemas") {
-                                                        new_asset_modal.category_index = 4;
-                                                    } else if name.contains("queries") {
-                                                        new_asset_modal.category_index = 5;
-                                                    } else if name.contains("seeds") {
-                                                        new_asset_modal.category_index = 6;
-                                                    }
-                                                }
-                                                NodeType::ProjectFile { category, .. } => {
-                                                    match category {
-                                                        ProjectCategory::Table => {
-                                                            new_asset_modal.category_index = 0
-                                                        }
-                                                        ProjectCategory::View => {
-                                                            new_asset_modal.category_index = 1
-                                                        }
-                                                        ProjectCategory::Macro => {
-                                                            new_asset_modal.category_index = 2
-                                                        }
-                                                        ProjectCategory::Trigger => {
-                                                            new_asset_modal.category_index = 3
-                                                        }
-                                                        ProjectCategory::Schema => {
-                                                            new_asset_modal.category_index = 4
-                                                        }
-                                                        ProjectCategory::Query => {
-                                                            new_asset_modal.category_index = 5
-                                                        }
-                                                        ProjectCategory::Seed => {
-                                                            new_asset_modal.category_index = 6
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
+                                    let selected_node = explorer_state
+                                        .selected()
+                                        .and_then(|idx| explorer_items.get(idx));
+                                    new_asset_modal.open_for_node(selected_node);
                                 } else if let Some(selected) = explorer_state.selected() {
                                     if selected < explorer_items.len() {
                                         match &explorer_items[selected].node_type {
@@ -2451,6 +2404,11 @@ pub fn run_ide_loop(
                                         status_msg = "⚠️ Applied LOCALLY on DuckPack! Use '-- @remote' at top of query to apply to remote Quack.".to_string();
                                     } else {
                                         if is_catalog_mutation {
+                                            refresh_attached_catalog(
+                                                conn,
+                                                db_path,
+                                                quack_disable_ssl,
+                                            );
                                             trigger_explorer_refresh = true;
                                         }
                                         status_msg = format!(
@@ -2463,18 +2421,33 @@ pub fn run_ide_loop(
                                     let timestamp = chrono::Local::now()
                                         .format("%Y-%m-%d %H:%M:%S")
                                         .to_string();
+                                    let sanitized_query =
+                                        if crate::engine::should_redact_sql_history(
+                                            &query_to_execute,
+                                        ) {
+                                            crate::engine::redact_connection_credentials(
+                                                query_to_execute.trim(),
+                                            )
+                                        } else {
+                                            query_to_execute.trim().to_string()
+                                        };
                                     let history_entry = format!(
                                         "-- Executed at {} (Took {:.2?})\n{};\n\n",
-                                        timestamp,
-                                        elapsed,
-                                        query_to_execute.trim()
+                                        timestamp, elapsed, sanitized_query
                                     );
                                     use std::io::Write;
                                     if let Ok(mut f) = std::fs::OpenOptions::new()
                                         .create(true)
                                         .append(true)
-                                        .open(history_path)
+                                        .open(&history_path)
                                     {
+                                        #[cfg(unix)]
+                                        {
+                                            use std::os::unix::fs::PermissionsExt;
+                                            let _ = f.set_permissions(
+                                                std::fs::Permissions::from_mode(0o600),
+                                            );
+                                        }
                                         let _ = f.write_all(history_entry.as_bytes());
                                     }
                                 }
@@ -2592,18 +2565,33 @@ pub fn run_ide_loop(
                                                 let timestamp = chrono::Local::now()
                                                     .format("%Y-%m-%d %H:%M:%S")
                                                     .to_string();
+                                                let sanitized_query =
+                                                    if crate::engine::should_redact_sql_history(
+                                                        &query_to_execute,
+                                                    ) {
+                                                        crate::engine::redact_connection_credentials(
+                                                            query_to_execute.trim(),
+                                                        )
+                                                    } else {
+                                                        query_to_execute.trim().to_string()
+                                                    };
                                                 let history_entry = format!(
                                                     "-- Executed at {} (Took {:.2?})\n{};\n\n",
-                                                    timestamp,
-                                                    elapsed,
-                                                    query_to_execute.trim()
+                                                    timestamp, elapsed, sanitized_query
                                                 );
                                                 use std::io::Write;
                                                 if let Ok(mut f) = std::fs::OpenOptions::new()
                                                     .create(true)
                                                     .append(true)
-                                                    .open(history_path)
+                                                    .open(&history_path)
                                                 {
+                                                    #[cfg(unix)]
+                                                    {
+                                                        use std::os::unix::fs::PermissionsExt;
+                                                        let _ = f.set_permissions(
+                                                            std::fs::Permissions::from_mode(0o600),
+                                                        );
+                                                    }
                                                     let _ = f.write_all(history_entry.as_bytes());
                                                 }
                                             }
@@ -2734,22 +2722,7 @@ pub fn run_ide_loop(
                         NodeType::Group => {
                             if explorer_mode == ExplorerMode::Project {
                                 if item_name.ends_with(":empty") {
-                                    new_asset_modal.reset();
-                                    if item_name.contains("tables") {
-                                        new_asset_modal.category_index = 0;
-                                    } else if item_name.contains("views") {
-                                        new_asset_modal.category_index = 1;
-                                    } else if item_name.contains("macros") {
-                                        new_asset_modal.category_index = 2;
-                                    } else if item_name.contains("triggers") {
-                                        new_asset_modal.category_index = 3;
-                                    } else if item_name.contains("schemas") {
-                                        new_asset_modal.category_index = 4;
-                                    } else if item_name.contains("queries") {
-                                        new_asset_modal.category_index = 5;
-                                    } else if item_name.contains("seeds") {
-                                        new_asset_modal.category_index = 6;
-                                    }
+                                    new_asset_modal.open_for_group_name(&item_name);
                                 } else {
                                     if expanded_project_groups.contains(&item_name) {
                                         expanded_project_groups.remove(&item_name);
@@ -3639,14 +3612,18 @@ mod tests {
         assert_eq!(modal.category_label(), "Trigger");
 
         modal.category_index = 4;
+        assert_eq!(modal.current_category(), ProjectCategory::Sequence);
+        assert_eq!(modal.category_label(), "Sequence");
+
+        modal.category_index = 5;
         assert_eq!(modal.current_category(), ProjectCategory::Schema);
         assert_eq!(modal.category_label(), "Schema");
 
-        modal.category_index = 5;
+        modal.category_index = 6;
         assert_eq!(modal.current_category(), ProjectCategory::Query);
         assert_eq!(modal.category_label(), "Query");
 
-        modal.category_index = 6;
+        modal.category_index = 7;
         assert_eq!(modal.current_category(), ProjectCategory::Seed);
         assert_eq!(modal.category_label(), "Seed");
     }
@@ -3666,6 +3643,9 @@ mod tests {
         let trigger_sql = generate_asset_boilerplate(ProjectCategory::Trigger, "trg_audit");
         assert!(trigger_sql.contains("CREATE OR REPLACE TRIGGER trg_audit"));
         assert!(trigger_sql.contains("FOR EACH ROW"));
+
+        let seq_sql = generate_asset_boilerplate(ProjectCategory::Sequence, "order_seq");
+        assert!(seq_sql.contains("CREATE SEQUENCE IF NOT EXISTS order_seq"));
 
         let schema_sql = generate_asset_boilerplate(ProjectCategory::Schema, "analytics");
         assert!(schema_sql.contains("CREATE SCHEMA IF NOT EXISTS analytics"));
@@ -3699,6 +3679,10 @@ mod tests {
         assert_eq!(
             get_asset_file_path(&root, ProjectCategory::Trigger, "orders_audit"),
             root.join("triggers").join("orders_audit.sql")
+        );
+        assert_eq!(
+            get_asset_file_path(&root, ProjectCategory::Sequence, "orders_seq"),
+            root.join("sequences").join("orders_seq.sql")
         );
         assert_eq!(
             get_asset_file_path(&root, ProjectCategory::Query, "analysis"),
@@ -4068,6 +4052,59 @@ mod tests {
         assert_eq!(modal.port, "1433");
         assert_eq!(modal.username, "sa");
 
+        modal.set_provider(7);
+        assert_eq!(modal.provider(), AttachProvider::DuckLake);
+        assert_eq!(modal.ducklake_backend, DuckLakeBackend::Quack);
+        assert_eq!(modal.host, "localhost");
+        assert_eq!(modal.port, "9494");
+        assert_eq!(modal.data_path, "s3://ducklake/data/");
+        assert_eq!(modal.alias, "my_lakehouse");
+        assert!(modal.disable_ssl);
+        assert_eq!(modal.field_count(), 11);
+
+        // Test DuckLake with Quack metadata catalog (default)
+        let (quack_dl_target, quack_alias) = modal.build_connection_target().unwrap();
+        assert_eq!(quack_alias, "my_lakehouse");
+        assert_eq!(quack_dl_target, "ducklake:quack:localhost:9494");
+
+        // Switch to PostgreSQL metadata catalog
+        modal.set_ducklake_backend(DuckLakeBackend::PostgreSQL);
+        assert_eq!(modal.port, "5432");
+        assert_eq!(modal.username, "lakehouse");
+        assert_eq!(modal.database, "ducklake");
+        assert_eq!(modal.field_count(), 12);
+
+        modal.password = "lakepass".to_string();
+        let (dl_target, dl_alias) = modal.build_connection_target().unwrap();
+        assert_eq!(dl_alias, "my_lakehouse");
+        assert_eq!(
+            dl_target,
+            "ducklake:postgres:host=localhost port=5432 dbname=ducklake user=lakehouse password=lakepass"
+        );
+
+        // Switch to LocalFile backend
+        modal.set_ducklake_backend(DuckLakeBackend::LocalFile);
+        assert_eq!(modal.path, "metadata.ducklake");
+        assert_eq!(modal.field_count(), 8);
+        let (file_dl_target, _) = modal.build_connection_target().unwrap();
+        assert_eq!(file_dl_target, "ducklake:metadata.ducklake");
+
+        // Switch to SQLite backend
+        modal.set_ducklake_backend(DuckLakeBackend::SQLite);
+        assert_eq!(modal.path, "metadata.db");
+        assert_eq!(modal.field_count(), 8);
+        let (sqlite_dl_target, _) = modal.build_connection_target().unwrap();
+        assert_eq!(sqlite_dl_target, "ducklake:sqlite:metadata.db");
+
+        // Test cycling via toggle_active on field 1
+        modal.active_field = 1;
+        modal.toggle_active();
+        assert_eq!(modal.ducklake_backend, DuckLakeBackend::Quack);
+        assert_eq!(modal.field_count(), 11);
+
+        modal.reset();
+        modal.set_provider(6);
+
         // Test MSSQL Connection String building
         modal.database = "mydb".to_string();
         modal.alias = "mssql_db".to_string();
@@ -4083,6 +4120,23 @@ mod tests {
         modal.disable_ssl = true;
         let (conn_str_no_ssl, _) = modal.build_connection_target().unwrap();
         assert!(conn_str_no_ssl.contains("Encrypt=no"));
+
+        // Test MSSQL with Windows Authentication / Trusted Connection
+        modal.trusted_connection = true;
+        let (trusted_conn, _) = modal.build_connection_target().unwrap();
+        assert!(trusted_conn.contains("Trusted_Connection=yes"));
+        assert!(!trusted_conn.contains("User Id="));
+        assert!(!trusted_conn.contains("Password="));
+
+        // Test toggling Windows Auth via Space
+        modal.active_field = 8;
+        modal.toggle_active(); // toggles off
+        assert!(!modal.trusted_connection);
+        assert_eq!(modal.username, "sa");
+
+        modal.toggle_active(); // toggles back on
+        assert!(modal.trusted_connection);
+        assert_eq!(modal.username, "");
 
         // Test Postgres URI building
         modal.reset();
@@ -4143,11 +4197,28 @@ mod tests {
         modal.handle_backspace();
         assert_eq!(modal.host, "10.");
 
-        // Test Navigation
-        modal.active_field = 1;
-        modal.nav_right();
+        // Test Navigation & Text Cursor Editing
+        modal.active_field = 1; // Host field ("10.")
+        assert_eq!(modal.cursor_pos, 3);
+        let conn = Connection::open_in_memory().unwrap();
+        // Left arrow moves cursor left
+        modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(modal.cursor_pos, 2);
+        // Insert character '9' at cursor (between '0' and '.') -> "109."
+        modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('9'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(modal.host, "109.");
+        assert_eq!(modal.cursor_pos, 3);
+
+        // Tab and BackTab field navigation
+        modal.next_field();
         assert_eq!(modal.active_field, 2); // To Port
-        modal.nav_left();
+        modal.prev_field();
         assert_eq!(modal.active_field, 1); // Back to Host
         modal.nav_down();
         assert_eq!(modal.active_field, 3); // Down to Database Name
@@ -4336,6 +4407,7 @@ mod tests {
         assert!(!tab.is_dirty);
         assert!(tab.active_file.is_none());
 
+        assert_eq!(db_icon("ducklake"), "🌊");
         assert_eq!(db_icon("sqlite"), "🗃️");
         assert_eq!(db_icon("postgres"), "🔌");
         assert_eq!(db_icon("postgresql"), "🔌");
@@ -4582,5 +4654,297 @@ mod tests {
                 assert_eq!(rect.height, 9);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_render_text_with_cursor_and_helpers() {
+        use crate::ide::modals::{
+            delete_char_at_cursor, delete_char_before_cursor, insert_char_at_cursor,
+            render_text_with_cursor,
+        };
+
+        let mut s = "hello".to_string();
+        let mut cur = 2; // between 'e' and 'l'
+        insert_char_at_cursor(&mut s, &mut cur, 'X');
+        assert_eq!(s, "heXllo");
+        assert_eq!(cur, 3);
+
+        delete_char_before_cursor(&mut s, &mut cur);
+        assert_eq!(s, "hello");
+        assert_eq!(cur, 2);
+
+        delete_char_at_cursor(&mut s, cur);
+        assert_eq!(s, "helo"); // deleted first 'l'
+        assert_eq!(cur, 2);
+
+        // Rendering tests
+        let line_end = render_text_with_cursor("abc", 3, true, false);
+        assert_eq!(line_end.spans.len(), 2);
+        assert_eq!(line_end.spans[0].content, "abc");
+        assert_eq!(line_end.spans[1].content, "█");
+
+        let line_mid = render_text_with_cursor("abc", 1, true, false);
+        assert_eq!(line_mid.spans.len(), 3);
+        assert_eq!(line_mid.spans[0].content, "a");
+        assert_eq!(line_mid.spans[1].content, "b"); // cursor under 'b'
+        assert_eq!(line_mid.spans[2].content, "c");
+
+        let line_masked = render_text_with_cursor("secret", 6, true, true);
+        assert_eq!(line_masked.spans[0].content, "******");
+        assert_eq!(line_masked.spans[1].content, "█");
+
+        let line_inactive = render_text_with_cursor("text", 2, false, false);
+        assert_eq!(line_inactive.spans.len(), 1);
+        assert_eq!(line_inactive.spans[0].content, "text");
+    }
+
+    #[test]
+    fn test_all_modals_cursor_navigation_and_editing() {
+        let conn = Connection::open_in_memory().unwrap();
+        let pdir = std::path::Path::new(".");
+
+        // 1. NewAssetModalState
+        let mut asset_modal = NewAssetModalState::new();
+        asset_modal.category_index = 0; // SQL Table
+        asset_modal.active_field = 1; // Name field
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('u'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('s'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.name, "usr");
+        assert_eq!(asset_modal.cursor_pos, 3);
+
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.cursor_pos, 2);
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('e'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.name, "user");
+        assert_eq!(asset_modal.cursor_pos, 3);
+
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Home, crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.cursor_pos, 0);
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Delete, crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.name, "ser");
+        assert_eq!(asset_modal.cursor_pos, 0);
+
+        asset_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::End, crossterm::event::KeyModifiers::NONE),
+            pdir,
+        );
+        assert_eq!(asset_modal.cursor_pos, 3);
+
+        // 2. AddBucketModalState
+        let mut bucket_modal = AddBucketModalState::new();
+        let mut exp_groups = HashSet::new();
+        bucket_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('a'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+            &mut exp_groups,
+        );
+        bucket_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('c'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+            &mut exp_groups,
+        );
+        bucket_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            pdir,
+            &mut exp_groups,
+        );
+        bucket_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::NONE),
+            pdir,
+            &mut exp_groups,
+        );
+        assert_eq!(bucket_modal.uri, "abc");
+
+        // 3. SecretModalState
+        let mut sec_modal = SecretModalState::new();
+        sec_modal.name.clear();
+        sec_modal.sync_cursor_to_end();
+        sec_modal.active_field = 1; // Secret Name
+        sec_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('m'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+            pdir,
+        );
+        sec_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('y'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+            pdir,
+        );
+        assert_eq!(sec_modal.name, "my");
+        sec_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            &conn,
+            pdir,
+        );
+        assert_eq!(sec_modal.cursor_pos, 1);
+        sec_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('_'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+            pdir,
+        );
+        assert_eq!(sec_modal.name, "m_y");
+
+        // 4. AttachModalState
+        let mut attach_modal = AttachModalState::new();
+        attach_modal.set_provider(7); // DuckLake
+        assert_eq!(attach_modal.provider(), AttachProvider::DuckLake);
+        assert_eq!(attach_modal.ducklake_backend, DuckLakeBackend::Quack);
+
+        // Backend switching on field 1
+        attach_modal.active_field = 1;
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Right, crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(attach_modal.ducklake_backend, DuckLakeBackend::PostgreSQL);
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(attach_modal.ducklake_backend, DuckLakeBackend::Quack);
+
+        // DATA_PATH text editing on Quack DuckLake (field 6)
+        attach_modal.active_field = 6;
+        attach_modal.data_path.clear();
+        attach_modal.sync_cursor_to_end();
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('s'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('3'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(attach_modal.data_path, "s3");
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Home, crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(attach_modal.cursor_pos, 0);
+        attach_modal.handle_key(
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('/'), crossterm::event::KeyModifiers::NONE),
+            &conn,
+        );
+        assert_eq!(attach_modal.data_path, "/s3");
+    }
+
+    #[test]
+    fn test_ducklake_modal_render_height_and_2d_nav() {
+        let backend = ratatui::backend::TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut modal = AttachModalState::new();
+        modal.is_open = true;
+        modal.set_provider(7); // DuckLake Quack
+
+        terminal
+            .draw(|f| {
+                modal.render(f);
+            })
+            .unwrap();
+
+        // 2D navigation Quack:
+        // 0 (Provider) down -> 2 (Host)
+        modal.active_field = 0;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 2);
+
+        // 1 (Backend) down -> 3 (Port)
+        modal.active_field = 1;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 3);
+
+        // 2 (Host) down -> 4 (Password)
+        modal.active_field = 2;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 4);
+
+        // 3 (Port) down -> 5 (Alias)
+        modal.active_field = 3;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 5);
+
+        // 4 or 5 down -> 6 (DATA_PATH)
+        modal.active_field = 4;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 6);
+
+        // 6 down -> 7 (Read-Only)
+        modal.active_field = 6;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 7);
+
+        // 7 right -> 8 (Disable SSL)
+        modal.nav_right();
+        assert_eq!(modal.active_field, 8);
+        assert!(modal.disable_ssl);
+        modal.toggle_active();
+        assert!(!modal.disable_ssl);
+        modal.toggle_active();
+        assert!(modal.disable_ssl);
+
+        // 7 down -> 9 (Submit)
+        modal.active_field = 7;
+        modal.nav_down();
+        assert_eq!(modal.active_field, 9);
+    }
+
+    #[test]
+    fn test_new_asset_modal_open_for_group_and_node_categories() {
+        let mut modal = NewAssetModalState::new();
+        let cases = [
+            ("group:tables", 0, ProjectCategory::Table, "Table"),
+            ("group:views", 1, ProjectCategory::View, "View"),
+            ("group:macros", 2, ProjectCategory::Macro, "Macro"),
+            ("group:triggers", 3, ProjectCategory::Trigger, "Trigger"),
+            ("group:sequences", 4, ProjectCategory::Sequence, "Sequence"),
+            ("group:schemas:empty", 5, ProjectCategory::Schema, "Schema"),
+            ("group:queries:empty", 6, ProjectCategory::Query, "Query"),
+            ("group:seeds:empty", 7, ProjectCategory::Seed, "Seed"),
+        ];
+
+        for (group_name, expected_idx, expected_cat, expected_label) in cases {
+            modal.open_for_group_name(group_name);
+            assert!(modal.is_open);
+            assert_eq!(modal.category_index, expected_idx, "Failed for group {}", group_name);
+            assert_eq!(modal.current_category(), expected_cat);
+            assert_eq!(modal.category_label(), expected_label);
+
+            let file_node = ExplorerNode {
+                name: "test.sql".to_string(),
+                display: "test.sql".to_string(),
+                level: 1,
+                is_expandable: false,
+                is_expanded: false,
+                node_type: NodeType::ProjectFile {
+                    path: PathBuf::from("test.sql"),
+                    category: expected_cat,
+                },
+            };
+            modal.open_for_node(Some(&file_node));
+            assert_eq!(modal.category_index, expected_idx);
+            assert_eq!(modal.current_category(), expected_cat);
+        }
     }
 }

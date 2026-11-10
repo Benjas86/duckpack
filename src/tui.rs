@@ -42,6 +42,7 @@ pub fn diff_item_compact_badge(item_type: &DiffItemType) -> (&'static str, Style
     match item_type {
         DiffItemType::CreateTable
         | DiffItemType::CreateSchema
+        | DiffItemType::CreateSequence
         | DiffItemType::CreateView
         | DiffItemType::CreateMacro
         | DiffItemType::CreateTrigger => ("[+]", Style::default().fg(Color::Green)),
@@ -55,6 +56,7 @@ pub fn diff_item_compact_badge(item_type: &DiffItemType) -> (&'static str, Style
         ),
         DiffItemType::DropTable
         | DiffItemType::DropSchema
+        | DiffItemType::DropSequence
         | DiffItemType::DropView
         | DiffItemType::DropMacro
         | DiffItemType::DropColumn
@@ -167,22 +169,24 @@ pub(crate) fn get_side_by_side_diff(
 /// `CREATE` statements execute first, followed by `ALTER`, and finally `DROP` statements.
 pub(crate) fn sort_diff_items(items: &mut Vec<DiffItem>) {
     items.sort_by_key(|item| match item.item_type {
-        DiffItemType::CreateSchema
-        | DiffItemType::CreateTable
+        DiffItemType::CreateSchema => 0,
+        DiffItemType::CreateSequence => 1,
+        DiffItemType::CreateTable
         | DiffItemType::CreateView
         | DiffItemType::CreateMacro
-        | DiffItemType::CreateTrigger => 1,
+        | DiffItemType::CreateTrigger => 2,
         DiffItemType::AlterTable
         | DiffItemType::RenameTable
         | DiffItemType::RenameColumn
-        | DiffItemType::AddConstraint => 2,
-        DiffItemType::DropSchema
-        | DiffItemType::DropTable
+        | DiffItemType::AddConstraint => 3,
+        DiffItemType::DropTrigger
         | DiffItemType::DropView
+        | DiffItemType::DropTable
         | DiffItemType::DropMacro
         | DiffItemType::DropColumn
-        | DiffItemType::DropTrigger
-        | DiffItemType::RecreateTable => 3,
+        | DiffItemType::DropSequence
+        | DiffItemType::DropSchema
+        | DiffItemType::RecreateTable => 4,
     });
 }
 
@@ -716,6 +720,16 @@ pub fn draw_and_handle_events(
                             DiffItemType::DropMacro => {
                                 if force_drop {
                                     ("[DROP MACRO] ", Style::default().fg(Color::Red))
+                                } else {
+                                    ("[IGNORED DROP] ", Style::default().fg(Color::DarkGray))
+                                }
+                            }
+                            DiffItemType::CreateSequence => {
+                                ("[SEQUENCE] ", Style::default().fg(Color::LightGreen))
+                            }
+                            DiffItemType::DropSequence => {
+                                if force_drop {
+                                    ("[DROP SEQ] ", Style::default().fg(Color::Red))
                                 } else {
                                     ("[IGNORED DROP] ", Style::default().fg(Color::DarkGray))
                                 }

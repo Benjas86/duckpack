@@ -268,6 +268,14 @@ pub fn get_duckdb_version_info(conn: &Connection) -> (String, Option<String>) {
 /// (e.g. ~/.duckdb/extensions/v2.0.0 vs dev commit hashes) and automatically installing
 /// from the official release CDN repository if DuckDB's internal autoload returns HTTP 404.
 pub fn ensure_extension_loaded(conn: &Connection, ext_name: &str) -> Result<()> {
+    let res = ensure_extension_loaded_inner(conn, ext_name);
+    if res.is_ok() && ext_name.eq_ignore_ascii_case("mssql") {
+        let _ = conn.execute("SET mssql_exec_invalidate_cache = true;", []);
+    }
+    res
+}
+
+fn ensure_extension_loaded_inner(conn: &Connection, ext_name: &str) -> Result<()> {
     // 1. Try standard LOAD <ext>;
     if conn.execute_batch(&format!("LOAD {};", ext_name)).is_ok() {
         return Ok(());
@@ -461,6 +469,50 @@ pub fn load_quack_extension(conn: &Connection) -> Result<()> {
     ensure_extension_loaded(conn, "quack")
 }
 
+/// Redacts sensitive credentials (`Password=...`, `Pwd=...`, `password=...`, `SECRET '...'`,
+/// `TOKEN '...'`, and `scheme://user:password@host`) from connection strings, SQL statements, or error messages.
+pub fn redact_connection_credentials(input: &str) -> String {
+    static ADO_PASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static LIBPQ_PASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static URI_PASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SQL_SECRET_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+    let ado_re = ADO_PASS_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(password|pwd)\s*=\s*(\{[^}]*\}|[^;'\s)]+)").unwrap()
+    });
+    let libpq_re = LIBPQ_PASS_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(password)\s*=\s*('(?:\\'|[^'])*'|[^\s';)]+)").unwrap()
+    });
+    let uri_re = URI_PASS_RE
+        .get_or_init(|| regex::Regex::new(r"([a-zA-Z0-9+.-]+://[^:/@\s]+):([^@\s]+)@").unwrap());
+    let sql_sec_re = SQL_SECRET_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b(SECRET|TOKEN|motherduck_token)\s*(=|\s+)\s*'([^']|'')*'",
+        )
+        .unwrap()
+    });
+
+    let s = ado_re.replace_all(input, "$1=***");
+    let s = libpq_re.replace_all(&s, "$1=***");
+    let s = uri_re.replace_all(&s, "$1:***@");
+    sql_sec_re.replace_all(&s, "$1$2'***'").into_owned()
+}
+
+/// Returns `true` if a SQL statement contains secret definitions or inline credentials
+/// that should be redacted before writing to `.history.sql`.
+pub fn should_redact_sql_history(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    lower.contains("create secret")
+        || lower.contains("create persistent secret")
+        || lower.contains("create or replace secret")
+        || lower.contains("create or replace persistent secret")
+        || lower.contains("motherduck_token")
+        || lower.contains("password=")
+        || lower.contains("pwd=")
+        || lower.contains("secret '")
+        || lower.contains("token '")
+}
+
 /// Connects to the target DuckDB database (local, motherduck remote, or quack remote).
 pub fn connect_target_db(
     db: &str,
@@ -517,6 +569,89 @@ pub fn connect_target_db(
         // while local temporary tables and session tables created in main/memory resolve seamlessly.
         let _ = conn.execute("SET search_path = 'target_db.main,main';", []);
         Ok(conn)
+    } else if db.starts_with("mssql:") {
+        let conn = open_duckdb_connection()
+            .with_context(|| "Failed to open in-memory DB for MSSQL ATTACH")?;
+        ensure_extension_loaded(&conn, "mssql")
+            .with_context(|| "Failed to install/load mssql extension")?;
+        let conn_str = db.strip_prefix("mssql:").unwrap_or(db);
+        let mut final_conn_str = conn_str.to_string();
+        if cfg!(target_os = "windows")
+            && !final_conn_str.to_lowercase().contains("trusted_connection=")
+            && !final_conn_str.to_lowercase().contains("integrated security=")
+            && !final_conn_str.to_lowercase().contains("authenticator=")
+            && !final_conn_str.to_lowercase().contains("user id=")
+            && !final_conn_str.to_lowercase().contains("uid=")
+        {
+            final_conn_str.push_str(";Trusted_Connection=yes");
+        }
+        let safe_conn_str = final_conn_str.replace('\'', "''");
+        let attach_res = conn.execute(
+            &format!("ATTACH '{}' AS target_db (TYPE MSSQL);", safe_conn_str),
+            [],
+        );
+        if let Err(e) = attach_res {
+            return Err(anyhow::anyhow!(
+                "Failed to attach MSSQL database '{}': {}",
+                redact_connection_credentials(db),
+                redact_connection_credentials(&e.to_string())
+            ));
+        }
+        if conn.execute("CONNECT target_db;", []).is_err() {
+            let _ = conn.execute("USE target_db;", []);
+        }
+        Ok(conn)
+    } else if db.starts_with("ducklake:") {
+        let conn = open_duckdb_connection()
+            .with_context(|| "Failed to open in-memory DB for DuckLake ATTACH")?;
+        let (target_path, options) = if let Some(idx) = db.find(" (") {
+            let (target, opts) = db.split_at(idx);
+            (target.trim(), opts.trim())
+        } else {
+            (db.trim(), "")
+        };
+        let resolved_token = resolve_quack_token(quack_token, None);
+        prepare_ducklake_connection(
+            &conn,
+            target_path,
+            options,
+            resolved_token.as_deref(),
+            None,
+        )?;
+        let safe_target = target_path.replace('\'', "''");
+        let mut opts_str = options.to_string();
+        if safe_target.contains("quack:") {
+            let quack_dsn = safe_target
+                .strip_prefix("ducklake:")
+                .unwrap_or(&safe_target);
+            if should_disable_quack_ssl(quack_dsn, quack_disable_ssl)
+                && !opts_str.to_lowercase().contains("metadata_parameters")
+            {
+                if opts_str.is_empty() {
+                    opts_str = "(METADATA_PARAMETERS MAP {'DISABLE_SSL': true})".to_string();
+                } else if opts_str.ends_with(')') {
+                    opts_str.pop();
+                    opts_str.push_str(", METADATA_PARAMETERS MAP {'DISABLE_SSL': true})");
+                }
+            }
+        }
+        let attach_sql = if opts_str.is_empty() {
+            format!("ATTACH '{}' AS target_db;", safe_target)
+        } else {
+            format!("ATTACH '{}' AS target_db {};", safe_target, opts_str)
+        };
+        let attach_res = conn.execute(&attach_sql, []);
+        if let Err(e) = attach_res {
+            return Err(anyhow::anyhow!(
+                "Failed to attach DuckLake lakehouse '{}': {}",
+                redact_connection_credentials(db),
+                redact_connection_credentials(&e.to_string())
+            ));
+        }
+        if conn.execute("CONNECT target_db;", []).is_err() {
+            let _ = conn.execute("USE target_db;", []);
+        }
+        Ok(conn)
     } else if is_remote(db) {
         let conn = open_duckdb_connection()
             .with_context(|| "Failed to open in-memory DB for remote ATTACH")?;
@@ -525,8 +660,8 @@ pub fn connect_target_db(
         if let Err(e) = attach_res {
             return Err(anyhow::anyhow!(
                 "Failed to attach remote database '{}': {}",
-                db,
-                e
+                redact_connection_credentials(db),
+                redact_connection_credentials(&e.to_string())
             ));
         }
         if conn.execute("CONNECT target_db;", []).is_err() {
@@ -818,14 +953,17 @@ pub fn apply_diff_with_executor(
             Ok(())
         };
 
+        let ignore_rules = load_ignore_rules(project_dir);
+
         let pre_deploy_dir = project_dir.join("scripts").join("pre-deploy");
         if pre_deploy_dir.exists() {
-            execute_directory_custom(&pre_deploy_dir, &mut execute_sql)?;
+            execute_directory_filtered(&pre_deploy_dir, project_dir, &ignore_rules, &mut execute_sql)?;
         }
 
         let mut views_to_apply = Vec::new();
         let mut triggers_to_apply = Vec::new();
         let mut drops_to_apply = Vec::new();
+        let mut drop_sequences = Vec::new();
         let mut drop_schemas = Vec::new();
 
         // 1. Create schemas first
@@ -840,6 +978,20 @@ pub fn apply_diff_with_executor(
         }
         if !schemas_to_apply.is_empty() {
             execute_sqls_with_retry_custom(schemas_to_apply, &mut execute_sql)?;
+        }
+
+        // 2. Create sequences before tables/macros
+        let mut sequences_to_apply = Vec::new();
+        for item in &diff.items {
+            if !item.selected || item.ignored {
+                continue;
+            }
+            if item.item_type == diff::DiffItemType::CreateSequence {
+                sequences_to_apply.push(item.sql.clone());
+            }
+        }
+        if !sequences_to_apply.is_empty() {
+            execute_sqls_with_retry_custom(sequences_to_apply, &mut execute_sql)?;
         }
 
         let mut structure_to_apply = Vec::new();
@@ -870,6 +1022,11 @@ pub fn apply_diff_with_executor(
                         drops_to_apply.push(item.sql.clone());
                     }
                 }
+                diff::DiffItemType::DropSequence => {
+                    if force_drop {
+                        drop_sequences.push(item.sql.clone());
+                    }
+                }
                 diff::DiffItemType::DropSchema => {
                     if force_drop {
                         drop_schemas.push(item.sql.clone());
@@ -881,7 +1038,7 @@ pub fn apply_diff_with_executor(
                 diff::DiffItemType::CreateTrigger => {
                     triggers_to_apply.push(item.sql.clone());
                 }
-                diff::DiffItemType::CreateSchema => {} // handled above
+                diff::DiffItemType::CreateSchema | diff::DiffItemType::CreateSequence => {} // handled above
             }
         }
 
@@ -899,9 +1056,12 @@ pub fn apply_diff_with_executor(
             execute_sqls_with_retry_custom(triggers_to_apply, &mut execute_sql)?;
         }
 
-        // 5. Drops
+        // 5. Drops (tables/columns/views/macros/triggers first, then sequences, then schemas)
         for drop_sql in drops_to_apply {
             let _ = execute_sql(&drop_sql); // Ignore errors if already dropped by cascade
+        }
+        for drop_sql in drop_sequences {
+            let _ = execute_sql(&drop_sql);
         }
         for drop_sql in drop_schemas {
             let _ = execute_sql(&drop_sql);
@@ -909,7 +1069,7 @@ pub fn apply_diff_with_executor(
 
         let post_deploy_dir = project_dir.join("scripts").join("post-deploy");
         if post_deploy_dir.exists() {
-            execute_directory_custom(&post_deploy_dir, &mut execute_sql)?;
+            execute_directory_filtered(&post_deploy_dir, project_dir, &ignore_rules, &mut execute_sql)?;
         }
 
         Ok(())
@@ -946,28 +1106,539 @@ pub struct ResolvedTargetConfig {
     pub insecure: Option<bool>,
 }
 
-fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
-    let mut cfg = ResolvedTargetConfig::default();
-
-    if let Some(db_val) = tbl
-        .get("db")
-        .or_else(|| tbl.get("default_db"))
-        .and_then(|v| v.as_str())
-    {
-        cfg.db = Some(db_val.to_string());
-    } else if let Some(host_val) = tbl.get("host").and_then(|v| v.as_str()) {
-        let clean_host = host_val
-            .strip_prefix("quack://")
-            .or_else(|| host_val.strip_prefix("quack:"))
-            .unwrap_or(host_val);
-        if let Some(port_val) = tbl.get("port").and_then(|v| v.as_integer()) {
-            cfg.db = Some(format!("quack:{}:{}", clean_host, port_val));
+/// Formats a normalized `quack:<host>:<port>` connection endpoint.
+pub fn format_quack_endpoint(host_raw: &str, port_raw: &str) -> String {
+    let trimmed = host_raw.trim();
+    let stripped = trimmed
+        .strip_prefix("quack://")
+        .or_else(|| trimmed.strip_prefix("quack:"))
+        .unwrap_or(trimmed);
+    let endpoint = if stripped.contains(':') {
+        stripped.to_string()
+    } else {
+        let port = if port_raw.trim().is_empty() {
+            "9494"
         } else {
-            cfg.db = Some(format!("quack:{}", clean_host));
+            port_raw.trim()
+        };
+        format!("{}:{}", stripped, port)
+    };
+    format!("quack:{}", endpoint)
+}
+
+fn escape_ado_value(val: &str) -> String {
+    let trimmed = val.trim();
+    if trimmed.contains(';') || trimmed.contains('{') || trimmed.contains('}') {
+        format!("{{{}}}", trimmed.replace('}', "}}"))
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn escape_libpq_value(val: &str) -> String {
+    let trimmed = val.trim();
+    if trimmed.chars().any(|c| c.is_whitespace()) || trimmed.contains('\'') || trimmed.contains('\\') {
+        format!("'{}'", trimmed.replace('\\', "\\\\").replace('\'', "\\'"))
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Formats an MSSQL ADO.NET connection string (without the `mssql:` prefix) from individual fields.
+#[allow(clippy::too_many_arguments)]
+pub fn format_mssql_connection_string(
+    host_raw: &str,
+    port_raw: &str,
+    database: &str,
+    username: &str,
+    password: &str,
+    trusted_connection: bool,
+    insecure: bool,
+    disable_ssl: bool,
+) -> String {
+    let host_trimmed = host_raw.trim();
+    let mut conn_str = if host_trimmed.contains('=') {
+        host_trimmed.to_string()
+    } else {
+        let port = if port_raw.trim().is_empty() {
+            "1433"
+        } else {
+            port_raw.trim()
+        };
+        format!("Server={},{}", escape_ado_value(host_trimmed), port)
+    };
+    if !database.trim().is_empty() && !conn_str.to_lowercase().contains("database=") {
+        conn_str.push_str(&format!(";Database={}", escape_ado_value(database)));
+    }
+    let use_trusted = trusted_connection
+        || (cfg!(target_os = "windows")
+            && username.trim().is_empty()
+            && password.trim().is_empty());
+
+    if use_trusted {
+        let lower = conn_str.to_lowercase();
+        if !lower.contains("trusted_connection=")
+            && !lower.contains("integrated security=")
+            && !lower.contains("authenticator=")
+        {
+            conn_str.push_str(";Trusted_Connection=yes");
+        }
+    } else {
+        let lower = conn_str.to_lowercase();
+        if !username.trim().is_empty()
+            && !lower.contains("user id=")
+            && !lower.contains("uid=")
+        {
+            conn_str.push_str(&format!(";User Id={}", escape_ado_value(username)));
+        }
+        if !password.trim().is_empty()
+            && !lower.contains("password=")
+            && !lower.contains("pwd=")
+        {
+            conn_str.push_str(&format!(";Password={}", escape_ado_value(password)));
+        }
+    }
+    if (insecure || conn_str.contains("localhost") || conn_str.contains("127.0.0.1"))
+        && !conn_str.to_lowercase().contains("trustservercertificate=")
+    {
+        conn_str.push_str(";TrustServerCertificate=yes");
+    }
+    if disable_ssl && !conn_str.to_lowercase().contains("encrypt=") {
+        conn_str.push_str(";Encrypt=no");
+    }
+    conn_str
+}
+
+/// Formats a normalized `ducklake:<catalog_dsn>` target string for the selected metadata backend.
+pub fn format_ducklake_target(
+    backend: &str,
+    host: &str,
+    port: &str,
+    database: &str,
+    username: &str,
+    password: &str,
+    path: &str,
+) -> std::result::Result<String, String> {
+    let cat = match backend.to_ascii_lowercase().as_str() {
+        "quack" => {
+            if host.trim().is_empty() {
+                return Err("Catalog host cannot be empty for DuckLake Quack backend.".to_string());
+            }
+            format_quack_endpoint(host, port)
+        }
+        "postgres" | "postgresql" => {
+            if host.trim().is_empty() {
+                return Err(
+                    "Catalog host cannot be empty for DuckLake PostgreSQL backend.".to_string(),
+                );
+            }
+            let host_raw = host.trim();
+            if host_raw.starts_with("postgres:") || host_raw.starts_with("postgresql:") {
+                host_raw.to_string()
+            } else {
+                let p = if port.trim().is_empty() {
+                    "5432"
+                } else {
+                    port.trim()
+                };
+                let db = if database.trim().is_empty() {
+                    "ducklake".to_string()
+                } else {
+                    escape_libpq_value(database)
+                };
+                let mut s = format!(
+                    "postgres:host={} port={} dbname={}",
+                    escape_libpq_value(host_raw),
+                    p,
+                    db
+                );
+                if !username.trim().is_empty() {
+                    s.push_str(&format!(" user={}", escape_libpq_value(username)));
+                }
+                if !password.trim().is_empty() {
+                    s.push_str(&format!(" password={}", escape_libpq_value(password)));
+                }
+                s
+            }
+        }
+        "file" | "duckdb" | "local" => {
+            if path.trim().is_empty() {
+                return Err(
+                    "Metadata file path cannot be empty for DuckLake Local File backend."
+                        .to_string(),
+                );
+            }
+            path.trim().to_string()
+        }
+        "sqlite" => {
+            if path.trim().is_empty() {
+                return Err(
+                    "SQLite metadata database path cannot be empty for DuckLake SQLite backend."
+                        .to_string(),
+                );
+            }
+            let p = path.trim();
+            if p.starts_with("sqlite:") {
+                p.to_string()
+            } else {
+                format!("sqlite:{}", p)
+            }
+        }
+        other => other.to_string(),
+    };
+
+    if cat.starts_with("ducklake:") {
+        Ok(cat)
+    } else {
+        Ok(format!("ducklake:{}", cat))
+    }
+}
+
+/// Builds the inner `TYPE S3, KEY_ID ..., SECRET ..., REGION ..., ENDPOINT ..., URL_STYLE 'path', USE_SSL ...`
+/// body for `CREATE SECRET (...)` in DuckDB.
+pub fn build_s3_secret_body(
+    key_id: &str,
+    secret_key: &str,
+    region: &str,
+    endpoint: &str,
+    use_ssl_default: bool,
+) -> String {
+    let safe_key = key_id.trim().replace('\'', "''");
+    let safe_secret = secret_key.trim().replace('\'', "''");
+    let safe_region = region.trim().replace('\'', "''");
+    let safe_endpoint = endpoint.trim().replace('\'', "''");
+
+    let mut clauses = vec!["TYPE S3".to_string()];
+    if !safe_key.is_empty() {
+        clauses.push(format!("KEY_ID '{}'", safe_key));
+    }
+    if !safe_secret.is_empty() {
+        clauses.push(format!("SECRET '{}'", safe_secret));
+    }
+    if !safe_region.is_empty() {
+        clauses.push(format!("REGION '{}'", safe_region));
+    }
+    let mut use_ssl = use_ssl_default;
+    if !safe_endpoint.is_empty() {
+        let clean_ep = safe_endpoint
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/');
+        clauses.push(format!("ENDPOINT '{}'", clean_ep));
+        clauses.push("URL_STYLE 'path'".to_string());
+        if safe_endpoint.starts_with("http://")
+            || clean_ep.starts_with("localhost")
+            || clean_ep.starts_with("127.0.0.1")
+        {
+            use_ssl = false;
+        }
+    }
+    clauses.push(format!("USE_SSL {}", use_ssl));
+    clauses.join(", ")
+}
+
+/// Checks if an S3 secret is already registered in `conn`; if not, inspects process env vars and `.env`
+/// in `project_dir` (defaulting to current working directory) for `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+/// `AWS_REGION`, and `AWS_ENDPOINT` and auto-registers a session S3 secret.
+pub fn ensure_s3_secret_from_env(conn: &Connection, project_dir: Option<&Path>) {
+    let existing_s3_secrets: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_secrets() WHERE lower(type) = 's3'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if existing_s3_secrets > 0 {
+        return;
+    }
+
+    let dir = project_dir.unwrap_or_else(|| Path::new("."));
+    let env_path = dir.join(".env");
+    let mut file_vars = std::collections::HashMap::new();
+    if env_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&env_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    file_vars.insert(
+                        k.trim().to_string(),
+                        v.trim().trim_matches('"').trim_matches('\'').to_string(),
+                    );
+                }
+            }
         }
     }
 
-    if let Some(val) = tbl.get("database").or_else(|| tbl.get("catalog")) {
+    let get_var = |key: &str| -> String {
+        std::env::var(key)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| file_vars.get(key).cloned().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_default()
+    };
+
+    let key_id = get_var("AWS_ACCESS_KEY_ID");
+    let secret_key = get_var("AWS_SECRET_ACCESS_KEY");
+    let mut region = get_var("AWS_REGION");
+    if region.is_empty() {
+        region = get_var("AWS_DEFAULT_REGION");
+    }
+    let endpoint = get_var("AWS_ENDPOINT");
+
+    if key_id.is_empty() && secret_key.is_empty() && endpoint.is_empty() {
+        return;
+    }
+    if region.is_empty() {
+        region = "us-east-1".to_string();
+    }
+
+    let secret_body = build_s3_secret_body(&key_id, &secret_key, &region, &endpoint, true);
+    let sql = format!("CREATE OR REPLACE SECRET s3_env_auto ({});", secret_body);
+    let _ = conn.execute(&sql, []);
+}
+
+/// Installs and loads the required DuckLake extensions (`ducklake`, plus `postgres`/`sqlite`/`quack`
+/// and `httpfs` when S3/HTTP storage paths are used) and binds Quack / S3 secrets on `conn`.
+pub fn prepare_ducklake_connection(
+    conn: &Connection,
+    target_dsn: &str,
+    data_path_or_opts: &str,
+    quack_token: Option<&str>,
+    project_dir: Option<&Path>,
+) -> Result<()> {
+    ensure_extension_loaded(conn, "ducklake")
+        .with_context(|| "Failed to install/load ducklake extension")?;
+    if target_dsn.contains("postgres") {
+        ensure_extension_loaded(conn, "postgres")
+            .with_context(|| "Failed to install/load postgres extension for DuckLake catalog")?;
+    }
+    if target_dsn.contains("sqlite") {
+        ensure_extension_loaded(conn, "sqlite")
+            .with_context(|| "Failed to install/load sqlite extension for DuckLake catalog")?;
+    }
+    if target_dsn.contains("quack") {
+        load_quack_extension(conn)
+            .with_context(|| "Failed to install/load quack extension for DuckLake catalog")?;
+        if let Some(token) = quack_token.filter(|t| !t.trim().is_empty()) {
+            let safe_token = token.trim().replace('\'', "''");
+            let _ = conn.execute(
+                &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
+                [],
+            );
+        }
+    }
+    if target_dsn.contains("s3://")
+        || target_dsn.contains("http://")
+        || target_dsn.contains("https://")
+        || data_path_or_opts.contains("s3://")
+        || data_path_or_opts.contains("http://")
+        || data_path_or_opts.contains("https://")
+    {
+        ensure_extension_loaded(conn, "httpfs")
+            .with_context(|| "Failed to install/load httpfs extension for DuckLake storage")?;
+        ensure_s3_secret_from_env(conn, project_dir);
+    }
+    Ok(())
+}
+
+fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
+    let mut cfg = ResolvedTargetConfig::default();
+
+    let provider = tbl
+        .get("provider")
+        .or_else(|| tbl.get("type"))
+        .and_then(|v| v.as_str());
+
+    if let Some(prov) = provider {
+        if prov.eq_ignore_ascii_case("mssql") {
+            let server = tbl
+                .get("server")
+                .or_else(|| tbl.get("host"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("localhost");
+            let port = tbl
+                .get("port")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(1433)
+                .to_string();
+            let db_name = tbl
+                .get("database")
+                .or_else(|| tbl.get("db"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let is_trusted = tbl
+                .get("trusted_connection")
+                .or_else(|| tbl.get("windows_auth"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(cfg!(target_os = "windows"));
+            let user = tbl
+                .get("username")
+                .or_else(|| tbl.get("user"))
+                .or_else(|| tbl.get("user_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let pass = tbl.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            let insecure = tbl
+                .get("insecure")
+                .or_else(|| tbl.get("trust_server_certificate"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let disable_ssl = tbl
+                .get("disable_ssl")
+                .or_else(|| tbl.get("no_encrypt"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let conn_str = format_mssql_connection_string(
+                server,
+                &port,
+                db_name,
+                user,
+                pass,
+                is_trusted,
+                insecure,
+                disable_ssl,
+            );
+            cfg.db = Some(format!("mssql:{}", conn_str));
+        } else if prov.eq_ignore_ascii_case("ducklake") {
+            let backend = tbl
+                .get("backend")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_ascii_lowercase());
+            let catalog_explicit = tbl.get("catalog").and_then(|v| v.as_str());
+            let data_path = tbl
+                .get("data_path")
+                .or_else(|| tbl.get("storage"))
+                .or_else(|| tbl.get("path"))
+                .and_then(|v| v.as_str());
+
+            let mut catalog_target = if let Some(cat) = catalog_explicit {
+                if cat.starts_with("ducklake:") {
+                    cat.to_string()
+                } else {
+                    format!("ducklake:{}", cat)
+                }
+            } else if backend.as_deref() == Some("quack") {
+                let server = tbl
+                    .get("server")
+                    .or_else(|| tbl.get("host"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("localhost");
+                let port = tbl
+                    .get("port")
+                    .and_then(|v| v.as_integer())
+                    .unwrap_or(9494)
+                    .to_string();
+                format_ducklake_target("quack", server, &port, "", "", "", "")
+                    .unwrap_or_else(|_| "ducklake:quack:localhost:9494".to_string())
+            } else if backend.as_deref() == Some("sqlite") {
+                let file_path = tbl
+                    .get("database")
+                    .or_else(|| tbl.get("file"))
+                    .or_else(|| tbl.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("metadata.db");
+                format_ducklake_target("sqlite", "", "", "", "", "", file_path)
+                    .unwrap_or_else(|_| "ducklake:sqlite:metadata.db".to_string())
+            } else if backend.as_deref() == Some("file") || backend.as_deref() == Some("duckdb") {
+                let file_path = tbl
+                    .get("database")
+                    .or_else(|| tbl.get("file"))
+                    .or_else(|| tbl.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("metadata.ducklake");
+                format_ducklake_target("file", "", "", "", "", "", file_path)
+                    .unwrap_or_else(|_| "ducklake:metadata.ducklake".to_string())
+            } else if let Some(server) = tbl
+                .get("server")
+                .or_else(|| tbl.get("host"))
+                .and_then(|v| v.as_str())
+            {
+                let is_quack = server.starts_with("quack:")
+                    || server.starts_with("quack://")
+                    || tbl.get("port").and_then(|v| v.as_integer()) == Some(9494);
+                if is_quack {
+                    let port = tbl
+                        .get("port")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(9494)
+                        .to_string();
+                    format_ducklake_target("quack", server, &port, "", "", "", "")
+                        .unwrap_or_else(|_| "ducklake:quack:localhost:9494".to_string())
+                } else {
+                    let port = tbl
+                        .get("port")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(5432)
+                        .to_string();
+                    let dbname = tbl
+                        .get("dbname")
+                        .or_else(|| tbl.get("database"))
+                        .or_else(|| tbl.get("db"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ducklake");
+                    let u = tbl
+                        .get("username")
+                        .or_else(|| tbl.get("user"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let p = tbl.get("password").and_then(|v| v.as_str()).unwrap_or("");
+                    format_ducklake_target("postgres", server, &port, dbname, u, p, "")
+                        .unwrap_or_else(|_| "ducklake:postgres:host=localhost port=5432 dbname=ducklake".to_string())
+                }
+            } else if let Some(db_val) = tbl
+                .get("database")
+                .or_else(|| tbl.get("db"))
+                .and_then(|v| v.as_str())
+            {
+                format!("ducklake:{}", db_val.trim_start_matches("ducklake:"))
+            } else {
+                "ducklake:ducklake".to_string()
+            };
+
+            if let Some(dp) = data_path {
+                catalog_target.push_str(&format!(" (DATA_PATH '{}')", dp));
+            }
+            cfg.db = Some(catalog_target);
+        }
+    }
+
+    if cfg.db.is_none() {
+        if let Some(db_val) = tbl
+            .get("db")
+            .or_else(|| tbl.get("default_db"))
+            .and_then(|v| v.as_str())
+        {
+            cfg.db = Some(db_val.to_string());
+        } else if let Some(host_val) = tbl.get("host").and_then(|v| v.as_str()) {
+            let clean_host = host_val
+                .strip_prefix("quack://")
+                .or_else(|| host_val.strip_prefix("quack:"))
+                .unwrap_or(host_val);
+            if let Some(port_val) = tbl.get("port").and_then(|v| v.as_integer()) {
+                cfg.db = Some(format!("quack:{}:{}", clean_host, port_val));
+            } else {
+                cfg.db = Some(format!("quack:{}", clean_host));
+            }
+        }
+    }
+
+    let is_provider_with_dsn_database = provider
+        .map(|p| p.eq_ignore_ascii_case("ducklake") || p.eq_ignore_ascii_case("mssql"))
+        .unwrap_or(false);
+
+    let catalog_val = if is_provider_with_dsn_database {
+        tbl.get("catalogs")
+    } else {
+        tbl.get("catalogs")
+            .or_else(|| tbl.get("database"))
+            .or_else(|| tbl.get("catalog"))
+    };
+
+    if let Some(val) = catalog_val {
         if let Some(s) = val.as_str() {
             cfg.catalogs = vec![s.to_string()];
         } else if let Some(arr) = val.as_array() {
@@ -1375,6 +2046,8 @@ impl TargetResolver {
 pub fn init_project(project_dir: &Path) -> Result<()> {
     let dirs = [
         "schemas",
+        "types",
+        "sequences",
         "tables",
         "views",
         "macros",
@@ -1434,6 +2107,8 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
 ## Project Structure
 
 - `schemas/`: Contains `CREATE SCHEMA` statements. Schemas deleted from this folder will be dropped **CASCADE** on the target DB!
+- `types/`: Contains `CREATE TYPE` statements (enums, custom data types).
+- `sequences/`: Contains `CREATE SEQUENCE` statements (compiled before tables to support `DEFAULT nextval('...')`).
 - `tables/`: Contains `CREATE TABLE` statements (one per file). Subdirectories supported for nested schemas.
 - `views/`: Contains `CREATE VIEW` statements (engine auto-forces `OR REPLACE`).
 - `macros/`: Contains `CREATE MACRO` statements.
@@ -1443,7 +2118,7 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
 - `scripts/`: Contains `pre-deploy` and `post-deploy` scripts.
 - `duckpack.toml`: Project configuration and targets.
 - `.env`: Environment variables for template interpolation. Write `${VAR_NAME}` in your SQL, and the engine will dynamically replace it!
-- `.duckpackignore`: Specifies tables or views to ignore during diffing (wildcards supported).
+- `.duckpackignore`: Specifies tables, views, sequences, triggers, or file paths from any directory (including `scripts/pre-deploy` and `scripts/post-deploy`) to ignore during compilation and deployment (wildcards supported).
 "#;
         fs::write(&readme_path, readme_content).with_context(|| "Failed to write README.md")?;
         println!("Created documentation file: {}", readme_path.display());
@@ -1464,11 +2139,15 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
 
     let ignore_path = project_dir.join(".duckpackignore");
     if !ignore_path.exists() {
-        let ignore_content = r#"# Specify tables, views, or triggers to ignore during diffing (wildcards supported).
-# Example:
+        let ignore_content = r#"# Specify tables, views, sequences, triggers, or file paths from any directory to ignore.
+# Wildcards (* and ?) and relative directory paths are supported.
+# Examples:
 # temp_*
 # *_backup
 # scratch_*
+# scripts/pre-deploy/01_one_time_seed.sql
+# scripts/post-deploy/*
+# archive/
 "#;
         fs::write(&ignore_path, ignore_content)
             .with_context(|| "Failed to write .duckpackignore")?;
@@ -1486,13 +2165,14 @@ Welcome to your declarative DuckDB project! This directory contains the desired 
     Ok(())
 }
 
-/// Compiles all declarative SQL directories (`schemas`, `macros`, `tables`, `views`, `triggers`)
-/// against any `DbExecutor` in dependency-safe topological order with retry.
+/// Compiles all declarative SQL directories (`schemas`, `types`, `sequences`, `macros`, `tables`, `views`, `triggers`)
+/// against any `DbExecutor` in dependency-safe topological order with retry, filtering out files matched by `.duckpackignore`.
 pub fn compile_project_declarations(exec: &mut dyn DbExecutor, project_dir: &Path) -> Result<()> {
-    for dir_name in ["schemas", "macros", "tables", "views", "triggers"] {
+    let ignore_rules = load_ignore_rules(project_dir);
+    for dir_name in ["schemas", "types", "sequences", "macros", "tables", "views", "triggers"] {
         let dir = project_dir.join(dir_name);
         if dir.exists() {
-            execute_directory_custom(&dir, |sql| exec.execute_batch(sql))?;
+            execute_directory_filtered(&dir, project_dir, &ignore_rules, |sql| exec.execute_batch(sql))?;
         }
     }
     Ok(())
@@ -1511,8 +2191,17 @@ pub fn build_shadow_db(project_dir: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn collect_sql_files_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+/// Recursively collects `.sql` files, filtering out any files or subdirectories matched by `ignore_rules`.
+pub fn collect_sql_files_filtered(
+    dir: &Path,
+    project_dir: &Path,
+    ignore_rules: &[String],
+    out: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
     if !dir.exists() {
+        return Ok(());
+    }
+    if is_file_ignored(dir, project_dir, ignore_rules) {
         return Ok(());
     }
     let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
@@ -1520,22 +2209,51 @@ fn collect_sql_files_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) ->
     for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            collect_sql_files_recursive(&path, out)?;
+            if !is_file_ignored(&path, project_dir, ignore_rules) {
+                collect_sql_files_filtered(&path, project_dir, ignore_rules, out)?;
+            }
         } else if path.is_file() && path.extension().unwrap_or_default() == "sql" {
-            out.push(path);
+            if !is_file_ignored(&path, project_dir, ignore_rules) {
+                out.push(path);
+            }
         }
     }
     Ok(())
 }
 
+/// Helper to collect all SQL files in `dir` respecting project `.duckpackignore`.
+pub fn collect_sql_files_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    let project_dir = discover_project_dir(dir);
+    let ignore_rules = load_ignore_rules(&project_dir);
+    collect_sql_files_filtered(dir, &project_dir, &ignore_rules, out)
+}
+
 /// A helper utility to iterate over a directory of `.sql` files and execute them using a custom executor function.
+/// Respects ignore rules from `.duckpackignore`, `.duckdbignore`, or `.duckignore`.
 /// Recursively scans subdirectories to support nested schemas and modular structures.
 pub fn execute_directory_custom<F>(dir: &Path, exec_fn: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<()>,
 {
+    let project_dir = discover_project_dir(dir);
+    let ignore_rules = load_ignore_rules(&project_dir);
+    execute_directory_filtered(dir, &project_dir, &ignore_rules, exec_fn)
+}
+
+/// A helper utility to iterate over a directory of `.sql` files and execute them using a custom executor function,
+/// filtering out any files or subdirectories matched by `ignore_rules`.
+/// Recursively scans subdirectories to support nested schemas and modular structures.
+pub fn execute_directory_filtered<F>(
+    dir: &Path,
+    project_dir: &Path,
+    ignore_rules: &[String],
+    exec_fn: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
     let mut files = Vec::new();
-    collect_sql_files_recursive(dir, &mut files)?;
+    collect_sql_files_filtered(dir, project_dir, ignore_rules, &mut files)?;
     let mut pending_sqls = Vec::new();
     for path in files {
         pending_sqls.push(diff::read_sql_with_env(&path)?);
@@ -1622,8 +2340,180 @@ pub fn load_ignore_rules(project_dir: &Path) -> Vec<String> {
     rules
 }
 
+/// Matches a string against a simple glob pattern where `*` matches 0 or more characters
+/// and `?` matches any single character.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern == text || pattern == "*" {
+        return true;
+    }
+    let mut regex_str = String::with_capacity(pattern.len() * 2 + 2);
+    regex_str.push('^');
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                }
+                regex_str.push_str(".*");
+            }
+            '?' => regex_str.push('.'),
+            '.' | '(' | ')' | '+' | '|' | '^' | '$' | '@' | '%' | '{' | '}' | '[' | ']' | '\\' => {
+                regex_str.push('\\');
+                regex_str.push(c);
+            }
+            other => regex_str.push(other),
+        }
+    }
+    regex_str.push('$');
+    regex::Regex::new(&regex_str)
+        .map(|re| re.is_match(text))
+        .unwrap_or(false)
+}
+
+/// Checks whether a file or directory path matches any ignore rule from `.duckpackignore`
+/// (or `.duckdbignore` / `.duckignore`). Supports relative paths from any directory (e.g. `scripts/pre-deploy/seed.sql`),
+/// path suffixes (`pre-deploy/seed.sql`), filenames (`seed.sql`), file stems (`seed`),
+/// directory paths (with trailing slash `scripts/pre-deploy/`), and wildcards (`*`, `?`).
+pub fn is_file_ignored(file_path: &Path, project_dir: &Path, rules: &[String]) -> bool {
+    if rules.is_empty() {
+        return false;
+    }
+
+    let norm_path_str = file_path.to_string_lossy().replace('\\', "/");
+    let norm_proj_str = project_dir.to_string_lossy().replace('\\', "/");
+
+    // Compute relative path string
+    let rel_str = if norm_path_str.starts_with(&norm_proj_str) {
+        let stripped = &norm_path_str[norm_proj_str.len()..];
+        stripped.trim_start_matches('/').to_string()
+    } else {
+        match file_path.strip_prefix(project_dir) {
+            Ok(p) => p.to_string_lossy().replace('\\', "/"),
+            Err(_) => norm_path_str.clone(),
+        }
+    };
+
+    let file_name = file_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let file_stem = file_path
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    for raw_rule in rules {
+        let pattern = raw_rule.trim();
+        if pattern.is_empty() || pattern.starts_with('#') {
+            continue;
+        }
+        let pattern = pattern.replace('\\', "/");
+        let pattern = pattern.strip_prefix("./").unwrap_or(&pattern);
+        let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+
+        if pattern.is_empty() {
+            continue;
+        }
+
+        // 1. Directory pattern (ending in /)
+        if pattern.ends_with('/') {
+            let dir_prefix = pattern.trim_end_matches('/');
+            if rel_str == dir_prefix
+                || rel_str.starts_with(pattern)
+                || rel_str.starts_with(&format!("{}/", dir_prefix))
+                || rel_str.ends_with(&format!("/{}", dir_prefix))
+                || rel_str.contains(&format!("/{}/", dir_prefix))
+            {
+                return true;
+            }
+        }
+
+        // 2. Pattern containing / (path-specific)
+        if pattern.contains('/') {
+            if rel_str == pattern {
+                return true;
+            }
+            if glob_match(pattern, &rel_str) {
+                return true;
+            }
+            // Suffix match (e.g. pattern "pre-deploy/01.sql" matching "scripts/pre-deploy/01.sql")
+            if rel_str.ends_with(&format!("/{}", pattern)) {
+                return true;
+            }
+            // Suffix glob match (e.g. pattern "pre-deploy/*" matching "scripts/pre-deploy/01.sql")
+            if glob_match(&format!("*/{}", pattern), &rel_str) {
+                return true;
+            }
+        } else {
+            // 3. Pattern without / (matches filename, file stem, or direct glob)
+            if file_name == pattern || file_stem == pattern {
+                return true;
+            }
+            if glob_match(pattern, &file_name) {
+                return true;
+            }
+            if glob_match(pattern, &file_stem) {
+                return true;
+            }
+            if glob_match(pattern, &rel_str) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Checks whether a database catalog object (table, view, macro, sequence, trigger)
+/// matches any ignore pattern from `.duckpackignore`. Supports direct names, unqualified names,
+/// wildcards (`*`, `?`), and path-like rules (e.g. `tables/users.sql` or `sequences/my_seq.sql`).
+pub fn is_object_ignored(obj_name: &str, rules: &[String]) -> bool {
+    if rules.is_empty() {
+        return false;
+    }
+    let unqual_name = obj_name.split('.').last().unwrap_or(obj_name);
+
+    for raw_rule in rules {
+        let pattern = raw_rule.trim();
+        if pattern.is_empty() || pattern.starts_with('#') {
+            continue;
+        }
+        let pattern = pattern.replace('\\', "/");
+        let pattern = pattern.strip_prefix("./").unwrap_or(&pattern);
+        let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+
+        if pattern.is_empty() {
+            continue;
+        }
+
+        // Direct match or glob on full qualified name or unqualified name
+        if obj_name == pattern || unqual_name == pattern {
+            return true;
+        }
+        if glob_match(pattern, obj_name) || glob_match(pattern, unqual_name) {
+            return true;
+        }
+
+        // If pattern contains a path separator (e.g. "tables/users.sql", "tables/users")
+        if pattern.contains('/') {
+            let p = Path::new(pattern);
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                if !stem.is_empty()
+                    && (stem == obj_name
+                        || stem == unqual_name
+                        || glob_match(stem, obj_name)
+                        || glob_match(stem, unqual_name))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Auto-discovers the active DuckPack project directory.
-/// If `start` contains `duckpack.toml`, `queries/`, `tables/`, or `schemas/`, it is returned.
+/// If `start` contains `duckpack.toml`, `queries/`, `tables/`, `schemas/`, or `sequences/`, it is returned.
 /// Otherwise, checks candidate subdirectories (e.g. `duckpack/`, `duckdb_project/`, `demo_project/`),
 /// and then checks parent directories.
 pub fn discover_project_dir(start: &Path) -> PathBuf {
@@ -1685,6 +2575,7 @@ fn is_project_root(path: &Path) -> bool {
         || path.join("queries").is_dir()
         || path.join("tables").is_dir()
         || path.join("schemas").is_dir()
+        || path.join("sequences").is_dir()
 }
 
 #[cfg(test)]
@@ -1854,6 +2745,120 @@ token_env = "PROD_TOKEN"
         assert_eq!(prod_cfg.catalogs, vec!["prod_cat".to_string()]);
         assert_eq!(prod_cfg.insecure, Some(false));
         assert_eq!(prod_cfg.token_env.as_deref(), Some("PROD_TOKEN"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_target_config_mssql_windows_auth() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "duckpack_mssql_cfg_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let toml_content = r#"
+[target]
+provider = "mssql"
+server = "sqlserver.corp.local"
+database = "FinanceDB"
+trusted_connection = true
+
+[env.sql_auth]
+provider = "mssql"
+server = "sqlserver.corp.local"
+database = "FinanceDB"
+trusted_connection = false
+username = "finance_app"
+password = "AppPassword123"
+"#;
+        std::fs::write(temp_dir.join("duckpack.toml"), toml_content).unwrap();
+
+        let cfg = resolve_target_config(&temp_dir, None);
+        assert!(cfg.db.is_some());
+        let db_str = cfg.db.unwrap();
+        assert!(db_str.starts_with("mssql:Server=sqlserver.corp.local,1433"));
+        assert!(db_str.contains(";Database=FinanceDB"));
+        assert!(db_str.contains(";Trusted_Connection=yes"));
+        assert!(!db_str.contains("User Id="));
+        assert!(!db_str.contains("Password="));
+
+        let sql_cfg = resolve_target_config(&temp_dir, Some("sql_auth"));
+        assert!(sql_cfg.db.is_some());
+        let sql_db = sql_cfg.db.unwrap();
+        assert!(sql_db.starts_with("mssql:Server=sqlserver.corp.local,1433"));
+        assert!(sql_db.contains(";Database=FinanceDB"));
+        assert!(!sql_db.contains("Trusted_Connection=yes"));
+        assert!(sql_db.contains(";User Id=finance_app"));
+        assert!(sql_db.contains(";Password=AppPassword123"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_target_config_ducklake() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "duckpack_ducklake_cfg_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let toml_content = r#"
+[target]
+provider = "ducklake"
+server = "postgres.lake.local"
+port = 5432
+database = "lake_metadata"
+username = "lake_user"
+password = "LakePassword"
+data_path = "s3://my-lake-bucket/data/"
+
+[env.local_lake]
+provider = "ducklake"
+catalog = "metadata.ducklake"
+data_path = "./parquet_data/"
+
+[env.quack_lake]
+provider = "ducklake"
+backend = "quack"
+server = "quack.lake.local"
+port = 9494
+data_path = "s3://quack-lake/data/"
+
+[env.sqlite_lake]
+provider = "ducklake"
+backend = "sqlite"
+database = "custom_meta.db"
+data_path = "/lake/data/"
+"#;
+        std::fs::write(temp_dir.join("duckpack.toml"), toml_content).unwrap();
+
+        let cfg = resolve_target_config(&temp_dir, None);
+        assert!(cfg.db.is_some());
+        let db_str = cfg.db.unwrap();
+        assert!(db_str.starts_with("ducklake:postgres:host=postgres.lake.local port=5432 dbname=lake_metadata"));
+        assert!(db_str.contains("user=lake_user"));
+        assert!(db_str.contains("password=LakePassword"));
+        assert!(db_str.contains("(DATA_PATH 's3://my-lake-bucket/data/')"));
+
+        let local_cfg = resolve_target_config(&temp_dir, Some("local_lake"));
+        assert!(local_cfg.db.is_some());
+        let local_db = local_cfg.db.unwrap();
+        assert_eq!(local_db, "ducklake:metadata.ducklake (DATA_PATH './parquet_data/')");
+
+        let quack_cfg = resolve_target_config(&temp_dir, Some("quack_lake"));
+        assert!(quack_cfg.db.is_some());
+        let quack_db = quack_cfg.db.unwrap();
+        assert_eq!(quack_db, "ducklake:quack:quack.lake.local:9494 (DATA_PATH 's3://quack-lake/data/')");
+
+        let sqlite_cfg = resolve_target_config(&temp_dir, Some("sqlite_lake"));
+        assert!(sqlite_cfg.db.is_some());
+        let sqlite_db = sqlite_cfg.db.unwrap();
+        assert_eq!(sqlite_db, "ducklake:sqlite:custom_meta.db (DATA_PATH '/lake/data/')");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -2035,6 +3040,159 @@ token_env = "TEST_RESOLVER_PROD_TOKEN"
     }
 
     #[test]
+    fn test_glob_match() {
+        assert!(glob_match("temp_*", "temp_users"));
+        assert!(!glob_match("temp_*", "users_temp"));
+        assert!(glob_match("*_backup", "users_backup"));
+        assert!(glob_match("scripts/pre-deploy/*", "scripts/pre-deploy/01_once.sql"));
+        assert!(!glob_match("scripts/pre-deploy/*", "scripts/post-deploy/01_once.sql"));
+        assert!(glob_match("01_once.sql", "01_once.sql"));
+        assert!(!glob_match("01_once.sql", "02_once.sql"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*.sql", "test.sql"));
+        assert!(!glob_match("*.sql", "test.csv"));
+    }
+
+    #[test]
+    fn test_is_file_ignored_various_patterns() {
+        let temp_dir = std::path::PathBuf::from("/mock/project");
+
+        // 1. Direct filename
+        let rules = vec!["01_seed_once.sql".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/pre-deploy/01_seed_once.sql"), &temp_dir, &rules));
+        assert!(is_file_ignored(&temp_dir.join("scripts/post-deploy/01_seed_once.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("scripts/pre-deploy/02_normal.sql"), &temp_dir, &rules));
+
+        // 2. Relative path from project root
+        let rules = vec!["scripts/pre-deploy/01_seed_once.sql".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/pre-deploy/01_seed_once.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("scripts/post-deploy/01_seed_once.sql"), &temp_dir, &rules));
+
+        // 3. Subpath / suffix match
+        let rules = vec!["pre-deploy/01_seed_once.sql".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/pre-deploy/01_seed_once.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("scripts/post-deploy/01_seed_once.sql"), &temp_dir, &rules));
+
+        // 4. Directory pattern with trailing slash
+        let rules = vec!["scripts/post-deploy/".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/post-deploy/01_cleanup.sql"), &temp_dir, &rules));
+        assert!(is_file_ignored(&temp_dir.join("scripts/post-deploy/nested/deep.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("scripts/pre-deploy/01_seed.sql"), &temp_dir, &rules));
+
+        // 5. Wildcard path patterns
+        let rules = vec!["scripts/pre-deploy/*".to_string(), "tables/staging_*".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/pre-deploy/any.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("scripts/post-deploy/any.sql"), &temp_dir, &rules));
+        assert!(is_file_ignored(&temp_dir.join("tables/staging_users.sql"), &temp_dir, &rules));
+        assert!(!is_file_ignored(&temp_dir.join("tables/users.sql"), &temp_dir, &rules));
+
+        // 6. Leading slash and ./ stripping
+        let rules = vec!["/scripts/pre-deploy/run.sql".to_string(), "./tables/old.sql".to_string()];
+        assert!(is_file_ignored(&temp_dir.join("scripts/pre-deploy/run.sql"), &temp_dir, &rules));
+        assert!(is_file_ignored(&temp_dir.join("tables/old.sql"), &temp_dir, &rules));
+    }
+
+    #[test]
+    fn test_is_object_ignored() {
+        let rules = vec![
+            "temp_*".to_string(),
+            "*_backup".to_string(),
+            "tables/legacy.sql".to_string(),
+            "core.secret_table".to_string(),
+            "sequences/custom_seq.sql".to_string(),
+        ];
+
+        // Wildcard prefix / suffix
+        assert!(is_object_ignored("temp_users", &rules));
+        assert!(is_object_ignored("orders_backup", &rules));
+        assert!(!is_object_ignored("normal_users", &rules));
+
+        // File-path rule matching object stem
+        assert!(is_object_ignored("legacy", &rules));
+        assert!(is_object_ignored("custom_seq", &rules));
+
+        // Qualified and unqualified matching
+        assert!(is_object_ignored("core.secret_table", &rules));
+        let rules_unqual = vec!["secret_table".to_string()];
+        assert!(is_object_ignored("secret_table", &rules_unqual));
+        assert!(is_object_ignored("core.secret_table", &rules_unqual));
+    }
+
+    #[test]
+    fn test_pre_and_post_deploy_ignore_execution() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_deploy_ignore_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pre_dir = temp_dir.join("scripts").join("pre-deploy");
+        let post_dir = temp_dir.join("scripts").join("post-deploy");
+        std::fs::create_dir_all(&pre_dir).unwrap();
+        std::fs::create_dir_all(&post_dir).unwrap();
+
+        // Pre-deploy scripts: one to run once then ignore, one always active
+        std::fs::write(
+            pre_dir.join("01_seed_once.sql"),
+            "CREATE TABLE should_not_exist (id INT);",
+        )
+        .unwrap();
+        std::fs::write(
+            pre_dir.join("02_always_active.sql"),
+            "CREATE TABLE active_pre (id INT);",
+        )
+        .unwrap();
+
+        // Post-deploy scripts
+        std::fs::write(
+            post_dir.join("99_post_ignored.sql"),
+            "CREATE TABLE post_should_not_exist (id INT);",
+        )
+        .unwrap();
+        std::fs::write(
+            post_dir.join("99_post_active.sql"),
+            "CREATE TABLE active_post (id INT);",
+        )
+        .unwrap();
+
+        // .duckpackignore ignores the one-time script and the post-deploy script
+        let ignore_content = "scripts/pre-deploy/01_seed_once.sql\n99_post_ignored.sql\n";
+        std::fs::write(temp_dir.join(".duckpackignore"), ignore_content).unwrap();
+
+        let mut target_conn = Connection::open_in_memory().unwrap();
+        let diff = crate::diff::DiffResult { items: Vec::new() };
+
+        // Apply diff with executor
+        let res = apply_diff_with_executor(
+            &mut target_conn,
+            &diff,
+            false,
+            false,
+            &temp_dir,
+            None,
+        );
+        assert!(res.is_ok());
+
+        // Verify ignored scripts were NOT executed
+        let pre_ignored_exists = target_conn
+            .execute_batch("SELECT * FROM should_not_exist")
+            .is_ok();
+        assert!(!pre_ignored_exists, "01_seed_once.sql was supposed to be ignored!");
+
+        let post_ignored_exists = target_conn
+            .execute_batch("SELECT * FROM post_should_not_exist")
+            .is_ok();
+        assert!(!post_ignored_exists, "99_post_ignored.sql was supposed to be ignored!");
+
+        // Verify active scripts WERE executed
+        assert!(target_conn.execute_batch("SELECT * FROM active_pre").is_ok());
+        assert!(target_conn.execute_batch("SELECT * FROM active_post").is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn test_save_cloud_secret_to_env() {
         let temp_dir = std::env::temp_dir().join(format!(
             "dp_env_sec_{}",
@@ -2136,5 +3294,125 @@ token_env = "TEST_RESOLVER_PROD_TOKEN"
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_ducklake_and_mssql_catalogs_not_polluted_by_dsn_database() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_dl_cat_clean_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let toml_content = r#"
+[env.dl_file]
+provider = "ducklake"
+backend = "file"
+database = "my_meta.ducklake"
+data_path = "./lake_data/"
+
+[env.dl_pg]
+provider = "ducklake"
+host = "localhost"
+database = "lake_metadata"
+catalogs = ["custom_cat"]
+
+[env.mssql_srv]
+provider = "mssql"
+host = "localhost"
+database = "FinanceDB"
+"#;
+        std::fs::write(temp_dir.join("duckpack.toml"), toml_content).unwrap();
+
+        let dl_file_cfg = resolve_target_config(&temp_dir, Some("dl_file"));
+        assert_eq!(
+            dl_file_cfg.db.as_deref(),
+            Some("ducklake:my_meta.ducklake (DATA_PATH './lake_data/')")
+        );
+        assert!(
+            dl_file_cfg.catalogs.is_empty(),
+            "DuckLake file database key must not pollute cfg.catalogs, got: {:?}",
+            dl_file_cfg.catalogs
+        );
+
+        let dl_pg_cfg = resolve_target_config(&temp_dir, Some("dl_pg"));
+        assert_eq!(dl_pg_cfg.catalogs, vec!["custom_cat".to_string()]);
+
+        let mssql_cfg = resolve_target_config(&temp_dir, Some("mssql_srv"));
+        assert!(
+            mssql_cfg.catalogs.is_empty(),
+            "MSSQL database key must not pollute cfg.catalogs, got: {:?}",
+            mssql_cfg.catalogs
+        );
+
+        let body = build_s3_secret_body(
+            "minioadmin",
+            "miniosecret",
+            "us-east-1",
+            "http://localhost:9000/",
+            true,
+        );
+        assert!(body.contains("TYPE S3"));
+        assert!(body.contains("KEY_ID 'minioadmin'"));
+        assert!(body.contains("SECRET 'miniosecret'"));
+        assert!(body.contains("ENDPOINT 'localhost:9000'"));
+        assert!(body.contains("URL_STYLE 'path'"));
+        assert!(body.contains("USE_SSL false"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_security_credential_redaction_and_dsn_escaping() {
+        let mssql_dsn = format_mssql_connection_string(
+            "sql.internal",
+            "1433",
+            "analytics",
+            "sa",
+            "pa;ss}word",
+            false,
+            true,
+            false,
+        );
+        assert!(
+            mssql_dsn.contains("Password={pa;ss}}word}"),
+            "Expected ADO.NET brace escaping for semicolon/brace in password, got: {}",
+            mssql_dsn
+        );
+        let redacted_mssql = redact_connection_credentials(&mssql_dsn);
+        assert!(!redacted_mssql.contains("pa;ss"));
+        assert!(redacted_mssql.contains("Password=***"));
+
+        let pg_dsn = format_ducklake_target(
+            "postgres",
+            "pg.internal",
+            "5432",
+            "lake_meta",
+            "pguser",
+            "my secret'pass",
+            "",
+        )
+        .unwrap();
+        assert!(
+            pg_dsn.contains("password='my secret\\'pass'"),
+            "Expected libpq single-quote escaping for password with spaces/quotes, got: {}",
+            pg_dsn
+        );
+        let redacted_pg = redact_connection_credentials(&pg_dsn);
+        assert!(!redacted_pg.contains("secret"));
+        assert!(redacted_pg.contains("password=***"));
+
+        let uri = "postgres://admin:super_secret_123@db.example.com:5432/prod";
+        let redacted_uri = redact_connection_credentials(uri);
+        assert_eq!(redacted_uri, "postgres://admin:***@db.example.com:5432/prod");
+
+        let sql = "CREATE SECRET (TYPE S3, KEY_ID 'AKIA123', SECRET 'top_secret_val', TOKEN 'tok_abc');";
+        assert!(should_redact_sql_history(sql));
+        let redacted_sql = redact_connection_credentials(sql);
+        assert!(!redacted_sql.contains("top_secret_val"));
+        assert!(!redacted_sql.contains("tok_abc"));
     }
 }

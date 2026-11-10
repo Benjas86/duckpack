@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="duckpack_logo.png" width="400" alt="DuckPack Logo" />
+  <img src="https://raw.githubusercontent.com/Benjas86/duckpack/main/duckpack_logo.png" width="400" alt="DuckPack Logo" />
 </p>
 
 <p align="center">
@@ -61,7 +61,7 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
   - [Directory Layout](#directory-layout)
   - [Configuration (`duckpack.toml`)](#configuration-duckpacktoml)
   - [Environment Variables (`.env`)](#environment-variables-env)
-  - [Ignoring Tables (`.duckdbignore`)](#ignoring-tables-duckdbignore)
+  - [Ignoring Assets & Scripts (`.duckpackignore`)](#ignoring-assets--scripts-duckpackignore)
 - [📦 DuckPacks (`.duckpack`) for CI/CD](#-duckpacks-duckpack-for-cicd)
 - [NOTE](#note)
 
@@ -69,7 +69,8 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
 
 ## ✨ Features
 
-- **Declarative Schema Management ("SSDT for DuckDB"):** Define your schemas, tables, views, and macros as raw `.sql` files. No migration timestamps, sequence numbers, or rollback scripts to maintain.
+- **Declarative Schema Management ("SSDT for DuckDB"):** Define your schemas, sequences, tables, views, and macros as raw `.sql` files. No migration timestamps, sequence numbers, or rollback scripts to maintain.
+- **First-Class Sequences & Dependency-Safe Compilation:** Native support for DuckDB `sequences/` compiled in topological order (`schemas` $\rightarrow$ `types` $\rightarrow$ `sequences` $\rightarrow$ `macros` $\rightarrow$ `tables` $\rightarrow$ `views` $\rightarrow$ `triggers`), ensuring tables with surrogate keys (`DEFAULT nextval('...')`) compile and apply seamlessly.
 - **Table Constraint Diffing & Copy-and-Swap Migrations:** Automatically introspects `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`, and `CHECK` constraints. Generates in-place `ALTER TABLE` statements for safe additions and transactional copy-and-swap (`__duckpack_swap`) staging tables for complex constraint modifications.
 - **Catalog-Aware Multi-Database Targeting:** Seamlessly target specific attached databases (via `--database <name>`, `duckpack.toml [target] database = "..."`, or Python `duckpack.apply(con, database="analytics")`) with strict catalog isolation.
 - **Clear Engine Boundary (SSDT vs Federation):** Full declarative DDL lifecycle management specifically engineered for DuckDB, Quack, and MotherDuck. External attached engines (MSSQL, PostgreSQL, MySQL, SQLite) are first-class citizens in Explore for ad-hoc querying, cross-DB joins, and DML (`INSERT INTO`, `UPDATE`), with schema DDL safely managed by external native tools.
@@ -77,11 +78,11 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
 - **Schema Drift Detection (`duckpack diff`):** Instant dry-run inspection to detect divergence between your declarative codebase and live databases without mutating state.
 - **Git-Style Smart Renames:** Uses Jaro-Winkler similarity matching (>80%) to detect renamed tables or columns, issuing non-destructive `ALTER TABLE RENAME` statements instead of dropping and recreating data.
 - **Built-in Interactive Terminal IDE:** Explore live databases, write queries with syntax highlighting and autocompletion (`Ctrl+Space`), and manage independent query tabs.
-- **Unified IDE Authoring & Project Mode (`F3: DB | F4: Project`):** Toggle between live database catalog inspection and declarative project authoring. Scaffold tables, views, macros, and schemas (`a`/`n`), edit with dirty tab indicators (`*`), validate project syntax and dependencies against an in-memory Shadow DB (`Ctrl+B`/`v`), inspect passive Git status badges (`[M]`, `[+]`, `[D]`), and run declarative diff & apply (`F6`/`Ctrl+D`) directly without quitting the IDE.
+- **Unified IDE Authoring & Project Mode (`F3: DB | F4: Project`):** Toggle between live database catalog inspection and declarative project authoring. Scaffold tables, views, macros, sequences, and schemas (`a`/`n`), edit with dirty tab indicators (`*`), validate project syntax and dependencies against an in-memory Shadow DB (`Ctrl+B`/`v`), inspect passive Git status badges (`[M]`, `[+]`, `[D]`), and run declarative diff & apply (`F6`/`Ctrl+D`) directly without quitting the IDE.
 - **Visual Primary Key & Foreign Key Indicators:** Inspect table structures in the Explorer tree with visual icons (`🔑` for Primary Keys, `🔗` for Foreign Keys with reference targets `[FK -> table.col]`, and composite `🔑🔗` badges).
 - **Dynamic Explorer Width Resizing & Snappy Scrolling:** Adjust sidebar width on the fly via `W` (cycling 25%/35%/50% presets) or `+`/`-` and `[`/`]` (5% increments from 15% to 60%). Navigate wide schemas quickly with 4-char arrow scrolling, `Shift+Arrow` 10-char jumps, and `Home` margin snap.
-- **Catalog-Aware Multi-Database Exploration:** Inspect multiple attached catalogs (local DuckDB, in-memory `memory` scratchpad, attached SQLite/Postgres/MySQL/MSSQL, and remote Quack `target_db` instances) in a unified hierarchical tree with catalog-qualified query generation and cross-database joins.
-- **Live Catalog Attach with Provider Presets (`Ctrl+A` / `d` / `b`):** Dynamically attach third-party databases, DuckDB files, MotherDuck, or remote Quack instances directly inside the IDE with provider presets and auto-installed extensions; cycle target catalogs on the fly.
+- **Catalog-Aware Multi-Database Exploration:** Inspect multiple attached catalogs (local DuckDB, in-memory `memory` scratchpad, DuckLake lakehouses `🌊`, attached SQLite/Postgres/MySQL/MSSQL `🔌`, and remote Quack `target_db` instances) in a unified hierarchical tree with catalog-qualified query generation, cross-database joins, and live external catalog cache invalidation (`r`).
+- **Live Catalog Attach with Provider Presets & DuckLake Triad (`Ctrl+A` / `d` / `b`):** Dynamically attach DuckLake lakehouses (with `DuckDB File`, `PostgreSQL`, `SQLite`, or `Quack` metadata backends + `DATA_PATH` + S3 secret auto-binding), third-party databases (including MSSQL Windows Auth / `Trusted_Connection`), DuckDB files, MotherDuck, or remote Quack instances directly inside the IDE with full cursor-navigable modal inputs; cycle target catalogs on the fly.
 - **Cloud Secrets Management & S3 Bucket Explorer (`Ctrl+K`):** Visually configure cloud storage credentials (AWS S3, Cloudflare R2, MinIO, Wasabi, Custom S3) with masked inputs (`*`) and dual-persistence (`CREATE PERSISTENT SECRET` + `.env`). Live-explore remote S3 buckets (`glob()`) and sample remote files (`read_parquet`, `read_csv`) with a single keypress.
 - **Temporary Table Discovery & Python Two-Way Sync:** Temporary tables and views (`CREATE TEMP TABLE ...`) appear seamlessly in the active database's Explorer tree with a distinct `[temp]` badge. Instant DDL auto-refresh updates the sidebar on `CREATE`/`DROP`/`ALTER`, and interactive Python exploration (`duckpack.explore(con)`) performs safe two-way session synchronization across the Quack bridge.
 - **Python Integration with Jupyter / VS Code Support:** Import `duckpack` into Python pipelines, pytest fixtures, or Jupyter notebooks (`duckpack.explore(con)`). Automatically spawns a connected native terminal window in non-interactive notebook environments.
@@ -286,14 +287,14 @@ DuckPack embeds DuckDB directly as an in-process engine:
 - **Engine Transparency:** Check the exact embedded DuckDB engine version anytime via:
   ```bash
   duckpack --version
-  # DuckPack v0.2.0 (embedded DuckDB v1.2.0)
+  # DuckPack v0.2.3 (embedded DuckDB v2.0.0)
   ```
   Or in Python:
   ```python
   import duckpack
 
-  print(duckpack.__version__)         # e.g. "0.2.0"
-  print(duckpack.__duckdb_version__)  # e.g. "1.2.0"
+  print(duckpack.__version__)         # e.g. "0.2.3"
+  print(duckpack.__duckdb_version__)  # e.g. "2.0.0"
   ```
 - **Proactive Storage Diagnostics:** If an older database file with an incompatible legacy storage format is encountered, DuckPack catches the internal engine error and prints clear migration guidance rather than an unhelpful internal crash dump.
 
@@ -343,7 +344,7 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | **Global / Navigation** | `Tab` | Cycle focus between **Explorer**, **Editor**, and **Results** panes |
 | | `?` | Toggle the Help Modal |
 | | `F3` / `1` | Switch Explorer to **Database Catalog** view (`target_db`, `memory`, attached DBs) |
-| | `F4` / `2` | Switch Explorer to **Project Files** view (`schemas/`, `tables/`, `views/`, `macros/`, `triggers/`, `queries/`, `seeds/`, `duckpack.toml`) |
+| | `F4` / `2` | Switch Explorer to **Project Files** view (`schemas/`, `sequences/`, `tables/`, `views/`, `macros/`, `triggers/`, `queries/`, `seeds/`, `duckpack.toml`) |
 | | `F6` / `Ctrl+D` | **In-IDE Declarative Diff & Apply:** Review diff modal with `Space` toggling, dependency locks, and migration apply |
 | | `Ctrl+B` / `v` | **Validate Project:** Verify SQL syntax and cross-asset dependencies against Shadow DB |
 | | `Alt+W` | Cycle Explorer width presets (`25%` $\rightarrow$ `35%` $\rightarrow$ `50%`) |
@@ -363,7 +364,7 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | | `Ctrl+N` / `Ctrl+P` | Switch to the **Next** / **Previous** tab |
 | **Explorer** | `Up` / `Down` | Navigate through databases/categories, table groups, tables, and columns |
 | | `Enter` / `Space` | Expand or collapse tree folder / open SQL file in editor tab |
-| | `a` / `n` | **Quick Add Asset Modal** (in Project mode: Table, View, Macro, Trigger, Schema, Query, Seed) |
+| | `a` / `n` | **Quick Add Asset Modal** (in Project mode: Table, View, Macro, Trigger, Sequence, Schema, Query, Seed) |
 | | `v` | **Validate Project** syntax and dependencies against Shadow DB (in Project mode) |
 | | `W` / `w` | **Cycle width presets:** `25%` $\rightarrow$ `35%` $\rightarrow$ `50%` $\rightarrow$ `25%` |
 | | `+` / `=` / `]` | **Widen Explorer** by +5% (up to 60%) |
@@ -400,10 +401,10 @@ DuckPack Explore features a dual-mode sidebar that brings the complete declarati
 
 - **Mode Switching (`F3` / `1` vs `F4` / `2`):**
   - **`[F3: Database Catalog]`**: Inspect live target and attached database catalogs, schemas, tables, views, triggers, columns, and constraints (`🔑`, `🔗`).
-  - **`[F4: Project Files]`**: Browse declarative asset files organized categorically (`📁 Schemas`, `📦 Tables`, `👁️ Views`, `🔧 Macros`, `⚡ Triggers`, `📄 Queries`, `🌱 Seeds`, `⚙️ Config`).
-- **Complete Scaffolding & Zero-Exit Authoring:** All canonical project categories (`schemas/`, `tables/`, `views/`, `macros/`, `triggers/`, `queries/`, `seeds/`) are always rendered in the project sidebar tree—even if the underlying folder does not exist on disk yet. Empty categories show an interactive `(empty - press 'a' to add)` placeholder so developers never need to leave DuckPack to scaffold new directories or assets.
+  - **`[F4: Project Files]`**: Browse declarative asset files organized categorically (`📁 Schemas`, `🔢 Sequences`, `📦 Tables`, `👁️ Views`, `🔧 Macros`, `⚡ Triggers`, `📄 Queries`, `🌱 Seeds`, `⚙️ Config`).
+- **Complete Scaffolding & Zero-Exit Authoring:** All canonical project categories (`schemas/`, `sequences/`, `tables/`, `views/`, `macros/`, `triggers/`, `queries/`, `seeds/`) are always rendered in the project sidebar tree—even if the underlying folder does not exist on disk yet. Empty categories show an interactive `(empty - press 'a' to add)` placeholder so developers never need to leave DuckPack to scaffold new directories or assets.
 - **Passive Git Awareness:** The Explorer header dynamically shows the current branch (e.g. `Project (main*) (25%)`), and files display status badges (`[M]` modified, `[+]` untracked, `[D]` deleted). DuckPack never commits or pushes, preserving index safety and SSH autonomy.
-- **Guided Asset Scaffolding (`a` or `n`):** Quick Add modal to scaffold a new Table, View, Macro, Trigger, Schema, Query, or Seed with clean boilerplate SQL/CSV. It automatically detects the selected folder category, creates the directory on disk if needed, writes the boilerplate, and opens the file in a new editor tab.
+- **Guided Asset Scaffolding (`a` or `n`):** Quick Add modal to scaffold a new Table, View, Macro, Trigger, Sequence, Schema, Query, or Seed with clean boilerplate SQL/CSV. It automatically detects the selected folder category, creates the directory on disk if needed, writes the boilerplate, and opens the file in a new editor tab.
 - **Direct File Editing & Dirty Tab Tracking:** Opened files bind directly to disk. Tabs show `*` when dirty (`users.sql *`). Pressing `Ctrl+S` writes changes to disk, clears the dirty indicator, and refreshes project file badges.
 - **In-IDE Syntax Validation (`Ctrl+B` or `v`):** Compiles the entire project against an in-memory Shadow DB to verify SQL syntax, macros, and cross-asset dependencies with error line jumps.
 - **In-IDE Diff & Selective Apply (`F6` or `Ctrl+D`):** Computes declarative diffs against the active target database and presents an interactive diff modal directly inside the IDE. Supports `Space` to select/deselect individual changes with automatic dependency locking (`[L]`) and applies only the selected migrations on `Enter`.
@@ -462,13 +463,15 @@ Press **`Ctrl+A`** from anywhere in the IDE to open the interactive **Attach Dat
 
 - **Provider Presets (cycle via `◄` / `►` or `h` / `l`):**
   - **`DuckDB (Local / In-Memory)`**: Attach `.duckdb` files or `:memory:` scratchpads.
+  - **`DuckLake (Lakehouse)`**: Orchestrate a three-part DuckLake connection triad (`🌊`) with an interactive **Metadata Backend** picker (**`DuckDB File`**, **`PostgreSQL`**, **`SQLite`**, or **`Quack`** with `Disable SSL` support), storage **`DATA_PATH`** (`s3://bucket/path/` or local directory), optional **`data_inlining_row_limit`**, and automated S3/Quack secret binding.
   - **`Remote Quack Server`**: Connect to live remote Quack server instances with optional token credentials and SSL disable toggles.
   - **`MotherDuck Cloud`**: Attach MotherDuck cloud databases (`md:database_name`) with optional service token injection.
   - **`SQLite`**: Attach SQLite database files (`.db`, `.sqlite`) with automatic installation and loading of the DuckDB `sqlite` extension.
   - **`PostgreSQL`**: Connect to remote Postgres servers via structured input fields (Host, Port, Database, User ID, Password, SSL Mode).
   - **`MySQL`**: Connect to remote MySQL servers via structured input fields (Host, Port, Database, User ID, Password, SSL Mode).
-  - **`Microsoft SQL Server (MSSQL)`**: Connect to remote SQL Server instances via structured input fields (Host, Port `1433`, Database, User ID `sa`, Password, Trust Server Certificate toggle).
-- **Structured Form Inputs**: No need to manually format complex connection strings; dedicated input boxes for Host, Port, Database, Username, Password, and Alias automatically assemble standard connection parameters.
+  - **`Microsoft SQL Server (MSSQL)`**: Connect to remote SQL Server instances via structured input fields (Host, Port `1433`, Database, User ID `sa`, Password, **Windows Auth (`Trusted_Connection=yes`)** toggle, and **Trust Server Certificate** toggle).
+- **Full Cursor Navigation & Structured Inputs**: Edit any modal text box naturally using `◄`/`►`, `Home`, `End`, `Backspace`, and `Delete`, with 2D field navigation (`▲`/`▼`/`Tab` and `◄`/`►` on side-by-side Host/Port fields).
+- **Live External Catalog Cache Refresh (`r` / `R`)**: Pressing `r` in the Explorer pane (or running DDL in the editor) automatically invalidates and refreshes cached metadata for attached **MSSQL** (`mssql_invalidate_cache` + `mssql_refresh_cache`), **PostgreSQL** (`pg_clear_cache`), **MySQL** (`mysql_clear_cache`), **MotherDuck**, and **Quack** catalogs so external changes (e.g. from dbt runs) appear immediately.
 - **Masked Token/Password Field**: Passwords and service tokens are rendered with `*` mask characters to protect against shoulder surfing or screen shares.
 - **Read-Only Toggle**: Press `Space` to toggle `READ_ONLY` mode.
 - **Safe Detach**: Select any attached database in the Explorer and press **`d`** (or `Delete`) to safely detach it from the active session.
@@ -674,8 +677,8 @@ import duckpack
 ```
 
 #### Engine Version Properties
-- **`duckpack.__version__: str`**: The version of DuckPack (e.g. `"0.2.0"`).
-- **`duckpack.__duckdb_version__: str`**: The embedded DuckDB engine version (e.g. `"1.2.0"`).
+- **`duckpack.__version__: str`**: The version of DuckPack (e.g. `"0.2.3"`).
+- **`duckpack.__duckdb_version__: str`**: The embedded DuckDB engine version (e.g. `"2.0.0"`).
 
 #### Functions
 
@@ -817,6 +820,8 @@ Running `duckpack init --project-dir my_project` generates the standard declarat
 ```
 my_project/
 ├── schemas/               # CREATE SCHEMA statements (supports nested schemas e.g. finance/reports.sql)
+├── types/                 # CREATE TYPE statements (enums, composite types)
+├── sequences/             # CREATE SEQUENCE statements (compiled before tables to support DEFAULT nextval('...'))
 ├── tables/                # CREATE TABLE statements (one table per .sql file; VARIANT types supported)
 ├── views/                 # CREATE VIEW & CREATE SECURE VIEW statements (engine auto-forces OR REPLACE)
 ├── macros/                # CREATE MACRO statements (supports DuckDB 2.0 lambda x: ... syntax)
@@ -828,11 +833,12 @@ my_project/
 │   └── post-deploy/       # Raw SQL executed AFTER migrations are applied
 ├── duckpack.toml          # Multi-environment targets configuration
 ├── .env                   # Environment variables for ${VAR} template substitution
-└── .duckdbignore          # Ignore patterns for tables/views
+├── .duckpackignore        # Ignore patterns for tables, views, sequences, triggers, and deployment scripts
 ```
 
 ### DuckDB v2.0 Authoring Guidelines
 
+- **First-Class Sequences & Surrogate Keys:** DuckDB eagerly validates sequence references at table creation time. Define sequence definitions in `sequences/` (e.g. `sequences/external_metric_id_seq.sql`). DuckPack compiles them prior to `tables/` during both Shadow DB compilation and migration execution, ensuring tables with surrogate keys (`DEFAULT nextval('...')`) compile and apply without dependency errors.
 - **Arbitrary Nested Schemas:** Schemas can be nested to any depth (`CREATE SCHEMA finance.reports;`). Table files can live in nested subdirectories (`tables/finance/reports/q3.sql`) or dot-named files (`tables/finance.reports.q3.sql`). DuckPack automatically resolves topological creation order (parents before children) and teardown order (children before parents).
 - **First-Class `VARIANT` Columns:** Tables and views support native `VARIANT` types and `variant_*` functions alongside JSON casts (`::JSON::VARIANT`). In-place type alterations (`ALTER TABLE t ALTER c TYPE VARIANT`) are applied without requiring table recreation.
 - **`CREATE SECURE VIEW`:** Secure views are fully supported in `views/`. When views are modified, DuckPack automatically emits `CREATE OR REPLACE SECURE VIEW` to preserve view protection.
@@ -850,7 +856,7 @@ Define connection targets, remote Quack instances, and environment profiles with
 ```toml
 [project]
 name = "analytics_warehouse"
-version = "0.2.0"
+version = "0.2.3"
 
 [target]
 default_db = "dev.duckdb"
@@ -869,6 +875,23 @@ db = "dev.duckdb"
 db = "quack:staging.company.internal:9494"
 database = "analytics_stg"
 insecure = true            # Disable SSL for internal/self-signed deployments
+
+[env.lakehouse]
+# Attach a DuckLake lakehouse catalog (DuckDB File, Postgres, SQLite, or Quack backend) + S3 storage:
+provider = "ducklake"
+catalog_dsn = "quack:localhost:9494"
+data_path = "s3://warehouse/gold/"
+inlining_limit = 1000
+insecure = true            # Passes METADATA_PARAMETERS MAP {'DISABLE_SSL': true} for Quack backend
+
+[env.sqlserver]
+# Attach a Microsoft SQL Server instance (with SQL Auth or Windows Authentication):
+provider = "mssql"
+host = "sqlserver.corp.local"
+port = 1433
+database = "analytics_dw"
+trusted_connection = true  # Windows Authentication (or set user / password_env)
+trust_server_certificate = true
 
 [env.prod]
 # Connect to production Quack or MotherDuck:
@@ -908,15 +931,26 @@ CREATE TABLE ${ENV}_customers_${REGION} (
 ```
 DuckPack loads `.env` (or `.env.<profile>` when using `--env <profile>`) and interpolates variables via regex before compiling.
 
-### Ignoring Tables (`.duckdbignore`)
+### Ignoring Assets & Scripts (`.duckpackignore`)
 
-Specify glob patterns for tables or views that DuckPack should ignore during schema diffs:
+Specify glob patterns for tables, views, sequences, triggers, or file paths from any directory (including `scripts/pre-deploy` and `scripts/post-deploy`) that DuckPack should ignore:
 ```
-# Ignore ephemeral tables and temp backups
+# Ignore ephemeral tables, backups, or schemas
 temp_*
 *_backup
 scratch.*
+
+# Ignore one-time deployment scripts after their initial run
+scripts/pre-deploy/01_one_time_seed.sql
+scripts/post-deploy/02_cleanup_staging.sql
+
+# Ignore an entire directory or wildcard paths
+archive/
+scripts/post-deploy/legacy_*
 ```
+
+> [!TIP]
+> **One-Time Deploy Scripts**: Place bootstrap or one-off data migration scripts in `scripts/pre-deploy/` or `scripts/post-deploy/` during your initial release. Once executed, add the file name or relative path (e.g. `01_one_time_seed.sql` or `scripts/pre-deploy/01_one_time_seed.sql`) to `.duckpackignore` so DuckPack safely bypasses it on subsequent deploys. DuckPack automatically supports legacy `.duckdbignore` and `.duckignore` filenames as fallbacks.
 
 ---
 

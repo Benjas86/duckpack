@@ -145,8 +145,21 @@ pub fn extract_autoload_extension_name(err_str: &str) -> Option<String> {
     None
 }
 
-/// Recursively discovers all `.sql` query files under a root queries directory.
+/// Recursively discovers all `.sql` query files under a root queries directory,
+/// respecting `.duckpackignore`.
 pub fn collect_queries_recursive(dir: &Path, base: &Path, queries: &mut Vec<String>) {
+    let project_dir = crate::engine::discover_project_dir(base);
+    let ignore_rules = crate::engine::load_ignore_rules(&project_dir);
+    collect_queries_recursive_internal(dir, base, &project_dir, &ignore_rules, queries);
+}
+
+fn collect_queries_recursive_internal(
+    dir: &Path,
+    base: &Path,
+    project_dir: &Path,
+    ignore_rules: &[String],
+    queries: &mut Vec<String>,
+) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         let mut sorted_entries: Vec<_> = entries.flatten().collect();
         sorted_entries.sort_by_key(|e| e.path());
@@ -162,8 +175,12 @@ pub fn collect_queries_recursive(dir: &Path, base: &Path, queries: &mut Vec<Stri
                 continue;
             }
 
+            if crate::engine::is_file_ignored(&path, project_dir, ignore_rules) {
+                continue;
+            }
+
             if path.is_dir() {
-                collect_queries_recursive(&path, base, queries);
+                collect_queries_recursive_internal(&path, base, project_dir, ignore_rules, queries);
             } else if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     if ext.eq_ignore_ascii_case("sql") {

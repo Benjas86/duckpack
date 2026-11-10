@@ -13,15 +13,108 @@ use std::path::{Path, PathBuf};
 use crate::catalog::{DatabaseInfo, ExplorerMetadata};
 use crate::ide::explorer::{
     apply_ide_diff_for_catalog, db_icon, generate_asset_boilerplate, get_asset_file_path,
-    ProjectCategory,
+    ExplorerNode, NodeType, ProjectCategory,
 };
+
+/// Inserts a character into a string at the unicode character position `*cursor`,
+/// advancing the cursor by 1.
+pub(crate) fn insert_char_at_cursor(s: &mut String, cursor: &mut usize, c: char) {
+    let char_count = s.chars().count();
+    let pos = (*cursor).min(char_count);
+    let byte_idx = s
+        .char_indices()
+        .nth(pos)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len());
+    s.insert(byte_idx, c);
+    *cursor = pos + 1;
+}
+
+/// Deletes the character before `*cursor` (Backspace), moving the cursor back by 1.
+pub(crate) fn delete_char_before_cursor(s: &mut String, cursor: &mut usize) {
+    if *cursor == 0 || s.is_empty() {
+        return;
+    }
+    let char_count = s.chars().count();
+    let pos = (*cursor).min(char_count);
+    if let Some((byte_idx, _)) = s.char_indices().nth(pos - 1) {
+        s.remove(byte_idx);
+        *cursor = pos - 1;
+    }
+}
+
+/// Deletes the character at `cursor` (Delete key). The cursor position remains unchanged.
+pub(crate) fn delete_char_at_cursor(s: &mut String, cursor: usize) {
+    let char_count = s.chars().count();
+    if cursor < char_count {
+        if let Some((byte_idx, _)) = s.char_indices().nth(cursor) {
+            s.remove(byte_idx);
+        }
+    }
+}
+
+/// Formats text for a modal text field with an active cursor indicator.
+/// When active:
+/// - If cursor is within the string, the character under the cursor has inverted Cyan background and bold Black text.
+/// - If cursor is at the end of the string, a Yellow '█' is appended.
+/// When inactive:
+/// - Text is rendered plainly with no cursor indicator.
+/// If `is_masked` is true, characters are masked with '*'.
+pub(crate) fn render_text_with_cursor(
+    text: &str,
+    cursor_pos: usize,
+    is_active: bool,
+    is_masked: bool,
+) -> Line<'static> {
+    let char_count = text.chars().count();
+    let display_string = if is_masked {
+        "*".repeat(char_count)
+    } else {
+        text.to_string()
+    };
+
+    if !is_active {
+        return Line::from(Span::raw(display_string));
+    }
+
+    let chars: Vec<char> = display_string.chars().collect();
+    let pos = cursor_pos.min(chars.len());
+
+    let mut spans = Vec::new();
+    if pos < chars.len() {
+        let before: String = chars[..pos].iter().collect();
+        if !before.is_empty() {
+            spans.push(Span::raw(before));
+        }
+        let cur_char = chars[pos].to_string();
+        spans.push(Span::styled(
+            cur_char,
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let after: String = chars[pos + 1..].iter().collect();
+        if !after.is_empty() {
+            spans.push(Span::raw(after));
+        }
+    } else {
+        if !display_string.is_empty() {
+            spans.push(Span::raw(display_string));
+        }
+        spans.push(Span::styled("█", Style::default().fg(Color::Yellow)));
+    }
+
+    Line::from(spans)
+}
 
 /// State for the New Asset modal dialog (`a` or `n` in Project view).
 #[derive(Clone, Debug)]
 pub(crate) struct NewAssetModalState {
     pub(crate) is_open: bool,
-    pub(crate) category_index: usize, // 0: Table, 1: View, 2: Macro, 3: Trigger, 4: Schema, 5: Query, 6: Seed
+    pub(crate) category_index: usize, // 0: Table, 1: View, 2: Macro, 3: Trigger, 4: Sequence, 5: Schema, 6: Query, 7: Seed
     pub(crate) name: String,
+    pub(crate) cursor_pos: usize,
     pub(crate) active_field: usize, // 0: category, 1: name, 2: create, 3: cancel
     pub(crate) error_msg: Option<String>,
 }
@@ -32,6 +125,7 @@ impl NewAssetModalState {
             is_open: false,
             category_index: 0,
             name: String::new(),
+            cursor_pos: 0,
             active_field: 1,
             error_msg: None,
         }
@@ -41,8 +135,60 @@ impl NewAssetModalState {
         self.is_open = true;
         self.category_index = 0;
         self.name.clear();
+        self.cursor_pos = 0;
         self.active_field = 1;
         self.error_msg = None;
+    }
+
+    pub(crate) fn set_category(&mut self, category: ProjectCategory) {
+        match category {
+            ProjectCategory::Table => self.category_index = 0,
+            ProjectCategory::View => self.category_index = 1,
+            ProjectCategory::Macro => self.category_index = 2,
+            ProjectCategory::Trigger => self.category_index = 3,
+            ProjectCategory::Sequence => self.category_index = 4,
+            ProjectCategory::Schema => self.category_index = 5,
+            ProjectCategory::Query => self.category_index = 6,
+            ProjectCategory::Seed => self.category_index = 7,
+            ProjectCategory::Config => {}
+        }
+    }
+
+    pub(crate) fn open_for_group_name(&mut self, group_name: &str) {
+        self.reset();
+        if group_name.contains("tables") {
+            self.set_category(ProjectCategory::Table);
+        } else if group_name.contains("views") {
+            self.set_category(ProjectCategory::View);
+        } else if group_name.contains("macros") {
+            self.set_category(ProjectCategory::Macro);
+        } else if group_name.contains("triggers") {
+            self.set_category(ProjectCategory::Trigger);
+        } else if group_name.contains("sequences") {
+            self.set_category(ProjectCategory::Sequence);
+        } else if group_name.contains("schemas") {
+            self.set_category(ProjectCategory::Schema);
+        } else if group_name.contains("queries") {
+            self.set_category(ProjectCategory::Query);
+        } else if group_name.contains("seeds") {
+            self.set_category(ProjectCategory::Seed);
+        }
+    }
+
+    pub(crate) fn open_for_node(&mut self, node: Option<&ExplorerNode>) {
+        self.reset();
+        if let Some(n) = node {
+            match &n.node_type {
+                NodeType::Group => self.open_for_group_name(&n.name),
+                NodeType::ProjectFile { category, .. } => self.set_category(*category),
+                NodeType::Table { .. } => self.set_category(ProjectCategory::Table),
+                NodeType::View { .. } => self.set_category(ProjectCategory::View),
+                NodeType::Macro => self.set_category(ProjectCategory::Macro),
+                NodeType::Trigger { .. } => self.set_category(ProjectCategory::Trigger),
+                NodeType::Query => self.set_category(ProjectCategory::Query),
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn current_category(&self) -> ProjectCategory {
@@ -51,8 +197,9 @@ impl NewAssetModalState {
             1 => ProjectCategory::View,
             2 => ProjectCategory::Macro,
             3 => ProjectCategory::Trigger,
-            4 => ProjectCategory::Schema,
-            5 => ProjectCategory::Query,
+            4 => ProjectCategory::Sequence,
+            5 => ProjectCategory::Schema,
+            6 => ProjectCategory::Query,
             _ => ProjectCategory::Seed,
         }
     }
@@ -63,8 +210,9 @@ impl NewAssetModalState {
             1 => "View",
             2 => "Macro",
             3 => "Trigger",
-            4 => "Schema",
-            5 => "Query",
+            4 => "Sequence",
+            5 => "Schema",
+            6 => "Query",
             _ => "Seed",
         }
     }
@@ -121,10 +269,11 @@ impl NewAssetModalState {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let p1 = Paragraph::new(format!(
-            "{}{}",
-            self.name,
-            if self.active_field == 1 { "█" } else { "" }
+        let p1 = Paragraph::new(render_text_with_cursor(
+            &self.name,
+            self.cursor_pos,
+            self.active_field == 1,
+            false,
         ))
         .block(
             Block::default()
@@ -201,32 +350,46 @@ impl NewAssetModalState {
             self.is_open = false;
         } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
             self.active_field = (self.active_field + 1) % 4;
+            if self.active_field == 1 {
+                self.cursor_pos = self.name.chars().count();
+            }
         } else if key.code == KeyCode::BackTab || key.code == KeyCode::Up {
             self.active_field = if self.active_field == 0 {
                 3
             } else {
                 self.active_field - 1
             };
+            if self.active_field == 1 {
+                self.cursor_pos = self.name.chars().count();
+            }
         } else if self.active_field == 0
             && (key.code == KeyCode::Left || key.code == KeyCode::Char('h'))
         {
             self.category_index = if self.category_index == 0 {
-                6
+                7
             } else {
                 self.category_index - 1
             };
         } else if self.active_field == 0
             && (key.code == KeyCode::Right || key.code == KeyCode::Char('l'))
         {
-            self.category_index = (self.category_index + 1) % 7;
+            self.category_index = (self.category_index + 1) % 8;
         } else if self.active_field >= 2
             && (key.code == KeyCode::Left || key.code == KeyCode::Right)
         {
             self.active_field = if self.active_field == 2 { 3 } else { 2 };
-        } else if key.code == KeyCode::Backspace {
-            if self.active_field == 1 {
-                self.name.pop();
-            }
+        } else if self.active_field == 1 && key.code == KeyCode::Left {
+            self.cursor_pos = self.cursor_pos.saturating_sub(1);
+        } else if self.active_field == 1 && key.code == KeyCode::Right {
+            self.cursor_pos = (self.cursor_pos + 1).min(self.name.chars().count());
+        } else if self.active_field == 1 && key.code == KeyCode::Home {
+            self.cursor_pos = 0;
+        } else if self.active_field == 1 && key.code == KeyCode::End {
+            self.cursor_pos = self.name.chars().count();
+        } else if self.active_field == 1 && key.code == KeyCode::Backspace {
+            delete_char_before_cursor(&mut self.name, &mut self.cursor_pos);
+        } else if self.active_field == 1 && key.code == KeyCode::Delete {
+            delete_char_at_cursor(&mut self.name, self.cursor_pos);
         } else if key.code == KeyCode::Enter {
             if self.active_field == 3 {
                 self.is_open = false;
@@ -253,7 +416,7 @@ impl NewAssetModalState {
         } else if let KeyCode::Char(c) = key.code {
             if !key.modifiers.contains(KeyModifiers::CONTROL) && self.active_field == 1 {
                 if c.is_alphanumeric() || c == '_' || c == '.' || c == '-' {
-                    self.name.push(c);
+                    insert_char_at_cursor(&mut self.name, &mut self.cursor_pos, c);
                 }
             }
         }
@@ -594,6 +757,7 @@ pub(crate) enum AttachProvider {
     PostgreSQL,
     MySQL,
     MSSQL,
+    DuckLake,
 }
 
 impl AttachProvider {
@@ -606,6 +770,7 @@ impl AttachProvider {
             AttachProvider::PostgreSQL => "PostgreSQL",
             AttachProvider::MySQL => "MySQL",
             AttachProvider::MSSQL => "SQL Server / MSSQL (Community)",
+            AttachProvider::DuckLake => "DuckLake (Lakehouse / S3)",
         }
     }
 
@@ -614,6 +779,10 @@ impl AttachProvider {
             self,
             AttachProvider::PostgreSQL | AttachProvider::MySQL | AttachProvider::MSSQL
         )
+    }
+
+    pub(crate) fn is_ducklake(&self) -> bool {
+        matches!(self, AttachProvider::DuckLake)
     }
 
     pub(crate) fn is_quack(&self) -> bool {
@@ -630,12 +799,51 @@ impl AttachProvider {
     }
 }
 
+/// Supported metadata catalog backends for DuckLake.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DuckLakeBackend {
+    Quack,
+    PostgreSQL,
+    LocalFile,
+    SQLite,
+}
+
+impl DuckLakeBackend {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            DuckLakeBackend::Quack => "Remote Quack Server",
+            DuckLakeBackend::PostgreSQL => "PostgreSQL Catalog",
+            DuckLakeBackend::LocalFile => "Local File (.ducklake / DuckDB)",
+            DuckLakeBackend::SQLite => "SQLite Catalog (.db)",
+        }
+    }
+
+    pub(crate) fn next(&self) -> Self {
+        match self {
+            DuckLakeBackend::Quack => DuckLakeBackend::PostgreSQL,
+            DuckLakeBackend::PostgreSQL => DuckLakeBackend::LocalFile,
+            DuckLakeBackend::LocalFile => DuckLakeBackend::SQLite,
+            DuckLakeBackend::SQLite => DuckLakeBackend::Quack,
+        }
+    }
+
+    pub(crate) fn prev(&self) -> Self {
+        match self {
+            DuckLakeBackend::Quack => DuckLakeBackend::SQLite,
+            DuckLakeBackend::PostgreSQL => DuckLakeBackend::Quack,
+            DuckLakeBackend::LocalFile => DuckLakeBackend::PostgreSQL,
+            DuckLakeBackend::SQLite => DuckLakeBackend::LocalFile,
+        }
+    }
+}
+
 /// State for the Attach Database modal dialog (Ctrl+A).
 #[derive(Clone, Debug)]
 pub(crate) struct AttachModalState {
     pub(crate) is_open: bool,
-    pub(crate) provider_index: usize, // 0: DuckDB, 1: Quack, 2: MotherDuck, 3: SQLite, 4: PostgreSQL, 5: MySQL, 6: MSSQL
-    pub(crate) path: String,          // For DuckDB / SQLite file path, MotherDuck DB name
+    pub(crate) provider_index: usize, // 0: DuckDB, 1: Quack, 2: MotherDuck, 3: SQLite, 4: PostgreSQL, 5: MySQL, 6: MSSQL, 7: DuckLake
+    pub(crate) ducklake_backend: DuckLakeBackend, // Quack, PostgreSQL, LocalFile, SQLite
+    pub(crate) path: String,          // For DuckDB / SQLite / DuckLake file path, MotherDuck DB name
     pub(crate) host: String,          // Host / Server (localhost, etc.)
     pub(crate) port: String,          // Port (1433, 5432, 3306, 9494)
     pub(crate) database: String,      // Database name (mydb, postgres, etc.)
@@ -643,9 +851,12 @@ pub(crate) struct AttachModalState {
     pub(crate) password: String,      // Password / Auth Token (Masked)
     pub(crate) alias: String,         // Catalog alias
     pub(crate) alias_is_custom: bool,
+    pub(crate) data_path: String,     // DuckLake Parquet / storage DATA_PATH (e.g. s3://bucket/data/)
+    pub(crate) cursor_pos: usize,
     pub(crate) read_only: bool,
     pub(crate) disable_ssl: bool,
     pub(crate) insecure: bool,
+    pub(crate) trusted_connection: bool,
     pub(crate) active_field: usize,
     pub(crate) error_msg: Option<String>,
 }
@@ -655,6 +866,7 @@ impl AttachModalState {
         let mut s = Self {
             is_open: false,
             provider_index: 0,
+            ducklake_backend: DuckLakeBackend::Quack,
             path: String::new(),
             host: String::new(),
             port: String::new(),
@@ -663,9 +875,12 @@ impl AttachModalState {
             password: String::new(),
             alias: String::new(),
             alias_is_custom: false,
+            data_path: String::new(),
+            cursor_pos: 0,
             read_only: false,
             disable_ssl: false,
             insecure: false,
+            trusted_connection: false,
             active_field: 1,
             error_msg: None,
         };
@@ -676,6 +891,7 @@ impl AttachModalState {
     pub(crate) fn reset(&mut self) {
         self.is_open = true;
         self.provider_index = 0;
+        self.ducklake_backend = DuckLakeBackend::Quack;
         self.path.clear();
         self.host.clear();
         self.port.clear();
@@ -684,9 +900,12 @@ impl AttachModalState {
         self.password.clear();
         self.alias.clear();
         self.alias_is_custom = false;
+        self.data_path.clear();
+        self.cursor_pos = 0;
         self.read_only = false;
         self.disable_ssl = false;
         self.insecure = false;
+        self.trusted_connection = false;
         self.active_field = 1;
         self.error_msg = None;
         self.set_provider(0);
@@ -700,17 +919,79 @@ impl AttachModalState {
             4 => AttachProvider::PostgreSQL,
             5 => AttachProvider::MySQL,
             6 => AttachProvider::MSSQL,
+            7 => AttachProvider::DuckLake,
             _ => AttachProvider::DuckDB,
         }
     }
 
-    pub(crate) fn set_provider(&mut self, idx: usize) {
-        self.provider_index = idx % 7;
+    pub(crate) fn set_ducklake_backend(&mut self, backend: DuckLakeBackend) {
+        self.ducklake_backend = backend;
         self.error_msg = None;
         let is_default_port = matches!(self.port.as_str(), "" | "1433" | "5432" | "3306" | "9494");
-        let is_default_user = matches!(self.username.as_str(), "" | "sa" | "postgres" | "root");
+        let is_default_user = matches!(self.username.as_str(), "" | "sa" | "postgres" | "root" | "lakehouse");
+        let is_default_host = matches!(self.host.as_str(), "" | "localhost");
+        let is_default_path = matches!(self.path.as_str(), "" | "metadata.ducklake" | "metadata.db" | "data.duckdb");
+
+        match backend {
+            DuckLakeBackend::Quack => {
+                if is_default_host {
+                    self.host = "localhost".to_string();
+                }
+                if is_default_port {
+                    self.port = "9494".to_string();
+                }
+                if self.host == "localhost" || self.host == "127.0.0.1" || self.host == "0.0.0.0" {
+                    self.disable_ssl = true;
+                }
+            }
+            DuckLakeBackend::PostgreSQL => {
+                if is_default_host {
+                    self.host = "localhost".to_string();
+                }
+                if is_default_port {
+                    self.port = "5432".to_string();
+                }
+                if is_default_user {
+                    self.username = "lakehouse".to_string();
+                }
+                if self.database.is_empty() {
+                    self.database = "ducklake".to_string();
+                }
+            }
+            DuckLakeBackend::LocalFile => {
+                if is_default_path {
+                    self.path = "metadata.ducklake".to_string();
+                }
+            }
+            DuckLakeBackend::SQLite => {
+                if is_default_path {
+                    self.path = "metadata.db".to_string();
+                }
+            }
+        }
+        if self.data_path.is_empty() {
+            self.data_path = "s3://ducklake/data/".to_string();
+        }
+        if !self.alias_is_custom {
+            self.alias = "my_lakehouse".to_string();
+        }
+        let total = self.field_count();
+        if self.active_field >= total {
+            self.active_field = 1;
+        }
+        self.sync_cursor_to_end();
+    }
+
+    pub(crate) fn set_provider(&mut self, idx: usize) {
+        self.provider_index = idx % 8;
+        self.error_msg = None;
+        let is_default_port = matches!(self.port.as_str(), "" | "1433" | "5432" | "3306" | "9494");
+        let is_default_user = matches!(self.username.as_str(), "" | "sa" | "postgres" | "root" | "lakehouse");
 
         match self.provider() {
+            AttachProvider::DuckLake => {
+                self.set_ducklake_backend(self.ducklake_backend);
+            }
             AttachProvider::MSSQL => {
                 if self.host.is_empty() {
                     self.host = "localhost".to_string();
@@ -718,8 +999,14 @@ impl AttachModalState {
                 if is_default_port {
                     self.port = "1433".to_string();
                 }
-                if is_default_user {
-                    self.username = "sa".to_string();
+                if cfg!(target_os = "windows") {
+                    self.trusted_connection = true;
+                    self.username.clear();
+                } else {
+                    self.trusted_connection = false;
+                    if is_default_user {
+                        self.username = "sa".to_string();
+                    }
                 }
                 if !self.alias_is_custom {
                     self.alias = if !self.database.is_empty() {
@@ -800,11 +1087,20 @@ impl AttachModalState {
         if self.active_field >= total {
             self.active_field = 1;
         }
+        self.sync_cursor_to_end();
     }
 
     pub(crate) fn field_count(&self) -> usize {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::MSSQL {
+            13
+        } else if p == AttachProvider::DuckLake {
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => 11,
+                DuckLakeBackend::PostgreSQL => 12,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 8,
+            }
+        } else if p.is_relational() {
             12
         } else if p.is_quack() {
             10
@@ -815,36 +1111,72 @@ impl AttachModalState {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn is_submit(&self) -> bool {
+    pub(crate) fn submit_index(&self) -> usize {
         let p = self.provider();
-        if p.is_relational() {
-            self.active_field == 10
+        if p == AttachProvider::MSSQL {
+            11
+        } else if p == AttachProvider::DuckLake {
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => 9,
+                DuckLakeBackend::PostgreSQL => 10,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 6,
+            }
+        } else if p.is_relational() {
+            10
         } else if p.is_quack() {
-            self.active_field == 8
+            8
         } else if p.is_motherduck() {
-            self.active_field == 5
+            5
         } else {
-            self.active_field == 4
+            4
         }
     }
 
-    pub(crate) fn is_cancel(&self) -> bool {
+    pub(crate) fn cancel_index(&self) -> usize {
         let p = self.provider();
-        if p.is_relational() {
-            self.active_field == 11
+        if p == AttachProvider::MSSQL {
+            12
+        } else if p == AttachProvider::DuckLake {
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => 10,
+                DuckLakeBackend::PostgreSQL => 11,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 7,
+            }
+        } else if p.is_relational() {
+            11
         } else if p.is_quack() {
-            self.active_field == 9
+            9
         } else if p.is_motherduck() {
-            self.active_field == 6
+            6
         } else {
-            self.active_field == 5
+            5
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_submit(&self) -> bool {
+        self.active_field == self.submit_index()
+    }
+
+    pub(crate) fn is_cancel(&self) -> bool {
+        self.active_field == self.cancel_index()
     }
 
     pub(crate) fn is_toggle_field(&self) -> bool {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::MSSQL {
+            (7..=10).contains(&self.active_field)
+        } else if p == AttachProvider::DuckLake {
+            if self.active_field == 1 {
+                true
+            } else {
+                match self.ducklake_backend {
+                    DuckLakeBackend::Quack => matches!(self.active_field, 7 | 8),
+                    DuckLakeBackend::PostgreSQL => self.active_field == 9,
+                    DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => self.active_field == 5,
+                }
+            }
+        } else if p.is_relational() {
             (7..=9).contains(&self.active_field)
         } else if p.is_quack() {
             (5..=7).contains(&self.active_field)
@@ -855,9 +1187,257 @@ impl AttachModalState {
         }
     }
 
+    pub(crate) fn is_text_field(&self) -> bool {
+        if self.active_field == 0 {
+            return false;
+        }
+        if self.provider() == AttachProvider::DuckLake && self.active_field == 1 {
+            return false;
+        }
+        if self.is_toggle_field() || self.is_submit() || self.is_cancel() {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn active_text(&self) -> Option<&str> {
+        let p = self.provider();
+        if p == AttachProvider::DuckLake {
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => match self.active_field {
+                    2 => Some(&self.host),
+                    3 => Some(&self.port),
+                    4 => Some(&self.password),
+                    5 => Some(&self.alias),
+                    6 => Some(&self.data_path),
+                    _ => None,
+                },
+                DuckLakeBackend::PostgreSQL => match self.active_field {
+                    2 => Some(&self.host),
+                    3 => Some(&self.port),
+                    4 => Some(&self.database),
+                    5 => Some(&self.username),
+                    6 => Some(&self.password),
+                    7 => Some(&self.alias),
+                    8 => Some(&self.data_path),
+                    _ => None,
+                },
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => match self.active_field {
+                    2 => Some(&self.path),
+                    3 => Some(&self.alias),
+                    4 => Some(&self.data_path),
+                    _ => None,
+                },
+            }
+        } else if p.is_relational() {
+            match self.active_field {
+                1 => Some(&self.host),
+                2 => Some(&self.port),
+                3 => Some(&self.database),
+                4 => Some(&self.username),
+                5 => Some(&self.password),
+                6 => Some(&self.alias),
+                _ => None,
+            }
+        } else if p.is_quack() {
+            match self.active_field {
+                1 => Some(&self.host),
+                2 => Some(&self.port),
+                3 => Some(&self.password),
+                4 => Some(&self.alias),
+                _ => None,
+            }
+        } else if p.is_motherduck() {
+            match self.active_field {
+                1 => Some(&self.path),
+                2 => Some(&self.password),
+                3 => Some(&self.alias),
+                _ => None,
+            }
+        } else {
+            match self.active_field {
+                1 => Some(&self.path),
+                2 => Some(&self.alias),
+                _ => None,
+            }
+        }
+    }
+
+    pub(crate) fn active_text_mut(&mut self) -> Option<&mut String> {
+        let p = self.provider();
+        if p == AttachProvider::DuckLake {
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => match self.active_field {
+                    2 => Some(&mut self.host),
+                    3 => Some(&mut self.port),
+                    4 => Some(&mut self.password),
+                    5 => Some(&mut self.alias),
+                    6 => Some(&mut self.data_path),
+                    _ => None,
+                },
+                DuckLakeBackend::PostgreSQL => match self.active_field {
+                    2 => Some(&mut self.host),
+                    3 => Some(&mut self.port),
+                    4 => Some(&mut self.database),
+                    5 => Some(&mut self.username),
+                    6 => Some(&mut self.password),
+                    7 => Some(&mut self.alias),
+                    8 => Some(&mut self.data_path),
+                    _ => None,
+                },
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => match self.active_field {
+                    2 => Some(&mut self.path),
+                    3 => Some(&mut self.alias),
+                    4 => Some(&mut self.data_path),
+                    _ => None,
+                },
+            }
+        } else if p.is_relational() {
+            match self.active_field {
+                1 => Some(&mut self.host),
+                2 => Some(&mut self.port),
+                3 => Some(&mut self.database),
+                4 => Some(&mut self.username),
+                5 => Some(&mut self.password),
+                6 => Some(&mut self.alias),
+                _ => None,
+            }
+        } else if p.is_quack() {
+            match self.active_field {
+                1 => Some(&mut self.host),
+                2 => Some(&mut self.port),
+                3 => Some(&mut self.password),
+                4 => Some(&mut self.alias),
+                _ => None,
+            }
+        } else if p.is_motherduck() {
+            match self.active_field {
+                1 => Some(&mut self.path),
+                2 => Some(&mut self.password),
+                3 => Some(&mut self.alias),
+                _ => None,
+            }
+        } else {
+            match self.active_field {
+                1 => Some(&mut self.path),
+                2 => Some(&mut self.alias),
+                _ => None,
+            }
+        }
+    }
+
+    pub(crate) fn sync_cursor_to_end(&mut self) {
+        self.cursor_pos = self.active_text().map(|s| s.chars().count()).unwrap_or(0);
+    }
+
+    pub(crate) fn is_port_field(&self) -> bool {
+        let p = self.provider();
+        if p == AttachProvider::DuckLake {
+            matches!(self.ducklake_backend, DuckLakeBackend::Quack | DuckLakeBackend::PostgreSQL)
+                && self.active_field == 3
+        } else if p.is_relational() || p.is_quack() {
+            self.active_field == 2
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn is_alias_field(&self) -> bool {
+        let p = self.provider();
+        if p == AttachProvider::DuckLake {
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => self.active_field == 5,
+                DuckLakeBackend::PostgreSQL => self.active_field == 7,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => self.active_field == 3,
+            }
+        } else if p.is_relational() {
+            self.active_field == 6
+        } else if p.is_quack() {
+            self.active_field == 4
+        } else if p.is_motherduck() {
+            self.active_field == 3
+        } else {
+            self.active_field == 2
+        }
+    }
+
+    pub(crate) fn sync_alias_if_default(&mut self) {
+        if self.alias_is_custom {
+            return;
+        }
+        let p = self.provider();
+        if p == AttachProvider::DuckLake {
+            if matches!(self.ducklake_backend, DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite) {
+                let stem = Path::new(&self.path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if !stem.is_empty() {
+                    self.alias = stem.to_string();
+                }
+            }
+        } else if p.is_relational() {
+            if !self.database.is_empty() {
+                self.alias = self.database.clone();
+            }
+        } else if p.is_motherduck() {
+            let clean = self.path.trim_start_matches("md:");
+            if !clean.is_empty() {
+                self.alias = clean.to_string();
+            }
+        } else if matches!(p, AttachProvider::DuckDB | AttachProvider::SQLite) {
+            let stem = Path::new(&self.path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if !stem.is_empty() {
+                self.alias = stem.to_string();
+            }
+        }
+    }
+
     pub(crate) fn toggle_active(&mut self) {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::DuckLake {
+            if self.active_field == 1 {
+                self.set_ducklake_backend(self.ducklake_backend.next());
+            } else {
+                match self.ducklake_backend {
+                    DuckLakeBackend::Quack => match self.active_field {
+                        7 => self.read_only = !self.read_only,
+                        8 => self.disable_ssl = !self.disable_ssl,
+                        _ => {}
+                    },
+                    DuckLakeBackend::PostgreSQL => {
+                        if self.active_field == 9 {
+                            self.read_only = !self.read_only;
+                        }
+                    }
+                    DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => {
+                        if self.active_field == 5 {
+                            self.read_only = !self.read_only;
+                        }
+                    }
+                }
+            }
+        } else if p == AttachProvider::MSSQL {
+            match self.active_field {
+                7 => self.read_only = !self.read_only,
+                8 => {
+                    self.trusted_connection = !self.trusted_connection;
+                    if self.trusted_connection {
+                        if self.username == "sa" {
+                            self.username.clear();
+                        }
+                    } else if self.username.is_empty() {
+                        self.username = "sa".to_string();
+                    }
+                }
+                9 => self.disable_ssl = !self.disable_ssl,
+                10 => self.insecure = !self.insecure,
+                _ => {}
+            }
+        } else if p.is_relational() {
             match self.active_field {
                 7 => self.read_only = !self.read_only,
                 8 => self.disable_ssl = !self.disable_ssl,
@@ -883,6 +1463,7 @@ impl AttachModalState {
     pub(crate) fn next_field(&mut self) {
         let total = self.field_count();
         self.active_field = (self.active_field + 1) % total;
+        self.sync_cursor_to_end();
     }
 
     pub(crate) fn prev_field(&mut self) {
@@ -892,115 +1473,103 @@ impl AttachModalState {
         } else {
             self.active_field - 1
         };
+        self.sync_cursor_to_end();
     }
 
     pub(crate) fn nav_left(&mut self) {
-        let p = self.provider();
         if self.active_field == 0 {
             let prev = if self.provider_index == 0 {
-                6
+                7
             } else {
                 self.provider_index - 1
             };
             self.set_provider(prev);
-        } else if p.is_relational() {
-            match self.active_field {
-                1 => self.active_field = 2,
-                2 => self.active_field = 1,
-                3 => self.active_field = 4,
-                4 => self.active_field = 3,
-                5 => self.active_field = 6,
-                6 => self.active_field = 5,
-                7 => self.active_field = 9,
-                8 => self.active_field = 7,
-                9 => self.active_field = 8,
-                10 => self.active_field = 11,
-                11 => self.active_field = 10,
-                _ => {}
-            }
-        } else if p.is_quack() {
-            match self.active_field {
-                1 => self.active_field = 2,
-                2 => self.active_field = 1,
-                3 => self.active_field = 4,
-                4 => self.active_field = 3,
-                5 => self.active_field = 7,
-                6 => self.active_field = 5,
-                7 => self.active_field = 6,
-                8 => self.active_field = 9,
-                9 => self.active_field = 8,
-                _ => {}
-            }
-        } else if p.is_motherduck() {
-            match self.active_field {
-                2 => self.active_field = 3,
-                3 => self.active_field = 2,
-                5 => self.active_field = 6,
-                6 => self.active_field = 5,
-                _ => {}
-            }
-        } else {
-            match self.active_field {
-                4 => self.active_field = 5,
-                5 => self.active_field = 4,
-                _ => {}
-            }
+        } else if self.provider() == AttachProvider::DuckLake && self.active_field == 1 {
+            self.set_ducklake_backend(self.ducklake_backend.prev());
+        } else if self.provider() == AttachProvider::DuckLake
+            && self.ducklake_backend == DuckLakeBackend::Quack
+            && matches!(self.active_field, 7 | 8)
+        {
+            self.active_field = if self.active_field == 7 { 8 } else { 7 };
+        } else if self.is_cancel() {
+            self.active_field = self.submit_index();
+        } else if self.is_submit() {
+            self.active_field = self.cancel_index();
+        } else if self.is_toggle_field() {
+            self.toggle_active();
         }
     }
 
     pub(crate) fn nav_right(&mut self) {
-        let p = self.provider();
         if self.active_field == 0 {
-            let next = (self.provider_index + 1) % 7;
+            let next = (self.provider_index + 1) % 8;
             self.set_provider(next);
-        } else if p.is_relational() {
-            match self.active_field {
-                1 => self.active_field = 2,
-                2 => self.active_field = 1,
-                3 => self.active_field = 4,
-                4 => self.active_field = 3,
-                5 => self.active_field = 6,
-                6 => self.active_field = 5,
-                7 => self.active_field = 8,
-                8 => self.active_field = 9,
-                9 => self.active_field = 7,
-                10 => self.active_field = 11,
-                11 => self.active_field = 10,
-                _ => {}
-            }
-        } else if p.is_quack() {
-            match self.active_field {
-                1 => self.active_field = 2,
-                2 => self.active_field = 1,
-                3 => self.active_field = 4,
-                4 => self.active_field = 3,
-                5 => self.active_field = 6,
-                6 => self.active_field = 7,
-                7 => self.active_field = 5,
-                8 => self.active_field = 9,
-                9 => self.active_field = 8,
-                _ => {}
-            }
-        } else if p.is_motherduck() {
-            match self.active_field {
-                2 => self.active_field = 3,
-                3 => self.active_field = 2,
-                5 => self.active_field = 6,
-                6 => self.active_field = 5,
-                _ => {}
-            }
-        } else {
-            match self.active_field {
-                4 => self.active_field = 5,
-                5 => self.active_field = 4,
-                _ => {}
-            }
+        } else if self.provider() == AttachProvider::DuckLake && self.active_field == 1 {
+            self.set_ducklake_backend(self.ducklake_backend.next());
+        } else if self.provider() == AttachProvider::DuckLake
+            && self.ducklake_backend == DuckLakeBackend::Quack
+            && matches!(self.active_field, 7 | 8)
+        {
+            self.active_field = if self.active_field == 7 { 8 } else { 7 };
+        } else if self.is_submit() {
+            self.active_field = self.cancel_index();
+        } else if self.is_cancel() {
+            self.active_field = self.submit_index();
+        } else if self.is_toggle_field() {
+            self.toggle_active();
         }
     }
 
     pub(crate) fn nav_down(&mut self) {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::DuckLake {
+            self.active_field = match self.ducklake_backend {
+                DuckLakeBackend::Quack => match self.active_field {
+                    0 => 2,
+                    1 => 3,
+                    2 => 4,
+                    3 => 5,
+                    4 | 5 => 6,
+                    6 => 7,
+                    7 => 9,
+                    8 => 10,
+                    9 | 10 => 0,
+                    _ => 0,
+                },
+                DuckLakeBackend::PostgreSQL => match self.active_field {
+                    0 => 2,
+                    1 => 3,
+                    2 => 4,
+                    3 => 5,
+                    4 => 6,
+                    5 => 7,
+                    6 | 7 => 8,
+                    8 => 9,
+                    9 => 10,
+                    10 | 11 => 0,
+                    _ => 0,
+                },
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => match self.active_field {
+                    0 => 2,
+                    1 => 3,
+                    2 | 3 => 4,
+                    4 => 5,
+                    5 => 6,
+                    6 | 7 => 0,
+                    _ => 0,
+                },
+            };
+        } else if p == AttachProvider::MSSQL {
+            self.active_field = match self.active_field {
+                0 => 1,
+                1 | 2 => 3,
+                3 | 4 => 5,
+                5 | 6 => 7,
+                7..=10 => 11,
+                11 | 12 => 0,
+                _ => 0,
+            };
+        } else if p.is_relational() {
             self.active_field = match self.active_field {
                 0 => 1,
                 1 | 2 => 3,
@@ -1038,11 +1607,62 @@ impl AttachModalState {
                 _ => 0,
             };
         }
+        self.sync_cursor_to_end();
     }
 
     pub(crate) fn nav_up(&mut self) {
         let p = self.provider();
-        if p.is_relational() {
+        if p == AttachProvider::DuckLake {
+            self.active_field = match self.ducklake_backend {
+                DuckLakeBackend::Quack => match self.active_field {
+                    0 => 9,
+                    1 => 10,
+                    2 => 0,
+                    3 => 1,
+                    4 => 2,
+                    5 => 3,
+                    6 => 4,
+                    7 | 8 => 6,
+                    9 => 7,
+                    10 => 8,
+                    _ => 0,
+                },
+                DuckLakeBackend::PostgreSQL => match self.active_field {
+                    0 => 10,
+                    1 => 11,
+                    2 => 0,
+                    3 => 1,
+                    4 => 2,
+                    5 => 3,
+                    6 => 4,
+                    7 => 5,
+                    8 => 6,
+                    9 => 8,
+                    10 | 11 => 9,
+                    _ => 0,
+                },
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => match self.active_field {
+                    0 => 6,
+                    1 => 7,
+                    2 => 0,
+                    3 => 1,
+                    4 => 2,
+                    5 => 4,
+                    6 | 7 => 5,
+                    _ => 0,
+                },
+            };
+        } else if p == AttachProvider::MSSQL {
+            self.active_field = match self.active_field {
+                0 => 11,
+                1 | 2 => 0,
+                3 | 4 => 1,
+                5 | 6 => 3,
+                7..=10 => 5,
+                11 | 12 => 7,
+                _ => 0,
+            };
+        } else if p.is_relational() {
             self.active_field = match self.active_field {
                 0 => 10,
                 1 | 2 => 0,
@@ -1080,211 +1700,87 @@ impl AttachModalState {
                 _ => 0,
             };
         }
+        self.sync_cursor_to_end();
     }
 
     pub(crate) fn handle_char(&mut self, c: char) {
-        let p = self.provider();
-        if p.is_relational() {
-            match self.active_field {
-                1 => self.host.push(c),
-                2 => {
-                    if c.is_ascii_digit() {
-                        self.port.push(c);
-                    }
-                }
-                3 => {
-                    self.database.push(c);
-                    if !self.alias_is_custom {
-                        self.alias = self.database.clone();
-                    }
-                }
-                4 => self.username.push(c),
-                5 => self.password.push(c),
-                6 => {
-                    self.alias.push(c);
-                    self.alias_is_custom = true;
-                }
-                _ => {}
-            }
-        } else if p.is_quack() {
-            match self.active_field {
-                1 => self.host.push(c),
-                2 => {
-                    if c.is_ascii_digit() {
-                        self.port.push(c);
-                    }
-                }
-                3 => self.password.push(c),
-                4 => {
-                    self.alias.push(c);
-                    self.alias_is_custom = true;
-                }
-                _ => {}
-            }
-        } else if p.is_motherduck() {
-            match self.active_field {
-                1 => {
-                    self.path.push(c);
-                    if !self.alias_is_custom {
-                        self.alias = self.path.trim_start_matches("md:").to_string();
-                    }
-                }
-                2 => self.password.push(c),
-                3 => {
-                    self.alias.push(c);
-                    self.alias_is_custom = true;
-                }
-                _ => {}
-            }
-        } else {
-            match self.active_field {
-                1 => {
-                    self.path.push(c);
-                    if !self.alias_is_custom {
-                        let stem = Path::new(&self.path)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("");
-                        self.alias = stem.to_string();
-                    }
-                }
-                2 => {
-                    self.alias.push(c);
-                    self.alias_is_custom = true;
-                }
-                _ => {}
-            }
+        if self.is_port_field() && !c.is_ascii_digit() {
+            return;
         }
+        if self.is_alias_field() {
+            self.alias_is_custom = true;
+        }
+        let mut cur = self.cursor_pos;
+        if let Some(t) = self.active_text_mut() {
+            insert_char_at_cursor(t, &mut cur, c);
+        }
+        self.cursor_pos = cur;
+        self.sync_alias_if_default();
     }
 
     pub(crate) fn handle_backspace(&mut self) {
-        let p = self.provider();
-        if p.is_relational() {
-            match self.active_field {
-                1 => {
-                    self.host.pop();
-                }
-                2 => {
-                    self.port.pop();
-                }
-                3 => {
-                    self.database.pop();
-                    if !self.alias_is_custom {
-                        self.alias = self.database.clone();
-                    }
-                }
-                4 => {
-                    self.username.pop();
-                }
-                5 => {
-                    self.password.pop();
-                }
-                6 => {
-                    self.alias.pop();
-                    self.alias_is_custom = true;
-                }
-                _ => {}
-            }
-        } else if p.is_quack() {
-            match self.active_field {
-                1 => {
-                    self.host.pop();
-                }
-                2 => {
-                    self.port.pop();
-                }
-                3 => {
-                    self.password.pop();
-                }
-                4 => {
-                    self.alias.pop();
-                    self.alias_is_custom = true;
-                }
-                _ => {}
-            }
-        } else if p.is_motherduck() {
-            match self.active_field {
-                1 => {
-                    self.path.pop();
-                    if !self.alias_is_custom {
-                        self.alias = self.path.trim_start_matches("md:").to_string();
-                    }
-                }
-                2 => {
-                    self.password.pop();
-                }
-                3 => {
-                    self.alias.pop();
-                    self.alias_is_custom = true;
-                }
-                _ => {}
-            }
-        } else {
-            match self.active_field {
-                1 => {
-                    self.path.pop();
-                    if !self.alias_is_custom {
-                        let stem = Path::new(&self.path)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("");
-                        self.alias = stem.to_string();
-                    }
-                }
-                2 => {
-                    self.alias.pop();
-                    self.alias_is_custom = true;
-                }
-                _ => {}
-            }
+        if self.is_alias_field() {
+            self.alias_is_custom = true;
         }
+        let mut cur = self.cursor_pos;
+        if let Some(t) = self.active_text_mut() {
+            delete_char_before_cursor(t, &mut cur);
+        }
+        self.cursor_pos = cur;
+        self.sync_alias_if_default();
+    }
+
+    pub(crate) fn handle_delete(&mut self) {
+        if self.is_alias_field() {
+            self.alias_is_custom = true;
+        }
+        let cur = self.cursor_pos;
+        if let Some(t) = self.active_text_mut() {
+            delete_char_at_cursor(t, cur);
+        }
+        self.sync_alias_if_default();
     }
 
     pub(crate) fn build_connection_target(&self) -> std::result::Result<(String, String), String> {
         let provider = self.provider();
         match provider {
+            AttachProvider::DuckLake => {
+                let backend_str = match self.ducklake_backend {
+                    DuckLakeBackend::Quack => "quack",
+                    DuckLakeBackend::PostgreSQL => "postgres",
+                    DuckLakeBackend::LocalFile => "file",
+                    DuckLakeBackend::SQLite => "sqlite",
+                };
+                let target = crate::engine::format_ducklake_target(
+                    backend_str,
+                    &self.host,
+                    &self.port,
+                    &self.database,
+                    &self.username,
+                    &self.password,
+                    &self.path,
+                )?;
+                let alias = if self.alias.trim().is_empty() {
+                    "my_lakehouse".to_string()
+                } else {
+                    self.alias.trim().to_string()
+                };
+                Ok((target.replace('\'', "''"), alias))
+            }
             AttachProvider::MSSQL => {
                 if self.host.trim().is_empty() {
                     return Err("Host / Server address cannot be empty for MSSQL.".to_string());
                 }
-                let host_raw = self.host.trim();
-                let mut conn_str = if host_raw.contains('=') {
-                    host_raw.to_string()
-                } else {
-                    let port = if self.port.trim().is_empty() {
-                        "1433"
-                    } else {
-                        self.port.trim()
-                    };
-                    format!("Server={},{}", host_raw, port)
-                };
-                if !self.database.trim().is_empty()
-                    && !conn_str.to_lowercase().contains("database=")
-                {
-                    conn_str.push_str(&format!(";Database={}", self.database.trim()));
-                }
-                if !self.username.trim().is_empty()
-                    && !conn_str.to_lowercase().contains("user id=")
-                    && !conn_str.to_lowercase().contains("uid=")
-                {
-                    conn_str.push_str(&format!(";User Id={}", self.username.trim()));
-                }
-                if !self.password.trim().is_empty()
-                    && !conn_str.to_lowercase().contains("password=")
-                    && !conn_str.to_lowercase().contains("pwd=")
-                {
-                    conn_str.push_str(&format!(";Password={}", self.password.trim()));
-                }
-                if (self.insecure
-                    || conn_str.contains("localhost")
-                    || conn_str.contains("127.0.0.1"))
-                    && !conn_str.to_lowercase().contains("trustservercertificate=")
-                {
-                    conn_str.push_str(";TrustServerCertificate=yes");
-                }
-                if self.disable_ssl && !conn_str.to_lowercase().contains("encrypt=") {
-                    conn_str.push_str(";Encrypt=no");
-                }
+                let conn_str = crate::engine::format_mssql_connection_string(
+                    &self.host,
+                    &self.port,
+                    &self.database,
+                    &self.username,
+                    &self.password,
+                    self.trusted_connection,
+                    self.insecure,
+                    self.disable_ssl,
+                );
                 let alias = if self.alias.trim().is_empty() {
                     if !self.database.trim().is_empty() {
                         self.database.trim().to_string()
@@ -1406,22 +1902,7 @@ impl AttachModalState {
                 if self.host.trim().is_empty() {
                     return Err("Host / Server cannot be empty for Remote Quack.".to_string());
                 }
-                let host_raw = self.host.trim();
-                let stripped = host_raw
-                    .strip_prefix("quack://")
-                    .or_else(|| host_raw.strip_prefix("quack:"))
-                    .unwrap_or(host_raw);
-                let endpoint = if stripped.contains(':') {
-                    stripped.to_string()
-                } else {
-                    let port = if self.port.trim().is_empty() {
-                        "9494"
-                    } else {
-                        self.port.trim()
-                    };
-                    format!("{}:{}", stripped, port)
-                };
-                let target = format!("quack:{}", endpoint);
+                let target = crate::engine::format_quack_endpoint(&self.host, &self.port);
                 let alias = if self.alias.trim().is_empty() {
                     "quack_remote".to_string()
                 } else {
@@ -1464,13 +1945,21 @@ impl AttachModalState {
     }
 
     pub(crate) fn render(&self, f: &mut Frame) {
-        let popup_width = 76.min(f.area().width.saturating_sub(4));
-        let err_lines = if self.error_msg.is_some() { 4 } else { 2 };
+        let popup_width = 82.min(f.area().width.saturating_sub(4));
+        let err_lines = if self.error_msg.is_some() { 3 } else { 1 };
         let is_relational = self.provider().is_relational();
-        let popup_height = if is_relational {
-            (19 + err_lines).min(f.area().height.saturating_sub(2))
+        let is_ducklake = self.provider().is_ducklake();
+        let popup_height = if is_ducklake {
+            let base = match self.ducklake_backend {
+                DuckLakeBackend::Quack => 17,
+                DuckLakeBackend::PostgreSQL => 20,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 14,
+            };
+            (base + err_lines + 2).min(f.area().height.saturating_sub(2))
+        } else if is_relational {
+            (17 + err_lines + 2).min(f.area().height.saturating_sub(2))
         } else {
-            (16 + err_lines).min(f.area().height.saturating_sub(2))
+            (14 + err_lines + 2).min(f.area().height.saturating_sub(2))
         };
         let popup_area = Rect {
             x: (f.area().width.saturating_sub(popup_width)) / 2,
@@ -1489,7 +1978,520 @@ impl AttachModalState {
 
         let inner_area = modal_block.inner(popup_area);
 
-        if is_relational {
+        if is_ducklake {
+            let (field_layout, submit_idx, cancel_idx, ro_idx, data_path_idx) = match self.ducklake_backend {
+                DuckLakeBackend::Quack => {
+                    let layout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3),         // 0: Provider Preset & Backend Picker
+                            Constraint::Length(3),         // 1: Host & Port
+                            Constraint::Length(3),         // 2: Password / Token & Alias
+                            Constraint::Length(3),         // 3: Storage DATA_PATH
+                            Constraint::Length(2),         // 4: Read-Only, Disable SSL toggles & S3 tip
+                            Constraint::Length(err_lines), // 5: Error/hint
+                            Constraint::Length(3),         // 6: Buttons
+                        ])
+                        .split(inner_area);
+                    (layout, 9, 10, 7, 6)
+                }
+                DuckLakeBackend::PostgreSQL => {
+                    let layout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3),         // 0: Provider Preset & Backend Picker
+                            Constraint::Length(3),         // 1: Host & Port
+                            Constraint::Length(3),         // 2: Database & Username
+                            Constraint::Length(3),         // 3: Password & Alias
+                            Constraint::Length(3),         // 4: Storage DATA_PATH
+                            Constraint::Length(2),         // 5: Read-Only toggle & S3 tip
+                            Constraint::Length(err_lines), // 6: Error/hint
+                            Constraint::Length(3),         // 7: Buttons
+                        ])
+                        .split(inner_area);
+                    (layout, 10, 11, 9, 8)
+                }
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => {
+                    let layout = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3),         // 0: Provider Preset & Backend Picker
+                            Constraint::Length(3),         // 1: File Path & Alias
+                            Constraint::Length(3),         // 2: Storage DATA_PATH
+                            Constraint::Length(2),         // 3: Read-Only toggle & S3 tip
+                            Constraint::Length(err_lines), // 4: Error/hint
+                            Constraint::Length(3),         // 5: Buttons
+                        ])
+                        .split(inner_area);
+                    (layout, 6, 7, 5, 4)
+                }
+            };
+
+            // 0: Row 0 split into Provider Preset (Left) and DuckLake Backend (Right)
+            let top_cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(field_layout[0]);
+
+            let f0_style = if self.active_field == 0 {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let prov_label = format!("  ◄ [ {} ] ►", self.provider().name());
+            let p0 = Paragraph::new(prov_label).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Provider (◄ / ►) ")
+                    .border_style(f0_style),
+            );
+            f.render_widget(p0, top_cols[0]);
+
+            let f1_style = if self.active_field == 1 {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let backend_label = format!("  ◄ [ {} ] ►", self.ducklake_backend.name());
+            let p1 = Paragraph::new(backend_label).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Backend (◄ / ► / Space) ")
+                    .border_style(f1_style),
+            );
+            f.render_widget(p1, top_cols[1]);
+
+            // Backend specific rows
+            match self.ducklake_backend {
+                DuckLakeBackend::Quack => {
+                    let host_port_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+                        .split(field_layout[1]);
+                    let f2_style = if self.active_field == 2 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p2_line = render_text_with_cursor(
+                        &self.host,
+                        self.cursor_pos,
+                        self.active_field == 2,
+                        false,
+                    );
+                    let p2 = Paragraph::new(p2_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Quack Catalog Host / Server (e.g. localhost) ")
+                            .border_style(f2_style),
+                    );
+                    f.render_widget(p2, host_port_cols[0]);
+
+                    let f3_style = if self.active_field == 3 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p3_line = render_text_with_cursor(
+                        &self.port,
+                        self.cursor_pos,
+                        self.active_field == 3,
+                        false,
+                    );
+                    let p3 = Paragraph::new(p3_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Port (9494) ")
+                            .border_style(f3_style),
+                    );
+                    f.render_widget(p3, host_port_cols[1]);
+
+                    let pass_alias_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(field_layout[2]);
+                    let f4_style = if self.active_field == 4 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p4_line = render_text_with_cursor(
+                        &self.password,
+                        self.cursor_pos,
+                        self.active_field == 4,
+                        true,
+                    );
+                    let p4 = Paragraph::new(p4_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Quack Auth Token / Password (Masked) ")
+                            .border_style(f4_style),
+                    );
+                    f.render_widget(p4, pass_alias_cols[0]);
+
+                    let f5_style = if self.active_field == 5 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p5_line = render_text_with_cursor(
+                        &self.alias,
+                        self.cursor_pos,
+                        self.active_field == 5,
+                        false,
+                    );
+                    let p5 = Paragraph::new(p5_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Lakehouse Catalog Alias ")
+                            .border_style(f5_style),
+                    );
+                    f.render_widget(p5, pass_alias_cols[1]);
+                }
+                DuckLakeBackend::PostgreSQL => {
+                    let host_port_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+                        .split(field_layout[1]);
+                    let f2_style = if self.active_field == 2 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p2_line = render_text_with_cursor(
+                        &self.host,
+                        self.cursor_pos,
+                        self.active_field == 2,
+                        false,
+                    );
+                    let p2 = Paragraph::new(p2_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" PostgreSQL Catalog Host (e.g. localhost) ")
+                            .border_style(f2_style),
+                    );
+                    f.render_widget(p2, host_port_cols[0]);
+
+                    let f3_style = if self.active_field == 3 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p3_line = render_text_with_cursor(
+                        &self.port,
+                        self.cursor_pos,
+                        self.active_field == 3,
+                        false,
+                    );
+                    let p3 = Paragraph::new(p3_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Port (5432) ")
+                            .border_style(f3_style),
+                    );
+                    f.render_widget(p3, host_port_cols[1]);
+
+                    let db_user_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(field_layout[2]);
+                    let f4_style = if self.active_field == 4 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p4_line = render_text_with_cursor(
+                        &self.database,
+                        self.cursor_pos,
+                        self.active_field == 4,
+                        false,
+                    );
+                    let p4 = Paragraph::new(p4_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Metadata Database Name (e.g. ducklake) ")
+                            .border_style(f4_style),
+                    );
+                    f.render_widget(p4, db_user_cols[0]);
+
+                    let f5_style = if self.active_field == 5 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p5_line = render_text_with_cursor(
+                        &self.username,
+                        self.cursor_pos,
+                        self.active_field == 5,
+                        false,
+                    );
+                    let p5 = Paragraph::new(p5_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Username (e.g. lakehouse) ")
+                            .border_style(f5_style),
+                    );
+                    f.render_widget(p5, db_user_cols[1]);
+
+                    let pass_alias_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(field_layout[3]);
+                    let f6_style = if self.active_field == 6 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p6_line = render_text_with_cursor(
+                        &self.password,
+                        self.cursor_pos,
+                        self.active_field == 6,
+                        true,
+                    );
+                    let p6 = Paragraph::new(p6_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Password (Masked) ")
+                            .border_style(f6_style),
+                    );
+                    f.render_widget(p6, pass_alias_cols[0]);
+
+                    let f7_style = if self.active_field == 7 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p7_line = render_text_with_cursor(
+                        &self.alias,
+                        self.cursor_pos,
+                        self.active_field == 7,
+                        false,
+                    );
+                    let p7 = Paragraph::new(p7_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Lakehouse Catalog Alias ")
+                            .border_style(f7_style),
+                    );
+                    f.render_widget(p7, pass_alias_cols[1]);
+                }
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => {
+                    let path_alias_cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                        .split(field_layout[1]);
+                    let f2_style = if self.active_field == 2 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let title = if self.ducklake_backend == DuckLakeBackend::LocalFile {
+                        " Catalog Metadata File (e.g. metadata.ducklake) "
+                    } else {
+                        " SQLite Catalog Database (e.g. metadata.db) "
+                    };
+                    let p2_line = render_text_with_cursor(
+                        &self.path,
+                        self.cursor_pos,
+                        self.active_field == 2,
+                        false,
+                    );
+                    let p2 = Paragraph::new(p2_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(title)
+                            .border_style(f2_style),
+                    );
+                    f.render_widget(p2, path_alias_cols[0]);
+
+                    let f3_style = if self.active_field == 3 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let p3_line = render_text_with_cursor(
+                        &self.alias,
+                        self.cursor_pos,
+                        self.active_field == 3,
+                        false,
+                    );
+                    let p3 = Paragraph::new(p3_line).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .title(" Lakehouse Catalog Alias ")
+                            .border_style(f3_style),
+                    );
+                    f.render_widget(p3, path_alias_cols[1]);
+                }
+            }
+
+            // DATA_PATH layout slot
+            let data_path_slot = match self.ducklake_backend {
+                DuckLakeBackend::Quack => 3,
+                DuckLakeBackend::PostgreSQL => 4,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 2,
+            };
+            let dp_style = if self.active_field == data_path_idx {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let dp_line = render_text_with_cursor(
+                &self.data_path,
+                self.cursor_pos,
+                self.active_field == data_path_idx,
+                false,
+            );
+            let dp_widget = Paragraph::new(dp_line).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Storage DATA_PATH (e.g. s3://bucket/data/ or /local/path/) ")
+                    .border_style(dp_style),
+            );
+            f.render_widget(dp_widget, field_layout[data_path_slot]);
+
+            // Read-Only, Disable SSL & Tip layout slot
+            let ro_slot = match self.ducklake_backend {
+                DuckLakeBackend::Quack => 4,
+                DuckLakeBackend::PostgreSQL => 5,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 3,
+            };
+            if self.ducklake_backend == DuckLakeBackend::Quack {
+                let toggle_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(22),
+                        Constraint::Percentage(24),
+                        Constraint::Percentage(54),
+                    ])
+                    .split(field_layout[ro_slot]);
+                let ro_style = if self.active_field == ro_idx {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Read-Only",
+                        if self.read_only { "X" } else { " " }
+                    ))
+                    .style(ro_style),
+                    toggle_cols[0],
+                );
+                let ssl_style = if self.active_field == 8 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "[{}] Disable SSL",
+                        if self.disable_ssl { "X" } else { " " }
+                    ))
+                    .style(ssl_style),
+                    toggle_cols[1],
+                );
+                f.render_widget(
+                    Paragraph::new("💡 Ctrl+X: S3 / RustFS secrets")
+                        .style(Style::default().fg(Color::DarkGray)),
+                    toggle_cols[2],
+                );
+            } else {
+                let toggle_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
+                    .split(field_layout[ro_slot]);
+                let ro_style = if self.active_field == ro_idx {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Read-Only",
+                        if self.read_only { "X" } else { " " }
+                    ))
+                    .style(ro_style),
+                    toggle_cols[0],
+                );
+                f.render_widget(
+                    Paragraph::new("💡 S3/RustFS Tip: Use Ctrl+X beforehand in IDE to configure S3 / RustFS secrets")
+                        .style(Style::default().fg(Color::DarkGray)),
+                    toggle_cols[1],
+                );
+            }
+
+            // Error / Help layout slot
+            let err_slot = match self.ducklake_backend {
+                DuckLakeBackend::Quack => 5,
+                DuckLakeBackend::PostgreSQL => 6,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 4,
+            };
+            if let Some(ref err) = self.error_msg {
+                f.render_widget(
+                    Paragraph::new(format!(" ⚠️ {}", err))
+                        .style(Style::default().fg(Color::LightRed))
+                        .wrap(Wrap { trim: true }),
+                    field_layout[err_slot],
+                );
+            } else {
+                f.render_widget(
+                    Paragraph::new(
+                        "  Tab/Arrows: Navigate | Space: Toggle | Enter: Attach | Esc: Cancel",
+                    )
+                    .style(Style::default().fg(Color::DarkGray))
+                    .wrap(Wrap { trim: true }),
+                    field_layout[err_slot],
+                );
+            }
+
+            // Buttons layout slot
+            let btn_slot = match self.ducklake_backend {
+                DuckLakeBackend::Quack => 6,
+                DuckLakeBackend::PostgreSQL => 7,
+                DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => 5,
+            };
+            let attach_btn_style = if self.active_field == submit_idx {
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let cancel_btn_style = if self.active_field == cancel_idx {
+                Style::default()
+                    .bg(Color::Red)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let buttons = Line::from(vec![
+                Span::styled(" [ 🌊 Attach Lakehouse ] ", attach_btn_style),
+                Span::raw("    "),
+                Span::styled(" [ Cancel ] ", cancel_btn_style),
+            ]);
+            f.render_widget(
+                Paragraph::new(buttons).alignment(Alignment::Center),
+                field_layout[btn_slot],
+            );
+        } else if is_relational {
             let field_layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -1527,12 +2529,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p1 = Paragraph::new(format!(
-                "{}{}",
-                self.host,
-                if self.active_field == 1 { "█" } else { "" }
-            ))
-            .block(
+            let p1_line = render_text_with_cursor(
+                &self.host,
+                self.cursor_pos,
+                self.active_field == 1,
+                false,
+            );
+            let p1 = Paragraph::new(p1_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1546,12 +2549,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p2 = Paragraph::new(format!(
-                "{}{}",
-                self.port,
-                if self.active_field == 2 { "█" } else { "" }
-            ))
-            .block(
+            let p2_line = render_text_with_cursor(
+                &self.port,
+                self.cursor_pos,
+                self.active_field == 2,
+                false,
+            );
+            let p2 = Paragraph::new(p2_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1569,12 +2573,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p3 = Paragraph::new(format!(
-                "{}{}",
-                self.database,
-                if self.active_field == 3 { "█" } else { "" }
-            ))
-            .block(
+            let p3_line = render_text_with_cursor(
+                &self.database,
+                self.cursor_pos,
+                self.active_field == 3,
+                false,
+            );
+            let p3 = Paragraph::new(p3_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1584,6 +2589,7 @@ impl AttachModalState {
             f.render_widget(p3, db_user_cols[0]);
 
             let user_title = match self.provider() {
+                AttachProvider::MSSQL if self.trusted_connection => " User ID (Windows Auth Active) ",
                 AttachProvider::MSSQL => " User ID (e.g. sa) ",
                 AttachProvider::PostgreSQL => " Username (e.g. postgres) ",
                 _ => " Username (e.g. root) ",
@@ -1593,12 +2599,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p4 = Paragraph::new(format!(
-                "{}{}",
-                self.username,
-                if self.active_field == 4 { "█" } else { "" }
-            ))
-            .block(
+            let p4_line = render_text_with_cursor(
+                &self.username,
+                self.cursor_pos,
+                self.active_field == 4,
+                false,
+            );
+            let p4 = Paragraph::new(p4_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1616,17 +2623,22 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let masked_pass = "*".repeat(self.password.len());
-            let p5 = Paragraph::new(format!(
-                "{}{}",
-                masked_pass,
-                if self.active_field == 5 { "█" } else { "" }
-            ))
-            .block(
+            let pass_title = if self.provider() == AttachProvider::MSSQL && self.trusted_connection {
+                " Password (Not Required for Windows Auth) "
+            } else {
+                " Password (Masked) "
+            };
+            let p5_line = render_text_with_cursor(
+                &self.password,
+                self.cursor_pos,
+                self.active_field == 5,
+                true,
+            );
+            let p5 = Paragraph::new(p5_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .title(" Password (Masked) ")
+                    .title(pass_title)
                     .border_style(f5_style),
             );
             f.render_widget(p5, pass_alias_cols[0]);
@@ -1636,12 +2648,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p6 = Paragraph::new(format!(
-                "{}{}",
-                self.alias,
-                if self.active_field == 6 { "█" } else { "" }
-            ))
-            .block(
+            let p6_line = render_text_with_cursor(
+                &self.alias,
+                self.cursor_pos,
+                self.active_field == 6,
+                false,
+            );
+            let p6 = Paragraph::new(p6_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1650,55 +2663,124 @@ impl AttachModalState {
             );
             f.render_widget(p6, pass_alias_cols[1]);
 
-            let toggle_cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(34),
-                ])
-                .split(field_layout[4]);
-            let f7_style = if self.active_field == 7 {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            f.render_widget(
-                Paragraph::new(format!(
-                    "  [{}] Read-Only",
-                    if self.read_only { "X" } else { " " }
-                ))
-                .style(f7_style),
-                toggle_cols[0],
-            );
+            let is_mssql = self.provider() == AttachProvider::MSSQL;
+            if is_mssql {
+                let toggle_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(24),
+                        Constraint::Percentage(28),
+                        Constraint::Percentage(24),
+                        Constraint::Percentage(24),
+                    ])
+                    .split(field_layout[4]);
 
-            let f8_style = if self.active_field == 8 {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            f.render_widget(
-                Paragraph::new(format!(
-                    "  [{}] Disable SSL",
-                    if self.disable_ssl { "X" } else { " " }
-                ))
-                .style(f8_style),
-                toggle_cols[1],
-            );
+                let f7_style = if self.active_field == 7 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Read-Only",
+                        if self.read_only { "X" } else { " " }
+                    ))
+                    .style(f7_style),
+                    toggle_cols[0],
+                );
 
-            let f9_style = if self.active_field == 9 {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                let f8_style = if self.active_field == 8 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Windows Auth",
+                        if self.trusted_connection { "X" } else { " " }
+                    ))
+                    .style(f8_style),
+                    toggle_cols[1],
+                );
+
+                let f9_style = if self.active_field == 9 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Disable SSL",
+                        if self.disable_ssl { "X" } else { " " }
+                    ))
+                    .style(f9_style),
+                    toggle_cols[2],
+                );
+
+                let f10_style = if self.active_field == 10 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Trust Cert",
+                        if self.insecure { "X" } else { " " }
+                    ))
+                    .style(f10_style),
+                    toggle_cols[3],
+                );
             } else {
-                Style::default().fg(Color::White)
-            };
-            f.render_widget(
-                Paragraph::new(format!(
-                    "  [{}] Insecure / Trust",
-                    if self.insecure { "X" } else { " " }
-                ))
-                .style(f9_style),
-                toggle_cols[2],
-            );
+                let toggle_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(33),
+                        Constraint::Percentage(33),
+                        Constraint::Percentage(34),
+                    ])
+                    .split(field_layout[4]);
+                let f7_style = if self.active_field == 7 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Read-Only",
+                        if self.read_only { "X" } else { " " }
+                    ))
+                    .style(f7_style),
+                    toggle_cols[0],
+                );
+
+                let f8_style = if self.active_field == 8 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Disable SSL",
+                        if self.disable_ssl { "X" } else { " " }
+                    ))
+                    .style(f8_style),
+                    toggle_cols[1],
+                );
+
+                let f9_style = if self.active_field == 9 {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "  [{}] Insecure / Trust",
+                        if self.insecure { "X" } else { " " }
+                    ))
+                    .style(f9_style),
+                    toggle_cols[2],
+                );
+            }
 
             if let Some(ref err) = self.error_msg {
                 f.render_widget(
@@ -1718,7 +2800,9 @@ impl AttachModalState {
                 );
             }
 
-            let attach_btn_style = if self.active_field == 10 {
+            let attach_btn_style = if (is_mssql && self.active_field == 11)
+                || (!is_mssql && self.active_field == 10)
+            {
                 Style::default()
                     .bg(Color::Cyan)
                     .fg(Color::Black)
@@ -1726,7 +2810,9 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::Cyan)
             };
-            let cancel_btn_style = if self.active_field == 11 {
+            let cancel_btn_style = if (is_mssql && self.active_field == 12)
+                || (!is_mssql && self.active_field == 11)
+            {
                 Style::default()
                     .bg(Color::Red)
                     .fg(Color::White)
@@ -1780,12 +2866,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p1 = Paragraph::new(format!(
-                "{}{}",
-                self.host,
-                if self.active_field == 1 { "█" } else { "" }
-            ))
-            .block(
+            let p1_line = render_text_with_cursor(
+                &self.host,
+                self.cursor_pos,
+                self.active_field == 1,
+                false,
+            );
+            let p1 = Paragraph::new(p1_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1799,12 +2886,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p2 = Paragraph::new(format!(
-                "{}{}",
-                self.port,
-                if self.active_field == 2 { "█" } else { "" }
-            ))
-            .block(
+            let p2_line = render_text_with_cursor(
+                &self.port,
+                self.cursor_pos,
+                self.active_field == 2,
+                false,
+            );
+            let p2 = Paragraph::new(p2_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1822,13 +2910,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let masked_token = "*".repeat(self.password.len());
-            let p3 = Paragraph::new(format!(
-                "{}{}",
-                masked_token,
-                if self.active_field == 3 { "█" } else { "" }
-            ))
-            .block(
+            let p3_line = render_text_with_cursor(
+                &self.password,
+                self.cursor_pos,
+                self.active_field == 3,
+                true,
+            );
+            let p3 = Paragraph::new(p3_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1842,12 +2930,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p4 = Paragraph::new(format!(
-                "{}{}",
-                self.alias,
-                if self.active_field == 4 { "█" } else { "" }
-            ))
-            .block(
+            let p4_line = render_text_with_cursor(
+                &self.alias,
+                self.cursor_pos,
+                self.active_field == 4,
+                false,
+            );
+            let p4 = Paragraph::new(p4_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1982,12 +3071,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p1 = Paragraph::new(format!(
-                "{}{}",
-                self.path,
-                if self.active_field == 1 { "█" } else { "" }
-            ))
-            .block(
+            let p1_line = render_text_with_cursor(
+                &self.path,
+                self.cursor_pos,
+                self.active_field == 1,
+                false,
+            );
+            let p1 = Paragraph::new(p1_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -2005,13 +3095,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let masked_token = "*".repeat(self.password.len());
-            let p2 = Paragraph::new(format!(
-                "{}{}",
-                masked_token,
-                if self.active_field == 2 { "█" } else { "" }
-            ))
-            .block(
+            let p2_line = render_text_with_cursor(
+                &self.password,
+                self.cursor_pos,
+                self.active_field == 2,
+                true,
+            );
+            let p2 = Paragraph::new(p2_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -2025,12 +3115,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p3 = Paragraph::new(format!(
-                "{}{}",
-                self.alias,
-                if self.active_field == 3 { "█" } else { "" }
-            ))
-            .block(
+            let p3_line = render_text_with_cursor(
+                &self.alias,
+                self.cursor_pos,
+                self.active_field == 3,
+                false,
+            );
+            let p3 = Paragraph::new(p3_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -2134,12 +3225,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p1 = Paragraph::new(format!(
-                "{}{}",
-                self.path,
-                if self.active_field == 1 { "█" } else { "" }
-            ))
-            .block(
+            let p1_line = render_text_with_cursor(
+                &self.path,
+                self.cursor_pos,
+                self.active_field == 1,
+                false,
+            );
+            let p1 = Paragraph::new(p1_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -2153,12 +3245,13 @@ impl AttachModalState {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let p2 = Paragraph::new(format!(
-                "{}{}",
-                self.alias,
-                if self.active_field == 2 { "█" } else { "" }
-            ))
-            .block(
+            let p2_line = render_text_with_cursor(
+                &self.alias,
+                self.cursor_pos,
+                self.active_field == 2,
+                false,
+            );
+            let p2 = Paragraph::new(p2_line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -2227,6 +3320,136 @@ impl AttachModalState {
         }
     }
 
+    pub(crate) fn execute_attach(&mut self, conn: &Connection) -> Option<String> {
+        match self.build_connection_target() {
+            Err(err) => {
+                self.error_msg = Some(err);
+            }
+            Ok((safe_path, alias)) => {
+                let provider = self.provider();
+                let ext_res = match provider {
+                    AttachProvider::DuckLake => {
+                        let opt_token = if self.password.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.password.trim())
+                        };
+                        crate::engine::prepare_ducklake_connection(
+                            conn,
+                            &safe_path,
+                            &self.data_path,
+                            opt_token,
+                            None,
+                        )
+                    }
+                    AttachProvider::SQLite => {
+                        crate::engine::ensure_extension_loaded(conn, "sqlite")
+                    }
+                    AttachProvider::PostgreSQL => {
+                        crate::engine::ensure_extension_loaded(conn, "postgres")
+                    }
+                    AttachProvider::MySQL => {
+                        crate::engine::ensure_extension_loaded(conn, "mysql")
+                    }
+                    AttachProvider::MSSQL => {
+                        crate::engine::ensure_extension_loaded(conn, "mssql")
+                    }
+                    AttachProvider::MotherDuck => {
+                        crate::engine::ensure_extension_loaded(conn, "motherduck")
+                    }
+                    AttachProvider::Quack => crate::engine::load_quack_extension(conn),
+                    AttachProvider::DuckDB => Ok(()),
+                };
+
+                if let Err(e) = ext_res {
+                    self.error_msg = Some(format!(
+                        "Failed to load required extension for {}: {}",
+                        provider.name(),
+                        e
+                    ));
+                } else {
+                    if provider == AttachProvider::MotherDuck
+                        && !self.password.trim().is_empty()
+                    {
+                        let safe_token = self.password.trim().replace('\'', "''");
+                        let _ = conn.execute(
+                            &format!("SET motherduck_token='{}';", safe_token),
+                            [],
+                        );
+                    }
+                    if provider == AttachProvider::Quack && !self.password.trim().is_empty() {
+                        let safe_token = self.password.trim().replace('\'', "''");
+                        let _ = conn.execute(
+                            &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
+                            [],
+                        );
+                    }
+
+                    let quoted_alias = format!("\"{}\"", alias.replace('"', "\"\""));
+                    let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, quoted_alias);
+                    let mut opts = Vec::new();
+                    match provider {
+                        AttachProvider::DuckLake => {
+                            if !self.data_path.trim().is_empty() {
+                                opts.push(format!(
+                                    "DATA_PATH '{}'",
+                                    self.data_path.trim().replace('\'', "''")
+                                ));
+                            }
+                            if self.ducklake_backend == DuckLakeBackend::Quack {
+                                let quack_dsn = safe_path
+                                    .strip_prefix("ducklake:")
+                                    .unwrap_or(&safe_path);
+                                if self.disable_ssl
+                                    || self.insecure
+                                    || crate::engine::should_disable_quack_ssl(quack_dsn, false)
+                                {
+                                    opts.push("METADATA_PARAMETERS MAP {'DISABLE_SSL': true}".to_string());
+                                }
+                            }
+                        }
+                        AttachProvider::SQLite => opts.push("TYPE SQLITE".to_string()),
+                        AttachProvider::PostgreSQL => {
+                            opts.push("TYPE POSTGRES".to_string())
+                        }
+                        AttachProvider::MySQL => opts.push("TYPE MYSQL".to_string()),
+                        AttachProvider::MSSQL => opts.push("TYPE MSSQL".to_string()),
+                        AttachProvider::Quack => {
+                            if self.disable_ssl
+                                || self.insecure
+                                || crate::engine::should_disable_quack_ssl(&safe_path, false)
+                            {
+                                opts.push("DISABLE_SSL true".to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                    if self.read_only {
+                        opts.push("READ_ONLY".to_string());
+                    }
+                    if !opts.is_empty() {
+                        attach_sql.push_str(&format!(" ({})", opts.join(", ")));
+                    }
+                    attach_sql.push(';');
+
+                    match conn.execute(&attach_sql, []) {
+                        Ok(_) => {
+                            self.is_open = false;
+                            return Some(alias);
+                        }
+                        Err(e) => {
+                            self.error_msg = Some(format!(
+                                "Attach Error: {}",
+                                crate::engine::redact_connection_credentials(&e.to_string())
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Processes a keyboard event in the Attach Database modal.
     /// Returns `Some(attached_alias)` if a database was attached successfully.
     pub(crate) fn handle_key(&mut self, key: KeyEvent, conn: &Connection) -> Option<String> {
@@ -2240,118 +3463,60 @@ impl AttachModalState {
             self.nav_down();
         } else if key.code == KeyCode::Up {
             self.nav_up();
-        } else if key.code == KeyCode::Left
-            || (self.active_field == 0 && key.code == KeyCode::Char('h'))
-        {
-            self.nav_left();
-        } else if key.code == KeyCode::Right
-            || (self.active_field == 0 && key.code == KeyCode::Char('l'))
-        {
-            self.nav_right();
-        } else if key.code == KeyCode::Char(' ') && self.is_toggle_field() {
-            self.toggle_active();
-        } else if key.code == KeyCode::Enter {
-            if self.is_cancel() {
-                self.is_open = false;
-            } else if self.is_toggle_field() {
-                self.toggle_active();
-            } else {
-                match self.build_connection_target() {
-                    Err(err) => {
-                        self.error_msg = Some(err);
-                    }
-                    Ok((safe_path, alias)) => {
-                        let provider = self.provider();
-                        let ext_res = match provider {
-                            AttachProvider::SQLite => {
-                                crate::engine::ensure_extension_loaded(conn, "sqlite")
-                            }
-                            AttachProvider::PostgreSQL => {
-                                crate::engine::ensure_extension_loaded(conn, "postgres")
-                            }
-                            AttachProvider::MySQL => {
-                                crate::engine::ensure_extension_loaded(conn, "mysql")
-                            }
-                            AttachProvider::MSSQL => {
-                                crate::engine::ensure_extension_loaded(conn, "mssql")
-                            }
-                            AttachProvider::MotherDuck => {
-                                crate::engine::ensure_extension_loaded(conn, "motherduck")
-                            }
-                            AttachProvider::Quack => crate::engine::load_quack_extension(conn),
-                            AttachProvider::DuckDB => Ok(()),
-                        };
-
-                        if let Err(e) = ext_res {
-                            self.error_msg = Some(format!(
-                                "Failed to load required extension for {}: {}",
-                                provider.name(),
-                                e
-                            ));
-                        } else {
-                            if provider == AttachProvider::MotherDuck
-                                && !self.password.trim().is_empty()
-                            {
-                                let safe_token = self.password.trim().replace('\'', "''");
-                                let _ = conn.execute(
-                                    &format!("SET motherduck_token='{}';", safe_token),
-                                    [],
-                                );
-                            }
-                            if provider == AttachProvider::Quack && !self.password.trim().is_empty()
-                            {
-                                let safe_token = self.password.trim().replace('\'', "''");
-                                let _ = conn.execute(
-                                    &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
-                                    [],
-                                );
-                            }
-
-                            let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, alias);
-                            let mut opts = Vec::new();
-                            match provider {
-                                AttachProvider::SQLite => opts.push("TYPE SQLITE".to_string()),
-                                AttachProvider::PostgreSQL => {
-                                    opts.push("TYPE POSTGRES".to_string())
-                                }
-                                AttachProvider::MySQL => opts.push("TYPE MYSQL".to_string()),
-                                AttachProvider::MSSQL => opts.push("TYPE MSSQL".to_string()),
-                                AttachProvider::Quack => {
-                                    if self.disable_ssl
-                                        || self.insecure
-                                        || crate::engine::should_disable_quack_ssl(&safe_path, false)
-                                    {
-                                        opts.push("DISABLE_SSL true".to_string());
-                                    }
-                                }
-                                _ => {}
-                            }
-                            if self.read_only {
-                                opts.push("READ_ONLY".to_string());
-                            }
-                            if !opts.is_empty() {
-                                attach_sql.push_str(&format!(" ({})", opts.join(", ")));
-                            }
-                            attach_sql.push(';');
-
-                            match conn.execute(&attach_sql, []) {
-                                Ok(_) => {
-                                    self.is_open = false;
-                                    return Some(alias);
-                                }
-                                Err(e) => {
-                                    self.error_msg = Some(format!("Attach Error: {}", e));
-                                }
-                            }
-                        }
+        } else if self.is_text_field() {
+            match key.code {
+                KeyCode::Left => {
+                    self.cursor_pos = self.cursor_pos.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    let len = self.active_text().map(|s| s.chars().count()).unwrap_or(0);
+                    self.cursor_pos = (self.cursor_pos + 1).min(len);
+                }
+                KeyCode::Home => {
+                    self.cursor_pos = 0;
+                }
+                KeyCode::End => {
+                    self.sync_cursor_to_end();
+                }
+                KeyCode::Backspace => {
+                    self.handle_backspace();
+                }
+                KeyCode::Delete => {
+                    self.handle_delete();
+                }
+                KeyCode::Enter => {
+                    return self.execute_attach(conn);
+                }
+                KeyCode::Char(c) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                        self.handle_char(c);
                     }
                 }
+                _ => {}
             }
-        } else if key.code == KeyCode::Backspace {
-            self.handle_backspace();
-        } else if let KeyCode::Char(c) = key.code {
-            if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                self.handle_char(c);
+        } else {
+            if key.code == KeyCode::Left
+                || ((self.active_field == 0
+                    || (self.provider() == AttachProvider::DuckLake && self.active_field == 1))
+                    && key.code == KeyCode::Char('h'))
+            {
+                self.nav_left();
+            } else if key.code == KeyCode::Right
+                || ((self.active_field == 0
+                    || (self.provider() == AttachProvider::DuckLake && self.active_field == 1))
+                    && key.code == KeyCode::Char('l'))
+            {
+                self.nav_right();
+            } else if key.code == KeyCode::Char(' ') && self.is_toggle_field() {
+                self.toggle_active();
+            } else if key.code == KeyCode::Enter {
+                if self.is_cancel() {
+                    self.is_open = false;
+                } else if self.is_toggle_field() {
+                    self.toggle_active();
+                } else {
+                    return self.execute_attach(conn);
+                }
             }
         }
         None
@@ -2391,6 +3556,7 @@ pub(crate) struct SecretModalState {
     pub(crate) region: String,
     pub(crate) endpoint: String,
     pub(crate) bucket: String,
+    pub(crate) cursor_pos: usize,
     pub(crate) use_ssl: bool,
     pub(crate) save_to_env: bool,
     pub(crate) active_field: usize, // 0: provider, 1: name, 2: key_id, 3: secret_key, 4: region, 5: endpoint, 6: bucket, 7: use_ssl, 8: save_to_env, 9: submit, 10: cancel
@@ -2408,6 +3574,7 @@ impl SecretModalState {
             region: "us-east-1".to_string(),
             endpoint: String::new(),
             bucket: String::new(),
+            cursor_pos: 0,
             use_ssl: true,
             save_to_env: true,
             active_field: 2,
@@ -2424,10 +3591,43 @@ impl SecretModalState {
         self.region = "us-east-1".to_string();
         self.endpoint.clear();
         self.bucket.clear();
+        self.cursor_pos = 0;
         self.use_ssl = true;
         self.save_to_env = true;
         self.active_field = 2;
         self.error_msg = None;
+    }
+
+    pub(crate) fn is_text_field(&self) -> bool {
+        (1..=6).contains(&self.active_field)
+    }
+
+    pub(crate) fn active_text(&self) -> Option<&str> {
+        match self.active_field {
+            1 => Some(&self.name),
+            2 => Some(&self.key_id),
+            3 => Some(&self.secret_key),
+            4 => Some(&self.region),
+            5 => Some(&self.endpoint),
+            6 => Some(&self.bucket),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn active_text_mut(&mut self) -> Option<&mut String> {
+        match self.active_field {
+            1 => Some(&mut self.name),
+            2 => Some(&mut self.key_id),
+            3 => Some(&mut self.secret_key),
+            4 => Some(&mut self.region),
+            5 => Some(&mut self.endpoint),
+            6 => Some(&mut self.bucket),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn sync_cursor_to_end(&mut self) {
+        self.cursor_pos = self.active_text().map(|s| s.chars().count()).unwrap_or(0);
     }
 
     pub(crate) fn provider(&self) -> CloudProvider {
@@ -2483,7 +3683,7 @@ impl SecretModalState {
 
     pub(crate) fn render(&self, f: &mut Frame) {
         let popup_width = 72.min(f.area().width.saturating_sub(4));
-        let popup_height = 24.min(f.area().height.saturating_sub(2));
+        let popup_height = 26.min(f.area().height.saturating_sub(2));
         let popup_area = Rect {
             x: (f.area().width.saturating_sub(popup_width)) / 2,
             y: (f.area().height.saturating_sub(popup_height)) / 2,
@@ -2535,10 +3735,11 @@ impl SecretModalState {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let p1 = Paragraph::new(format!(
-            "{}{}",
-            self.name,
-            if self.active_field == 1 { "█" } else { "" }
+        let p1 = Paragraph::new(render_text_with_cursor(
+            &self.name,
+            self.cursor_pos,
+            self.active_field == 1,
+            false,
         ))
         .block(
             Block::default()
@@ -2554,10 +3755,11 @@ impl SecretModalState {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let p2 = Paragraph::new(format!(
-            "{}{}",
-            self.key_id,
-            if self.active_field == 2 { "█" } else { "" }
+        let p2 = Paragraph::new(render_text_with_cursor(
+            &self.key_id,
+            self.cursor_pos,
+            self.active_field == 2,
+            false,
         ))
         .block(
             Block::default()
@@ -2573,11 +3775,11 @@ impl SecretModalState {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let masked_secret = "*".repeat(self.secret_key.len());
-        let p3 = Paragraph::new(format!(
-            "{}{}",
-            masked_secret,
-            if self.active_field == 3 { "█" } else { "" }
+        let p3 = Paragraph::new(render_text_with_cursor(
+            &self.secret_key,
+            self.cursor_pos,
+            self.active_field == 3,
+            true,
         ))
         .block(
             Block::default()
@@ -2598,10 +3800,11 @@ impl SecretModalState {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let p_reg = Paragraph::new(format!(
-            "{}{}",
-            self.region,
-            if self.active_field == 4 { "█" } else { "" }
+        let p_reg = Paragraph::new(render_text_with_cursor(
+            &self.region,
+            self.cursor_pos,
+            self.active_field == 4,
+            false,
         ))
         .block(
             Block::default()
@@ -2617,10 +3820,11 @@ impl SecretModalState {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let p_end = Paragraph::new(format!(
-            "{}{}",
-            self.endpoint,
-            if self.active_field == 5 { "█" } else { "" }
+        let p_end = Paragraph::new(render_text_with_cursor(
+            &self.endpoint,
+            self.cursor_pos,
+            self.active_field == 5,
+            false,
         ))
         .block(
             Block::default()
@@ -2636,10 +3840,11 @@ impl SecretModalState {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let p6 = Paragraph::new(format!(
-            "{}{}",
-            self.bucket,
-            if self.active_field == 6 { "█" } else { "" }
+        let p6 = Paragraph::new(render_text_with_cursor(
+            &self.bucket,
+            self.cursor_pos,
+            self.active_field == 6,
+            false,
         ))
         .block(
             Block::default()
@@ -2734,12 +3939,14 @@ impl SecretModalState {
             self.is_open = false;
         } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
             self.active_field = (self.active_field + 1) % 11;
+            self.sync_cursor_to_end();
         } else if key.code == KeyCode::BackTab || key.code == KeyCode::Up {
             self.active_field = if self.active_field == 0 {
                 10
             } else {
                 self.active_field - 1
             };
+            self.sync_cursor_to_end();
         } else if self.active_field == 0
             && (key.code == KeyCode::Left || key.code == KeyCode::Char('h'))
         {
@@ -2758,6 +3965,26 @@ impl SecretModalState {
             && (key.code == KeyCode::Left || key.code == KeyCode::Right)
         {
             self.active_field = if self.active_field == 9 { 10 } else { 9 };
+        } else if self.is_text_field() && key.code == KeyCode::Left {
+            self.cursor_pos = self.cursor_pos.saturating_sub(1);
+        } else if self.is_text_field() && key.code == KeyCode::Right {
+            let len = self.active_text().map(|s| s.chars().count()).unwrap_or(0);
+            self.cursor_pos = (self.cursor_pos + 1).min(len);
+        } else if self.is_text_field() && key.code == KeyCode::Home {
+            self.cursor_pos = 0;
+        } else if self.is_text_field() && key.code == KeyCode::End {
+            self.sync_cursor_to_end();
+        } else if self.is_text_field() && key.code == KeyCode::Backspace {
+            let mut cur = self.cursor_pos;
+            if let Some(t) = self.active_text_mut() {
+                delete_char_before_cursor(t, &mut cur);
+            }
+            self.cursor_pos = cur;
+        } else if self.is_text_field() && key.code == KeyCode::Delete {
+            let cur = self.cursor_pos;
+            if let Some(t) = self.active_text_mut() {
+                delete_char_at_cursor(t, cur);
+            }
         } else if key.code == KeyCode::Char(' ') && self.active_field == 7 {
             self.use_ssl = !self.use_ssl;
         } else if key.code == KeyCode::Char(' ') && self.active_field == 8 {
@@ -2770,44 +3997,27 @@ impl SecretModalState {
             } else if self.active_field == 8 {
                 self.save_to_env = !self.save_to_env;
             } else {
-                let safe_name = self.name.trim().replace("'", "''");
-                let safe_key = self.key_id.trim().replace("'", "''");
-                let safe_secret = self.secret_key.trim().replace("'", "''");
-                let safe_region = self.region.trim().replace("'", "''");
-                let safe_endpoint = self.endpoint.trim().replace("'", "''");
+                let safe_name = self.name.trim();
 
                 if safe_name.is_empty() {
                     self.error_msg = Some("Secret name cannot be empty.".to_string());
+                } else if !safe_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    self.error_msg = Some(
+                        "Secret name must contain only alphanumeric characters and underscores."
+                            .to_string(),
+                    );
                 } else {
                     let _ = conn.execute("INSTALL httpfs; LOAD httpfs;", []);
-                    let mut clauses = vec!["TYPE S3".to_string()];
-                    if !safe_key.is_empty() {
-                        clauses.push(format!("KEY_ID '{}'", safe_key));
-                    }
-                    if !safe_secret.is_empty() {
-                        clauses.push(format!("SECRET '{}'", safe_secret));
-                    }
-                    if !safe_region.is_empty() {
-                        clauses.push(format!("REGION '{}'", safe_region));
-                    }
-                    let mut use_ssl = self.use_ssl;
-                    if !safe_endpoint.is_empty() {
-                        let clean_ep = safe_endpoint
-                            .trim_start_matches("http://")
-                            .trim_start_matches("https://")
-                            .trim_end_matches('/');
-                        clauses.push(format!("ENDPOINT '{}'", clean_ep));
-                        clauses.push("URL_STYLE 'path'".to_string());
-                        if safe_endpoint.starts_with("http://")
-                            || clean_ep.starts_with("localhost")
-                            || clean_ep.starts_with("127.0.0.1")
-                        {
-                            use_ssl = false;
-                        }
-                    }
-                    clauses.push(format!("USE_SSL {}", use_ssl));
-
-                    let secret_body = clauses.join(", ");
+                    let secret_body = crate::engine::build_s3_secret_body(
+                        &self.key_id,
+                        &self.secret_key,
+                        &self.region,
+                        &self.endpoint,
+                        self.use_ssl,
+                    );
                     let persistent_sql = format!(
                         "CREATE OR REPLACE PERSISTENT SECRET {} ({});",
                         safe_name, secret_body
@@ -2856,51 +4066,13 @@ impl SecretModalState {
                     }
                 }
             }
-        } else if key.code == KeyCode::Backspace {
-            match self.active_field {
-                1 => {
-                    self.name.pop();
-                }
-                2 => {
-                    self.key_id.pop();
-                }
-                3 => {
-                    self.secret_key.pop();
-                }
-                4 => {
-                    self.region.pop();
-                }
-                5 => {
-                    self.endpoint.pop();
-                }
-                6 => {
-                    self.bucket.pop();
-                }
-                _ => {}
-            }
         } else if let KeyCode::Char(c) = key.code {
-            if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                match self.active_field {
-                    1 => {
-                        self.name.push(c);
-                    }
-                    2 => {
-                        self.key_id.push(c);
-                    }
-                    3 => {
-                        self.secret_key.push(c);
-                    }
-                    4 => {
-                        self.region.push(c);
-                    }
-                    5 => {
-                        self.endpoint.push(c);
-                    }
-                    6 => {
-                        self.bucket.push(c);
-                    }
-                    _ => {}
+            if !key.modifiers.contains(KeyModifiers::CONTROL) && self.is_text_field() {
+                let mut cur = self.cursor_pos;
+                if let Some(t) = self.active_text_mut() {
+                    insert_char_at_cursor(t, &mut cur, c);
                 }
+                self.cursor_pos = cur;
             }
         }
         None
@@ -2999,6 +4171,7 @@ pub(crate) fn populate_secret_modal_for_edit(
     } else {
         modal.provider_index = 0;
     }
+    modal.sync_cursor_to_end();
 }
 
 /// State for the Add Cloud Bucket modal dialog.
@@ -3007,6 +4180,7 @@ pub(crate) struct AddBucketModalState {
     pub(crate) is_open: bool,
     pub(crate) initial_uri: Option<String>,
     pub(crate) uri: String,
+    pub(crate) cursor_pos: usize,
     pub(crate) save_to_env: bool,
     pub(crate) active_field: usize, // 0: uri, 1: save_to_env, 2: submit, 3: cancel
     pub(crate) error_msg: Option<String>,
@@ -3018,6 +4192,7 @@ impl AddBucketModalState {
             is_open: false,
             initial_uri: None,
             uri: String::new(),
+            cursor_pos: 0,
             save_to_env: true,
             active_field: 0,
             error_msg: None,
@@ -3028,6 +4203,7 @@ impl AddBucketModalState {
         self.is_open = true;
         self.initial_uri = None;
         self.uri.clear();
+        self.cursor_pos = 0;
         self.save_to_env = true;
         self.active_field = 0;
         self.error_msg = None;
@@ -3067,10 +4243,11 @@ impl AddBucketModalState {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let p0 = Paragraph::new(format!(
-            "{}{}",
-            self.uri,
-            if self.active_field == 0 { "█" } else { "" }
+        let p0 = Paragraph::new(render_text_with_cursor(
+            &self.uri,
+            self.cursor_pos,
+            self.active_field == 0,
+            false,
         ))
         .block(
             Block::default()
@@ -3149,16 +4326,30 @@ impl AddBucketModalState {
             self.is_open = false;
         } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
             self.active_field = (self.active_field + 1) % 4;
+            if self.active_field == 0 {
+                self.cursor_pos = self.uri.chars().count();
+            }
         } else if key.code == KeyCode::BackTab || key.code == KeyCode::Up {
             self.active_field = if self.active_field == 0 {
                 3
             } else {
                 self.active_field - 1
             };
+            if self.active_field == 0 {
+                self.cursor_pos = self.uri.chars().count();
+            }
         } else if self.active_field >= 2
             && (key.code == KeyCode::Left || key.code == KeyCode::Right)
         {
             self.active_field = if self.active_field == 2 { 3 } else { 2 };
+        } else if self.active_field == 0 && key.code == KeyCode::Left {
+            self.cursor_pos = self.cursor_pos.saturating_sub(1);
+        } else if self.active_field == 0 && key.code == KeyCode::Right {
+            self.cursor_pos = (self.cursor_pos + 1).min(self.uri.chars().count());
+        } else if self.active_field == 0 && key.code == KeyCode::Home {
+            self.cursor_pos = 0;
+        } else if self.active_field == 0 && key.code == KeyCode::End {
+            self.cursor_pos = self.uri.chars().count();
         } else if key.code == KeyCode::Char(' ') && self.active_field == 1 {
             self.save_to_env = !self.save_to_env;
         } else if key.code == KeyCode::Enter {
@@ -3234,10 +4425,12 @@ impl AddBucketModalState {
                 }
             }
         } else if key.code == KeyCode::Backspace && self.active_field == 0 {
-            self.uri.pop();
+            delete_char_before_cursor(&mut self.uri, &mut self.cursor_pos);
+        } else if key.code == KeyCode::Delete && self.active_field == 0 {
+            delete_char_at_cursor(&mut self.uri, self.cursor_pos);
         } else if let KeyCode::Char(c) = key.code {
             if !key.modifiers.contains(KeyModifiers::CONTROL) && self.active_field == 0 {
-                self.uri.push(c);
+                insert_char_at_cursor(&mut self.uri, &mut self.cursor_pos, c);
             }
         }
         None

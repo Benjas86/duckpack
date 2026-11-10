@@ -5,7 +5,7 @@ DEMO_DIR="demo_project"
 echo "Scaffolding DuckPack Demo Project in '$DEMO_DIR'..."
 
 rm -rf "$DEMO_DIR"
-mkdir -p "$DEMO_DIR/schemas" "$DEMO_DIR/tables" "$DEMO_DIR/views" "$DEMO_DIR/queries" "$DEMO_DIR/macros"
+mkdir -p "$DEMO_DIR/schemas" "$DEMO_DIR/sequences" "$DEMO_DIR/tables" "$DEMO_DIR/views" "$DEMO_DIR/queries" "$DEMO_DIR/macros"
 
 # 1. Environment Profiles
 cat << 'EOF' > "$DEMO_DIR/.env.staging"
