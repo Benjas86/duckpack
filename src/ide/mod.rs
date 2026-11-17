@@ -24,11 +24,11 @@ pub(crate) use explorer::{
 };
 pub(crate) use modals::{
     AddBucketModalState, AttachModalState, DatabasePickerModalState, ExitConfirmationModalState,
-    InIdeDiffModalState, NewAssetModalState, SecretModalState, populate_secret_modal_for_edit,
-    render_help_modal, render_schema_visualizer_modal,
+    InIdeDiffModalState, NewAssetModalState, SecretModalState, TimeTravelModalState,
+    populate_secret_modal_for_edit, render_help_modal, render_schema_visualizer_modal,
 };
 #[cfg(test)]
-pub(crate) use modals::{AttachProvider, CloudProvider, DuckLakeBackend};
+pub(crate) use modals::{AttachProvider, CloudProvider, DuckLakeBackend, TimeTravelMode};
 
 use anyhow::Result;
 use duckdb::Connection;
@@ -180,6 +180,7 @@ pub fn run_ide_loop(
 
     let mut new_asset_modal = NewAssetModalState::new();
     let mut in_ide_diff_modal = InIdeDiffModalState::new();
+    let mut time_travel_modal = TimeTravelModalState::new();
 
     let mut explorer_state = ListState::default();
     let mut explorer_horizontal_scroll: usize = 0;
@@ -623,6 +624,8 @@ pub fn run_ide_loop(
                 new_asset_modal.render(f, project_dir);
             } else if in_ide_diff_modal.is_open {
                 in_ide_diff_modal.render(f);
+            } else if time_travel_modal.is_open {
+                time_travel_modal.render(f);
             }
 
             // Status Bar
@@ -1091,6 +1094,19 @@ pub fn run_ide_loop(
                         tabs[active_tab_index].target_database = db_name.clone();
                         status_msg =
                             format!("Target database switched to '{}' for active tab.", db_name);
+                    }
+                } else if time_travel_modal.is_open {
+                    if let Some((db_name, sql)) = time_travel_modal.handle_key(key) {
+                        open_query_in_tabs(
+                            &mut tabs,
+                            &mut active_tab_index,
+                            sql,
+                            Some(db_name.clone()),
+                        );
+                        focus = FocusPane::Editor;
+                        execute_query = true;
+                        status_msg =
+                            format!("Executed DuckLake time-travel query on '{}'", db_name);
                     }
                 } else if key.code == KeyCode::Char('a')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1648,7 +1664,7 @@ pub fn run_ide_loop(
                                             NodeType::CloudSecret { name, .. } => {
                                                 let query = format!(
                                                     "SELECT * FROM duckdb_secrets() WHERE name = '{}';",
-                                                    name
+                                                    name.replace('\'', "''")
                                                 );
                                                 open_query_in_tabs(
                                                     &mut tabs,
@@ -1661,7 +1677,133 @@ pub fn run_ide_loop(
                                                 status_msg =
                                                     format!("Inspecting secret '{}'", name);
                                             }
+                                            NodeType::Snapshot {
+                                                database,
+                                                snapshot_id,
+                                                ..
+                                            } => {
+                                                let safe_db = database.replace('\'', "''");
+                                                let query = format!(
+                                                    "SELECT * FROM ducklake_snapshots('{}') WHERE snapshot_id = {};",
+                                                    safe_db, snapshot_id
+                                                );
+                                                open_query_in_tabs(
+                                                    &mut tabs,
+                                                    &mut active_tab_index,
+                                                    query,
+                                                    Some(database.clone()),
+                                                );
+                                                focus = FocusPane::Editor;
+                                                execute_query = true;
+                                                status_msg = format!(
+                                                    "Inspecting DuckLake '{}' snapshot v{}",
+                                                    database, snapshot_id
+                                                );
+                                            }
+                                            NodeType::Group
+                                                if item_name == "Snapshots"
+                                                    || item_name.ends_with(":Snapshots") =>
+                                            {
+                                                let db_name = item_name
+                                                    .strip_suffix(":Snapshots")
+                                                    .unwrap_or(&meta.active_database);
+                                                let safe_db = db_name.replace('\'', "''");
+                                                let query = format!(
+                                                    "SELECT * FROM ducklake_snapshots('{}') ORDER BY snapshot_id DESC LIMIT 50;",
+                                                    safe_db
+                                                );
+                                                open_query_in_tabs(
+                                                    &mut tabs,
+                                                    &mut active_tab_index,
+                                                    query,
+                                                    Some(db_name.to_string()),
+                                                );
+                                                focus = FocusPane::Editor;
+                                                execute_query = true;
+                                                status_msg = format!(
+                                                    "Queried DuckLake snapshots for '{}'",
+                                                    db_name
+                                                );
+                                            }
                                             _ => {}
+                                        }
+                                    }
+                                }
+                            } else if key.code == KeyCode::Char('t') {
+                                if let Some(selected) = explorer_state.selected() {
+                                    if selected < explorer_items.len() {
+                                        let item_type = &explorer_items[selected].node_type;
+                                        let item_name = &explorer_items[selected].name;
+                                        match item_type {
+                                            NodeType::Table {
+                                                database,
+                                                schema,
+                                                is_temporary,
+                                            } => {
+                                                let db_name = database
+                                                    .as_deref()
+                                                    .unwrap_or(&meta.active_database);
+                                                let schema_name =
+                                                    schema.as_deref().unwrap_or("main");
+                                                if *is_temporary {
+                                                    status_msg = "⚠️ Time-Travel ('t') is not available for temporary tables.".to_string();
+                                                } else if let Some(db_info) = meta
+                                                    .databases
+                                                    .iter()
+                                                    .find(|d| d.name.eq_ignore_ascii_case(db_name))
+                                                {
+                                                    if db_info.db_type.eq_ignore_ascii_case("ducklake")
+                                                        || !db_info.snapshots.is_empty()
+                                                    {
+                                                        time_travel_modal.open_for_ducklake(
+                                                            db_info,
+                                                            Some((schema_name, item_name)),
+                                                            None,
+                                                        );
+                                                    } else {
+                                                        status_msg = format!(
+                                                            "⚠️ Time-Travel ('t') requires a DuckLake catalog ('{}' is '{}').",
+                                                            db_info.name, db_info.db_type
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            NodeType::Snapshot {
+                                                database,
+                                                snapshot_id,
+                                                ..
+                                            } => {
+                                                if let Some(db_info) = meta
+                                                    .databases
+                                                    .iter()
+                                                    .find(|d| d.name.eq_ignore_ascii_case(database))
+                                                {
+                                                    time_travel_modal.open_for_ducklake(
+                                                        db_info,
+                                                        None,
+                                                        Some(*snapshot_id),
+                                                    );
+                                                }
+                                            }
+                                            NodeType::Group
+                                                if item_name == "Snapshots"
+                                                    || item_name.ends_with(":Snapshots") =>
+                                            {
+                                                let db_name = item_name
+                                                    .strip_suffix(":Snapshots")
+                                                    .unwrap_or(&meta.active_database);
+                                                if let Some(db_info) = meta
+                                                    .databases
+                                                    .iter()
+                                                    .find(|d| d.name.eq_ignore_ascii_case(db_name))
+                                                {
+                                                    time_travel_modal
+                                                        .open_for_ducklake(db_info, None, None);
+                                                }
+                                            }
+                                            _ => {
+                                                status_msg = "⚠️ Select a DuckLake table or snapshot node and press 't' for Time-Travel.".to_string();
+                                            }
                                         }
                                     }
                                 }
@@ -2819,6 +2961,28 @@ pub fn run_ide_loop(
                         NodeType::Column { .. } => {}
                         NodeType::Macro => {}
                         NodeType::Trigger { .. } => {}
+                        NodeType::Snapshot {
+                            database,
+                            snapshot_id,
+                            ..
+                        } => {
+                            let safe_db = database.replace('\'', "''");
+                            let query = format!(
+                                "SELECT * FROM ducklake_snapshots('{}') WHERE snapshot_id = {};",
+                                safe_db, snapshot_id
+                            );
+                            open_query_in_tabs(
+                                &mut tabs,
+                                &mut active_tab_index,
+                                query,
+                                Some(database.clone()),
+                            );
+                            focus = FocusPane::Editor;
+                            status_msg = format!(
+                                "Inspecting DuckLake '{}' snapshot v{} (press Ctrl+E/F5 to run, or 't' in Explorer for Time-Travel)",
+                                database, snapshot_id
+                            );
+                        }
                         NodeType::AddSecretAction => {
                             secret_modal.reset();
                         }

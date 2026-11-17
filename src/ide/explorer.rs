@@ -37,6 +37,13 @@ pub(crate) enum NodeType {
     Table { database: Option<String>, schema: Option<String>, is_temporary: bool },
     View { database: Option<String>, schema: Option<String>, is_temporary: bool },
     Trigger { database: Option<String>, schema: Option<String>, table: Option<String> },
+    Snapshot {
+        database: String,
+        snapshot_id: i64,
+        snapshot_time: String,
+        schema_version: Option<i64>,
+        changes: String,
+    },
     Query,
     Macro,
     Column { data_type: String, is_pk: bool, is_fk: bool, fk_target: Option<String> },
@@ -749,6 +756,49 @@ pub(crate) fn rebuild_explorer_nodes(
                         }
                     }
                 }
+
+                if db.db_type.eq_ignore_ascii_case("ducklake") || !db.snapshots.is_empty() {
+                    let snap_group_key = format!("{}:Snapshots", db.name);
+                    let is_snap_group_expanded = expanded_groups.contains(&snap_group_key);
+                    items.push(ExplorerNode {
+                        name: snap_group_key.clone(),
+                        display: format!("  📸 Snapshots ({})", db.snapshots.len()),
+                        level: 1,
+                        is_expandable: true,
+                        is_expanded: is_snap_group_expanded,
+                        node_type: NodeType::Group,
+                    });
+
+                    if is_snap_group_expanded {
+                        if db.snapshots.is_empty() {
+                            items.push(ExplorerNode {
+                                name: format!("{}:Snapshots:empty", db.name),
+                                display: "    └─ (no snapshots found)".to_string(),
+                                level: 2,
+                                is_expandable: false,
+                                is_expanded: false,
+                                node_type: NodeType::Group,
+                            });
+                        } else {
+                            for snap in &db.snapshots {
+                                items.push(ExplorerNode {
+                                    name: format!("v{}", snap.snapshot_id),
+                                    display: format!("    ├─ 🕒 {}", snap.display_summary()),
+                                    level: 2,
+                                    is_expandable: false,
+                                    is_expanded: false,
+                                    node_type: NodeType::Snapshot {
+                                        database: db.name.clone(),
+                                        snapshot_id: snap.snapshot_id,
+                                        snapshot_time: snap.snapshot_time.clone(),
+                                        schema_version: snap.schema_version,
+                                        changes: snap.changes.clone(),
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -888,6 +938,53 @@ pub(crate) fn rebuild_explorer_nodes(
                             table: None,
                         },
                     });
+                }
+            }
+        }
+
+        let is_single_ducklake = meta
+            .databases
+            .first()
+            .map(|d| d.db_type.eq_ignore_ascii_case("ducklake"))
+            .unwrap_or(false)
+            || !meta.snapshots.is_empty();
+        if is_single_ducklake {
+            let is_expanded = expanded_groups.contains("Snapshots");
+            items.push(ExplorerNode {
+                name: "Snapshots".to_string(),
+                display: format!("📸 Snapshots ({})", meta.snapshots.len()),
+                level: 0,
+                is_expandable: true,
+                is_expanded,
+                node_type: NodeType::Group,
+            });
+            if is_expanded {
+                if meta.snapshots.is_empty() {
+                    items.push(ExplorerNode {
+                        name: "Snapshots:empty".to_string(),
+                        display: "  └─ (no snapshots found)".to_string(),
+                        level: 1,
+                        is_expandable: false,
+                        is_expanded: false,
+                        node_type: NodeType::Group,
+                    });
+                } else {
+                    for snap in &meta.snapshots {
+                        items.push(ExplorerNode {
+                            name: format!("v{}", snap.snapshot_id),
+                            display: format!("  ├─ 🕒 {}", snap.display_summary()),
+                            level: 1,
+                            is_expandable: false,
+                            is_expanded: false,
+                            node_type: NodeType::Snapshot {
+                                database: snap.database.clone(),
+                                snapshot_id: snap.snapshot_id,
+                                snapshot_time: snap.snapshot_time.clone(),
+                                schema_version: snap.schema_version,
+                                changes: snap.changes.clone(),
+                            },
+                        });
+                    }
                 }
             }
         }

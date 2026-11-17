@@ -419,7 +419,11 @@ pub(crate) fn render_help_modal(f: &mut Frame) {
         ]),
         Line::from(vec![
             Span::styled(" q / s     ", Style::default().fg(Color::Cyan)),
-            Span::raw("Query Table (in Explorer pane)"),
+            Span::raw("Query Table / Snapshot (in Explorer pane)"),
+        ]),
+        Line::from(vec![
+            Span::styled(" t         ", Style::default().fg(Color::Cyan)),
+            Span::raw("DuckLake Time-Travel & Snapshot Diff Modal (in Explorer pane)"),
         ]),
         Line::from(vec![
             Span::styled(" e         ", Style::default().fg(Color::Cyan)),

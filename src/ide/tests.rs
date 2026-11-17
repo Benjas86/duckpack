@@ -1370,6 +1370,7 @@ fn test_explorer_nodes_secrets_and_cloud_buckets() {
         temp_views: HashSet::new(),
         macros: vec![],
         triggers: vec![],
+        snapshots: vec![],
         queries: vec![],
         dictionary: vec![],
         secrets: vec![("my_s3_secret".to_string(), "s3".to_string())],
@@ -1456,6 +1457,7 @@ fn test_database_picker_modal_state() {
             tables: vec![],
             views: vec![],
             triggers: vec![],
+            snapshots: vec![],
         },
         crate::catalog::DatabaseInfo {
             name: "analytics_db".to_string(),
@@ -1466,6 +1468,7 @@ fn test_database_picker_modal_state() {
             tables: vec![],
             views: vec![],
             triggers: vec![],
+            snapshots: vec![],
         },
         crate::catalog::DatabaseInfo {
             name: "mssql_db".to_string(),
@@ -1476,6 +1479,7 @@ fn test_database_picker_modal_state() {
             tables: vec![],
             views: vec![],
             triggers: vec![],
+            snapshots: vec![],
         },
     ];
 
@@ -2051,4 +2055,164 @@ fn test_new_asset_modal_open_for_group_and_node_categories() {
         assert_eq!(modal.category_index, expected_idx);
         assert_eq!(modal.current_category(), expected_cat);
     }
+}
+
+#[test]
+fn test_ducklake_snapshots_explorer_and_time_travel_modal() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let conn = Connection::open_in_memory().unwrap();
+    // Mock ducklake_snapshots(db) as a table macro so we can test load_ducklake_snapshots offline
+    conn.execute_batch(
+        "CREATE TABLE __mock_snaps (
+            db VARCHAR,
+            snapshot_id BIGINT,
+            snapshot_time VARCHAR,
+            schema_version BIGINT,
+            changes VARCHAR,
+            commit_message VARCHAR
+        );
+        INSERT INTO __mock_snaps VALUES
+            ('lake_db', 15, '2026-11-12 18:30:00', 3, '{tables_inserted=[gold_orders]}', 'dbt run gold'),
+            ('lake_db', 14, '2026-11-12 18:00:00', 2, '{tables_created=[gold_orders]}', 'duckpack apply v0.3.0');
+        CREATE MACRO ducklake_snapshots(cat) AS TABLE
+            SELECT snapshot_id, snapshot_time, schema_version, changes, commit_message
+            FROM __mock_snaps WHERE db = cat;",
+    )
+    .unwrap();
+
+    let snaps = crate::catalog::load_ducklake_snapshots(&conn, "lake_db", false);
+    assert_eq!(snaps.len(), 2);
+    assert_eq!(snaps[0].snapshot_id, 15);
+    assert_eq!(snaps[0].schema_version, Some(3));
+    assert!(snaps[0].display_summary().contains("v15 — 2026-11-12 18:30:00 [schema v3] \"dbt run gold\" {tables_inserted=[gold_orders]}"));
+
+    let lake_info = crate::catalog::DatabaseInfo {
+        name: "lake_db".to_string(),
+        db_type: "ducklake".to_string(),
+        path: Some("ducklake:metadata.ducklake".to_string()),
+        is_active: false,
+        readonly: false,
+        tables: vec![
+            crate::catalog::TableEntry {
+                database: "lake_db".to_string(),
+                schema: "main".to_string(),
+                name: "gold_orders".to_string(),
+                row_count: Some(250),
+                is_temporary: false,
+            },
+            crate::catalog::TableEntry {
+                database: "lake_db".to_string(),
+                schema: "mart.finance".to_string(),
+                name: "revenue-daily".to_string(),
+                row_count: Some(10),
+                is_temporary: false,
+            },
+        ],
+        views: vec![],
+        triggers: vec![],
+        snapshots: snaps.clone(),
+    };
+
+    let mem_info = crate::catalog::DatabaseInfo {
+        name: "memory".to_string(),
+        db_type: "duckdb".to_string(),
+        path: None,
+        is_active: true,
+        readonly: false,
+        tables: vec![],
+        views: vec![],
+        triggers: vec![],
+        snapshots: vec![],
+    };
+
+    let meta = ExplorerMetadata {
+        databases: vec![mem_info, lake_info.clone()],
+        active_database: "memory".to_string(),
+        tables: vec![],
+        table_counts: HashMap::new(),
+        views: vec![],
+        temp_tables: HashSet::new(),
+        temp_views: HashSet::new(),
+        macros: vec![],
+        triggers: vec![],
+        snapshots: vec![],
+        queries: vec![],
+        dictionary: vec![],
+        secrets: vec![],
+        cloud_buckets: vec![],
+    };
+
+    let mut expanded_groups = HashSet::new();
+    expanded_groups.insert("db:lake_db".to_string());
+    expanded_groups.insert("lake_db:Snapshots".to_string());
+    let expanded_tables = HashSet::new();
+
+    let nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
+    assert!(nodes.iter().any(|n| n.name == "lake_db:Snapshots" && n.display.contains("📸 Snapshots (2)")));
+    assert!(nodes.iter().any(|n| matches!(
+        &n.node_type,
+        NodeType::Snapshot { database, snapshot_id: 15, .. } if database == "lake_db"
+    )));
+
+    // Test TimeTravelModalState across all 3 modes + cursor editing + identifier/literal escaping
+    let mut modal = TimeTravelModalState::new();
+    modal.open_for_ducklake(&lake_info, Some(("main", "gold_orders")), None);
+    assert!(modal.is_open);
+    assert_eq!(modal.mode, TimeTravelMode::Version);
+    assert_eq!(modal.version_input, "15");
+    assert_eq!(modal.start_version_input, "14");
+    assert_eq!(modal.end_version_input, "15");
+    assert_eq!(
+        modal.build_sql().unwrap(),
+        "SELECT * FROM lake_db.gold_orders AT (VERSION => 15) LIMIT 100;"
+    );
+
+    // Navigate down in snapshot list (active_field == 2) -> selects snapshot 14
+    modal.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(modal.selected_snapshot_idx, 1);
+    assert_eq!(modal.version_input, "14");
+    assert_eq!(
+        modal.build_sql().unwrap(),
+        "SELECT * FROM lake_db.gold_orders AT (VERSION => 14) LIMIT 100;"
+    );
+
+    // Switch mode to Timestamp
+    modal.active_field = 1;
+    modal.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(modal.mode, TimeTravelMode::Timestamp);
+    assert_eq!(
+        modal.build_sql().unwrap(),
+        "SELECT * FROM lake_db.gold_orders AT (TIMESTAMP => TIMESTAMP '2026-11-12 18:00:00') LIMIT 100;"
+    );
+
+    // Switch mode to TableChanges and switch table to mart.finance."revenue-daily"
+    modal.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(modal.mode, TimeTravelMode::TableChanges);
+    modal.active_field = 0;
+    modal.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(
+        modal.build_sql().unwrap(),
+        "SELECT * FROM ducklake_table_changes('lake_db', 'mart.finance', 'revenue-daily', 13, 14) LIMIT 100;"
+    );
+
+    // Switch back to Version on mart.finance."revenue-daily" to verify qualified identifier quoting
+    modal.active_field = 1;
+    modal.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(modal.mode, TimeTravelMode::Version);
+    assert_eq!(
+        modal.build_sql().unwrap(),
+        "SELECT * FROM lake_db.mart.finance.\"revenue-daily\" AT (VERSION => 14) LIMIT 100;"
+    );
+
+    // Pressing Enter executes and returns (database, sql)
+    let res = modal.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        res,
+        Some((
+            "lake_db".to_string(),
+            "SELECT * FROM lake_db.mart.finance.\"revenue-daily\" AT (VERSION => 14) LIMIT 100;".to_string()
+        ))
+    );
+    assert!(!modal.is_open);
 }
