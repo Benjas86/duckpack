@@ -287,13 +287,13 @@ DuckPack embeds DuckDB directly as an in-process engine:
 - **Engine Transparency:** Check the exact embedded DuckDB engine version anytime via:
   ```bash
   duckpack --version
-  # DuckPack v0.2.3 (embedded DuckDB v2.0.0)
+  # DuckPack v0.3.0 (embedded DuckDB v2.0.0)
   ```
   Or in Python:
   ```python
   import duckpack
 
-  print(duckpack.__version__)         # e.g. "0.2.3"
+  print(duckpack.__version__)         # e.g. "0.3.0"
   print(duckpack.__duckdb_version__)  # e.g. "2.0.0"
   ```
 - **Proactive Storage Diagnostics:** If an older database file with an incompatible legacy storage format is encountered, DuckPack catches the internal engine error and prints clear migration guidance rather than an unhelpful internal crash dump.
@@ -679,7 +679,7 @@ import duckpack
 ```
 
 #### Engine Version Properties
-- **`duckpack.__version__: str`**: The version of DuckPack (e.g. `"0.2.3"`).
+- **`duckpack.__version__: str`**: The version of DuckPack (e.g. `"0.3.0"`).
 - **`duckpack.__duckdb_version__: str`**: The embedded DuckDB engine version (e.g. `"2.0.0"`).
 
 #### Functions
@@ -863,7 +863,7 @@ Define connection targets, remote Quack instances, and environment profiles with
 ```toml
 [project]
 name = "analytics_warehouse"
-version = "0.2.3"
+version = "0.3.0"
 
 [target]
 default_db = "dev.duckdb"
