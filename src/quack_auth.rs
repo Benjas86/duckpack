@@ -516,16 +516,21 @@ pub fn compile_quack_auth_sql(
     // 1. Authentication Macro: _duckpack_auth.authenticate(p_sid, p_client_token, p_server_token)
     // Allows:
     //  - Any enabled user in _duckpack_auth.quack_users matching sha256(p_client_token)
-    //  - Break-glass fallback for the server's own startup master token (p_server_token)
+    //  - Break-glass fallback for the server's own startup master token via quack_check_token()
     // Always rejects any session explicitly marked revoked = true in _duckpack_auth.quack_sessions.
-    sql.push_str(
+    let master_token_fallback = if include_global_hooks {
+        "        WHEN quack_check_token(p_sid, p_client_token, p_server_token) THEN true\n"
+    } else {
+        "        WHEN p_server_token IS NOT NULL AND p_server_token <> '' AND p_client_token = p_server_token THEN true\n"
+    };
+    sql.push_str(&format!(
         "CREATE OR REPLACE MACRO _duckpack_auth.authenticate(p_sid, p_client_token, p_server_token) AS (\n\
          \x20   CASE\n\
          \x20       WHEN EXISTS (\n\
          \x20           SELECT 1 FROM _duckpack_auth.quack_sessions s\n\
-         \x20           WHERE CAST(s.sid AS VARCHAR) = CAST(p_sid AS VARCHAR) AND s.revoked = true\n\
+         \x20           WHERE lower(CAST(s.sid AS VARCHAR)) = lower(CAST(p_sid AS VARCHAR)) AND s.revoked = true\n\
          \x20       ) THEN false\n\
-         \x20       WHEN p_server_token IS NOT NULL AND p_server_token <> '' AND p_client_token = p_server_token THEN true\n\
+         {master_token_fallback}\
          \x20       WHEN EXISTS (\n\
          \x20           SELECT 1 FROM _duckpack_auth.quack_users u\n\
          \x20           WHERE u.enabled = true\n\
@@ -533,8 +538,8 @@ pub fn compile_quack_auth_sql(
          \x20       ) THEN true\n\
          \x20       ELSE false\n\
          \x20   END\n\
-         );\n",
-    );
+         );\n"
+    ));
 
     // 2. Role Resolution Macro: _duckpack_auth.resolve_role(p_sid)
     // Correlates p_sid via:
@@ -569,10 +574,10 @@ pub fn compile_quack_auth_sql(
 
     // 3. Query Sanitization Macro: _duckpack_auth.sanitize_sql(p_q)
     // Strips /* ... */ block comments, -- ... line comments, single-quoted string literals '...',
-    // and trailing semicolons, then lowercases and trims.
+    // and trailing semicolons, then lowercases and trims ALL whitespace (spaces, tabs, newlines, CR).
     sql.push_str(
         "CREATE OR REPLACE MACRO _duckpack_auth.sanitize_sql(p_q) AS (\n\
-         \x20   lower(trim(regexp_replace(\n\
+         \x20   lower(regexp_replace(regexp_replace(\n\
          \x20       regexp_replace(\n\
          \x20           regexp_replace(\n\
          \x20               regexp_replace(COALESCE(p_q, ''), '/\\*[\\s\\S]*?\\*/', ' ', 'g'),\n\
@@ -581,7 +586,7 @@ pub fn compile_quack_auth_sql(
          \x20           '''([^'']|'''')*''', '''''', 'g'\n\
          \x20       ),\n\
          \x20       ';\\s*$', ''\n\
-         \x20   )))\n\
+         \x20   ), '^\\s+|\\s+$', '', 'g'))\n\
          );\n",
     );
 
@@ -600,9 +605,9 @@ pub fn compile_quack_auth_sql(
     };
 
     let reader_prefix_pattern = if config.reader_allow_explain_describe {
-        "^(select|with|values|from|table|explain|describe|desc|show|summarize|use|pragma)\\b"
+        "^(select|with|values|from|table|explain|describe|desc|show|summarize|use|pragma|begin|start|commit|rollback|abort|set)\\b"
     } else {
-        "^(select|with|values|from|table|use|pragma)\\b"
+        "^(select|with|values|from|table|use|pragma|begin|start|commit|rollback|abort|set)\\b"
     };
 
     sql.push_str(&format!(
@@ -624,7 +629,8 @@ pub fn compile_quack_auth_sql(
          \x20           AND strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0\n\
          \x20           AND regexp_matches(_duckpack_auth.sanitize_sql(p_query), '{reader_prefix_pattern}')\n\
          \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(_duckpack_auth|quack_users|quack_sessions|quack_authentication_function|quack_authorization_function|quack_serve|quack_stop|quack_cancel)\\b')\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(insert|update|delete|merge|create|alter|drop|truncate|copy|call|vacuum|rename|grant|revoke|execute|attach|detach|install|load|export|import|set|reset)\\b')\n\
+         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(set|reset)\\s+global\\b')\n\
+         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(insert|update|delete|merge|create|alter|drop|truncate|copy|call|vacuum|rename|grant|revoke|execute|attach|detach|install|load|export|import|reset)\\b')\n\
          \x20       )\n\
          \x20       ELSE false\n\
          \x20   END\n\
@@ -683,14 +689,39 @@ pub fn append_quack_auth_diff_items(
     };
     let q_alias = crate::diff::find_any_quack_alias(target_exec, _catalog);
     let is_quack_target = q_alias.is_some();
-    let Ok(compiled_sql) = compile_quack_auth_sql(&config, project_dir, None, is_quack_target)
-    else {
+    // Auto-detect the deploying connection's active connection_id so it is whitelisted as 'admin'
+    // in _duckpack_auth.quack_sessions and cannot lock itself out during apply/COMMIT.
+    let deploying_sid: Option<String> = if let Some(ref qa) = q_alias {
+        let quoted_qa = format!("\"{}\"", qa.replace('"', "\"\""));
+        let sid_q = format!(
+            "SELECT connection_id FROM {}.query('SELECT CAST(connection_id AS VARCHAR) AS connection_id FROM quack_active_connections() ORDER BY query_started_at DESC NULLS LAST LIMIT 1')",
+            quoted_qa
+        );
+        target_exec
+            .query_rows(&sid_q)
+            .ok()
+            .and_then(|(_, rows)| rows.into_iter().next())
+            .and_then(|r| r.into_iter().next())
+            .filter(|s| !s.is_empty() && s != "NULL")
+    } else {
+        None
+    };
+    let Ok(compiled_sql) = compile_quack_auth_sql(
+        &config,
+        project_dir,
+        deploying_sid.as_deref(),
+        is_quack_target,
+    ) else {
         return;
     };
 
     // Query existing _duckpack_auth.quack_users AND verify all 4 macros exist on target_exec
     let query = "SELECT username, role, token_sha256, client_id_hash, CAST(enabled AS VARCHAR) FROM _duckpack_auth.quack_users ORDER BY username";
-    let macros_query = "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authorize' OR COALESCE(macro_definition, '') LIKE '%use|pragma%') AND (function_name <> 'resolve_role' OR COALESCE(macro_definition, '') LIKE '%ac.connection_id%')";
+    let macros_query = if is_quack_target {
+        "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authenticate' OR COALESCE(macro_definition, '') LIKE '%quack_check_token%') AND (function_name <> 'authorize' OR COALESCE(macro_definition, '') LIKE '%abort|set%') AND (function_name <> 'resolve_role' OR COALESCE(macro_definition, '') LIKE '%ac.connection_id%') AND (function_name <> 'sanitize_sql' OR strpos(COALESCE(macro_definition, ''), '^\\s+|\\s+$') > 0)"
+    } else {
+        "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authorize' OR COALESCE(macro_definition, '') LIKE '%abort|set%') AND (function_name <> 'sanitize_sql' OR strpos(COALESCE(macro_definition, ''), '^\\s+|\\s+$') > 0)"
+    };
     let (actual_rows, macros_count) = if let Some(ref qa) = q_alias {
         let quoted_qa = format!("\"{}\"", qa.replace('"', "\"\""));
         let remote_q = format!(
