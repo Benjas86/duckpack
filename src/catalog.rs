@@ -73,6 +73,127 @@ impl TriggerEntry {
     }
 }
 
+/// Represents an immutable commit snapshot in a DuckLake catalog (`ducklake_snapshots('<alias>')`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotEntry {
+    pub database: String,
+    pub snapshot_id: i64,
+    pub snapshot_time: String,
+    pub schema_version: Option<i64>,
+    pub changes: String,
+    pub commit_message: Option<String>,
+}
+
+impl SnapshotEntry {
+    /// Formats a concise one-line summary for the Explorer tree and Time-Travel modal picker.
+    pub fn display_summary(&self) -> String {
+        let ver_tag = self
+            .schema_version
+            .map(|v| format!(" [schema v{}]", v))
+            .unwrap_or_default();
+        let mut details = String::new();
+        if let Some(ref msg) = self.commit_message {
+            if !msg.trim().is_empty() {
+                details.push_str(&format!(" \"{}\"", msg.trim()));
+            }
+        }
+        if !self.changes.trim().is_empty() && self.changes.trim() != "{}" {
+            details.push_str(&format!(" {}", self.changes.trim()));
+        }
+        format!(
+            "v{} — {}{}{}",
+            self.snapshot_id, self.snapshot_time, ver_tag, details
+        )
+    }
+}
+
+/// Loads up to 50 recent snapshots from `ducklake_snapshots('<db_name>')` (ordered newest-first).
+/// Supports both local DuckLake attachments and remote Quack-attached DuckLakes.
+pub fn load_ducklake_snapshots(
+    conn: &Connection,
+    db_name: &str,
+    is_quack: bool,
+) -> Vec<SnapshotEntry> {
+    let safe_db = db_name.replace('\'', "''");
+    let mut snapshots = Vec::new();
+
+    let parse_rows = |sql: &str, include_commit_msg: bool, out: &mut Vec<SnapshotEntry>| -> bool {
+        if let Ok(mut stmt) = conn.prepare(sql) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(snap_id), Ok(snap_time)) =
+                        (row.get::<_, i64>(0), row.get::<_, String>(1))
+                    {
+                        let schema_version: Option<i64> = row.get(2).ok();
+                        let changes: String = row.get(3).unwrap_or_default();
+                        let commit_message: Option<String> = if include_commit_msg {
+                            row.get::<_, String>(4)
+                                .ok()
+                                .filter(|s| !s.trim().is_empty())
+                        } else {
+                            None
+                        };
+                        out.push(SnapshotEntry {
+                            database: db_name.to_string(),
+                            snapshot_id: snap_id,
+                            snapshot_time: snap_time,
+                            schema_version,
+                            changes,
+                            commit_message,
+                        });
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    };
+
+    let sql_with_msg = format!(
+        "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR), CAST(schema_version AS BIGINT), COALESCE(CAST(changes AS VARCHAR), ''), COALESCE(CAST(commit_message AS VARCHAR), '') FROM ducklake_snapshots('{}') ORDER BY snapshot_id DESC LIMIT 50",
+        safe_db
+    );
+    let sql_basic = format!(
+        "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR), CAST(schema_version AS BIGINT), COALESCE(CAST(changes AS VARCHAR), '') FROM ducklake_snapshots('{}') ORDER BY snapshot_id DESC LIMIT 50",
+        safe_db
+    );
+
+    if !parse_rows(&sql_with_msg, true, &mut snapshots) {
+        let _ = parse_rows(&sql_basic, false, &mut snapshots);
+    }
+
+    if snapshots.is_empty() {
+        let quoted_db = format!("\"{}\"", db_name.replace('"', "\"\""));
+        let method_with_msg = format!(
+            "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR), CAST(schema_version AS BIGINT), COALESCE(CAST(changes AS VARCHAR), ''), COALESCE(CAST(commit_message AS VARCHAR), '') FROM {}.snapshots() ORDER BY snapshot_id DESC LIMIT 50",
+            quoted_db
+        );
+        let method_basic = format!(
+            "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR), CAST(schema_version AS BIGINT), COALESCE(CAST(changes AS VARCHAR), '') FROM {}.snapshots() ORDER BY snapshot_id DESC LIMIT 50",
+            quoted_db
+        );
+        if !parse_rows(&method_with_msg, true, &mut snapshots) {
+            let _ = parse_rows(&method_basic, false, &mut snapshots);
+        }
+    }
+
+    if snapshots.is_empty() && is_quack {
+        let remote_with_msg = format!(
+            "SELECT * FROM target_db.query('SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) AS snapshot_time, CAST(schema_version AS BIGINT) AS schema_version, COALESCE(CAST(changes AS VARCHAR), '''') AS changes, COALESCE(CAST(commit_message AS VARCHAR), '''') AS commit_message FROM ducklake_snapshots(''{}'') ORDER BY snapshot_id DESC LIMIT 50')",
+            safe_db
+        );
+        let remote_basic = format!(
+            "SELECT * FROM target_db.query('SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) AS snapshot_time, CAST(schema_version AS BIGINT) AS schema_version, COALESCE(CAST(changes AS VARCHAR), '''') AS changes FROM ducklake_snapshots(''{}'') ORDER BY snapshot_id DESC LIMIT 50')",
+            safe_db
+        );
+        if !parse_rows(&remote_with_msg, true, &mut snapshots) {
+            let _ = parse_rows(&remote_basic, false, &mut snapshots);
+        }
+    }
+
+    snapshots
+}
+
 /// Metadata holding info on an attached database catalog.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DatabaseInfo {
@@ -84,6 +205,7 @@ pub struct DatabaseInfo {
     pub tables: Vec<TableEntry>,
     pub views: Vec<ViewEntry>,
     pub triggers: Vec<TriggerEntry>,
+    pub snapshots: Vec<SnapshotEntry>,
 }
 
 /// Metadata holding all discoverable entities in the database and project.
@@ -98,6 +220,7 @@ pub struct ExplorerMetadata {
     pub temp_views: HashSet<String>,
     pub macros: Vec<String>,
     pub triggers: Vec<String>,
+    pub snapshots: Vec<SnapshotEntry>,
     pub queries: Vec<String>,
     pub dictionary: Vec<String>,
     pub secrets: Vec<(String, String)>,
@@ -907,6 +1030,11 @@ pub fn load_explorer_metadata(
         }
 
         let is_active = name == &active_database;
+        let db_snapshots = if db_type.eq_ignore_ascii_case("ducklake") {
+            load_ducklake_snapshots(conn, name, is_quack)
+        } else {
+            Vec::new()
+        };
         databases.push(DatabaseInfo {
             name: name.clone(),
             db_type: db_type.clone(),
@@ -916,6 +1044,7 @@ pub fn load_explorer_metadata(
             tables: db_tables,
             views: db_views,
             triggers: db_triggers,
+            snapshots: db_snapshots,
         });
     }
 
@@ -935,6 +1064,7 @@ pub fn load_explorer_metadata(
     let mut table_counts: HashMap<String, i64> = HashMap::new();
     let mut views: Vec<String> = Vec::new();
     let mut triggers: Vec<String> = Vec::new();
+    let mut snapshots: Vec<SnapshotEntry> = Vec::new();
     let mut temp_tables: HashSet<String> = HashSet::new();
     let mut temp_views: HashSet<String> = HashSet::new();
 
@@ -965,6 +1095,7 @@ pub fn load_explorer_metadata(
         for trg in &active_info.triggers {
             triggers.push(format!("{} (on {})", trg.display_name(), trg.table_name));
         }
+        snapshots = active_info.snapshots.clone();
     }
 
     let mut macros: Vec<String> = Vec::new();
@@ -1121,6 +1252,7 @@ pub fn load_explorer_metadata(
         temp_views,
         macros,
         triggers,
+        snapshots,
         queries,
         dictionary,
         secrets,

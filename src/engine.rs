@@ -879,12 +879,56 @@ pub fn apply_diff(
     apply_diff_with_executor(&mut exec, diff, force_drop, is_remote, project_dir, catalog)
 }
 
+/// Formats a structured DuckLake snapshot commit message summarizing the applied declarative schema changes.
+pub fn format_ducklake_commit_message(diff: &diff::DiffResult, force_drop: bool) -> String {
+    let active_items: Vec<&diff::DiffItem> = diff
+        .items
+        .iter()
+        .filter(|i| i.selected && !i.ignored && (force_drop || !i.item_type.is_destructive()))
+        .collect();
+    let count = active_items.len();
+    let summary: Vec<String> = active_items
+        .iter()
+        .take(5)
+        .map(|i| format!("{:?} {}", i.item_type, i.obj_name))
+        .collect();
+    let suffix = if count > 5 {
+        format!(", +{} more", count - 5)
+    } else {
+        String::new()
+    };
+    if summary.is_empty() {
+        format!("duckpack apply: [v{}] 0 schema changes", duckpack_version())
+    } else {
+        format!(
+            "duckpack apply: [v{}] {} schema change(s) ({}{})",
+            duckpack_version(),
+            count,
+            summary.join(", "),
+            suffix
+        )
+    }
+}
+
 /// Applies a computed `DiffResult` against any `DbExecutor` adapter (`duckdb::Connection` or `PyDbExecutor`).
 /// Orchestrates `pre-deploy` hooks, topological retry across schema phases, `post-deploy` hooks, and transactional rollback.
 pub fn apply_diff_with_executor(
     exec: &mut dyn DbExecutor,
     diff: &diff::DiffResult,
     force_drop: bool,
+    is_remote: bool,
+    project_dir: &Path,
+    catalog: Option<&str>,
+) -> Result<()> {
+    apply_diff_with_lake_options(exec, diff, force_drop, false, is_remote, project_dir, catalog)
+}
+
+/// Applies a computed `DiffResult` with explicit control over `--allow-lake-rewrite` (`allow_lake_rewrite`).
+pub fn apply_diff_with_lake_options(
+    exec: &mut dyn DbExecutor,
+    diff: &diff::DiffResult,
+    force_drop: bool,
+    allow_lake_rewrite: bool,
     is_remote: bool,
     project_dir: &Path,
     catalog: Option<&str>,
@@ -913,6 +957,38 @@ pub fn apply_diff_with_executor(
         target_cat = &orig_db;
     }
 
+    let lake_info = diff::get_ducklake_catalog_info_exec(exec, Some(target_cat));
+    let env_allow_rewrite = std::env::var("DUCKPACK_ALLOW_LAKE_REWRITE")
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+    let effective_allow_lake_rewrite = allow_lake_rewrite || env_allow_rewrite;
+
+    if let Some(ref lake) = lake_info {
+        if let Some(recreate_item) = diff.items.iter().find(|i| {
+            i.selected && !i.ignored && i.item_type == diff::DiffItemType::RecreateTable
+        }) {
+            if !effective_allow_lake_rewrite {
+                let path_detail = lake
+                    .path
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| format!(" in {}", p))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "Cannot execute physical copy-and-swap on DuckLake table '{}' in catalog '{}'.\n\
+                     Modifying this constraint would require rewriting underlying Parquet files{}.\n\
+                     Pass '--allow-lake-rewrite' (or set DUCKPACK_ALLOW_LAKE_REWRITE=true) to force full table recreation.",
+                    recreate_item.obj_name,
+                    lake.name,
+                    path_detail
+                );
+            }
+        }
+    }
+
     if !is_quack && !target_cat.is_empty() && target_cat != orig_db {
         exec.execute_batch(&format!("USE \"{}\";", target_cat.replace('\"', "\"\"")))?;
     }
@@ -920,13 +996,14 @@ pub fn apply_diff_with_executor(
     let has_recreate = diff.items.iter().any(|i| {
         i.selected && !i.ignored && i.item_type == diff::DiffItemType::RecreateTable && force_drop
     });
-    let is_remote_effective = (is_remote || is_quack) && !has_recreate;
+    let is_ducklake = lake_info.is_some();
+    let is_remote_effective = (is_remote || is_quack || is_ducklake) && !has_recreate;
 
     if is_remote_effective {
         if is_quack {
             let _ = exec.execute_batch("CALL target_db.query('BEGIN TRANSACTION;');");
         } else {
-            exec.execute_batch("BEGIN TRANSACTION;")?;
+            let _ = exec.execute_batch("BEGIN TRANSACTION;");
         }
     }
 
@@ -1070,6 +1147,17 @@ pub fn apply_diff_with_executor(
         let post_deploy_dir = project_dir.join("scripts").join("post-deploy");
         if post_deploy_dir.exists() {
             execute_directory_filtered(&post_deploy_dir, project_dir, &ignore_rules, &mut execute_sql)?;
+        }
+
+        if let Some(ref lake) = lake_info {
+            let commit_msg = format_ducklake_commit_message(diff, force_drop);
+            let safe_msg = commit_msg.replace('\'', "''");
+            let quoted_cat = format!("\"{}\"", lake.name.replace('"', "\"\""));
+            let tag_sql = format!(
+                "CALL {}.set_commit_message('duckpack', '{}');",
+                quoted_cat, safe_msg
+            );
+            let _ = execute_sql(&tag_sql);
         }
 
         Ok(())
@@ -3414,5 +3502,116 @@ database = "FinanceDB"
         let redacted_sql = redact_connection_credentials(sql);
         assert!(!redacted_sql.contains("top_secret_val"));
         assert!(!redacted_sql.contains("tok_abc"));
+    }
+
+    #[test]
+    fn test_ducklake_phase3_rewrite_guard_and_snapshot_tagging() {
+        struct MockDuckLakeExec {
+            executed: Vec<String>,
+        }
+        impl DbExecutor for MockDuckLakeExec {
+            fn execute(&mut self, sql: &str) -> Result<()> {
+                self.executed.push(sql.to_string());
+                Ok(())
+            }
+            fn execute_batch(&mut self, sql: &str) -> Result<()> {
+                self.executed.push(sql.to_string());
+                Ok(())
+            }
+            fn query_rows(&mut self, sql: &str) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+                if sql.contains("SELECT current_database()") {
+                    Ok((vec!["current_database()".to_string()], vec![vec!["lake_prod".to_string()]]))
+                } else if sql.contains("FROM duckdb_databases()") {
+                    Ok((
+                        vec![
+                            "database_name".to_string(),
+                            "type".to_string(),
+                            "path".to_string(),
+                            "readonly".to_string(),
+                        ],
+                        vec![vec![
+                            "lake_prod".to_string(),
+                            "ducklake".to_string(),
+                            "s3://my-bucket/warehouse/".to_string(),
+                            "false".to_string(),
+                        ]],
+                    ))
+                } else {
+                    Ok((vec![], vec![]))
+                }
+            }
+        }
+
+        let mut exec = MockDuckLakeExec { executed: Vec::new() };
+
+        // 1. Verify validate_target_catalog_exec permits ducklake for apply
+        let validated = diff::validate_target_catalog_exec(&mut exec, Some("lake_prod"), true).unwrap();
+        assert_eq!(validated, "lake_prod");
+
+        // 2. Verify RecreateTable is blocked by default when targeting a DuckLake catalog
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_lake_phase3_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let recreate_diff = diff::DiffResult {
+            items: vec![diff::DiffItem {
+                item_type: diff::DiffItemType::RecreateTable,
+                obj_name: "orders".to_string(),
+                sql: "CREATE TABLE orders__duckpack_swap AS SELECT * FROM orders;".to_string(),
+                old_def: Some("CREATE TABLE orders (id INT);".to_string()),
+                new_def: Some("CREATE TABLE orders (id INT PRIMARY KEY);".to_string()),
+                selected: true,
+                ignored: false,
+                locked: false,
+            }],
+        };
+
+        unsafe {
+            std::env::remove_var("DUCKPACK_ALLOW_LAKE_REWRITE");
+        }
+        let err = apply_diff_with_lake_options(
+            &mut exec,
+            &recreate_diff,
+            true,
+            false,
+            false,
+            &temp_dir,
+            Some("lake_prod"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("Cannot execute physical copy-and-swap on DuckLake table 'orders'"),
+            "Expected DuckLake copy-and-swap guard error, got: {}",
+            err
+        );
+        assert!(err.contains("--allow-lake-rewrite"));
+        assert!(exec.executed.is_empty(), "No SQL should execute when guard blocks");
+
+        // 3. Verify allow_lake_rewrite = true permits the migration and tags the DuckLake snapshot commit
+        apply_diff_with_lake_options(
+            &mut exec,
+            &recreate_diff,
+            true,
+            true,
+            false,
+            &temp_dir,
+            Some("lake_prod"),
+        )
+        .unwrap();
+        assert!(
+            exec.executed
+                .iter()
+                .any(|s| s.contains("CALL \"lake_prod\".set_commit_message('duckpack', 'duckpack apply: [v")),
+            "Expected structured DuckLake snapshot commit message call, got: {:?}",
+            exec.executed
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

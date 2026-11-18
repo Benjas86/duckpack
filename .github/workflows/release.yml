@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*.*.*"
+  release:
+    types: [published]
   workflow_dispatch:
 
 jobs:
@@ -87,10 +89,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            manylinux: "musllinux_1_2"
           - os: macos-latest
             target: aarch64-apple-darwin
             deployment_target: "10.15"
@@ -107,7 +114,8 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist --strip
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target || '' }}
 

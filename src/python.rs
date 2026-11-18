@@ -599,7 +599,7 @@ fn run_apply_tui(
 
 /// Apply declarative schema migrations to the target database.
 #[pyfunction]
-#[pyo3(signature = (target = None, project_dir = ".", database = None, catalog = None, auto_approve = true, force_drop = false, interactive = false, quack_token = None, insecure = false, env = None))]
+#[pyo3(signature = (target = None, project_dir = ".", database = None, catalog = None, auto_approve = true, force_drop = false, allow_lake_rewrite = false, interactive = false, quack_token = None, insecure = false, env = None))]
 pub fn apply(
     py: Python<'_>,
     target: Option<&Bound<'_, PyAny>>,
@@ -608,11 +608,17 @@ pub fn apply(
     catalog: Option<&str>,
     auto_approve: bool,
     force_drop: bool,
+    allow_lake_rewrite: bool,
     interactive: bool,
     quack_token: Option<&str>,
     insecure: bool,
     env: Option<&str>,
 ) -> PyResult<ApplyResult> {
+    if allow_lake_rewrite {
+        unsafe {
+            std::env::set_var("DUCKPACK_ALLOW_LAKE_REWRITE", "true");
+        }
+    }
     let p_dir = PathBuf::from(project_dir);
     if !p_dir.exists() {
         return Err(SchemaError::new_err(format!(
