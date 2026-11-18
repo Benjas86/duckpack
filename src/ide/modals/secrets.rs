@@ -122,6 +122,25 @@ impl SecretModalState {
         self.cursor_pos = self.active_text().map(|s| s.chars().count()).unwrap_or(0);
     }
 
+    /// Pastes a single-line string from the system clipboard into the active text field at the cursor.
+    pub(crate) fn paste_text(&mut self, raw: &str) {
+        if !self.is_text_field() {
+            return;
+        }
+        let cleaned: String = raw
+            .trim_matches(|c| c == '\r' || c == '\n')
+            .chars()
+            .filter(|&c| c != '\r' && c != '\n' && !c.is_control())
+            .collect();
+        let mut cur = self.cursor_pos;
+        if let Some(buf) = self.active_text_mut() {
+            for ch in cleaned.chars() {
+                insert_char_at_cursor(buf, &mut cur, ch);
+            }
+        }
+        self.cursor_pos = cur;
+    }
+
     pub(crate) fn provider(&self) -> CloudProvider {
         match self.provider_index {
             1 => CloudProvider::CloudflareR2,

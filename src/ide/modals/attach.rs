@@ -210,6 +210,11 @@ impl AttachModalState {
                 if self.host == "localhost" || self.host == "127.0.0.1" || self.host == "0.0.0.0" {
                     self.disable_ssl = true;
                 }
+                if self.password.is_empty() {
+                    if let Some(env_tok) = crate::engine::resolve_quack_token(None, None) {
+                        self.password = env_tok;
+                    }
+                }
             }
             DuckLakeBackend::PostgreSQL => {
                 if is_default_host {
@@ -325,6 +330,14 @@ impl AttachModalState {
                 }
                 if is_default_port {
                     self.port = "9494".to_string();
+                }
+                if self.host == "localhost" || self.host == "127.0.0.1" || self.host == "0.0.0.0" {
+                    self.disable_ssl = true;
+                }
+                if self.password.is_empty() {
+                    if let Some(env_tok) = crate::engine::resolve_quack_token(None, None) {
+                        self.password = env_tok;
+                    }
                 }
                 if !self.alias_is_custom {
                     self.alias = "quack_remote".to_string();
@@ -983,6 +996,18 @@ impl AttachModalState {
         }
         self.cursor_pos = cur;
         self.sync_alias_if_default();
+    }
+
+    /// Pastes a single-line string from the system clipboard into the active text field at the cursor.
+    pub(crate) fn paste_text(&mut self, raw: &str) {
+        let cleaned: String = raw
+            .trim_matches(|c| c == '\r' || c == '\n')
+            .chars()
+            .filter(|&c| c != '\r' && c != '\n' && !c.is_control())
+            .collect();
+        for ch in cleaned.chars() {
+            self.handle_char(ch);
+        }
     }
 
     pub(crate) fn handle_backspace(&mut self) {
@@ -2644,12 +2669,13 @@ impl AttachModalState {
                             [],
                         );
                     }
-                    if provider == AttachProvider::Quack && !self.password.trim().is_empty() {
-                        let safe_token = self.password.trim().replace('\'', "''");
-                        let _ = conn.execute(
-                            &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
-                            [],
-                        );
+                    if provider == AttachProvider::Quack {
+                        let opt_token = if self.password.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.password.trim())
+                        };
+                        let _ = crate::engine::apply_quack_token_secret(conn, opt_token);
                     }
 
                     let quoted_alias = format!("\"{}\"", alias.replace('"', "\"\""));

@@ -302,26 +302,54 @@ fn is_target_db_quack(exec: &mut dyn crate::engine::DbExecutor) -> bool {
     crate::engine::is_quack_target_attached(exec)
 }
 
-fn detect_quack_alias(exec: &mut dyn crate::engine::DbExecutor, safe_cat: &str) -> Option<String> {
+pub fn detect_quack_alias(
+    exec: &mut dyn crate::engine::DbExecutor,
+    safe_cat: &str,
+) -> Option<String> {
+    if !safe_cat.is_empty() {
+        let cat_quack = exec
+            .query_rows(&format!(
+                "SELECT count(*) FROM duckdb_databases() WHERE internal = false AND database_name = '{}' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+                safe_cat
+            ))
+            .ok()
+            .and_then(|(_, rows)| rows.into_iter().next())
+            .and_then(|r| r.into_iter().next())
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0)
+            > 0;
+        if cat_quack {
+            return Some(safe_cat.to_string());
+        }
+    }
     if is_target_db_quack(exec) {
         return Some("target_db".to_string());
     }
-    let cat_quack = exec
-        .query_rows(&format!(
-            "SELECT count(*) FROM duckdb_databases() WHERE internal = false AND database_name = '{}' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
-            safe_cat
-        ))
-        .ok()
-        .and_then(|(_, rows)| rows.into_iter().next())
-        .and_then(|r| r.into_iter().next())
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0)
-        > 0;
-    if cat_quack {
-        Some(safe_cat.to_string())
-    } else {
-        None
+    None
+}
+
+/// Finds the alias of an attached Quack database on `exec`, preferring `preferred_cat` if it is a Quack DB,
+/// then `target_db`, then any attached database with `type = 'quack'`.
+pub fn find_any_quack_alias(
+    exec: &mut dyn crate::engine::DbExecutor,
+    preferred_cat: Option<&str>,
+) -> Option<String> {
+    if let Some(cat) = preferred_cat {
+        let safe = cat.replace('\'', "''");
+        if let Some(found) = detect_quack_alias(exec, &safe) {
+            return Some(found);
+        }
     }
+    if is_target_db_quack(exec) {
+        return Some("target_db".to_string());
+    }
+    exec.query_rows(
+        "SELECT database_name FROM duckdb_databases() WHERE internal = false AND (lower(type) = 'quack' OR path LIKE 'quack:%') LIMIT 1",
+    )
+    .ok()
+    .and_then(|(_, rows)| rows.into_iter().next())
+    .and_then(|r| r.into_iter().next())
+    .filter(|s| !s.is_empty())
 }
 
 fn current_database_exec(exec: &mut dyn crate::engine::DbExecutor) -> String {
@@ -1338,12 +1366,19 @@ pub fn diff_project(
     let (_shadow_conn, shadow_snapshot) = CatalogSnapshot::from_project_dir(project_dir)?;
     let target_snapshot = CatalogSnapshot::introspect(target_exec, catalog)?;
     let ignore_list = crate::engine::load_ignore_rules(project_dir);
-    Ok(compute_diff_snapshots(
+    let mut diff_result = compute_diff_snapshots(
         &shadow_snapshot,
         &target_snapshot,
         project_dir,
         &ignore_list,
-    ))
+    );
+    crate::quack_auth::append_quack_auth_diff_items(
+        project_dir,
+        target_exec,
+        catalog,
+        &mut diff_result,
+    );
+    Ok(diff_result)
 }
 
 /// The core diffing engine.
@@ -1369,7 +1404,10 @@ pub fn compute_diff(
     let mut diff = DiffResult { items: Vec::new() };
 
     let is_ignored = |name: &str| -> bool {
-        crate::engine::is_object_ignored(name, ignore_list)
+        name == "_duckpack_auth"
+            || name.starts_with("_duckpack_auth.")
+            || name.starts_with("__duckpack_")
+            || crate::engine::is_object_ignored(name, ignore_list)
     };
 
     let mut created_tables = Vec::new();

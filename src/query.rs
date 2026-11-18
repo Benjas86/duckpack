@@ -15,8 +15,13 @@ pub fn is_remote_directive_query(query: &str) -> bool {
     })
 }
 
-/// Strips the `-- @remote` directive and wraps the query for remote execution on target_db.
+/// Strips the `-- @remote` directive and wraps the query for remote execution on `target_db`.
 pub fn wrap_remote_query(query: &str) -> (String, bool) {
+    wrap_remote_query_for_catalog(query, "target_db")
+}
+
+/// Strips the `-- @remote` directive and wraps the query for remote execution on the specified Quack catalog alias.
+pub fn wrap_remote_query_for_catalog(query: &str, catalog_alias: &str) -> (String, bool) {
     let stripped_lines: Vec<&str> = query
         .lines()
         .filter(|line| {
@@ -44,13 +49,64 @@ pub fn wrap_remote_query(query: &str) -> (String, bool) {
         || lower.starts_with("from"))
         && !is_mutating_cte;
 
+    let alias_clean = if catalog_alias.trim().is_empty() {
+        "target_db"
+    } else {
+        catalog_alias.trim()
+    };
+    let quoted_alias = if alias_clean
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        alias_clean.to_string()
+    } else {
+        format!("\"{}\"", alias_clean.replace('"', "\"\""))
+    };
     let escaped = clean_stripped.replace('\'', "''");
     let wrapped = if is_select {
-        format!("SELECT * FROM target_db.query('{}')", escaped)
+        format!("SELECT * FROM {}.query('{}')", quoted_alias, escaped)
     } else {
-        format!("FROM target_db.query('{}');", escaped)
+        format!("FROM {}.query('{}');", quoted_alias, escaped)
     };
     (wrapped, is_select)
+}
+
+/// Returns `true` if a statement in a Quack-targeted tab must be executed server-side via `<quack_alias>.query(...)`
+/// because the Quack client catalog proxy does not forward it (e.g., `SET GLOBAL`, `RESET GLOBAL`, `CREATE/DROP MACRO`,
+/// `duckdb_settings()`, `duckdb_functions()`, `quack_active_connections()`, or `_duckpack_auth.*` macro calls).
+pub fn should_auto_route_to_quack(query: &str) -> bool {
+    let lower = query.trim().to_lowercase();
+    if lower.contains(".query(") || lower.contains("quack_query(") {
+        return false;
+    }
+    let mut clean_lower = lower.as_str();
+    loop {
+        if clean_lower.starts_with("--") {
+            if let Some(idx) = clean_lower.find('\n') {
+                clean_lower = clean_lower[idx..].trim_start();
+            } else {
+                clean_lower = "";
+            }
+        } else if clean_lower.starts_with("/*") {
+            if let Some(idx) = clean_lower.find("*/") {
+                clean_lower = clean_lower[idx + 2..].trim_start();
+            } else {
+                clean_lower = "";
+            }
+        } else {
+            break;
+        }
+    }
+    clean_lower.starts_with("set global ")
+        || clean_lower.starts_with("reset global ")
+        || clean_lower.starts_with("create macro ")
+        || clean_lower.starts_with("create or replace macro ")
+        || clean_lower.starts_with("drop macro ")
+        || clean_lower.contains("duckdb_functions()")
+        || clean_lower.contains("duckdb_settings()")
+        || clean_lower.contains("quack_active_connections()")
+        || clean_lower.contains("_duckpack_auth.")
+        || clean_lower.contains("_duckpack_quack_")
 }
 
 /// Checks if an unadorned statement executed on a remote connection appears to be a secret or session setting.

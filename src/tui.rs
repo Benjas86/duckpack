@@ -65,8 +65,9 @@ pub fn diff_item_compact_badge(item_type: &DiffItemType) -> (&'static str, Style
 }
 
 /// Recalculates the locked state of all diff items based on their dependencies.
-/// If a parent item (like a CREATE TABLE) is deselected, dependent items (like ALTER TABLE or INSERT)
+/// If a parent item (like a CREATE TABLE) is deselected, dependent items (like ALTER TABLE or CREATE VIEW)
 /// are automatically locked and deselected to prevent invalid SQL execution.
+/// Note: DROP items do not lock CREATE/ALTER items, and self-contained `_duckpack_auth.*` items are never locked.
 pub(crate) fn recompute_locks(items: &mut Vec<DiffItem>) {
     for item in items.iter_mut() {
         item.locked = false;
@@ -76,9 +77,24 @@ pub(crate) fn recompute_locks(items: &mut Vec<DiffItem>) {
         changed = false;
         for i in 0..items.len() {
             if !items[i].selected {
+                // Deselecting a DROP item does not prevent creating/altering other objects
+                let is_drop = matches!(
+                    items[i].item_type,
+                    DiffItemType::DropTable
+                        | DiffItemType::DropSchema
+                        | DiffItemType::DropSequence
+                        | DiffItemType::DropView
+                        | DiffItemType::DropMacro
+                        | DiffItemType::DropColumn
+                        | DiffItemType::DropTrigger
+                );
+                if is_drop {
+                    continue;
+                }
                 let obj_name = items[i].obj_name.clone();
                 for j in 0..items.len() {
                     if i != j
+                        && !items[j].obj_name.starts_with("_duckpack_auth.")
                         && (!items[j].locked || items[j].selected)
                         && items[j].sql.contains(&obj_name)
                     {
@@ -243,6 +259,12 @@ impl DiffReviewSession {
             &target_snapshot,
             &self.project_dir,
             &ignore_list,
+        );
+        crate::quack_auth::append_quack_auth_diff_items(
+            &self.project_dir,
+            exec,
+            Some(&self.active_catalog),
+            &mut self.diff_result,
         );
         sort_diff_items(&mut self.diff_result.items);
         self.target_snapshot = Some(target_snapshot);

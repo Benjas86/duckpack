@@ -1033,6 +1033,15 @@ pub fn run_ide_loop(
                     tabs[active_tab_index].textarea.input(ev.clone());
                 }
             }
+            Event::Paste(pasted_text) => {
+                if attach_modal.is_open {
+                    attach_modal.paste_text(&pasted_text);
+                } else if secret_modal.is_open {
+                    secret_modal.paste_text(&pasted_text);
+                } else if focus == FocusPane::Editor {
+                    tabs[active_tab_index].textarea.insert_str(&pasted_text);
+                }
+            }
             Event::Key(key) => {
                 if exit_confirm_modal.is_open {
                     match exit_confirm_modal.handle_key(key) {
@@ -1069,7 +1078,13 @@ pub fn run_ide_loop(
                         trigger_explorer_refresh = true;
                     }
                 } else if attach_modal.is_open {
-                    if let Some(alias) = attach_modal.handle_key(key, conn) {
+                    if key.code == KeyCode::Char('v')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if let Some(text) = get_clipboard_text(&mut os_clipboard) {
+                            attach_modal.paste_text(&text);
+                        }
+                    } else if let Some(alias) = attach_modal.handle_key(key, conn) {
                         tabs[active_tab_index].target_database = alias.clone();
                         status_msg = format!(
                             "Attached database '{}' successfully and switched active tab context.",
@@ -1078,7 +1093,13 @@ pub fn run_ide_loop(
                         trigger_explorer_refresh = true;
                     }
                 } else if secret_modal.is_open {
-                    if let Some(msg) = secret_modal.handle_key(key, conn, project_dir) {
+                    if key.code == KeyCode::Char('v')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if let Some(text) = get_clipboard_text(&mut os_clipboard) {
+                            secret_modal.paste_text(&text);
+                        }
+                    } else if let Some(msg) = secret_modal.handle_key(key, conn, project_dir) {
                         status_msg = msg;
                         trigger_explorer_refresh = true;
                     }
@@ -2344,8 +2365,36 @@ pub fn run_ide_loop(
                 );
 
                 let is_explicit_remote = is_remote_directive_query(&query_to_execute);
-                let (exec_query, is_paginatable, is_mutation) = if is_explicit_remote {
-                    let (eq, is_pag) = wrap_remote_query(&query_to_execute);
+                let active_tab_is_quack = meta
+                    .databases
+                    .iter()
+                    .find(|d| d.name == active_tab.target_database)
+                    .map(|d| {
+                        d.db_type.eq_ignore_ascii_case("quack")
+                            || d.path
+                                .as_deref()
+                                .map(|p| p.starts_with("quack:"))
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+                    || (is_quack && active_tab.target_database == "target_db");
+
+                let remote_quack_alias = if active_tab_is_quack {
+                    Some(active_tab.target_database.clone())
+                } else {
+                    let mut exec_ref: &Connection = conn;
+                    crate::diff::find_any_quack_alias(
+                        &mut exec_ref,
+                        Some(&active_tab.target_database),
+                    )
+                };
+
+                let should_route_via_quack = is_explicit_remote
+                    || (active_tab_is_quack && should_auto_route_to_quack(&query_to_execute));
+
+                let (exec_query, is_paginatable, is_mutation) = if should_route_via_quack {
+                    let alias = remote_quack_alias.as_deref().unwrap_or("target_db");
+                    let (eq, is_pag) = wrap_remote_query_for_catalog(&query_to_execute, alias);
                     (eq, is_pag, false)
                 } else {
                     let mut clean_lower = query_to_execute.trim().to_lowercase();

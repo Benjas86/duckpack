@@ -487,7 +487,7 @@ pub fn redact_connection_credentials(input: &str) -> String {
         .get_or_init(|| regex::Regex::new(r"([a-zA-Z0-9+.-]+://[^:/@\s]+):([^@\s]+)@").unwrap());
     let sql_sec_re = SQL_SECRET_RE.get_or_init(|| {
         regex::Regex::new(
-            r"(?i)\b(SECRET|TOKEN|motherduck_token)\s*(=|\s+)\s*'([^']|'')*'",
+            r"(?i)\b(SECRET|TOKEN|motherduck_token|quack_default_client_id)\s*(=|\s+)\s*'([^']|'')*'",
         )
         .unwrap()
     });
@@ -507,10 +507,97 @@ pub fn should_redact_sql_history(sql: &str) -> bool {
         || lower.contains("create or replace secret")
         || lower.contains("create or replace persistent secret")
         || lower.contains("motherduck_token")
+        || lower.contains("quack_default_client_id")
         || lower.contains("password=")
         || lower.contains("pwd=")
         || lower.contains("secret '")
         || lower.contains("token '")
+}
+
+/// Applies a Quack authentication token to `conn` using `CREATE OR REPLACE SECRET (TYPE QUACK, TOKEN '...')`.
+/// Drops any stale temporary `quack` secrets first so a previously failed or empty token never shadows the new token.
+/// If `explicit_token` is `None` or empty, falls back to `resolve_quack_token(None, None)` (`QUACK_TOKEN` / `DUCKDB_QUACK_TOKEN`).
+pub fn apply_quack_token_secret(
+    conn: &Connection,
+    explicit_token: Option<&str>,
+) -> Result<Option<String>> {
+    let cleaned_explicit = explicit_token
+        .map(|s| {
+            let t = s.trim();
+            let unquoted = if (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2)
+                || (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
+            {
+                &t[1..t.len() - 1]
+            } else {
+                t
+            };
+            let var_candidate = unquoted
+                .strip_prefix("${")
+                .and_then(|v| v.strip_suffix('}'))
+                .or_else(|| unquoted.strip_prefix('$'))
+                .unwrap_or(unquoted)
+                .trim();
+            if !var_candidate.is_empty()
+                && var_candidate
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && var_candidate.chars().any(|c| c.is_ascii_uppercase())
+            {
+                if let Ok(env_val) = std::env::var(var_candidate) {
+                    let ev = env_val.trim();
+                    if !ev.is_empty() {
+                        return ev.to_string();
+                    }
+                }
+            }
+            unquoted.trim().to_string()
+        })
+        .filter(|s| !s.is_empty());
+
+    let resolved = cleaned_explicit.or_else(|| resolve_quack_token(None, None));
+    if let Some(ref token) = resolved {
+        // Drop any existing temporary quack secrets so stale tokens cannot shadow the new secret
+        let mut stale_names: Vec<String> = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT name FROM duckdb_secrets() WHERE lower(type) = 'quack' AND persistent = false",
+        ) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(name) = row.get::<_, String>(0) {
+                        stale_names.push(name);
+                    }
+                }
+            }
+        }
+        for name in stale_names {
+            let safe_name = name.replace('"', "\"\"");
+            let _ = conn.execute(
+                &format!("DROP TEMPORARY SECRET IF EXISTS \"{}\";", safe_name),
+                [],
+            );
+            let _ = conn.execute(&format!("DROP SECRET IF EXISTS \"{}\";", safe_name), []);
+        }
+
+        let safe_token = token.replace('\'', "''");
+        // Synchronize quack_default_client_id with the token so quack_active_connections()."hashed client id"
+        // deterministically matches sha256(token) (_duckpack_auth.quack_users.client_id_hash) on the server!
+        let _ = conn.execute(
+            &format!("SET quack_default_client_id = '{}';", safe_token),
+            [],
+        );
+        conn.execute(
+            &format!("CREATE OR REPLACE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
+            [],
+        )
+        .or_else(|_| {
+            conn.execute(
+                &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
+                [],
+            )
+        })
+        .with_context(|| "Failed to set quack auth secret")?;
+    }
+    Ok(resolved)
 }
 
 /// Connects to the target DuckDB database (local, motherduck remote, or quack remote).
@@ -526,16 +613,7 @@ pub fn connect_target_db(
             format!("Failed to install/load quack extension for target '{}'", db)
         })?;
 
-        let token = resolve_quack_token(quack_token, None);
-
-        if let Some(token) = token {
-            let safe_token = token.replace('\'', "''");
-            conn.execute(
-                &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
-                [],
-            )
-            .with_context(|| "Failed to set quack auth secret")?;
-        }
+        apply_quack_token_secret(&conn, quack_token)?;
 
         let disable_ssl = should_disable_quack_ssl(db, quack_disable_ssl);
         let attach_sql = build_quack_attach_sql(db, disable_ssl);
@@ -933,14 +1011,21 @@ pub fn apply_diff_with_lake_options(
     project_dir: &Path,
     catalog: Option<&str>,
 ) -> Result<()> {
-    let is_quack = is_quack_target_attached(exec);
+    let req_cat_safe = catalog.unwrap_or("").replace('\'', "''");
+    let quack_alias = diff::detect_quack_alias(exec, &req_cat_safe);
+    let is_quack = quack_alias.is_some();
+    let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+    let quoted_q_alias = format!("\"{}\"", q_alias.replace('"', "\"\""));
 
     let orig_db: String = if is_quack {
-        exec.query_rows("SELECT * FROM target_db.query('SELECT current_database()')")
-            .ok()
-            .and_then(|(_, rows)| rows.into_iter().next())
-            .and_then(|r| r.into_iter().next())
-            .unwrap_or_else(|| "memory".to_string())
+        exec.query_rows(&format!(
+            "SELECT * FROM {}.query('SELECT current_database()')",
+            quoted_q_alias
+        ))
+        .ok()
+        .and_then(|(_, rows)| rows.into_iter().next())
+        .and_then(|r| r.into_iter().next())
+        .unwrap_or_else(|| "memory".to_string())
     } else {
         exec.query_rows("SELECT current_database()")
             .ok()
@@ -950,14 +1035,15 @@ pub fn apply_diff_with_lake_options(
     };
 
     let mut target_cat = catalog.unwrap_or(&orig_db);
-    // If connected via Quack, 'target_db' is merely DuckPack's client-side attachment alias.
-    // The remote Quack database server does NOT have a catalog named 'target_db'.
-    // Therefore, any target catalog pointing to 'target_db' must resolve to the remote server's active database (orig_db).
-    if is_quack && (target_cat == "target_db" || target_cat.is_empty()) {
+    // If connected via Quack, the client-side attachment alias (e.g. 'target_db' or 'quack_remote')
+    // does not exist as a catalog name on the remote Quack server itself.
+    // Resolve it to the remote server's active database (orig_db).
+    if is_quack && (target_cat == q_alias || target_cat == "target_db" || target_cat.is_empty()) {
         target_cat = &orig_db;
     }
 
     let lake_info = diff::get_ducklake_catalog_info_exec(exec, Some(target_cat));
+    let any_quack_alias = diff::find_any_quack_alias(exec, Some(target_cat));
     let env_allow_rewrite = std::env::var("DUCKPACK_ALLOW_LAKE_REWRITE")
         .map(|v| {
             let t = v.trim();
@@ -1001,7 +1087,10 @@ pub fn apply_diff_with_lake_options(
 
     if is_remote_effective {
         if is_quack {
-            let _ = exec.execute_batch("CALL target_db.query('BEGIN TRANSACTION;');");
+            let _ = exec.execute_batch(&format!(
+                "CALL {}.query('BEGIN TRANSACTION;');",
+                quoted_q_alias
+            ));
         } else {
             let _ = exec.execute_batch("BEGIN TRANSACTION;");
         }
@@ -1014,15 +1103,45 @@ pub fn apply_diff_with_lake_options(
                 let safe_sql = sql.replace('\'', "''");
                 if !safe_cat.is_empty() {
                     exec.execute_batch(&format!(
-                        "CALL target_db.query('USE \"{}\"; {}')",
-                        safe_cat, safe_sql
+                        "CALL {}.query('USE \"{}\"; {}')",
+                        quoted_q_alias, safe_cat, safe_sql
                     ))
                     .with_context(|| {
-                        format!("Failed executing DDL on catalog '{}' via Quack", target_cat)
+                        format!(
+                            "Failed executing DDL on catalog '{}' via Quack ('{}')",
+                            target_cat, q_alias
+                        )
                     })?;
                 } else {
-                    exec.execute_batch(&format!("CALL target_db.query('{}')", safe_sql))
-                        .with_context(|| "Failed executing DDL via Quack".to_string())?;
+                    exec.execute_batch(&format!(
+                        "CALL {}.query('{}')",
+                        quoted_q_alias, safe_sql
+                    ))
+                    .with_context(|| "Failed executing DDL via Quack".to_string())?;
+                }
+            } else if sql.contains("_duckpack_auth") {
+                if let Some(ref qa) = any_quack_alias {
+                    let quoted_qa = format!("\"{}\"", qa.replace('"', "\"\""));
+                    let safe_sql = sql.replace('\'', "''");
+                    exec.execute_batch(&format!("CALL {}.query('{}')", quoted_qa, safe_sql))
+                        .with_context(|| {
+                            format!("Failed deploying _duckpack_auth to Quack catalog '{}'", qa)
+                        })?;
+                } else if is_ducklake && !orig_db.is_empty() {
+                    // DuckLake storage catalogs do not implement CreateFunction (CREATE MACRO);
+                    // execute _duckpack_auth in the primary DuckDB catalog and switch back.
+                    let _ = exec.execute_batch(&format!(
+                        "USE \"{}\";",
+                        orig_db.replace('"', "\"\"")
+                    ));
+                    let res = exec.execute_batch(sql);
+                    let _ = exec.execute_batch(&format!(
+                        "USE \"{}\";",
+                        target_cat.replace('"', "\"\"")
+                    ));
+                    res?;
+                } else {
+                    exec.execute_batch(sql)?;
                 }
             } else {
                 exec.execute_batch(sql)?;
@@ -1166,13 +1285,19 @@ pub fn apply_diff_with_lake_options(
     if is_remote_effective {
         if result.is_ok() {
             if is_quack {
-                let _ = exec.execute_batch("CALL target_db.query('COMMIT;');");
+                let _ = exec.execute_batch(&format!(
+                    "CALL {}.query('COMMIT;');",
+                    quoted_q_alias
+                ));
             } else {
                 exec.execute_batch("COMMIT;")?;
             }
         } else {
             if is_quack {
-                let _ = exec.execute_batch("CALL target_db.query('ROLLBACK;');");
+                let _ = exec.execute_batch(&format!(
+                    "CALL {}.query('ROLLBACK;');",
+                    quoted_q_alias
+                ));
             } else {
                 exec.execute_batch("ROLLBACK;")?;
             }
@@ -1510,13 +1635,7 @@ pub fn prepare_ducklake_connection(
     if target_dsn.contains("quack") {
         load_quack_extension(conn)
             .with_context(|| "Failed to install/load quack extension for DuckLake catalog")?;
-        if let Some(token) = quack_token.filter(|t| !t.trim().is_empty()) {
-            let safe_token = token.trim().replace('\'', "''");
-            let _ = conn.execute(
-                &format!("CREATE SECRET (TYPE QUACK, TOKEN '{}');", safe_token),
-                [],
-            );
-        }
+        let _ = apply_quack_token_secret(conn, quack_token);
     }
     if target_dsn.contains("s3://")
         || target_dsn.contains("http://")
