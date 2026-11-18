@@ -168,14 +168,31 @@ pub fn should_disable_quack_ssl(db: &str, flag_disable_ssl: bool) -> bool {
         || is_quack_loopback(db)
 }
 
+/// Builds the SQL ATTACH statement for a Quack database, optionally embedding an explicit `TOKEN '...'`
+/// so persistent secrets in `~/.duckdb/stored_secrets` can never shadow the active token.
+pub fn build_quack_attach_sql_with_token(
+    db: &str,
+    disable_ssl: bool,
+    token: Option<&str>,
+) -> String {
+    let safe_db = db.replace('\'', "''");
+    let mut opts = Vec::new();
+    if disable_ssl {
+        opts.push("DISABLE_SSL true".to_string());
+    }
+    if let Some(tok) = token.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        opts.push(format!("TOKEN '{}'", tok.replace('\'', "''")));
+    }
+    if opts.is_empty() {
+        format!("ATTACH '{}' AS target_db;", safe_db)
+    } else {
+        format!("ATTACH '{}' AS target_db ({});", safe_db, opts.join(", "))
+    }
+}
+
 /// Builds the SQL ATTACH statement for a Quack database.
 pub fn build_quack_attach_sql(db: &str, disable_ssl: bool) -> String {
-    let safe_db = db.replace("'", "''");
-    if disable_ssl {
-        format!("ATTACH '{}' AS target_db (DISABLE_SSL true);", safe_db)
-    } else {
-        format!("ATTACH '{}' AS target_db;", safe_db)
-    }
+    build_quack_attach_sql_with_token(db, disable_ssl, None)
 }
 
 /// Returns the display version string of DuckPack (e.g. "0.2.1_dev1").
@@ -579,8 +596,12 @@ pub fn apply_quack_token_secret(
         }
 
         let safe_token = token.replace('\'', "''");
-        // Synchronize quack_default_client_id with the token so quack_active_connections()."hashed client id"
-        // deterministically matches sha256(token) (_duckpack_auth.quack_users.client_id_hash) on the server!
+        // Synchronize quack_default_client_id (both global and session) with the token so
+        // quack_active_connections().client_id_hash deterministically matches sha256(token) on the server.
+        let _ = conn.execute(
+            &format!("SET GLOBAL quack_default_client_id = '{}';", safe_token),
+            [],
+        );
         let _ = conn.execute(
             &format!("SET quack_default_client_id = '{}';", safe_token),
             [],
@@ -613,10 +634,11 @@ pub fn connect_target_db(
             format!("Failed to install/load quack extension for target '{}'", db)
         })?;
 
-        apply_quack_token_secret(&conn, quack_token)?;
+        let applied_token = apply_quack_token_secret(&conn, quack_token)?;
 
         let disable_ssl = should_disable_quack_ssl(db, quack_disable_ssl);
-        let attach_sql = build_quack_attach_sql(db, disable_ssl);
+        let attach_sql =
+            build_quack_attach_sql_with_token(db, disable_ssl, applied_token.as_deref());
 
         let attach_res = conn.execute(&attach_sql, []);
         if let Err(e) = attach_res {

@@ -514,13 +514,18 @@ pub fn compile_quack_auth_sql(
     }
 
     // 1. Authentication Macro: _duckpack_auth.authenticate(p_sid, p_client_token, p_server_token)
+    // Allows:
+    //  - Any enabled user in _duckpack_auth.quack_users matching sha256(p_client_token)
+    //  - Break-glass fallback for the server's own startup master token (p_server_token)
+    // Always rejects any session explicitly marked revoked = true in _duckpack_auth.quack_sessions.
     sql.push_str(
         "CREATE OR REPLACE MACRO _duckpack_auth.authenticate(p_sid, p_client_token, p_server_token) AS (\n\
          \x20   CASE\n\
          \x20       WHEN EXISTS (\n\
          \x20           SELECT 1 FROM _duckpack_auth.quack_sessions s\n\
-         \x20           WHERE s.sid = p_sid AND s.revoked = true\n\
+         \x20           WHERE CAST(s.sid AS VARCHAR) = CAST(p_sid AS VARCHAR) AND s.revoked = true\n\
          \x20       ) THEN false\n\
+         \x20       WHEN p_server_token IS NOT NULL AND p_server_token <> '' AND p_client_token = p_server_token THEN true\n\
          \x20       WHEN EXISTS (\n\
          \x20           SELECT 1 FROM _duckpack_auth.quack_users u\n\
          \x20           WHERE u.enabled = true\n\
@@ -534,13 +539,13 @@ pub fn compile_quack_auth_sql(
     // 2. Role Resolution Macro: _duckpack_auth.resolve_role(p_sid)
     // Correlates p_sid via:
     //  1) Explicit session override / revocation in _duckpack_auth.quack_sessions
-    //  2) Live Quack connection table quack_active_connections() (quack_connection_id = p_sid)
-    //     matched against _duckpack_auth.quack_users.client_id_hash ("hashed client id")
+    //  2) Live Quack connection table quack_active_connections() (connection_id = p_sid)
+    //     matched against _duckpack_auth.quack_users.client_id_hash / token_sha256 (case-insensitive)
     //  3) Direct username / client_id_hash / token_sha256 match on p_sid
     //  4) Configured default_role fallback
     let default_role_str = config.default_role.as_str();
     let quack_active_conn_clause = if include_global_hooks {
-        "            (SELECT u.role FROM quack_active_connections() ac JOIN _duckpack_auth.quack_users u ON u.enabled = true AND (u.client_id_hash = CAST(ac.\"hashed client id\" AS VARCHAR) OR u.token_sha256 = CAST(ac.\"hashed client id\" AS VARCHAR)) WHERE CAST(ac.quack_connection_id AS VARCHAR) = CAST(p_sid AS VARCHAR) LIMIT 1),\n"
+        "            (SELECT u.role FROM quack_active_connections() ac JOIN _duckpack_auth.quack_users u ON u.enabled = true AND (lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) OR lower(u.token_sha256) = lower(CAST(ac.client_id_hash AS VARCHAR))) WHERE lower(CAST(ac.connection_id AS VARCHAR)) = lower(CAST(p_sid AS VARCHAR)) LIMIT 1),\n"
     } else {
         ""
     };
@@ -549,12 +554,12 @@ pub fn compile_quack_auth_sql(
          \x20   CASE\n\
          \x20       WHEN EXISTS (\n\
          \x20           SELECT 1 FROM _duckpack_auth.quack_sessions s\n\
-         \x20           WHERE CAST(s.sid AS VARCHAR) = CAST(p_sid AS VARCHAR) AND s.revoked = true\n\
+         \x20           WHERE lower(CAST(s.sid AS VARCHAR)) = lower(CAST(p_sid AS VARCHAR)) AND s.revoked = true\n\
          \x20       ) THEN 'none'\n\
          \x20       ELSE COALESCE(\n\
-         \x20           (SELECT s.role FROM _duckpack_auth.quack_sessions s WHERE CAST(s.sid AS VARCHAR) = CAST(p_sid AS VARCHAR) AND s.revoked = false LIMIT 1),\n\
+         \x20           (SELECT s.role FROM _duckpack_auth.quack_sessions s WHERE lower(CAST(s.sid AS VARCHAR)) = lower(CAST(p_sid AS VARCHAR)) AND s.revoked = false LIMIT 1),\n\
          {quack_active_conn_clause}\
-         \x20           (SELECT u.role FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND (u.username = CAST(p_sid AS VARCHAR) OR u.client_id_hash = CAST(p_sid AS VARCHAR) OR u.token_sha256 = sha256(COALESCE(CAST(p_sid AS VARCHAR), ''))) LIMIT 1),\n\
+         \x20           (SELECT u.role FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND (u.username = CAST(p_sid AS VARCHAR) OR lower(u.client_id_hash) = lower(CAST(p_sid AS VARCHAR)) OR lower(u.token_sha256) = sha256(COALESCE(CAST(p_sid AS VARCHAR), ''))) LIMIT 1),\n\
          \x20           '{}'\n\
          \x20       )\n\
          \x20   END\n\
@@ -685,7 +690,7 @@ pub fn append_quack_auth_diff_items(
 
     // Query existing _duckpack_auth.quack_users AND verify all 4 macros exist on target_exec
     let query = "SELECT username, role, token_sha256, client_id_hash, CAST(enabled AS VARCHAR) FROM _duckpack_auth.quack_users ORDER BY username";
-    let macros_query = "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authorize' OR COALESCE(macro_definition, '') LIKE '%use|pragma%')";
+    let macros_query = "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authorize' OR COALESCE(macro_definition, '') LIKE '%use|pragma%') AND (function_name <> 'resolve_role' OR COALESCE(macro_definition, '') LIKE '%ac.connection_id%')";
     let (actual_rows, macros_count) = if let Some(ref qa) = q_alias {
         let quoted_qa = format!("\"{}\"", qa.replace('"', "\"\""));
         let remote_q = format!(

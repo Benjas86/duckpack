@@ -2669,14 +2669,18 @@ impl AttachModalState {
                             [],
                         );
                     }
-                    if provider == AttachProvider::Quack {
+                    let quack_applied_token = if provider == AttachProvider::Quack {
                         let opt_token = if self.password.trim().is_empty() {
                             None
                         } else {
                             Some(self.password.trim())
                         };
-                        let _ = crate::engine::apply_quack_token_secret(conn, opt_token);
-                    }
+                        crate::engine::apply_quack_token_secret(conn, opt_token)
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
 
                     let quoted_alias = format!("\"{}\"", alias.replace('"', "\"\""));
                     let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, quoted_alias);
@@ -2713,6 +2717,9 @@ impl AttachModalState {
                                 || crate::engine::should_disable_quack_ssl(&safe_path, false)
                             {
                                 opts.push("DISABLE_SSL true".to_string());
+                            }
+                            if let Some(ref tok) = quack_applied_token {
+                                opts.push(format!("TOKEN '{}'", tok.replace('\'', "''")));
                             }
                         }
                         _ => {}
