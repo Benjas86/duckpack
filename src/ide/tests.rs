@@ -2149,6 +2149,7 @@ fn test_ducklake_snapshots_explorer_and_time_travel_modal() {
     let expanded_tables = HashSet::new();
 
     let nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
+    assert!(nodes.iter().any(|n| n.name == "db:lake_db" && n.display.contains("🌊 lake_db [ducklake -> ducklake:metadata.ducklake]")));
     assert!(nodes.iter().any(|n| n.name == "lake_db:Snapshots" && n.display.contains("📸 Snapshots (2)")));
     assert!(nodes.iter().any(|n| matches!(
         &n.node_type,

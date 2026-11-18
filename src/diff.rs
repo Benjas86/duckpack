@@ -446,10 +446,10 @@ pub fn validate_target_catalog_exec(
                 );
             }
             let typ = db_info.db_type.to_lowercase();
-            if typ != "duckdb" && typ != "quack" {
+            if typ != "duckdb" && typ != "quack" && typ != "ducklake" {
                 anyhow::bail!(
                     "Cannot apply declarative schema migrations to '{}' (engine type: {}). \
-                    DuckPack declarative schema management is designed specifically for DuckDB catalogs. \
+                    DuckPack declarative schema management is designed specifically for DuckDB and DuckLake catalogs. \
                     External attached engines are supported for querying and DML, but schema DDL is managed externally.",
                     db_info.name,
                     db_info.db_type
@@ -467,6 +467,21 @@ pub fn validate_target_catalog_exec(
             available
         );
     }
+}
+
+/// Returns `Some(AttachedDatabase)` if the specified (or active) target catalog is an attached `ducklake` catalog.
+pub fn get_ducklake_catalog_info_exec(
+    exec: &mut dyn crate::engine::DbExecutor,
+    catalog: Option<&str>,
+) -> Option<AttachedDatabase> {
+    let attached = list_attached_databases_exec(exec).unwrap_or_default();
+    let target = match catalog {
+        Some(c) if !c.is_empty() => c.to_string(),
+        _ => current_database_exec(exec),
+    };
+    attached.into_iter().find(|d| {
+        d.name.eq_ignore_ascii_case(&target) && d.db_type.eq_ignore_ascii_case("ducklake")
+    })
 }
 
 /// Common Table Expression for DuckDB 2.0 to resolve fully qualified nested schemas hierarchically.

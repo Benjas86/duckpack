@@ -73,7 +73,7 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
 - **First-Class Sequences & Dependency-Safe Compilation:** Native support for DuckDB `sequences/` compiled in topological order (`schemas` $\rightarrow$ `types` $\rightarrow$ `sequences` $\rightarrow$ `macros` $\rightarrow$ `tables` $\rightarrow$ `views` $\rightarrow$ `triggers`), ensuring tables with surrogate keys (`DEFAULT nextval('...')`) compile and apply seamlessly.
 - **Table Constraint Diffing & Copy-and-Swap Migrations:** Automatically introspects `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`, and `CHECK` constraints. Generates in-place `ALTER TABLE` statements for safe additions and transactional copy-and-swap (`__duckpack_swap`) staging tables for complex constraint modifications.
 - **Catalog-Aware Multi-Database Targeting:** Seamlessly target specific attached databases (via `--database <name>`, `duckpack.toml [target] database = "..."`, or Python `duckpack.apply(con, database="analytics")`) with strict catalog isolation.
-- **Clear Engine Boundary (SSDT vs Federation):** Full declarative DDL lifecycle management specifically engineered for DuckDB, Quack, and MotherDuck. External attached engines (MSSQL, PostgreSQL, MySQL, SQLite) are first-class citizens in Explore for ad-hoc querying, cross-DB joins, and DML (`INSERT INTO`, `UPDATE`), with schema DDL safely managed by external native tools.
+- **Clear Engine Boundary (SSDT vs Federation):** Full declarative DDL lifecycle management specifically engineered for DuckDB, DuckLake, Quack, and MotherDuck (with a physical copy-and-swap Parquet rewrite guard `--allow-lake-rewrite` and automatic `set_commit_message` snapshot tagging for DuckLake). External attached engines (MSSQL, PostgreSQL, MySQL, SQLite) are first-class citizens in Explore for ad-hoc querying, cross-DB joins, and DML (`INSERT INTO`, `UPDATE`), with schema DDL safely managed by external native tools.
 - **Interactive Apply Parity (CLI & Notebook):** Review visual colored diffs and apply migrations interactively with live confirmation prompts in terminal, Python scripts, or Jupyter notebooks (with automated external terminal pop-out).
 - **Schema Drift Detection (`duckpack diff`):** Instant dry-run inspection to detect divergence between your declarative codebase and live databases without mutating state.
 - **Git-Style Smart Renames:** Uses Jaro-Winkler similarity matching (>80%) to detect renamed tables or columns, issuing non-destructive `ALTER TABLE RENAME` statements instead of dropping and recreating data.
@@ -82,7 +82,7 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
 - **Visual Primary Key & Foreign Key Indicators:** Inspect table structures in the Explorer tree with visual icons (`🔑` for Primary Keys, `🔗` for Foreign Keys with reference targets `[FK -> table.col]`, and composite `🔑🔗` badges).
 - **Dynamic Explorer Width Resizing & Snappy Scrolling:** Adjust sidebar width on the fly via `W` (cycling 25%/35%/50% presets) or `+`/`-` and `[`/`]` (5% increments from 15% to 60%). Navigate wide schemas quickly with 4-char arrow scrolling, `Shift+Arrow` 10-char jumps, and `Home` margin snap.
 - **Catalog-Aware Multi-Database Exploration:** Inspect multiple attached catalogs (local DuckDB, in-memory `memory` scratchpad, DuckLake lakehouses `🌊`, attached SQLite/Postgres/MySQL/MSSQL `🔌`, and remote Quack `target_db` instances) in a unified hierarchical tree with catalog-qualified query generation, cross-database joins, and live external catalog cache invalidation (`r`).
-- **Live Catalog Attach with Provider Presets & DuckLake Triad (`Ctrl+A` / `d` / `b`):** Dynamically attach DuckLake lakehouses (with `DuckDB File`, `PostgreSQL`, `SQLite`, or `Quack` metadata backends + `DATA_PATH` + S3 secret auto-binding), third-party databases (including MSSQL Windows Auth / `Trusted_Connection`), DuckDB files, MotherDuck, or remote Quack instances directly inside the IDE with full cursor-navigable modal inputs; cycle target catalogs on the fly.
+- **Live Catalog Attach with Provider Presets & DuckLake Triad (`Ctrl+A` / `d` / `b` / `t`):** Dynamically attach DuckLake lakehouses (with `DuckDB File`, `PostgreSQL`, `SQLite`, or `Quack` metadata backends + `DATA_PATH` + S3 secret auto-binding), inspect versioned commits under `📸 Snapshots (N)`, and launch the interactive **Time-Travel & Snapshot Diff Modal (`t`)** (`AT (VERSION => N)`, `AT (TIMESTAMP => '...')`, `ducklake_table_changes(...)`); also attach third-party databases (including MSSQL Windows Auth / `Trusted_Connection`), DuckDB files, MotherDuck, or remote Quack instances directly inside the IDE with full cursor-navigable modal inputs.
 - **Cloud Secrets Management & S3 Bucket Explorer (`Ctrl+K`):** Visually configure cloud storage credentials (AWS S3, Cloudflare R2, MinIO, Wasabi, Custom S3) with masked inputs (`*`) and dual-persistence (`CREATE PERSISTENT SECRET` + `.env`). Live-explore remote S3 buckets (`glob()`) and sample remote files (`read_parquet`, `read_csv`) with a single keypress.
 - **Temporary Table Discovery & Python Two-Way Sync:** Temporary tables and views (`CREATE TEMP TABLE ...`) appear seamlessly in the active database's Explorer tree with a distinct `[temp]` badge. Instant DDL auto-refresh updates the sidebar on `CREATE`/`DROP`/`ALTER`, and interactive Python exploration (`duckpack.explore(con)`) performs safe two-way session synchronization across the Quack bridge.
 - **Python Integration with Jupyter / VS Code Support:** Import `duckpack` into Python pipelines, pytest fixtures, or Jupyter notebooks (`duckpack.explore(con)`). Automatically spawns a connected native terminal window in non-interactive notebook environments.
@@ -172,12 +172,12 @@ cargo install duckpack
 | `duckpack init` | Scaffold a new declarative database project | `-p, --project-dir <DIR>` | `.` |
 | `duckpack build` | Validate SQL syntax against an in-memory Shadow DB | `-p, --project-dir <DIR>` | `.` |
 | `duckpack diff` | Compare declarative project state against target database without applying changes | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`None`<br>`false` |
-| `duckpack apply` | Compute diff and apply migrations to target database | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--auto-approve`<br>`--interactive`<br>`--force-drop`<br>`--out <FILE>`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`false`<br>`false`<br>`false`<br>`None`<br>`None`<br>`false` |
+| `duckpack apply` | Compute diff and apply migrations to target database | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--auto-approve`<br>`--interactive`<br>`--force-drop`<br>`--allow-lake-rewrite`<br>`--out <FILE>`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`false`<br>`false`<br>`false`<br>`false`<br>`None`<br>`None`<br>`false` |
 | `duckpack explore` | Open the interactive terminal IDE / query editor | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--remote <SSH_TARGET>`<br>`-P, --port <PORT>`<br>`--auto-install`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`None`<br>`22`<br>`false`<br>`None`<br>`false` |
 | `duckpack compile` | Package project into an immutable `.duckpack` snapshot | `-p, --project-dir <DIR>`<br>`-o, --out <FILE>` | `.`<br>*(Required)* |
 | `duckpack deploy` | Deploy compiled project to a remote server over SSH | `-p, --project-dir <DIR>`<br>`-r, --remote <HOST>`<br>`-d, --db <URI>`<br>`-P, --port <PORT>`<br>`--auto-install` | `.`<br>*(Required)*<br>`local.duckdb`<br>`22`<br>`false` |
-| `duckpack python status` | Check if Python bindings are installed in active environment | — | — |
-| `duckpack python install` | Install/upgrade `duckpack` Python package via pip | `--upgrade` | `false` |
+| `duckpack python status` | Check active Python environment (`$VIRTUAL_ENV`, `./.venv`, or `python3`), detected installer (`uv` / `pip`), and installed versions | — | — |
+| `duckpack python install` | Install/upgrade `duckpack` Python package in active environment (auto-detects `uv` or `pip`) | `-U, --upgrade`<br>`--installer, --method <auto\|uv\|pip>`<br>`--uv`<br>`--pip` | `false`<br>`auto`<br>`false`<br>`false` |
 
 ---
 
@@ -372,14 +372,16 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | | `Left` / `Right` / `h` / `l` | **Scroll horizontally** by 4 characters |
 | | `Shift + Left` / `Right` | **Fast horizontal scroll** by 10 characters |
 | | `Home` | **Snap horizontal scroll** back to left margin |
-| | `q` / `s` | **Query table/view** (generates catalog-qualified SQL into editor) |
-| | `Ctrl+A` | **Attach Database** dialog with Provider Presets (DuckDB, SQLite, Postgres, MySQL, MotherDuck, Quack) |
+| | `q` / `s` | **Query table/view/snapshot** (generates catalog-qualified SQL or `ducklake_snapshots()` into editor) |
+| | `t` | **DuckLake Time-Travel & Snapshot Diff Modal:** Interactive picker for `AT (VERSION => N)`, `AT (TIMESTAMP => '...')`, and `ducklake_table_changes(...)` |
+| | `Ctrl+A` | **Attach Database** dialog with Provider Presets (DuckDB, DuckLake, SQLite, Postgres, MySQL, MSSQL, MotherDuck, Quack) |
 | | `Ctrl+K` | **Cloud Secrets & S3 Buckets:** Add S3/R2/MinIO credentials with masking, `.env` persistence, and bucket exploration |
 | | `d` | **Detach Database** from current session |
 | | `b` | **Cycle Target Catalog** for diff/apply operations |
 | | `r` / `R` | **Refresh Explorer:** re-scans live database (in DB mode) or disk & git status (in Project mode) |
 | **In-IDE Diff & Apply** | `Space` | **Toggle selection** `[x]` / `[ ]` of highlighted migration with dependency locking `[L]` |
 | | `a` | **Toggle All:** select or deselect all eligible migrations |
+| | `w` | **Toggle Allow Lake Rewrite (`[OFF/ON]`):** permit physical copy-and-swap table rewrites on DuckLake catalogs |
 | | `Enter` | **Apply selected changes** directly to target database catalog |
 | | `Esc` | **Close** diff review dialog without applying changes |
 | **Apply Review Screen** | `y` | **Confirm and apply** all pending declarative migrations |
@@ -688,8 +690,8 @@ import duckpack
 - **`duckpack.stop_server() -> bool`**
   Stops any active background Quack session bridge started by `duckpack.explore(con)` in a notebook.
 
-- **`duckpack.apply(target=None, project_dir=".", auto_approve=True, force_drop=False, interactive=False, database=None, catalog=None, env=None) -> ApplyResult`**
-  Computes schema diffs and applies declarative migrations. In interactive mode (`auto_approve=False` or `interactive=True`), opens the visual review TUI. When `target=None`, auto-resolves database targets from `duckpack.toml`. Returns an `ApplyResult`.
+- **`duckpack.apply(target=None, project_dir=".", auto_approve=True, force_drop=False, allow_lake_rewrite=False, interactive=False, database=None, catalog=None, env=None) -> ApplyResult`**
+  Computes schema diffs and applies declarative migrations. In interactive mode (`auto_approve=False` or `interactive=True`), opens the visual review TUI. When targeting a DuckLake catalog, physical copy-and-swap table rewrites (`RecreateTable`) are blocked unless `allow_lake_rewrite=True` is passed, and applied migrations automatically tag the DuckLake snapshot via `set_commit_message`. When `target=None`, auto-resolves database targets from `duckpack.toml`. Returns an `ApplyResult`.
 
 - **`duckpack.diff(target=None, project_dir=".", database=None, catalog=None, env=None) -> DiffSummary`**
   Compares declarative project state against target database or attached catalog without mutating data. When `target=None`, auto-resolves from `duckpack.toml`. Returns a `DiffSummary`.
@@ -713,14 +715,19 @@ import duckpack
 
 ### CLI Python Management
 
-Check and install the Python bindings directly from the standalone DuckPack CLI:
+Check and install the Python bindings directly from the standalone DuckPack CLI. `duckpack python` automatically detects `$VIRTUAL_ENV`, `./.venv`, and whether your environment is managed by **`uv`** (`uv.lock` / `pyvenv.cfg` / missing `pip`) or **`pip`**:
 
 ```bash
-# Verify Python extension status in active environment
+# Verify Python interpreter, detected installer (uv or pip), and installed package versions
 duckpack python status
 
-# Install or upgrade duckpack in active environment via pip
+# Install or upgrade duckpack in the active environment (auto-detects uv vs pip)
 duckpack python install --upgrade
+
+# Or explicitly select uv or pip:
+duckpack python install --uv -U
+duckpack python install --pip -U
+duckpack python install --installer uv
 ```
 
 ---

@@ -7,7 +7,7 @@ use duckpack::tui;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use duckdb::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The core CLI argument parser configuration using `clap`.
 /// Dictates all available terminal commands for duckpack.
@@ -57,6 +57,9 @@ enum Commands {
         /// Allow destructive drops (tables/columns)
         #[arg(long)]
         force_drop: bool,
+        /// Allow physical copy-and-swap table rewrites on DuckLake catalogs
+        #[arg(long)]
+        allow_lake_rewrite: bool,
         /// Apply automatically without showing the TUI
         #[arg(long)]
         auto_approve: bool,
@@ -164,11 +167,20 @@ enum Commands {
 /// Subcommands for the `duckpack python` CLI helper
 #[derive(Subcommand, Debug, PartialEq)]
 enum PythonCommands {
-    /// Install duckpack Python package into the active Python environment
+    /// Install duckpack Python package into the active Python environment (auto-detects uv or pip)
     Install {
         /// Upgrade existing package
-        #[arg(long)]
+        #[arg(short = 'U', long)]
         upgrade: bool,
+        /// Package installer to use: 'auto' (default), 'uv', or 'pip'
+        #[arg(long, visible_alias = "method", default_value = "auto")]
+        installer: String,
+        /// Force installation using 'uv pip install'
+        #[arg(long, conflicts_with = "pip")]
+        uv: bool,
+        /// Force installation using 'python -m pip install'
+        #[arg(long, conflicts_with = "uv")]
+        pip: bool,
     },
     /// Check whether duckpack Python package is installed in the active Python environment
     Status,
@@ -285,7 +297,12 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Apply { project_dir, db, database, force_drop, auto_approve, interactive: _, out, quack_token, quack_disable_ssl } => {
+        Commands::Apply { project_dir, db, database, force_drop, allow_lake_rewrite, auto_approve, interactive: _, out, quack_token, quack_disable_ssl } => {
+            if *allow_lake_rewrite {
+                unsafe {
+                    std::env::set_var("DUCKPACK_ALLOW_LAKE_REWRITE", "true");
+                }
+            }
             if !project_dir.exists() {
                 eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
                 return Ok(());
@@ -595,11 +612,17 @@ fn main() -> Result<()> {
                 PythonCommands::Status => {
                     let embedded_ver = duckpack::engine::embedded_duckdb_version();
                     let dp_ver = duckpack::engine::duckpack_version();
+                    let py_bin = resolve_active_python_binary();
+                    let detected_installer =
+                        resolve_python_installer("auto", false, false, &py_bin);
                     println!("🦆 DuckPack CLI: v{}", dp_ver);
                     println!("   Embedded DuckDB engine: {}", embedded_ver);
-                    println!("\nChecking active Python environment (python3)...");
+                    println!(
+                        "\nChecking active Python environment ({}, installer: {})...",
+                        py_bin, detected_installer
+                    );
 
-                    let duckpack_py_out = std::process::Command::new("python3")
+                    let duckpack_py_out = std::process::Command::new(&py_bin)
                         .args(["-c", "import duckpack; print(duckpack.__version__)"])
                         .output();
                     match duckpack_py_out {
@@ -610,11 +633,13 @@ fn main() -> Result<()> {
                         }
                         _ => {
                             println!("✗ DuckPack Python package: not installed");
-                            println!("  Run 'duckpack python install' to install it via pip.");
+                            println!(
+                                "  Run 'duckpack python install' (or 'duckpack python install --uv') to install it."
+                            );
                         }
                     }
 
-                    let duckdb_py_out = std::process::Command::new("python3")
+                    let duckdb_py_out = std::process::Command::new(&py_bin)
                         .args(["-c", "import duckdb; print(duckdb.__version__)"])
                         .output();
                     match duckdb_py_out {
@@ -628,24 +653,53 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                PythonCommands::Install { upgrade } => {
-                    println!("Installing DuckPack Python package into active Python environment...");
-                    let mut cmd = std::process::Command::new("python3");
-                    cmd.args(["-m", "pip", "install"]);
-                    if *upgrade {
-                        cmd.arg("--upgrade");
-                    }
-                    cmd.arg("duckpack");
-                    let status = cmd.status();
+                PythonCommands::Install {
+                    upgrade,
+                    installer,
+                    uv,
+                    pip,
+                } => {
+                    let py_bin = resolve_active_python_binary();
+                    let chosen = resolve_python_installer(installer, *uv, *pip, &py_bin);
+                    let (prog, args) = build_python_install_command(chosen, &py_bin, *upgrade);
+                    println!(
+                        "Installing DuckPack Python package via '{}' ({} {})...",
+                        chosen,
+                        prog,
+                        args.join(" ")
+                    );
+                    let status = std::process::Command::new(&prog).args(&args).status();
                     match status {
                         Ok(s) if s.success() => {
-                            println!("✓ Successfully installed DuckPack Python package!");
+                            println!(
+                                "✓ Successfully installed DuckPack Python package via '{}'!",
+                                chosen
+                            );
                         }
                         Ok(s) => {
-                            eprintln!("pip install exited with status {}", s);
+                            if chosen == "pip" && !*pip && installer == "auto" && is_uv_available()
+                            {
+                                println!(
+                                    "pip exited with {}; falling back to 'uv pip install'...",
+                                    s
+                                );
+                                let (uv_prog, uv_args) =
+                                    build_python_install_command("uv", &py_bin, *upgrade);
+                                if let Ok(uv_s) =
+                                    std::process::Command::new(&uv_prog).args(&uv_args).status()
+                                {
+                                    if uv_s.success() {
+                                        println!(
+                                            "✓ Successfully installed DuckPack Python package via 'uv'!"
+                                        );
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            eprintln!("{} install exited with status {}", chosen, s);
                         }
                         Err(e) => {
-                            eprintln!("Failed to execute python3: {}", e);
+                            eprintln!("Failed to execute '{}': {}", prog, e);
                         }
                     }
                 }
@@ -659,6 +713,114 @@ fn main() -> Result<()> {
 /// Quotes a string as a single-quoted POSIX shell token (`'...'`, escaping embedded `'` as `'\''`).
 fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Resolves the active Python interpreter binary (`$VIRTUAL_ENV/bin/python`, `./.venv/bin/python`, or `python3`).
+fn resolve_active_python_binary() -> String {
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        let unix_py = PathBuf::from(&venv).join("bin").join("python");
+        if unix_py.exists() {
+            return unix_py.to_string_lossy().to_string();
+        }
+        let win_py = PathBuf::from(&venv).join("Scripts").join("python.exe");
+        if win_py.exists() {
+            return win_py.to_string_lossy().to_string();
+        }
+    }
+    let local_unix = PathBuf::from(".venv").join("bin").join("python");
+    if local_unix.exists() {
+        return local_unix.to_string_lossy().to_string();
+    }
+    let local_win = PathBuf::from(".venv").join("Scripts").join("python.exe");
+    if local_win.exists() {
+        return local_win.to_string_lossy().to_string();
+    }
+    "python3".to_string()
+}
+
+fn is_uv_available() -> bool {
+    std::process::Command::new("uv")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn is_uv_managed_environment() -> bool {
+    if std::env::var("UV_PROJECT_ENVIRONMENT").is_ok() || Path::new("uv.lock").exists() {
+        return true;
+    }
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        if let Ok(cfg) = std::fs::read_to_string(PathBuf::from(venv).join("pyvenv.cfg")) {
+            if cfg.lines().any(|l| l.trim_start().starts_with("uv =")) {
+                return true;
+            }
+        }
+    }
+    if let Ok(cfg) = std::fs::read_to_string(Path::new(".venv").join("pyvenv.cfg")) {
+        if cfg.lines().any(|l| l.trim_start().starts_with("uv =")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Determines which Python package installer (`"uv"` or `"pip"`) to use based on CLI flags and environment introspection.
+fn resolve_python_installer(
+    explicit_installer: &str,
+    force_uv: bool,
+    force_pip: bool,
+    py_bin: &str,
+) -> &'static str {
+    if force_uv || explicit_installer.eq_ignore_ascii_case("uv") {
+        return "uv";
+    }
+    if force_pip || explicit_installer.eq_ignore_ascii_case("pip") {
+        return "pip";
+    }
+    if is_uv_available() {
+        if is_uv_managed_environment() {
+            return "uv";
+        }
+        let pip_ok = std::process::Command::new(py_bin)
+            .args(["-m", "pip", "--version"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !pip_ok {
+            return "uv";
+        }
+    }
+    "pip"
+}
+
+/// Builds the `(program, args)` tuple for installing `duckpack` via `"uv"` or `"pip"`.
+fn build_python_install_command(
+    installer: &str,
+    py_bin: &str,
+    upgrade: bool,
+) -> (String, Vec<String>) {
+    if installer.eq_ignore_ascii_case("uv") {
+        let mut args = vec!["pip".to_string(), "install".to_string()];
+        if py_bin != "python3" {
+            args.push("--python".to_string());
+            args.push(py_bin.to_string());
+        } else if std::env::var("VIRTUAL_ENV").is_err() && !Path::new(".venv").exists() {
+            args.push("--system".to_string());
+        }
+        if upgrade {
+            args.push("--upgrade".to_string());
+        }
+        args.push("duckpack".to_string());
+        ("uv".to_string(), args)
+    } else {
+        let mut args = vec!["-m".to_string(), "pip".to_string(), "install".to_string()];
+        if upgrade {
+            args.push("--upgrade".to_string());
+        }
+        args.push("duckpack".to_string());
+        (py_bin.to_string(), args)
+    }
 }
 
 /// Launches the interactive visual diff & declarative migration review TUI.
@@ -835,15 +997,54 @@ mod tests {
 
         let cli_install = Cli::try_parse_from(["duckpack", "python", "install"]).unwrap();
         match cli_install.command {
-            Commands::Python { command } => assert_eq!(command, PythonCommands::Install { upgrade: false }),
+            Commands::Python { command } => assert_eq!(
+                command,
+                PythonCommands::Install {
+                    upgrade: false,
+                    installer: "auto".to_string(),
+                    uv: false,
+                    pip: false,
+                }
+            ),
             _ => panic!("Expected Python install command"),
         }
 
         let cli_upgrade = Cli::try_parse_from(["duckpack", "python", "install", "--upgrade"]).unwrap();
         match cli_upgrade.command {
-            Commands::Python { command } => assert_eq!(command, PythonCommands::Install { upgrade: true }),
+            Commands::Python { command } => assert_eq!(
+                command,
+                PythonCommands::Install {
+                    upgrade: true,
+                    installer: "auto".to_string(),
+                    uv: false,
+                    pip: false,
+                }
+            ),
             _ => panic!("Expected Python install upgrade command"),
         }
+
+        let cli_uv = Cli::try_parse_from(["duckpack", "python", "install", "--uv", "-U"]).unwrap();
+        match cli_uv.command {
+            Commands::Python { command } => assert_eq!(
+                command,
+                PythonCommands::Install {
+                    upgrade: true,
+                    installer: "auto".to_string(),
+                    uv: true,
+                    pip: false,
+                }
+            ),
+            _ => panic!("Expected Python install --uv command"),
+        }
+        assert_eq!(resolve_python_installer("auto", true, false, "python3"), "uv");
+        assert_eq!(resolve_python_installer("uv", false, false, "python3"), "uv");
+        assert_eq!(resolve_python_installer("pip", false, false, "python3"), "pip");
+        let (uv_prog, uv_args) = build_python_install_command("uv", ".venv/bin/python", true);
+        assert_eq!(uv_prog, "uv");
+        assert_eq!(
+            uv_args,
+            vec!["pip", "install", "--python", ".venv/bin/python", "--upgrade", "duckpack"]
+        );
     }
 
     #[test]

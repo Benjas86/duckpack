@@ -162,6 +162,21 @@ pub fn load_ducklake_snapshots(
         let _ = parse_rows(&sql_basic, false, &mut snapshots);
     }
 
+    if snapshots.is_empty() {
+        let quoted_db = format!("\"{}\"", db_name.replace('"', "\"\""));
+        let method_with_msg = format!(
+            "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR), CAST(schema_version AS BIGINT), COALESCE(CAST(changes AS VARCHAR), ''), COALESCE(CAST(commit_message AS VARCHAR), '') FROM {}.snapshots() ORDER BY snapshot_id DESC LIMIT 50",
+            quoted_db
+        );
+        let method_basic = format!(
+            "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR), CAST(schema_version AS BIGINT), COALESCE(CAST(changes AS VARCHAR), '') FROM {}.snapshots() ORDER BY snapshot_id DESC LIMIT 50",
+            quoted_db
+        );
+        if !parse_rows(&method_with_msg, true, &mut snapshots) {
+            let _ = parse_rows(&method_basic, false, &mut snapshots);
+        }
+    }
+
     if snapshots.is_empty() && is_quack {
         let remote_with_msg = format!(
             "SELECT * FROM target_db.query('SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) AS snapshot_time, CAST(schema_version AS BIGINT) AS schema_version, COALESCE(CAST(changes AS VARCHAR), '''') AS changes, COALESCE(CAST(commit_message AS VARCHAR), '''') AS commit_message FROM ducklake_snapshots(''{}'') ORDER BY snapshot_id DESC LIMIT 50')",

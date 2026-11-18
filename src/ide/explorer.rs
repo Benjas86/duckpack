@@ -402,12 +402,23 @@ pub(crate) fn apply_ide_diff_for_catalog(
     diff_result: &crate::diff::DiffResult,
     catalog: Option<&str>,
 ) -> Result<(), String> {
+    apply_ide_diff_for_catalog_with_options(project_dir, target_conn, diff_result, catalog, false)
+}
+
+pub(crate) fn apply_ide_diff_for_catalog_with_options(
+    project_dir: &Path,
+    target_conn: &Connection,
+    diff_result: &crate::diff::DiffResult,
+    catalog: Option<&str>,
+    allow_lake_rewrite: bool,
+) -> Result<(), String> {
     let mut exec = target_conn;
     let target_cat = crate::diff::validate_target_catalog_exec(&mut exec, catalog, true).ok();
-    crate::engine::apply_diff_with_executor(
+    crate::engine::apply_diff_with_lake_options(
         &mut exec,
         diff_result,
         true,
+        allow_lake_rewrite,
         false,
         project_dir,
         target_cat.as_deref(),
@@ -591,7 +602,16 @@ pub(crate) fn rebuild_explorer_nodes(
             let icon = db_icon(&db.db_type);
             let active_tag = if db.is_active { " [Active]" } else { "" };
             let ro_tag = if db.readonly { " [RO]" } else { "" };
-            let type_tag = format!(" ({})", db.db_type);
+            let type_tag = if db.db_type.eq_ignore_ascii_case("ducklake") {
+                if let Some(ref p) = db.path.as_ref().filter(|s| !s.trim().is_empty()) {
+                    let clean_p = crate::engine::redact_connection_credentials(p.trim());
+                    format!(" [ducklake -> {}]", clean_p)
+                } else {
+                    " (ducklake)".to_string()
+                }
+            } else {
+                format!(" ({})", db.db_type)
+            };
 
             items.push(ExplorerNode {
                 name: db_key.clone(),

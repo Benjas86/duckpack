@@ -10,8 +10,8 @@ use ratatui::{
 use std::path::{Path, PathBuf};
 
 use crate::ide::explorer::{
-    apply_ide_diff_for_catalog, generate_asset_boilerplate, get_asset_file_path, ExplorerNode,
-    NodeType, ProjectCategory,
+    apply_ide_diff_for_catalog_with_options, generate_asset_boilerplate, get_asset_file_path,
+    ExplorerNode, NodeType, ProjectCategory,
 };
 use super::input::{
     delete_char_at_cursor, delete_char_before_cursor, insert_char_at_cursor,
@@ -340,6 +340,7 @@ pub(crate) struct InIdeDiffModalState {
     pub(crate) is_open: bool,
     pub(crate) diff_result: Option<crate::diff::DiffResult>,
     pub(crate) selected_index: usize,
+    pub(crate) allow_lake_rewrite: bool,
     pub(crate) error_msg: Option<String>,
 }
 
@@ -349,6 +350,7 @@ impl InIdeDiffModalState {
             is_open: false,
             diff_result: None,
             selected_index: 0,
+            allow_lake_rewrite: false,
             error_msg: None,
         }
     }
@@ -357,6 +359,7 @@ impl InIdeDiffModalState {
         self.is_open = false;
         self.diff_result = None;
         self.selected_index = 0;
+        self.allow_lake_rewrite = false;
         self.error_msg = None;
     }
 
@@ -516,11 +519,21 @@ impl InIdeDiffModalState {
                         diff_layout[2],
                     );
                 } else {
-                    f.render_widget(
-                        Paragraph::new(
-                            "  Space: Toggle Selection | a: Toggle All | Enter: Apply Selected | Esc: Cancel",
+                    let has_recreate = diff
+                        .items
+                        .iter()
+                        .any(|i| !i.ignored && i.item_type == crate::diff::DiffItemType::RecreateTable);
+                    let hint_str = if has_recreate {
+                        format!(
+                            "  Space: Toggle | a: All | w: Allow Lake Rewrite [{}] | Enter: Apply | Esc: Cancel",
+                            if self.allow_lake_rewrite { "ON" } else { "OFF" }
                         )
-                        .style(Style::default().fg(Color::DarkGray)),
+                    } else {
+                        "  Space: Toggle Selection | a: Toggle All | Enter: Apply Selected | Esc: Cancel"
+                            .to_string()
+                    };
+                    f.render_widget(
+                        Paragraph::new(hint_str).style(Style::default().fg(Color::DarkGray)),
                         diff_layout[2],
                     );
                 }
@@ -602,6 +615,9 @@ impl InIdeDiffModalState {
                 crate::tui::recompute_locks(&mut diff.items);
                 self.error_msg = None;
             }
+        } else if key.code == KeyCode::Char('w') || key.code == KeyCode::Char('W') {
+            self.allow_lake_rewrite = !self.allow_lake_rewrite;
+            self.error_msg = None;
         } else if key.code == KeyCode::Enter {
             if let Some(ref diff) = self.diff_result {
                 let active_indices: Vec<usize> = diff
@@ -619,7 +635,13 @@ impl InIdeDiffModalState {
                         .filter(|&&idx| diff.items[idx].selected && !diff.items[idx].locked)
                         .count();
                     if selected_count > 0 {
-                        match apply_ide_diff_for_catalog(project_dir, conn, diff, tab_catalog) {
+                        match apply_ide_diff_for_catalog_with_options(
+                            project_dir,
+                            conn,
+                            diff,
+                            tab_catalog,
+                            self.allow_lake_rewrite,
+                        ) {
                             Ok(_) => {
                                 self.is_open = false;
                                 return Some(format!(
