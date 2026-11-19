@@ -2721,6 +2721,11 @@ impl AttachModalState {
                             if let Some(ref tok) = quack_applied_token {
                                 opts.push(format!("TOKEN '{}'", tok.replace('\'', "''")));
                             }
+                            if let Some(cid) =
+                                crate::engine::resolve_quack_client_id(quack_applied_token.as_deref())
+                            {
+                                opts.push(format!("CLIENT_ID '{}'", cid.replace('\'', "''")));
+                            }
                         }
                         _ => {}
                     }

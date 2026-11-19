@@ -464,6 +464,31 @@ pub fn compile_quack_auth_sql(
     deploying_sid: Option<&str>,
     include_global_hooks: bool,
 ) -> Result<String> {
+    let empty_hashes = std::collections::HashMap::new();
+    compile_quack_auth_sql_with_options(
+        config,
+        project_dir,
+        deploying_sid,
+        None,
+        &empty_hashes,
+        include_global_hooks,
+        include_global_hooks,
+    )
+}
+
+/// Full compiler for `_duckpack_auth` with separate control over `quack_server_mode`
+/// (uses `quack_check_token` and `quack_active_connections()`) vs `include_global_hooks`
+/// (appends `SET GLOBAL quack_authentication_function / quack_authorization_function`,
+/// which MUST only be run outside a transaction after `COMMIT`).
+pub fn compile_quack_auth_sql_with_options(
+    config: &QuackAuthConfig,
+    project_dir: &Path,
+    deploying_sid: Option<&str>,
+    master_client_id_hash: Option<&str>,
+    live_client_id_hashes: &std::collections::HashMap<String, String>,
+    quack_server_mode: bool,
+    include_global_hooks: bool,
+) -> Result<String> {
     let resolved_users = validate_quack_auth_config(config, project_dir)?;
 
     let mut sql = String::new();
@@ -490,11 +515,15 @@ pub fn compile_quack_auth_sql(
 
     // Declaratively sync _duckpack_auth.quack_users to match duckpack.toml
     sql.push_str("DELETE FROM _duckpack_auth.quack_users;\n");
-    for (u, token_hash, client_id_hash) in &resolved_users {
+    for (u, token_hash, default_client_id_hash) in &resolved_users {
+        let effective_cid_hash = live_client_id_hashes
+            .get(&u.username)
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| default_client_id_hash.to_lowercase());
         let safe_user = u.username.replace('\'', "''");
         let safe_role = u.role.as_str().replace('\'', "''");
         let safe_tok_hash = token_hash.replace('\'', "''");
-        let safe_cid_hash = client_id_hash.replace('\'', "''");
+        let safe_cid_hash = effective_cid_hash.replace('\'', "''");
         sql.push_str(&format!(
             "INSERT INTO _duckpack_auth.quack_users (username, role, token_sha256, client_id_hash, enabled) \
              VALUES ('{}', '{}', '{}', '{}', {});\n",
@@ -502,11 +531,26 @@ pub fn compile_quack_auth_sql(
         ));
     }
 
+    // Bind the deploying master connection's server-salted client_id_hash to 'admin'
+    // (empty token_sha256 so it never grants authentication on its own; only grants admin role
+    // to connections authenticated by quack_check_token or matching client_id_hash).
+    if let Some(mh) = master_client_id_hash
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let safe_mh = mh.to_lowercase().replace('\'', "''");
+        sql.push_str(&format!(
+            "INSERT INTO _duckpack_auth.quack_users (username, role, token_sha256, client_id_hash, enabled) \
+             VALUES ('__duckpack_master', 'admin', '', '{}', true);\n",
+            safe_mh
+        ));
+    }
+
     // Auto-whitelist deploying session as 'admin' to prevent self-lockout
     if let Some(sid) = deploying_sid.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let safe_sid = sid.replace('\'', "''");
         sql.push_str(&format!(
-            "DELETE FROM _duckpack_auth.quack_sessions WHERE sid = '{}';\n\
+            "DELETE FROM _duckpack_auth.quack_sessions WHERE lower(CAST(sid AS VARCHAR)) = lower('{}');\n\
              INSERT INTO _duckpack_auth.quack_sessions (sid, username, role, revoked) \
              VALUES ('{}', '__duckpack_deployer', 'admin', false);\n",
             safe_sid, safe_sid
@@ -518,7 +562,7 @@ pub fn compile_quack_auth_sql(
     //  - Any enabled user in _duckpack_auth.quack_users matching sha256(p_client_token)
     //  - Break-glass fallback for the server's own startup master token via quack_check_token()
     // Always rejects any session explicitly marked revoked = true in _duckpack_auth.quack_sessions.
-    let master_token_fallback = if include_global_hooks {
+    let master_token_fallback = if quack_server_mode {
         "        WHEN quack_check_token(p_sid, p_client_token, p_server_token) THEN true\n"
     } else {
         "        WHEN p_server_token IS NOT NULL AND p_server_token <> '' AND p_client_token = p_server_token THEN true\n"
@@ -534,6 +578,7 @@ pub fn compile_quack_auth_sql(
          \x20       WHEN EXISTS (\n\
          \x20           SELECT 1 FROM _duckpack_auth.quack_users u\n\
          \x20           WHERE u.enabled = true\n\
+         \x20             AND u.token_sha256 <> ''\n\
          \x20             AND u.token_sha256 = sha256(COALESCE(p_client_token, ''))\n\
          \x20       ) THEN true\n\
          \x20       ELSE false\n\
@@ -549,8 +594,8 @@ pub fn compile_quack_auth_sql(
     //  3) Direct username / client_id_hash / token_sha256 match on p_sid
     //  4) Configured default_role fallback
     let default_role_str = config.default_role.as_str();
-    let quack_active_conn_clause = if include_global_hooks {
-        "            (SELECT u.role FROM quack_active_connections() ac JOIN _duckpack_auth.quack_users u ON u.enabled = true AND (lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) OR lower(u.token_sha256) = lower(CAST(ac.client_id_hash AS VARCHAR))) WHERE lower(CAST(ac.connection_id AS VARCHAR)) = lower(CAST(p_sid AS VARCHAR)) LIMIT 1),\n"
+    let quack_active_conn_clause = if quack_server_mode {
+        "            (SELECT u.role FROM quack_active_connections() ac JOIN _duckpack_auth.quack_users u ON u.enabled = true AND (lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) OR (u.token_sha256 <> '' AND lower(u.token_sha256) = lower(CAST(ac.client_id_hash AS VARCHAR)))) WHERE lower(CAST(ac.connection_id AS VARCHAR)) = lower(CAST(p_sid AS VARCHAR)) ORDER BY CASE u.role WHEN 'admin' THEN 1 WHEN 'writer' THEN 2 WHEN 'reader' THEN 3 ELSE 4 END LIMIT 1),\n"
     } else {
         ""
     };
@@ -564,7 +609,7 @@ pub fn compile_quack_auth_sql(
          \x20       ELSE COALESCE(\n\
          \x20           (SELECT s.role FROM _duckpack_auth.quack_sessions s WHERE lower(CAST(s.sid AS VARCHAR)) = lower(CAST(p_sid AS VARCHAR)) AND s.revoked = false LIMIT 1),\n\
          {quack_active_conn_clause}\
-         \x20           (SELECT u.role FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND (u.username = CAST(p_sid AS VARCHAR) OR lower(u.client_id_hash) = lower(CAST(p_sid AS VARCHAR)) OR lower(u.token_sha256) = sha256(COALESCE(CAST(p_sid AS VARCHAR), ''))) LIMIT 1),\n\
+         \x20           (SELECT u.role FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND (u.username = CAST(p_sid AS VARCHAR) OR lower(u.client_id_hash) = lower(CAST(p_sid AS VARCHAR)) OR (u.token_sha256 <> '' AND lower(u.token_sha256) = sha256(COALESCE(CAST(p_sid AS VARCHAR), '')))) ORDER BY CASE u.role WHEN 'admin' THEN 1 WHEN 'writer' THEN 2 WHEN 'reader' THEN 3 ELSE 4 END LIMIT 1),\n\
          \x20           '{}'\n\
          \x20       )\n\
          \x20   END\n\
@@ -669,9 +714,132 @@ pub fn export_quack_rbac_bootstrap_script(
     Ok(out_path)
 }
 
+/// Queries a live Quack server for:
+/// 1. The deploying connection's own `connection_id` (via `quack_connection_id('<qa>')`) and its
+///    server-salted `client_id_hash` (used to bind `__duckpack_master` as `admin`).
+/// 2. Each configured user's exact server-salted `client_id_hash` by probing the Quack server via
+///    `quack_query(..., client_id = '<raw_client_id>')`.
+fn harvest_quack_client_id_hashes(
+    target_exec: &mut dyn DbExecutor,
+    qa: &str,
+    config: &QuackAuthConfig,
+    project_dir: &Path,
+) -> (
+    Option<String>,
+    Option<String>,
+    std::collections::HashMap<String, String>,
+) {
+    let mut live_hashes = std::collections::HashMap::new();
+    let quoted_qa = format!("\"{}\"", qa.replace('"', "\"\""));
+    let safe_qa_lit = qa.replace('\'', "''");
+
+    // 1. Get our exact connection_id via quack_connection_id('<qa>')
+    let deploying_sid = target_exec
+        .query_rows(&format!(
+            "SELECT CAST(quack_connection_id('{}') AS VARCHAR)",
+            safe_qa_lit
+        ))
+        .ok()
+        .and_then(|(_, rows)| rows.into_iter().next())
+        .and_then(|r| r.into_iter().next())
+        .filter(|s| !s.is_empty() && s != "NULL")
+        .or_else(|| {
+            let fallback_q = format!(
+                "SELECT connection_id FROM {}.query('SELECT CAST(connection_id AS VARCHAR) AS connection_id FROM quack_active_connections() ORDER BY query_started_at DESC NULLS LAST LIMIT 1')",
+                quoted_qa
+            );
+            target_exec
+                .query_rows(&fallback_q)
+                .ok()
+                .and_then(|(_, rows)| rows.into_iter().next())
+                .and_then(|r| r.into_iter().next())
+                .filter(|s| !s.is_empty() && s != "NULL")
+        });
+
+    // 2. Get the deploying master connection's live server-salted client_id_hash
+    let master_client_id_hash = if let Some(ref sid) = deploying_sid {
+        let safe_sid = sid.replace('\'', "''");
+        let cid_q = format!(
+            "SELECT client_id_hash FROM {}.query('SELECT CAST(client_id_hash AS VARCHAR) AS client_id_hash FROM quack_active_connections() WHERE lower(CAST(connection_id AS VARCHAR)) = lower(''{}'') LIMIT 1')",
+            quoted_qa, safe_sid
+        );
+        target_exec
+            .query_rows(&cid_q)
+            .ok()
+            .and_then(|(_, rows)| rows.into_iter().next())
+            .and_then(|r| r.into_iter().next())
+            .filter(|s| !s.is_empty() && s != "NULL")
+            .map(|s| s.to_lowercase())
+    } else {
+        None
+    };
+
+    // 3. Look up the attached Quack server's URI so we can harvest each user's live salted client_id_hash
+    let quack_uri = target_exec
+        .query_rows(&format!(
+            "SELECT path FROM duckdb_databases() WHERE database_name = '{}' LIMIT 1",
+            safe_qa_lit
+        ))
+        .ok()
+        .and_then(|(_, rows)| rows.into_iter().next())
+        .and_then(|r| r.into_iter().next())
+        .filter(|s| s.starts_with("quack:"));
+
+    if let Some(uri) = quack_uri {
+        let disable_ssl = crate::engine::should_disable_quack_ssl(&uri, false);
+        let safe_uri = uri.replace('\'', "''");
+        for (idx, u) in config.users.iter().enumerate() {
+            let Some(user_token) = resolve_user_token(project_dir, &u.token_env) else {
+                continue;
+            };
+            let raw_cid = u.client_id.as_deref().unwrap_or(&user_token);
+            let safe_cid = raw_cid.replace('\'', "''");
+            let nonce = format!(
+                "__dp_probe_{}_{}",
+                idx,
+                std::process::id()
+            );
+            let inner_sql = format!(
+                "SELECT CAST(client_id_hash AS VARCHAR) AS client_id_hash FROM quack_active_connections() WHERE query LIKE '%{}%' LIMIT 1",
+                nonce
+            );
+            let safe_inner = inner_sql.replace('\'', "''");
+            let probe_sql = format!(
+                "SELECT client_id_hash FROM quack_query('{}', '{}', client_id = '{}', disable_ssl = {})",
+                safe_uri, safe_inner, safe_cid, disable_ssl
+            );
+            let probed = target_exec
+                .query_rows(&probe_sql)
+                .or_else(|_| {
+                    if !disable_ssl {
+                        let fallback_probe = format!(
+                            "SELECT client_id_hash FROM quack_query('{}', '{}', client_id = '{}', disable_ssl = true)",
+                            safe_uri, safe_inner, safe_cid
+                        );
+                        target_exec.query_rows(&fallback_probe)
+                    } else {
+                        Err(anyhow::anyhow!("probe failed"))
+                    }
+                })
+                .ok()
+                .and_then(|(_, rows)| rows.into_iter().next())
+                .and_then(|r| r.into_iter().next())
+                .filter(|s| !s.is_empty() && s != "NULL")
+                .map(|s| s.to_lowercase());
+
+            if let Some(h) = probed {
+                live_hashes.insert(u.username.clone(), h);
+            }
+        }
+    }
+
+    (deploying_sid, master_client_id_hash, live_hashes)
+}
+
 /// Introspects the target database's `_duckpack_auth.quack_users` table and compares it against
-/// `duckpack.toml` (`[quack_auth]`). If any user, role, token hash, or enabled flag has drifted,
-/// or if `_duckpack_auth` has not been deployed yet, appends a declarative `DiffItem` to `diff_result`.
+/// `duckpack.toml` (`[quack_auth]`). If any user, role, token hash, client_id_hash, macro, or
+/// global hook has drifted, or if `_duckpack_auth` has not been deployed yet, appends a declarative
+/// `DiffItem` to `diff_result`.
 pub fn append_quack_auth_diff_items(
     project_dir: &Path,
     target_exec: &mut dyn DbExecutor,
@@ -689,56 +857,47 @@ pub fn append_quack_auth_diff_items(
     };
     let q_alias = crate::diff::find_any_quack_alias(target_exec, _catalog);
     let is_quack_target = q_alias.is_some();
-    // Auto-detect the deploying connection's active connection_id so it is whitelisted as 'admin'
-    // in _duckpack_auth.quack_sessions and cannot lock itself out during apply/COMMIT.
-    let deploying_sid: Option<String> = if let Some(ref qa) = q_alias {
-        let quoted_qa = format!("\"{}\"", qa.replace('"', "\"\""));
-        let sid_q = format!(
-            "SELECT connection_id FROM {}.query('SELECT CAST(connection_id AS VARCHAR) AS connection_id FROM quack_active_connections() ORDER BY query_started_at DESC NULLS LAST LIMIT 1')",
-            quoted_qa
-        );
-        target_exec
-            .query_rows(&sid_q)
-            .ok()
-            .and_then(|(_, rows)| rows.into_iter().next())
-            .and_then(|r| r.into_iter().next())
-            .filter(|s| !s.is_empty() && s != "NULL")
-    } else {
-        None
-    };
-    let Ok(compiled_sql) = compile_quack_auth_sql(
-        &config,
-        project_dir,
-        deploying_sid.as_deref(),
-        is_quack_target,
-    ) else {
-        return;
-    };
 
-    // Query existing _duckpack_auth.quack_users AND verify all 4 macros exist on target_exec
-    let query = "SELECT username, role, token_sha256, client_id_hash, CAST(enabled AS VARCHAR) FROM _duckpack_auth.quack_users ORDER BY username";
+    // Query existing _duckpack_auth.quack_users FIRST so we can detect non-admin (Authorization failed)
+    // callers immediately without probing or emitting misleading RBAC diffs.
+    let query = "SELECT username, role, token_sha256, lower(client_id_hash), CAST(enabled AS VARCHAR) FROM _duckpack_auth.quack_users WHERE username <> '__duckpack_master' ORDER BY username";
     let macros_query = if is_quack_target {
         "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authenticate' OR COALESCE(macro_definition, '') LIKE '%quack_check_token%') AND (function_name <> 'authorize' OR COALESCE(macro_definition, '') LIKE '%abort|set%') AND (function_name <> 'resolve_role' OR COALESCE(macro_definition, '') LIKE '%ac.connection_id%') AND (function_name <> 'sanitize_sql' OR strpos(COALESCE(macro_definition, ''), '^\\s+|\\s+$') > 0)"
     } else {
         "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authorize' OR COALESCE(macro_definition, '') LIKE '%abort|set%') AND (function_name <> 'sanitize_sql' OR strpos(COALESCE(macro_definition, ''), '^\\s+|\\s+$') > 0)"
     };
-    let (actual_rows, macros_count) = if let Some(ref qa) = q_alias {
+    let wrapper_query = "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = 'main' AND function_name IN ('_duckpack_quack_authenticate', '_duckpack_quack_authorize')";
+    let hooks_query = "SELECT count(*) FROM duckdb_settings() WHERE (name = 'quack_authentication_function' AND value = '_duckpack_quack_authenticate') OR (name = 'quack_authorization_function' AND value = '_duckpack_quack_authorize')";
+
+    let (actual_rows, macros_count, wrappers_count, hooks_active) = if let Some(ref qa) = q_alias {
         let quoted_qa = format!("\"{}\"", qa.replace('"', "\"\""));
         let remote_q = format!(
             "SELECT * FROM {}.query('{}')",
             quoted_qa,
             query.replace('\'', "''")
         );
+        let rows_res = target_exec
+            .query_rows(&remote_q)
+            .or_else(|e| {
+                if e.to_string().contains("Authorization failed") {
+                    Err(e)
+                } else {
+                    target_exec.query_rows(query)
+                }
+            });
+        if let Err(ref e) = rows_res {
+            if e.to_string().contains("Authorization failed") {
+                // Non-admin caller (reader/writer) cannot read or manage _duckpack_auth
+                return;
+            }
+        }
+        let rows = rows_res.ok().map(|(_, rows)| rows);
+
         let remote_m = format!(
             "SELECT * FROM {}.query('{}')",
             quoted_qa,
             macros_query.replace('\'', "''")
         );
-        let rows = target_exec
-            .query_rows(&remote_q)
-            .or_else(|_| target_exec.query_rows(query))
-            .ok()
-            .map(|(_, rows)| rows);
         let m_count = target_exec
             .query_rows(&remote_m)
             .or_else(|_| target_exec.query_rows(macros_query))
@@ -747,7 +906,34 @@ pub fn append_quack_auth_diff_items(
             .and_then(|r| r.into_iter().next())
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
-        (rows, m_count)
+
+        let remote_w = format!(
+            "SELECT * FROM {}.query('{}')",
+            quoted_qa,
+            wrapper_query.replace('\'', "''")
+        );
+        let w_count = target_exec
+            .query_rows(&remote_w)
+            .ok()
+            .and_then(|(_, r)| r.into_iter().next())
+            .and_then(|r| r.into_iter().next())
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let remote_h = format!(
+            "SELECT * FROM {}.query('{}')",
+            quoted_qa,
+            hooks_query.replace('\'', "''")
+        );
+        let h_count = target_exec
+            .query_rows(&remote_h)
+            .ok()
+            .and_then(|(_, r)| r.into_iter().next())
+            .and_then(|r| r.into_iter().next())
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        (rows, m_count, w_count, h_count)
     } else {
         let rows = target_exec.query_rows(query).ok().map(|(_, rows)| rows);
         let m_count = target_exec
@@ -757,24 +943,55 @@ pub fn append_quack_auth_diff_items(
             .and_then(|r| r.into_iter().next())
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
-        (rows, m_count)
+        let w_count = target_exec
+            .query_rows(wrapper_query)
+            .ok()
+            .and_then(|(_, r)| r.into_iter().next())
+            .and_then(|r| r.into_iter().next())
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        (rows, m_count, w_count, 2)
+    };
+
+    // Harvest the live Quack server's salted client_id_hash values for deployer & every user
+    let (deploying_sid, master_cid_hash, live_hashes) = if let Some(ref qa) = q_alias {
+        harvest_quack_client_id_hashes(target_exec, qa, &config, project_dir)
+    } else {
+        (None, None, std::collections::HashMap::new())
+    };
+
+    // Compile WITHOUT SET GLOBAL hooks inside the DDL batch (apply_diff activates hooks AFTER COMMIT!)
+    let Ok(compiled_sql) = compile_quack_auth_sql_with_options(
+        &config,
+        project_dir,
+        deploying_sid.as_deref(),
+        master_cid_hash.as_deref(),
+        &live_hashes,
+        is_quack_target,
+        false,
+    ) else {
+        return;
     };
 
     let mut sorted_expected = expected_users.clone();
     sorted_expected.sort_by(|a, b| a.0.username.cmp(&b.0.username));
 
-    let is_in_sync = if macros_count < 4 {
+    let is_in_sync = if macros_count < 4 || wrappers_count < 2 || hooks_active < 2 {
         false
     } else if let Some(ref rows) = actual_rows {
         if rows.len() != sorted_expected.len() {
             false
         } else {
             rows.iter().zip(sorted_expected.iter()).all(|(r, (u, th, ch))| {
+                let expected_cid_hash = live_hashes
+                    .get(&u.username)
+                    .map(|s| s.as_str())
+                    .unwrap_or(ch.as_str());
                 r.len() >= 5
                     && r[0] == u.username
                     && r[1] == u.role.as_str()
                     && r[2] == *th
-                    && r[3] == *ch
+                    && r[3].eq_ignore_ascii_case(expected_cid_hash)
                     && (r[4].eq_ignore_ascii_case("true") || r[4] == "1") == u.enabled
             })
         }

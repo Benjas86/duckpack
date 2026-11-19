@@ -168,8 +168,24 @@ pub fn should_disable_quack_ssl(db: &str, flag_disable_ssl: bool) -> bool {
         || is_quack_loopback(db)
 }
 
+/// Resolves the effective Quack client ID for RBAC role correlation:
+/// uses `QUACK_CLIENT_ID` from the environment if set, otherwise defaults to the active auth token.
+pub fn resolve_quack_client_id(token: Option<&str>) -> Option<String> {
+    if let Ok(cid) = std::env::var("QUACK_CLIENT_ID") {
+        let trimmed = cid.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    token
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Builds the SQL ATTACH statement for a Quack database, optionally embedding an explicit `TOKEN '...'`
-/// so persistent secrets in `~/.duckdb/stored_secrets` can never shadow the active token.
+/// and `CLIENT_ID '...'` so persistent secrets in `~/.duckdb/stored_secrets` never shadow the active token
+/// and the server's `quack_active_connections().client_id_hash` correlates deterministically.
 pub fn build_quack_attach_sql_with_token(
     db: &str,
     disable_ssl: bool,
@@ -182,6 +198,9 @@ pub fn build_quack_attach_sql_with_token(
     }
     if let Some(tok) = token.map(|s| s.trim()).filter(|s| !s.is_empty()) {
         opts.push(format!("TOKEN '{}'", tok.replace('\'', "''")));
+    }
+    if let Some(cid) = resolve_quack_client_id(token) {
+        opts.push(format!("CLIENT_ID '{}'", cid.replace('\'', "''")));
     }
     if opts.is_empty() {
         format!("ATTACH '{}' AS target_db;", safe_db)
@@ -504,7 +523,7 @@ pub fn redact_connection_credentials(input: &str) -> String {
         .get_or_init(|| regex::Regex::new(r"([a-zA-Z0-9+.-]+://[^:/@\s]+):([^@\s]+)@").unwrap());
     let sql_sec_re = SQL_SECRET_RE.get_or_init(|| {
         regex::Regex::new(
-            r"(?i)\b(SECRET|TOKEN|motherduck_token|quack_default_client_id)\s*(=|\s+)\s*'([^']|'')*'",
+            r"(?i)\b(SECRET|TOKEN|CLIENT_ID|motherduck_token|quack_default_client_id)\s*(=|\s+)\s*'([^']|'')*'",
         )
         .unwrap()
     });
@@ -596,14 +615,16 @@ pub fn apply_quack_token_secret(
         }
 
         let safe_token = token.replace('\'', "''");
-        // Synchronize quack_default_client_id (both global and session) with the token so
-        // quack_active_connections().client_id_hash deterministically matches sha256(token) on the server.
+        let effective_cid = resolve_quack_client_id(Some(token)).unwrap_or_else(|| token.clone());
+        let safe_cid = effective_cid.replace('\'', "''");
+        // Synchronize quack_default_client_id (both global and session) with the resolved client ID
+        // so quack_active_connections().client_id_hash correlates deterministically on the server.
         let _ = conn.execute(
-            &format!("SET GLOBAL quack_default_client_id = '{}';", safe_token),
+            &format!("SET GLOBAL quack_default_client_id = '{}';", safe_cid),
             [],
         );
         let _ = conn.execute(
-            &format!("SET quack_default_client_id = '{}';", safe_token),
+            &format!("SET quack_default_client_id = '{}';", safe_cid),
             [],
         );
         conn.execute(
@@ -1304,13 +1325,23 @@ pub fn apply_diff_with_lake_options(
         Ok(())
     })();
 
+    let applied_quack_auth = diff.items.iter().any(|i| {
+        i.selected && !i.ignored && i.obj_name == "_duckpack_auth.quack_rbac_policy"
+    });
+
     if is_remote_effective {
         if result.is_ok() {
             if is_quack {
-                let _ = exec.execute_batch(&format!(
+                exec.execute_batch(&format!(
                     "CALL {}.query('COMMIT;');",
                     quoted_q_alias
-                ));
+                ))
+                .with_context(|| {
+                    format!(
+                        "Failed to commit transaction on Quack catalog '{}'",
+                        q_alias
+                    )
+                })?;
             } else {
                 exec.execute_batch("COMMIT;")?;
             }
@@ -1322,6 +1353,42 @@ pub fn apply_diff_with_lake_options(
                 ));
             } else {
                 exec.execute_batch("ROLLBACK;")?;
+            }
+        }
+    }
+
+    // Activate Quack global RBAC hooks ONLY AFTER COMMIT has succeeded so that all _duckpack_auth
+    // tables and _duckpack_quack_* macros are committed and visible to fresh server-side connections.
+    if result.is_ok() && applied_quack_auth {
+        let hook_quack_alias = quack_alias.as_deref().or(any_quack_alias.as_deref());
+        if let Some(qa) = hook_quack_alias {
+            if let Some(qa_cfg) = crate::quack_auth::load_quack_auth_config(project_dir) {
+                let quoted_qa = format!("\"{}\"", qa.replace('"', "\"\""));
+                let (auth_fn, authz_fn) = if qa_cfg.enabled {
+                    ("_duckpack_quack_authenticate", "_duckpack_quack_authorize")
+                } else {
+                    ("quack_check_token", "quack_nop_authorization")
+                };
+                exec.execute_batch(&format!(
+                    "CALL {}.query('SET GLOBAL quack_authentication_function = ''{}'';');",
+                    quoted_qa, auth_fn
+                ))
+                .with_context(|| {
+                    format!(
+                        "Failed to activate quack_authentication_function='{}' on '{}'",
+                        auth_fn, qa
+                    )
+                })?;
+                exec.execute_batch(&format!(
+                    "CALL {}.query('SET GLOBAL quack_authorization_function = ''{}'';');",
+                    quoted_qa, authz_fn
+                ))
+                .with_context(|| {
+                    format!(
+                        "Failed to activate quack_authorization_function='{}' on '{}'",
+                        authz_fn, qa
+                    )
+                })?;
             }
         }
     }
