@@ -55,6 +55,7 @@ DuckPack includes a **rich terminal IDE** for live database exploration and firs
   - [CLI Python Management](#cli-python-management)
 - [🦆 Quack Remote Server Integration](#-quack-remote-server-integration)
   - [Exploring Remote Quack Servers from CLI](#exploring-remote-quack-servers-from-cli)
+  - [Declarative Quack RBAC, Live Session Monitor (`Ctrl+U`) & Post-Start Hook (`--rbac-only`)](#declarative-quack-rbac-live-session-monitor-ctrlu--post-start-hook---rbac-only)
   - [The `-- @remote` Query Directive](#the---remote-query-directive)
   - [SSL & Non-TLS Options](#ssl--non-tls-options)
 - [📁 Declarative Project Structure](#-declarative-project-structure)
@@ -172,7 +173,7 @@ cargo install duckpack
 | `duckpack init` | Scaffold a new declarative database project | `-p, --project-dir <DIR>` | `.` |
 | `duckpack build` | Validate SQL syntax against an in-memory Shadow DB | `-p, --project-dir <DIR>` | `.` |
 | `duckpack diff` | Compare declarative project state against target database without applying changes | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`None`<br>`false` |
-| `duckpack apply` | Compute diff and apply migrations to target database | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--auto-approve`<br>`--interactive`<br>`--force-drop`<br>`--allow-lake-rewrite`<br>`--out <FILE>`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`false`<br>`false`<br>`false`<br>`false`<br>`None`<br>`None`<br>`false` |
+| `duckpack apply` | Compute diff and apply migrations to target database | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--auto-approve`<br>`--interactive`<br>`--force-drop`<br>`--allow-lake-rewrite`<br>`--rbac-only`<br>`--out <FILE>`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`false`<br>`false`<br>`false`<br>`false`<br>`false`<br>`None`<br>`None`<br>`false` |
 | `duckpack explore` | Open the interactive terminal IDE / query editor | `-p, --project-dir <DIR>`<br>`-d, --db <URI>`<br>`--database, --catalog <NAME>`<br>`--remote <SSH_TARGET>`<br>`-P, --port <PORT>`<br>`--auto-install`<br>`--quack-token <TOKEN>`<br>`--insecure` | `.`<br>`local.duckdb`<br>`None`<br>`None`<br>`22`<br>`false`<br>`None`<br>`false` |
 | `duckpack compile` | Package project into an immutable `.duckpack` snapshot | `-p, --project-dir <DIR>`<br>`-o, --out <FILE>` | `.`<br>*(Required)* |
 | `duckpack deploy` | Deploy compiled project to a remote server over SSH | `-p, --project-dir <DIR>`<br>`-r, --remote <HOST>`<br>`-d, --db <URI>`<br>`-P, --port <PORT>`<br>`--auto-install` | `.`<br>*(Required)*<br>`local.duckdb`<br>`22`<br>`false` |
@@ -376,6 +377,7 @@ Or transition instantly from `duckpack apply` by pressing **`e`**.
 | | `t` | **DuckLake Time-Travel & Snapshot Diff Modal:** Interactive picker for `AT (VERSION => N)`, `AT (TIMESTAMP => '...')`, and `ducklake_table_changes(...)` |
 | | `Ctrl+A` | **Attach Database** dialog with Provider Presets (DuckDB, DuckLake, SQLite, Postgres, MySQL, MSSQL, MotherDuck, Quack) |
 | | `Ctrl+K` | **Cloud Secrets & S3 Buckets:** Add S3/R2/MinIO credentials with masking, `.env` persistence, and bucket exploration |
+| | `Ctrl+U` | **Quack RBAC & Live Session Monitor:** Inspect live `quack_active_connections()`, cancel queries (`c`), revoke sessions (`x`), override roles (`r`), manage `[quack_auth]` users, deploy (`d`), and export post-start hooks (`e`) |
 | | `d` | **Detach Database** from current session |
 | | `b` | **Cycle Target Catalog** for diff/apply operations |
 | | `r` / `R` | **Refresh Explorer:** re-scans live database (in DB mode) or disk & git status (in Project mode) |
@@ -814,6 +816,108 @@ If you are running a local development container (e.g. bound to `0.0.0.0:9494` o
 - For other non-TLS endpoints, explicitly disable SSL using `--insecure` (or `--quack-disable-ssl`), or set `DUCKDB_QUACK_DISABLE_SSL=true`:
   ```bash
   duckpack explore --db quack:10.0.0.5:9494 --quack-token <token> --insecure
+  ```
+
+### Declarative Quack RBAC, Live Session Monitor (`Ctrl+U`) & Post-Start Hook (`--rbac-only`)
+
+DuckPack includes built-in declarative Role-Based Access Control (RBAC) for shared Quack servers (`admin`, `writer`, `reader`) with zero cleartext tokens stored on the server or in `duckpack.toml`.
+
+#### 1. Declarative Users & Roles (`duckpack.toml` + `.env`)
+
+Declare users in `duckpack.toml` and store tokens exclusively in `.env` (`0600` permissions):
+
+```toml
+[quack_auth]
+enabled = true
+default_role = "reader" # "admin" | "writer" | "reader" | "none"
+writer_allow_temp_tables = true
+reader_allow_explain_describe = true
+allow_copy = false
+
+[[quack_auth.users]]
+username = "alice"
+role = "admin"
+token_env = "QUACK_USER_ALICE_TOKEN"
+client_id = "alice"
+
+[[quack_auth.users]]
+username = "dbt_runner"
+role = "writer"
+token_env = "QUACK_USER_DBT_TOKEN"
+client_id = "dbt_runner"
+
+[[quack_auth.users]]
+username = "bi_reader"
+role = "reader"
+token_env = "QUACK_USER_BI_TOKEN"
+client_id = "bi_reader"
+```
+
+When you run `duckpack apply`, DuckPack automatically:
+1. Hashes each resolved token with **SHA-256** (cleartext tokens never reach the server).
+2. Harvests each user's live server-salted `client_id_hash` from the running Quack instance and binds the deploying master session as `admin`.
+3. Commits `_duckpack_auth` tables and hardened SQL authorization macros (stripping comments/string literals, blocking multi-statement piggybacking, and protecting `_duckpack_auth` / `SET GLOBAL` / `ATTACH` from non-admins) **before** activating `SET GLOBAL quack_authentication_function` and `SET GLOBAL quack_authorization_function`.
+4. Isolates per-alias credentials (`ATTACH ... (TOKEN ..., CLIENT_ID ...)`) in `Ctrl+A` so you can attach Admin, Writer, and Reader aliases side by side in the same Explore session.
+
+#### 2. Interactive Session Monitor & User Manager (`Ctrl+U`)
+
+Inside `duckpack explore`, press **`Ctrl+U`** (or select **`🛡️ Quack RBAC & Sessions (Ctrl+U)`** in the Explorer tree):
+
+- **Tab 1 — Live Sessions (`quack_active_connections()`)**:
+  - `c`: Cancel an active query (`quack_cancel(server_id, connection_id)`)
+  - `x`: Revoke or restore a session immediately (writes `revoked = true/false` into `_duckpack_auth.quack_sessions`)
+  - `r`: Cycle a live session's role override (`admin` / `writer` / `reader`)
+  - `u` / `F5`: Refresh active connections
+- **Tab 2 — Declarative Users & Roles**:
+  - `a`: Add a user (auto-generates a 256-bit cryptographic token into `.env` with `0600` permissions)
+  - `Space`: Enable/disable user (protected by the **Admin Lockout Prevention Guard**)
+  - `r`: Cycle role (`admin` / `writer` / `reader`)
+  - `t`: Rotate 256-bit token in `.env`
+  - `Del`: Remove user (protected by Admin Lockout Prevention Guard)
+  - `d`: Deploy/sync RBAC immediately (`--rbac-only` equivalent)
+  - `e`: Export executable post-start hook (`scripts/quack_rbac_post_start.sh`) and bootstrap SQL (`scripts/quack_rbac_init.sql`)
+
+#### 3. Container & Server Restarts (`--rbac-only` Post-Start Hook)
+
+Even when your Quack server backs onto a persistent `.duckdb` file on disk, DuckDB/Quack resets two in-memory states on every server/container restart:
+1. `SET GLOBAL quack_authentication_function` and `SET GLOBAL quack_authorization_function`
+2. Quack's random per-server salt used to compute `quack_active_connections().client_id_hash`
+
+Use **`--rbac-only`** to re-sync **only** `_duckpack_auth` (live salted hashes + global hooks) on startup **without** applying pending user tables, views, or destructive drops:
+
+```bash
+duckpack apply --env prod --rbac-only --auto-approve
+```
+
+Press **`e`** inside `Ctrl+U` to generate the ready-to-use `scripts/quack_rbac_post_start.sh` (`chmod 0755`), which retries until Quack is ready and runs `--rbac-only --auto-approve`:
+
+- **Docker Entrypoint**:
+  ```bash
+  /app/scripts/quack_rbac_post_start.sh &
+  exec duckdb /data/warehouse.duckdb -c "LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '${QUACK_MASTER_TOKEN}', disable_ssl = true);"
+  ```
+- **Docker Compose**:
+  ```yaml
+  services:
+    quack-db:
+      image: my-duckdb-quack:latest
+      environment:
+        DUCKPACK_ENV: prod
+        QUACK_MASTER_TOKEN: ${QUACK_MASTER_TOKEN}
+      entrypoint: ["/bin/bash", "-c", "/app/scripts/quack_rbac_post_start.sh & exec duckdb /data/warehouse.duckdb -c \"LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '$QUACK_MASTER_TOKEN', disable_ssl = true);\""]
+  ```
+- **Kubernetes `lifecycle.postStart`**:
+  ```yaml
+  lifecycle:
+    postStart:
+      exec:
+        command: ["/app/scripts/quack_rbac_post_start.sh"]
+  ```
+- **systemd (`ExecStartPost`)**:
+  ```ini
+  [Service]
+  ExecStart=/usr/local/bin/duckdb /var/lib/duckdb/warehouse.duckdb -c "LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '${QUACK_MASTER_TOKEN}', disable_ssl = true);"
+  ExecStartPost=/opt/my_project/scripts/quack_rbac_post_start.sh
   ```
 
 ---

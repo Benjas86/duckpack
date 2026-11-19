@@ -1045,6 +1045,348 @@ pub fn append_quack_auth_diff_items(
     }
 }
 
+/// Represents a live or recently active client session returned by `quack_active_connections()`,
+/// enriched with resolved RBAC identity (`username`, `role`, `revoked`) from `_duckpack_auth`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveQuackSession {
+    pub server_id: String,
+    pub connection_id: String,
+    pub client_id_hash: String,
+    pub username: String,
+    pub role: String,
+    pub revoked: bool,
+    pub state: String,
+    pub query: String,
+    pub cached_rows: String,
+    pub query_started_at: String,
+}
+
+/// Loads all live sessions from `quack_active_connections()` on the target Quack server alias,
+/// correlating each session with `_duckpack_auth.quack_sessions` and `_duckpack_auth.quack_users`.
+/// Gracefully falls back to plain `quack_active_connections()` if `_duckpack_auth` has not been
+/// deployed yet or if the caller is a non-admin.
+pub fn load_live_quack_sessions(
+    conn: &duckdb::Connection,
+    quack_alias: &str,
+    config: Option<&QuackAuthConfig>,
+) -> Result<Vec<LiveQuackSession>> {
+    let mut exec: &duckdb::Connection = conn;
+    let quoted_qa = format!("\"{}\"", quack_alias.replace('"', "\"\""));
+    let default_role = config
+        .map(|c| c.default_role.as_str())
+        .unwrap_or("reader");
+    let safe_default = default_role.replace('\'', "''");
+
+    let enriched_inner = format!(
+        "SELECT \
+            COALESCE(CAST(ac.server_id AS VARCHAR), '') AS server_id, \
+            COALESCE(CAST(ac.connection_id AS VARCHAR), '') AS connection_id, \
+            COALESCE(CAST(ac.client_id_hash AS VARCHAR), '') AS client_id_hash, \
+            COALESCE( \
+                (SELECT s.username FROM _duckpack_auth.quack_sessions s WHERE lower(CAST(s.sid AS VARCHAR)) = lower(CAST(ac.connection_id AS VARCHAR)) LIMIT 1), \
+                (SELECT u.username FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) ORDER BY CASE u.role WHEN 'admin' THEN 1 WHEN 'writer' THEN 2 WHEN 'reader' THEN 3 ELSE 4 END LIMIT 1), \
+                '<default>' \
+            ) AS username, \
+            COALESCE( \
+                (SELECT CASE WHEN s.revoked THEN 'none' ELSE s.role END FROM _duckpack_auth.quack_sessions s WHERE lower(CAST(s.sid AS VARCHAR)) = lower(CAST(ac.connection_id AS VARCHAR)) LIMIT 1), \
+                (SELECT u.role FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) ORDER BY CASE u.role WHEN 'admin' THEN 1 WHEN 'writer' THEN 2 WHEN 'reader' THEN 3 ELSE 4 END LIMIT 1), \
+                '{}' \
+            ) AS role, \
+            COALESCE( \
+                (SELECT CAST(s.revoked AS VARCHAR) FROM _duckpack_auth.quack_sessions s WHERE lower(CAST(s.sid AS VARCHAR)) = lower(CAST(ac.connection_id AS VARCHAR)) LIMIT 1), \
+                'false' \
+            ) AS revoked, \
+            COALESCE(CAST(ac.state AS VARCHAR), '') AS state, \
+            COALESCE(CAST(ac.query AS VARCHAR), '') AS query, \
+            COALESCE(CAST(ac.cached_rows AS VARCHAR), '') AS cached_rows, \
+            COALESCE(CAST(ac.query_started_at AS VARCHAR), '') AS query_started_at \
+         FROM quack_active_connections() ac \
+         ORDER BY ac.query_started_at DESC NULLS LAST",
+        safe_default
+    );
+
+    let enriched_sql = format!(
+        "SELECT * FROM {}.query('{}')",
+        quoted_qa,
+        enriched_inner.replace('\'', "''")
+    );
+
+    let rows = match exec.query_rows(&enriched_sql) {
+        Ok((_, rows)) => rows,
+        Err(_) => {
+            // Fallback when _duckpack_auth is not yet deployed or caller lacks access to _duckpack_auth
+            let plain_inner = format!(
+                "SELECT \
+                    COALESCE(CAST(server_id AS VARCHAR), ''), \
+                    COALESCE(CAST(connection_id AS VARCHAR), ''), \
+                    COALESCE(CAST(client_id_hash AS VARCHAR), ''), \
+                    '<unmanaged>', \
+                    '{}', \
+                    'false', \
+                    COALESCE(CAST(state AS VARCHAR), ''), \
+                    COALESCE(CAST(query AS VARCHAR), ''), \
+                    COALESCE(CAST(cached_rows AS VARCHAR), ''), \
+                    COALESCE(CAST(query_started_at AS VARCHAR), '') \
+                 FROM quack_active_connections() \
+                 ORDER BY query_started_at DESC NULLS LAST",
+                safe_default
+            );
+            let plain_sql = format!(
+                "SELECT * FROM {}.query('{}')",
+                quoted_qa,
+                plain_inner.replace('\'', "''")
+            );
+            exec.query_rows(&plain_sql)
+                .with_context(|| {
+                    format!(
+                        "Failed to query quack_active_connections() on '{}'",
+                        quack_alias
+                    )
+                })?
+                .1
+        }
+    };
+
+    let mut sessions = Vec::new();
+    for r in rows {
+        if r.len() >= 10 {
+            sessions.push(LiveQuackSession {
+                server_id: r[0].clone(),
+                connection_id: r[1].clone(),
+                client_id_hash: r[2].clone(),
+                username: r[3].clone(),
+                role: r[4].clone(),
+                revoked: r[5].eq_ignore_ascii_case("true") || r[5] == "1",
+                state: r[6].clone(),
+                query: r[7].clone(),
+                cached_rows: r[8].clone(),
+                query_started_at: r[9].clone(),
+            });
+        }
+    }
+    Ok(sessions)
+}
+
+/// Cancels the currently running query for a live Quack session via `quack_cancel(server_id, sid)`.
+pub fn cancel_quack_session_query(
+    conn: &duckdb::Connection,
+    quack_alias: &str,
+    server_id: &str,
+    sid: &str,
+) -> Result<()> {
+    let quoted_qa = format!("\"{}\"", quack_alias.replace('"', "\"\""));
+    let safe_srv = server_id.replace('\'', "''");
+    let safe_sid = sid.replace('\'', "''");
+    let inner = format!("SELECT * FROM quack_cancel('{}', '{}')", safe_srv, safe_sid);
+    let sql = format!(
+        "SELECT * FROM {}.query('{}')",
+        quoted_qa,
+        inner.replace('\'', "''")
+    );
+    conn.execute_batch(&sql).with_context(|| {
+        format!(
+            "Failed to cancel query for session '{}' on '{}'",
+            sid, quack_alias
+        )
+    })?;
+    Ok(())
+}
+
+/// Persists an explicit role override or revocation (`revoked = true`) for a live session ID
+/// in `_duckpack_auth.quack_sessions` on the target Quack server.
+pub fn set_quack_session_override(
+    conn: &duckdb::Connection,
+    quack_alias: &str,
+    sid: &str,
+    username: &str,
+    role: &str,
+    revoked: bool,
+) -> Result<()> {
+    let quoted_qa = format!("\"{}\"", quack_alias.replace('"', "\"\""));
+    let safe_sid = sid.replace('\'', "''");
+    let safe_user = username.replace('\'', "''");
+    let safe_role = role.replace('\'', "''");
+    let inner = format!(
+        "CREATE SCHEMA IF NOT EXISTS _duckpack_auth; \
+         CREATE TABLE IF NOT EXISTS _duckpack_auth.quack_sessions (sid VARCHAR PRIMARY KEY, username VARCHAR, role VARCHAR NOT NULL, revoked BOOLEAN NOT NULL DEFAULT false, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP); \
+         DELETE FROM _duckpack_auth.quack_sessions WHERE lower(CAST(sid AS VARCHAR)) = lower('{}'); \
+         INSERT INTO _duckpack_auth.quack_sessions (sid, username, role, revoked) VALUES ('{}', '{}', '{}', {});",
+        safe_sid, safe_sid, safe_user, safe_role, revoked
+    );
+    let sql = format!(
+        "CALL {}.query('{}')",
+        quoted_qa,
+        inner.replace('\'', "''")
+    );
+    conn.execute_batch(&sql).with_context(|| {
+        format!(
+            "Failed to update session override for '{}' on '{}'",
+            sid, quack_alias
+        )
+    })?;
+    Ok(())
+}
+
+/// Deploys or syncs ONLY the declarative Quack RBAC policy (`_duckpack_auth` tables, harvested live
+/// salted `client_id_hash` values, macros, and post-COMMIT `SET GLOBAL` hooks) without touching any
+/// user tables, views, or pending schema migrations.
+/// Used by both `duckpack apply --rbac-only` and the `Ctrl+U` TUI Deploy action.
+pub fn deploy_quack_rbac_now(
+    exec: &mut dyn DbExecutor,
+    quack_alias: Option<&str>,
+    project_dir: &Path,
+) -> Result<usize> {
+    let config = load_quack_auth_config(project_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No [quack_auth] section found in {}/duckpack.toml.",
+            project_dir.display()
+        )
+    })?;
+    let resolved_users = validate_quack_auth_config(&config, project_dir)?;
+    let qa_opt = crate::diff::find_any_quack_alias(exec, quack_alias);
+    let is_quack = qa_opt.is_some();
+
+    let (deploying_sid, master_cid_hash, live_hashes) = if let Some(ref qa) = qa_opt {
+        harvest_quack_client_id_hashes(exec, qa, &config, project_dir)
+    } else {
+        (None, None, std::collections::HashMap::new())
+    };
+
+    let compiled_sql = compile_quack_auth_sql_with_options(
+        &config,
+        project_dir,
+        deploying_sid.as_deref(),
+        master_cid_hash.as_deref(),
+        &live_hashes,
+        is_quack,
+        false,
+    )?;
+
+    if let Some(ref qa) = qa_opt {
+        let quoted_qa = format!("\"{}\"", qa.replace('"', "\"\""));
+        let safe_sql = compiled_sql.replace('\'', "''");
+        exec.execute_batch(&format!("CALL {}.query('BEGIN TRANSACTION;');", quoted_qa))?;
+        let deploy_res = exec.execute_batch(&format!("CALL {}.query('{}')", quoted_qa, safe_sql));
+        if let Err(e) = deploy_res {
+            let _ = exec.execute_batch(&format!("CALL {}.query('ROLLBACK;');", quoted_qa));
+            return Err(e).with_context(|| {
+                format!("Failed deploying _duckpack_auth RBAC policy to '{}'", qa)
+            });
+        }
+        exec.execute_batch(&format!("CALL {}.query('COMMIT;');", quoted_qa))
+            .with_context(|| format!("Failed to COMMIT _duckpack_auth policy on '{}'", qa))?;
+
+        // Activate (or disable) global hooks strictly AFTER COMMIT succeeds
+        let (auth_fn, authz_fn) = if config.enabled {
+            ("_duckpack_quack_authenticate", "_duckpack_quack_authorize")
+        } else {
+            ("quack_check_token", "quack_nop_authorization")
+        };
+        exec.execute_batch(&format!(
+            "CALL {}.query('SET GLOBAL quack_authentication_function = ''{}'';');",
+            quoted_qa, auth_fn
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to set quack_authentication_function='{}' on '{}'",
+                auth_fn, qa
+            )
+        })?;
+        exec.execute_batch(&format!(
+            "CALL {}.query('SET GLOBAL quack_authorization_function = ''{}'';');",
+            quoted_qa, authz_fn
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to set quack_authorization_function='{}' on '{}'",
+                authz_fn, qa
+            )
+        })?;
+    } else {
+        exec.execute_batch(&compiled_sql)
+            .with_context(|| "Failed deploying _duckpack_auth RBAC policy locally")?;
+    }
+
+    Ok(resolved_users.len())
+}
+
+/// Generates an executable, idempotent post-start shell script (`scripts/quack_rbac_post_start.sh`)
+/// ready for Docker `ENTRYPOINT`, Compose, Kubernetes `postStart`, or `systemd ExecStartPost`.
+/// Waits for the Quack server to accept connections and runs `duckpack apply --env <profile> --rbac-only --auto-approve`
+/// to re-harvest the restarted server's salted `client_id_hash` values and re-activate the global RBAC hooks
+/// without touching any user tables or pending schema migrations.
+pub fn export_quack_rbac_post_start_script(
+    project_dir: &Path,
+    env_profile: Option<&str>,
+) -> Result<PathBuf> {
+    let scripts_dir = project_dir.join("scripts");
+    std::fs::create_dir_all(&scripts_dir)?;
+    let out_path = scripts_dir.join("quack_rbac_post_start.sh");
+    let default_env = env_profile
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("prod");
+
+    let script = format!(
+        r#"#!/usr/bin/env bash
+# DuckPack Quack RBAC Post-Start Hook
+#
+# Why this script exists:
+#   Even though _duckpack_auth tables & macros persist inside your .duckdb file on disk,
+#   DuckDB/Quack resets two in-memory server states on every container/service restart:
+#     1. SET GLOBAL quack_authentication_function / quack_authorization_function
+#     2. Quack's per-server random salt used for quack_active_connections().client_id_hash
+#
+#   This script waits for the Quack server to become reachable and runs:
+#     duckpack apply --env "$DUCKPACK_ENV" --rbac-only --auto-approve
+#   which ONLY syncs _duckpack_auth (re-harvesting live salted hashes + re-activating hooks)
+#   and NEVER modifies or drops user tables or runs pending schema migrations.
+#
+# Usage examples:
+#   1. Standalone / CI-CD:
+#        ./scripts/quack_rbac_post_start.sh
+#        DUCKPACK_ENV=staging ./scripts/quack_rbac_post_start.sh
+#   2. Docker entrypoint (background post-start alongside quack_serve):
+#        ./scripts/quack_rbac_post_start.sh &
+#        exec duckdb /data/warehouse.duckdb -c "LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '${{QUACK_MASTER_TOKEN}}', disable_ssl = true);"
+#   3. Kubernetes lifecycle.postStart / systemd ExecStartPost:
+#        ExecStartPost=/path/to/project/scripts/quack_rbac_post_start.sh
+
+set -euo pipefail
+
+PROJECT_DIR="${{DUCKPACK_PROJECT_DIR:-$(cd "$(dirname "${{BASH_SOURCE[0]}}")/.." && pwd)}}"
+DUCKPACK_ENV="${{DUCKPACK_ENV:-{default_env}}}"
+DUCKPACK_BIN="${{DUCKPACK_BIN:-duckpack}}"
+MAX_RETRIES="${{QUACK_RBAC_MAX_RETRIES:-30}}"
+SLEEP_SECS="${{QUACK_RBAC_RETRY_SLEEP:-1}}"
+
+echo "[duckpack-rbac] Waiting for Quack server (env=${{DUCKPACK_ENV}}, project=${{PROJECT_DIR}})..."
+
+for attempt in $(seq 1 "${{MAX_RETRIES}}"); do
+    if "${{DUCKPACK_BIN}}" apply --project-dir "${{PROJECT_DIR}}" --env "${{DUCKPACK_ENV}}" --rbac-only --auto-approve; then
+        echo "[duckpack-rbac] Quack RBAC synced and global hooks activated (attempt ${{attempt}}/${{MAX_RETRIES}})."
+        exit 0
+    fi
+    if [ "${{attempt}}" -lt "${{MAX_RETRIES}}" ]; then
+        sleep "${{SLEEP_SECS}}"
+    fi
+done
+
+echo "[duckpack-rbac] ERROR: Failed to sync Quack RBAC after ${{MAX_RETRIES}} attempts." >&2
+exit 1
+"#
+    );
+
+    std::fs::write(&out_path, script)
+        .with_context(|| format!("Failed to write {}", out_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(out_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1225,6 +1567,75 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(lockout_err.contains("Admin Lockout Prevention Guard"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_export_quack_rbac_post_start_script_and_local_deploy_rbac_only() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_quack_post_start_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Verify post-start script export content & executable permissions
+        let sh_path = export_quack_rbac_post_start_script(&temp_dir, Some("staging")).unwrap();
+        assert_eq!(sh_path, temp_dir.join("scripts").join("quack_rbac_post_start.sh"));
+        let content = std::fs::read_to_string(&sh_path).unwrap();
+        assert!(content.starts_with("#!/usr/bin/env bash"));
+        assert!(content.contains("--rbac-only --auto-approve"));
+        assert!(content.contains("DUCKPACK_ENV:-staging"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sh_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "Post-start hook script should be executable (0755)");
+        }
+
+        // 2. Verify deploy_quack_rbac_now deploys ONLY _duckpack_auth without touching pending user tables
+        save_env_key_value(&temp_dir, "QUACK_TEST_ADMIN", "admin_secret_1234").unwrap();
+        let cfg = QuackAuthConfig {
+            enabled: true,
+            default_role: QuackRole::Reader,
+            users: vec![QuackAuthUser {
+                username: "alice".to_string(),
+                role: QuackRole::Admin,
+                token_env: "QUACK_TEST_ADMIN".to_string(),
+                client_id: Some("alice".to_string()),
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        save_quack_auth_config(&temp_dir, &cfg).unwrap();
+        // Put a pending user table in tables/ that must NOT be created by deploy_quack_rbac_now
+        std::fs::create_dir_all(temp_dir.join("tables")).unwrap();
+        std::fs::write(
+            temp_dir.join("tables").join("untouched_table.sql"),
+            "CREATE TABLE untouched_table (id INT);",
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        let mut exec: &Connection = &conn;
+        let synced = deploy_quack_rbac_now(&mut exec, None, &temp_dir).unwrap();
+        assert_eq!(synced, 1);
+
+        let user_cnt: i64 = conn
+            .query_row("SELECT count(*) FROM _duckpack_auth.quack_users WHERE username = 'alice'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(user_cnt, 1);
+
+        let untouched_exists: i64 = conn
+            .query_row("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'untouched_table'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            untouched_exists, 0,
+            "deploy_quack_rbac_now (--rbac-only) must NOT create pending user tables"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

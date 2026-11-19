@@ -53,6 +53,7 @@ pub(crate) enum NodeType {
     CloudFile { path: String, is_dir: bool },
     AddSecretAction,
     AddBucketAction,
+    QuackRbacAction,
 }
 
 /// Represents a single renderable node in the Explorer sidebar.
@@ -1056,6 +1057,26 @@ pub(crate) fn rebuild_explorer_nodes(
                 });
             }
         }
+    }
+
+    // Quack RBAC & Live Sessions shortcut node (shown whenever a Quack server is attached)
+    let has_quack_db = is_quack
+        || meta.databases.iter().any(|d| {
+            d.db_type.eq_ignore_ascii_case("quack")
+                || d.path
+                    .as_deref()
+                    .map(|p| p.starts_with("quack:"))
+                    .unwrap_or(false)
+        });
+    if has_quack_db {
+        items.push(ExplorerNode {
+            name: "quack_rbac_monitor".to_string(),
+            display: "🛡️ Quack RBAC & Sessions (Ctrl+U)".to_string(),
+            level: 0,
+            is_expandable: false,
+            is_expanded: false,
+            node_type: NodeType::QuackRbacAction,
+        });
     }
 
     // Secrets & Cloud Buckets Section

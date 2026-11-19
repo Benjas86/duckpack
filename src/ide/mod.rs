@@ -24,11 +24,14 @@ pub(crate) use explorer::{
 };
 pub(crate) use modals::{
     AddBucketModalState, AttachModalState, DatabasePickerModalState, ExitConfirmationModalState,
-    InIdeDiffModalState, NewAssetModalState, SecretModalState, TimeTravelModalState,
-    populate_secret_modal_for_edit, render_help_modal, render_schema_visualizer_modal,
+    InIdeDiffModalState, NewAssetModalState, QuackAuthModalState, SecretModalState,
+    TimeTravelModalState, populate_secret_modal_for_edit, render_help_modal,
+    render_schema_visualizer_modal,
 };
 #[cfg(test)]
-pub(crate) use modals::{AttachProvider, CloudProvider, DuckLakeBackend, TimeTravelMode};
+pub(crate) use modals::{
+    AttachProvider, CloudProvider, DuckLakeBackend, QuackAuthTab, TimeTravelMode,
+};
 
 use anyhow::Result;
 use duckdb::Connection;
@@ -181,6 +184,7 @@ pub fn run_ide_loop(
     let mut new_asset_modal = NewAssetModalState::new();
     let mut in_ide_diff_modal = InIdeDiffModalState::new();
     let mut time_travel_modal = TimeTravelModalState::new();
+    let mut quack_auth_modal = QuackAuthModalState::new();
 
     let mut explorer_state = ListState::default();
     let mut explorer_horizontal_scroll: usize = 0;
@@ -626,6 +630,8 @@ pub fn run_ide_loop(
                 in_ide_diff_modal.render(f);
             } else if time_travel_modal.is_open {
                 time_travel_modal.render(f);
+            } else if quack_auth_modal.is_open {
+                quack_auth_modal.render(f);
             }
 
             // Status Bar
@@ -1038,6 +1044,8 @@ pub fn run_ide_loop(
                     attach_modal.paste_text(&pasted_text);
                 } else if secret_modal.is_open {
                     secret_modal.paste_text(&pasted_text);
+                } else if quack_auth_modal.is_open {
+                    quack_auth_modal.paste_text(&pasted_text);
                 } else if focus == FocusPane::Editor {
                     tabs[active_tab_index].textarea.insert_str(&pasted_text);
                 }
@@ -1129,6 +1137,17 @@ pub fn run_ide_loop(
                         status_msg =
                             format!("Executed DuckLake time-travel query on '{}'", db_name);
                     }
+                } else if quack_auth_modal.is_open {
+                    if key.code == KeyCode::Char('v')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if let Some(text) = get_clipboard_text(&mut os_clipboard) {
+                            quack_auth_modal.paste_text(&text);
+                        }
+                    } else if let Some(msg) = quack_auth_modal.handle_key(key, conn, project_dir) {
+                        status_msg = msg;
+                        trigger_explorer_refresh = true;
+                    }
                 } else if key.code == KeyCode::Char('a')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
@@ -1137,6 +1156,14 @@ pub fn run_ide_loop(
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     secret_modal.reset();
+                } else if key.code == KeyCode::Char('u')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    let tab_cat = tabs
+                        .get(active_tab_index)
+                        .map(|t| t.target_database.as_str())
+                        .filter(|c| !c.is_empty() && *c != "memory");
+                    quack_auth_modal.open(conn, project_dir, tab_cat);
                 } else if show_help || show_schema_visualizer {
                     if key.code == KeyCode::Esc
                         || key.code == KeyCode::Char('q')
@@ -3037,6 +3064,13 @@ pub fn run_ide_loop(
                         }
                         NodeType::AddBucketAction => {
                             add_bucket_modal.reset();
+                        }
+                        NodeType::QuackRbacAction => {
+                            let tab_cat = tabs
+                                .get(active_tab_index)
+                                .map(|t| t.target_database.as_str())
+                                .filter(|c| !c.is_empty() && *c != "memory");
+                            quack_auth_modal.open(conn, project_dir, tab_cat);
                         }
                         NodeType::CloudSecret { name, .. } => {
                             let query =

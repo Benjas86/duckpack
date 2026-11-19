@@ -2217,3 +2217,111 @@ fn test_ducklake_snapshots_explorer_and_time_travel_modal() {
     );
     assert!(!modal.is_open);
 }
+
+#[test]
+fn test_quack_auth_modal_user_lifecycle_lockout_guard_and_export() {
+    use ratatui::crossterm::event::KeyEvent;
+    let temp_dir = std::env::temp_dir().join(format!(
+        "dp_ide_quack_auth_modal_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+
+    let mut modal = QuackAuthModalState::new();
+    modal.open(&conn, &temp_dir, None);
+    assert!(modal.is_open);
+    assert_eq!(modal.active_tab, QuackAuthTab::Users);
+    assert!(modal.config.users.is_empty());
+
+    // Press 'a' to add first user ("alice" as Admin)
+    modal.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(modal.adding_user);
+    for c in "alice".chars() {
+        modal.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &conn, &temp_dir);
+    }
+    // Tab to Role field (defaults to Reader -> Right -> Admin)
+    modal.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &conn, &temp_dir);
+    assert_eq!(modal.add_field, 1);
+    assert_eq!(modal.new_token_env, "QUACK_USER_ALICE_TOKEN");
+    modal.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &conn, &temp_dir);
+    assert_eq!(modal.new_role, crate::quack_auth::QuackRole::Admin);
+
+    // Enter saves user, generates 256-bit token in .env, and writes duckpack.toml
+    let msg = modal.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(msg.is_some());
+    assert!(!modal.adding_user);
+    assert_eq!(modal.config.users.len(), 1);
+    assert_eq!(modal.config.users[0].username, "alice");
+    assert_eq!(modal.config.users[0].role, crate::quack_auth::QuackRole::Admin);
+    assert!(
+        crate::quack_auth::resolve_user_token(&temp_dir, "QUACK_USER_ALICE_TOKEN").is_some(),
+        "Token must be generated and saved into .env"
+    );
+
+    // Admin Lockout Prevention Guard: trying to disable or demote the sole admin must be blocked!
+    modal.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(modal.config.users[0].enabled, "Sole admin cannot be disabled");
+    assert!(modal.error_msg.as_deref().unwrap_or("").contains("Admin Lockout Prevention Guard"));
+
+    modal.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &conn, &temp_dir);
+    assert_eq!(modal.config.users[0].role, crate::quack_auth::QuackRole::Admin, "Sole admin cannot be demoted");
+
+    // Press 'e' to export post-start shell script and SQL bootstrap script
+    let exp_msg = modal.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(exp_msg.is_some());
+    assert!(temp_dir.join("scripts").join("quack_rbac_post_start.sh").exists());
+    assert!(temp_dir.join("scripts").join("quack_rbac_init.sql").exists());
+
+    // Press 'd' to deploy RBAC locally
+    let dep_msg = modal.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(dep_msg.as_deref().unwrap_or("").contains("Synced 1 Quack RBAC user"));
+
+    // Press Esc to close
+    modal.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(!modal.is_open);
+
+    // Verify Ratatui rendering across LiveSessions, Users, and inline Add User form without panicking
+    let backend = ratatui::backend::TestBackend::new(110, 32);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    modal.is_open = true;
+    modal.quack_alias = Some("target_db".to_string());
+    modal.sessions.push(crate::quack_auth::LiveQuackSession {
+        server_id: "srv1".to_string(),
+        connection_id: "sid_1234567890abcdef".to_string(),
+        client_id_hash: "ABCDEF".to_string(),
+        username: "alice".to_string(),
+        role: "admin".to_string(),
+        revoked: false,
+        state: "IDLE".to_string(),
+        query: "SELECT * FROM orders".to_string(),
+        cached_rows: "0".to_string(),
+        query_started_at: "2026-11-19 12:00:00".to_string(),
+    });
+    modal.active_tab = QuackAuthTab::LiveSessions;
+    terminal.draw(|f| modal.render(f)).unwrap();
+    modal.active_tab = QuackAuthTab::Users;
+    terminal.draw(|f| modal.render(f)).unwrap();
+    modal.adding_user = true;
+    terminal.draw(|f| modal.render(f)).unwrap();
+
+    // Verify Explorer renders QuackRbacAction when is_quack = true, and hides it for local DuckDB
+    let meta = load_explorer_metadata(&conn, &temp_dir, false);
+    let expanded_groups = HashSet::new();
+    let expanded_tables = HashSet::new();
+    let local_nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
+    assert!(
+        !local_nodes.iter().any(|n| n.node_type == NodeType::QuackRbacAction),
+        "Local DuckDB explorer should not display QuackRbacAction node"
+    );
+    let quack_nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, true);
+    assert!(
+        quack_nodes.iter().any(|n| n.node_type == NodeType::QuackRbacAction),
+        "Quack explorer should display QuackRbacAction node"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

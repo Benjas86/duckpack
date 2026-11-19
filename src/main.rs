@@ -75,6 +75,9 @@ enum Commands {
         /// Disable SSL/TLS verification for Quack connection (plain HTTP)
         #[arg(long, visible_alias = "insecure", alias = "quack-insecure")]
         quack_disable_ssl: bool,
+        /// Sync ONLY the declarative Quack RBAC policy (_duckpack_auth + live client_id_hash + global hooks) without running user schema migrations
+        #[arg(long)]
+        rbac_only: bool,
     },
     /// Show schema differences between project and target database
     Diff {
@@ -297,7 +300,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Apply { project_dir, db, database, force_drop, allow_lake_rewrite, auto_approve, interactive: _, out, quack_token, quack_disable_ssl } => {
+        Commands::Apply { project_dir, db, database, force_drop, allow_lake_rewrite, auto_approve, interactive: _, out, quack_token, quack_disable_ssl, rbac_only } => {
             if *allow_lake_rewrite {
                 unsafe {
                     std::env::set_var("DUCKPACK_ALLOW_LAKE_REWRITE", "true");
@@ -305,6 +308,20 @@ fn main() -> Result<()> {
             }
             if !project_dir.exists() {
                 eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
+                return Ok(());
+            }
+
+            if *rbac_only {
+                let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                let user_count = duckpack::quack_auth::deploy_quack_rbac_now(
+                    &mut target_conn,
+                    database.as_deref(),
+                    project_dir,
+                )?;
+                println!(
+                    "🦆 DuckPack RBAC: Synced {} declarative user(s) and activated Quack authentication/authorization hooks.",
+                    user_count
+                );
                 return Ok(());
             }
 
