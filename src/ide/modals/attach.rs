@@ -2669,15 +2669,17 @@ impl AttachModalState {
                             [],
                         );
                     }
+                    // Resolve the Quack token WITHOUT mutating conn's global QUACK secret or
+                    // quack_default_client_id so multiple Quack aliases (e.g. Admin target_db +
+                    // Reader quack_remote) stay completely isolated inside the same session.
+                    let has_explicit_quack_password = !self.password.trim().is_empty();
                     let quack_applied_token = if provider == AttachProvider::Quack {
-                        let opt_token = if self.password.trim().is_empty() {
-                            None
-                        } else {
+                        let opt_token = if has_explicit_quack_password {
                             Some(self.password.trim())
+                        } else {
+                            None
                         };
-                        crate::engine::apply_quack_token_secret(conn, opt_token)
-                            .ok()
-                            .flatten()
+                        crate::engine::resolve_explicit_quack_token(opt_token)
                     } else {
                         None
                     };
@@ -2720,10 +2722,14 @@ impl AttachModalState {
                             }
                             if let Some(ref tok) = quack_applied_token {
                                 opts.push(format!("TOKEN '{}'", tok.replace('\'', "''")));
-                            }
-                            if let Some(cid) =
-                                crate::engine::resolve_quack_client_id(quack_applied_token.as_deref())
-                            {
+                                // When an explicit token is entered in Ctrl+A, bind CLIENT_ID to that
+                                // exact token so an ambient QUACK_CLIENT_ID env var cannot bleed across roles.
+                                let cid = if has_explicit_quack_password {
+                                    tok.clone()
+                                } else {
+                                    crate::engine::resolve_quack_client_id(Some(tok))
+                                        .unwrap_or_else(|| tok.clone())
+                                };
                                 opts.push(format!("CLIENT_ID '{}'", cid.replace('\'', "''")));
                             }
                         }

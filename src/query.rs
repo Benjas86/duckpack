@@ -105,7 +105,10 @@ pub fn should_auto_route_to_quack(query: &str) -> bool {
         || clean_lower.contains("duckdb_functions()")
         || clean_lower.contains("duckdb_settings()")
         || clean_lower.contains("quack_active_connections()")
-        || clean_lower.contains("_duckpack_auth.")
+        || clean_lower.contains("_duckpack_auth.authenticate(")
+        || clean_lower.contains("_duckpack_auth.authorize(")
+        || clean_lower.contains("_duckpack_auth.resolve_role(")
+        || clean_lower.contains("_duckpack_auth.sanitize_sql(")
         || clean_lower.contains("_duckpack_quack_")
 }
 

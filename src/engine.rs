@@ -550,13 +550,10 @@ pub fn should_redact_sql_history(sql: &str) -> bool {
         || lower.contains("token '")
 }
 
-/// Applies a Quack authentication token to `conn` using `CREATE OR REPLACE SECRET (TYPE QUACK, TOKEN '...')`.
-/// Drops any stale temporary `quack` secrets first so a previously failed or empty token never shadows the new token.
-/// If `explicit_token` is `None` or empty, falls back to `resolve_quack_token(None, None)` (`QUACK_TOKEN` / `DUCKDB_QUACK_TOKEN`).
-pub fn apply_quack_token_secret(
-    conn: &Connection,
-    explicit_token: Option<&str>,
-) -> Result<Option<String>> {
+/// Cleans an explicit Quack token input (trimming surrounding quotes and expanding `$VAR`/`${VAR}` or
+/// uppercase env var names) and falls back to `resolve_quack_token(None, None)` when empty.
+/// Pure helper — does NOT mutate `conn` secrets or global `quack_default_client_id`.
+pub fn resolve_explicit_quack_token(explicit_token: Option<&str>) -> Option<String> {
     let cleaned_explicit = explicit_token
         .map(|s| {
             let t = s.trim();
@@ -590,7 +587,17 @@ pub fn apply_quack_token_secret(
         })
         .filter(|s| !s.is_empty());
 
-    let resolved = cleaned_explicit.or_else(|| resolve_quack_token(None, None));
+    cleaned_explicit.or_else(|| resolve_quack_token(None, None))
+}
+
+/// Applies a Quack authentication token to `conn` using `CREATE OR REPLACE SECRET (TYPE QUACK, TOKEN '...')`.
+/// Drops any stale temporary `quack` secrets first so a previously failed or empty token never shadows the new token.
+/// If `explicit_token` is `None` or empty, falls back to `resolve_quack_token(None, None)` (`QUACK_TOKEN` / `DUCKDB_QUACK_TOKEN`).
+pub fn apply_quack_token_secret(
+    conn: &Connection,
+    explicit_token: Option<&str>,
+) -> Result<Option<String>> {
+    let resolved = resolve_explicit_quack_token(explicit_token);
     if let Some(ref token) = resolved {
         // Drop any existing temporary quack secrets so stale tokens cannot shadow the new secret
         let mut stale_names: Vec<String> = Vec::new();

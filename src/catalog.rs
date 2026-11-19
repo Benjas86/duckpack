@@ -803,10 +803,18 @@ pub fn load_explorer_metadata(
         } else {
             format!("SELECT count(*) FROM {}.{}.{}", quoted_db, quoted_schema, quoted_table)
         };
-        if let Ok(count) = conn.query_row(&count_sql, [], |r| r.get::<_, i64>(0)) {
-            t.row_count = Some(count);
+        match conn.query_row(&count_sql, [], |r| r.get::<_, i64>(0)) {
+            Ok(count) => {
+                t.row_count = Some(count);
+            }
+            Err(_) if t.schema.eq_ignore_ascii_case("_duckpack_auth") => {
+                t.row_count = None;
+            }
+            Err(_) => {}
         }
     }
+    // Hide internal _duckpack_auth tables from the Explorer when the connected user lacks access (non-admin)
+    all_tables.retain(|t| !(t.schema.eq_ignore_ascii_case("_duckpack_auth") && t.row_count.is_none()));
 
     let mut all_views: Vec<ViewEntry> = Vec::new();
     if is_quack {
