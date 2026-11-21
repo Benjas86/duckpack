@@ -618,15 +618,18 @@ pub fn compile_quack_auth_sql_with_options(
     ));
 
     // 3. Query Sanitization Macro: _duckpack_auth.sanitize_sql(p_q)
-    // Strips /* ... */ block comments, -- ... line comments, single-quoted string literals '...',
-    // and trailing semicolons, then lowercases and trims ALL whitespace (spaces, tabs, newlines, CR).
+    // Strips /* ... */ block comments, -- ... line comments, dollar-quoted strings $$...$$,
+    // single-quoted string literals '...', and trailing semicolons, then lowercases and trims ALL whitespace.
     sql.push_str(
         "CREATE OR REPLACE MACRO _duckpack_auth.sanitize_sql(p_q) AS (\n\
          \x20   lower(regexp_replace(regexp_replace(\n\
          \x20       regexp_replace(\n\
          \x20           regexp_replace(\n\
-         \x20               regexp_replace(COALESCE(p_q, ''), '/\\*[\\s\\S]*?\\*/', ' ', 'g'),\n\
-         \x20               '--[^\\r\\n]*', ' ', 'g'\n\
+         \x20               regexp_replace(\n\
+         \x20                   regexp_replace(COALESCE(p_q, ''), '/\\*[\\s\\S]*?\\*/', ' ', 'g'),\n\
+         \x20                   '--[^\\r\\n]*', ' ', 'g'\n\
+         \x20               ),\n\
+         \x20               '\\$\\$[\\s\\S]*?\\$\\$', '''''', 'g'\n\
          \x20           ),\n\
          \x20           '''([^'']|'''')*''', '''''', 'g'\n\
          \x20       ),\n\
@@ -662,8 +665,8 @@ pub fn compile_quack_auth_sql_with_options(
          \x20       WHEN 'writer' THEN (\n\
          \x20           _duckpack_auth.sanitize_sql(p_query) <> ''\n\
          \x20           AND strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(_duckpack_auth|quack_users|quack_sessions|quack_authentication_function|quack_authorization_function|quack_serve|quack_stop|quack_cancel)\\b')\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(attach|detach|install|load|export|import|drop|alter|truncate|vacuum|rename|grant|revoke)\\b')\n\
+         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(_duckpack_auth|quack_users|quack_sessions|quack_authentication_function|quack_authorization_function|quack_serve|quack_stop|quack_cancel|quack_query|quack_query_by_name|quack_generate_keys|quack_identify|enable_logging|disable_logging)\\b')\n\
+         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(attach|detach|install|load|export|import|drop|alter|truncate|vacuum|rename|grant|revoke|call)\\b')\n\
          \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(set|reset)\\s+(global|session)\\b')\n\
          \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(create|drop)\\s+(or\\s+replace\\s+)?(persistent\\s+|temporary\\s+|temp\\s+)?secret\\b')\n\
          \x20           {writer_create_rule}\n\
@@ -673,7 +676,7 @@ pub fn compile_quack_auth_sql_with_options(
          \x20           _duckpack_auth.sanitize_sql(p_query) <> ''\n\
          \x20           AND strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0\n\
          \x20           AND regexp_matches(_duckpack_auth.sanitize_sql(p_query), '{reader_prefix_pattern}')\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(_duckpack_auth|quack_users|quack_sessions|quack_authentication_function|quack_authorization_function|quack_serve|quack_stop|quack_cancel)\\b')\n\
+         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(_duckpack_auth|quack_users|quack_sessions|quack_authentication_function|quack_authorization_function|quack_serve|quack_stop|quack_cancel|quack_query|quack_query_by_name|quack_generate_keys|quack_identify|enable_logging|disable_logging)\\b')\n\
          \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(set|reset)\\s+global\\b')\n\
          \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(insert|update|delete|merge|create|alter|drop|truncate|copy|call|vacuum|rename|grant|revoke|execute|attach|detach|install|load|export|import|reset)\\b')\n\
          \x20       )\n\
@@ -788,11 +791,15 @@ fn harvest_quack_client_id_hashes(
     if let Some(uri) = quack_uri {
         let disable_ssl = crate::engine::should_disable_quack_ssl(&uri, false);
         let safe_uri = uri.replace('\'', "''");
+        let ambient_master_token = crate::engine::resolve_quack_token(None, None);
         for (idx, u) in config.users.iter().enumerate() {
             let Some(user_token) = resolve_user_token(project_dir, &u.token_env) else {
                 continue;
             };
             let raw_cid = u.client_id.as_deref().unwrap_or(&user_token);
+            if raw_cid.chars().count() < 4 {
+                continue;
+            }
             let safe_cid = raw_cid.replace('\'', "''");
             let nonce = format!(
                 "__dp_probe_{}_{}",
@@ -804,28 +811,57 @@ fn harvest_quack_client_id_hashes(
                 nonce
             );
             let safe_inner = inner_sql.replace('\'', "''");
-            let probe_sql = format!(
-                "SELECT client_id_hash FROM quack_query('{}', '{}', client_id = '{}', disable_ssl = {})",
-                safe_uri, safe_inner, safe_cid, disable_ssl
-            );
-            let probed = target_exec
-                .query_rows(&probe_sql)
-                .or_else(|_| {
-                    if !disable_ssl {
-                        let fallback_probe = format!(
-                            "SELECT client_id_hash FROM quack_query('{}', '{}', client_id = '{}', disable_ssl = true)",
-                            safe_uri, safe_inner, safe_cid
-                        );
-                        target_exec.query_rows(&fallback_probe)
+
+            // Try probing with explicit token so inline-token attaches (Ctrl+A, Workspace, Ctrl+U)
+            // without a matching session QUACK secret still harvest live server-salted hashes.
+            // Order: ambient master token (works on initial bootstrap before RBAC is active),
+            // user's own token (works post-RBAC deploy), then implicit session secret fallback.
+            let mut candidate_tokens: Vec<Option<String>> = Vec::new();
+            if let Some(ref mt) = ambient_master_token {
+                candidate_tokens.push(Some(mt.clone()));
+            }
+            if ambient_master_token.as_deref() != Some(user_token.as_str()) {
+                candidate_tokens.push(Some(user_token.clone()));
+            }
+            candidate_tokens.push(None);
+
+            let ssl_modes: Vec<bool> = if disable_ssl {
+                vec![true]
+            } else {
+                vec![false, true]
+            };
+
+            let mut probed: Option<String> = None;
+            'probe: for &ssl_off in &ssl_modes {
+                for tok_opt in &candidate_tokens {
+                    let probe_sql = if let Some(tok) = tok_opt {
+                        format!(
+                            "SELECT client_id_hash FROM quack_query('{}', '{}', token = '{}', client_id = '{}', disable_ssl = {})",
+                            safe_uri,
+                            safe_inner,
+                            tok.replace('\'', "''"),
+                            safe_cid,
+                            ssl_off
+                        )
                     } else {
-                        Err(anyhow::anyhow!("probe failed"))
+                        format!(
+                            "SELECT client_id_hash FROM quack_query('{}', '{}', client_id = '{}', disable_ssl = {})",
+                            safe_uri, safe_inner, safe_cid, ssl_off
+                        )
+                    };
+                    if let Ok((_, rows)) = target_exec.query_rows(&probe_sql) {
+                        if let Some(h) = rows
+                            .into_iter()
+                            .next()
+                            .and_then(|r| r.into_iter().next())
+                            .filter(|s| !s.is_empty() && s != "NULL")
+                        {
+                            probed = Some(h.to_lowercase());
+                            break 'probe;
+                        }
                     }
-                })
-                .ok()
-                .and_then(|(_, rows)| rows.into_iter().next())
-                .and_then(|r| r.into_iter().next())
-                .filter(|s| !s.is_empty() && s != "NULL")
-                .map(|s| s.to_lowercase());
+                }
+            }
 
             if let Some(h) = probed {
                 live_hashes.insert(u.username.clone(), h);
@@ -1167,28 +1203,35 @@ pub fn load_live_quack_sessions(
     Ok(sessions)
 }
 
-/// Cancels the currently running query for a live Quack session via `quack_cancel(server_id, sid)`.
+/// Cancels the currently running query for a live Quack session via the DuckDB v2.0
+/// client-side table function `quack_cancel(catalog, connection_id)`.
 pub fn cancel_quack_session_query(
     conn: &duckdb::Connection,
     quack_alias: &str,
-    server_id: &str,
+    _server_id: &str,
     sid: &str,
 ) -> Result<()> {
-    let quoted_qa = format!("\"{}\"", quack_alias.replace('"', "\"\""));
-    let safe_srv = server_id.replace('\'', "''");
+    let safe_alias = quack_alias.replace('\'', "''");
     let safe_sid = sid.replace('\'', "''");
-    let inner = format!("SELECT * FROM quack_cancel('{}', '{}')", safe_srv, safe_sid);
-    let sql = format!(
-        "SELECT * FROM {}.query('{}')",
-        quoted_qa,
-        inner.replace('\'', "''")
-    );
-    conn.execute_batch(&sql).with_context(|| {
+    let sql = format!("SELECT * FROM quack_cancel('{}', '{}')", safe_alias, safe_sid);
+    let mut exec: &duckdb::Connection = conn;
+    let (_, rows) = exec.query_rows(&sql).with_context(|| {
         format!(
             "Failed to cancel query for session '{}' on '{}'",
             sid, quack_alias
         )
     })?;
+    if let Some(first_row) = rows.first() {
+        if let Some(success_str) = first_row.get(1) {
+            if success_str.eq_ignore_ascii_case("false") || success_str == "0" {
+                anyhow::bail!(
+                    "Quack server reported no active cancellable query for session '{}' on '{}'",
+                    sid,
+                    quack_alias
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1348,7 +1391,7 @@ pub fn export_quack_rbac_post_start_script(
 #        DUCKPACK_ENV=staging ./scripts/quack_rbac_post_start.sh
 #   2. Docker entrypoint (background post-start alongside quack_serve):
 #        ./scripts/quack_rbac_post_start.sh &
-#        exec duckdb /data/warehouse.duckdb -c "LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '${{QUACK_MASTER_TOKEN}}', disable_ssl = true);"
+#        exec duckdb /data/warehouse.duckdb -init <(echo "LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', allow_other_hostname = true, token = '${{QUACK_MASTER_TOKEN}}', disable_ssl = true);") -no-stdin
 #   3. Kubernetes lifecycle.postStart / systemd ExecStartPost:
 #        ExecStartPost=/path/to/project/scripts/quack_rbac_post_start.sh
 

@@ -1150,7 +1150,7 @@ impl AttachModalState {
                     return Err("Host / Server address cannot be empty for MySQL.".to_string());
                 }
                 let host_raw = self.host.trim();
-                let mut uri = if host_raw.contains("://") {
+                let mut conn_str = if host_raw.contains('=') {
                     host_raw.to_string()
                 } else {
                     let port = if self.port.trim().is_empty() {
@@ -1158,29 +1158,32 @@ impl AttachModalState {
                     } else {
                         self.port.trim()
                     };
-                    let user_part =
-                        if !self.username.trim().is_empty() && !self.password.trim().is_empty() {
-                            format!("{}:{}@", self.username.trim(), self.password.trim())
-                        } else if !self.username.trim().is_empty() {
-                            format!("{}@", self.username.trim())
-                        } else {
-                            String::new()
-                        };
-                    let db_part = if !self.database.trim().is_empty() {
-                        format!("/{}", self.database.trim())
-                    } else {
-                        String::new()
-                    };
-                    format!("mysql://{}{}:{}{}", user_part, host_raw, port, db_part)
-                };
-                if self.disable_ssl {
-                    if uri.contains('?') {
-                        if !uri.to_lowercase().contains("ssl-mode=") {
-                            uri.push_str("&ssl-mode=DISABLED");
-                        }
-                    } else {
-                        uri.push_str("?ssl-mode=DISABLED");
+                    let mut parts = vec![
+                        format!("host={}", crate::engine::escape_libpq_value(host_raw)),
+                        format!("port={}", port),
+                    ];
+                    if !self.database.trim().is_empty() {
+                        parts.push(format!(
+                            "database={}",
+                            crate::engine::escape_libpq_value(&self.database)
+                        ));
                     }
+                    if !self.username.trim().is_empty() {
+                        parts.push(format!(
+                            "user={}",
+                            crate::engine::escape_libpq_value(&self.username)
+                        ));
+                    }
+                    if !self.password.trim().is_empty() {
+                        parts.push(format!(
+                            "password={}",
+                            crate::engine::escape_libpq_value(&self.password)
+                        ));
+                    }
+                    parts.join(" ")
+                };
+                if self.disable_ssl && !conn_str.to_lowercase().contains("ssl_mode=") {
+                    conn_str.push_str(" ssl_mode=disabled");
                 }
                 let alias = if self.alias.trim().is_empty() {
                     if !self.database.trim().is_empty() {
@@ -1191,7 +1194,7 @@ impl AttachModalState {
                 } else {
                     self.alias.trim().to_string()
                 };
-                Ok((uri.replace('\'', "''"), alias))
+                Ok((conn_str.replace('\'', "''"), alias))
             }
             AttachProvider::Quack => {
                 if self.host.trim().is_empty() {
@@ -1209,13 +1212,26 @@ impl AttachModalState {
                 if self.path.trim().is_empty() {
                     return Err("MotherDuck database name cannot be empty.".to_string());
                 }
-                let target = if self.path.trim().starts_with("md:") {
-                    self.path.trim().to_string()
+                let raw = self.path.trim();
+                let mut target = if raw.starts_with("md:") || raw.starts_with("motherduck:") {
+                    raw.to_string()
                 } else {
-                    format!("md:{}", self.path.trim())
+                    format!("md:{}", raw)
                 };
+                if !self.password.trim().is_empty()
+                    && !target.to_lowercase().contains("motherduck_token=")
+                {
+                    let sep = if target.contains('?') { '&' } else { '?' };
+                    target.push_str(&format!("{}motherduck_token={}", sep, self.password.trim()));
+                }
                 let alias = if self.alias.trim().is_empty() {
-                    self.path.trim().trim_start_matches("md:").to_string()
+                    raw.strip_prefix("motherduck:")
+                        .or_else(|| raw.strip_prefix("md:"))
+                        .unwrap_or(raw)
+                        .split('?')
+                        .next()
+                        .unwrap_or("my_db")
+                        .to_string()
                 } else {
                     self.alias.trim().to_string()
                 };
@@ -2640,17 +2656,15 @@ impl AttachModalState {
                 let provider = self.provider();
                 let ext_res = match provider {
                     AttachProvider::DuckLake => {
-                        let opt_token = if self.password.trim().is_empty() {
-                            None
-                        } else {
-                            Some(self.password.trim())
-                        };
-                        crate::engine::prepare_ducklake_connection(
+                        // Do NOT mutate global QUACK secrets here; per-endpoint scoped secrets
+                        // are created below so multi-container DuckLake attaches remain isolated.
+                        crate::engine::prepare_ducklake_connection_with_options(
                             conn,
                             &safe_path,
                             &self.data_path,
-                            opt_token,
                             None,
+                            None,
+                            false,
                         )
                     }
                     AttachProvider::SQLite => {
@@ -2679,15 +2693,8 @@ impl AttachModalState {
                         e
                     ));
                 } else {
-                    if provider == AttachProvider::MotherDuck
-                        && !self.password.trim().is_empty()
-                    {
-                        let safe_token = self.password.trim().replace('\'', "''");
-                        let _ = conn.execute(
-                            &format!("SET motherduck_token='{}';", safe_token),
-                            [],
-                        );
-                    }
+                    // MotherDuck token is passed inline via `?motherduck_token=...` in build_connection_target
+                    // (DuckDB does not support `SET motherduck_token = ...` at runtime).
                     // Resolve the Quack token WITHOUT mutating conn's global QUACK secret or
                     // quack_default_client_id so multiple Quack aliases (e.g. Admin target_db +
                     // Reader quack_remote) stay completely isolated inside the same session.

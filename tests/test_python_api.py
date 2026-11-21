@@ -4,7 +4,7 @@ import pytest
 import duckpack
 
 def test_duckpack_version_and_exports():
-    assert duckpack.__version__ == "0.3.5_dev18"
+    assert duckpack.__version__ == "0.3.5_dev19"
     assert hasattr(duckpack, "explore")
     assert hasattr(duckpack, "apply")
     assert hasattr(duckpack, "diff")

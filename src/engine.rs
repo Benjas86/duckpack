@@ -137,24 +137,32 @@ pub fn is_quack_target_attached(exec: &mut dyn DbExecutor) -> bool {
         > 0
 }
 
+fn extract_quack_host(db: &str) -> &str {
+    let stripped = db
+        .trim()
+        .strip_prefix("quack://")
+        .or_else(|| db.trim().strip_prefix("quack:"))
+        .unwrap_or(db.trim());
+    let without_path = stripped.split('/').next().unwrap_or(stripped);
+    if without_path.starts_with('[') {
+        if let Some(end) = without_path.find(']') {
+            return &without_path[..=end];
+        }
+        return without_path;
+    }
+    without_path.split(':').next().unwrap_or(without_path)
+}
+
 /// Determines if the provided quack connection URI targets the 0.0.0.0 local unspecified address.
 pub fn is_quack_zero_host(db: &str) -> bool {
-    let stripped = db
-        .strip_prefix("quack://")
-        .or_else(|| db.strip_prefix("quack:"))
-        .unwrap_or(db);
-    stripped.starts_with("0.0.0.0") || stripped.starts_with("[::]")
+    let host = extract_quack_host(db);
+    host == "0.0.0.0" || host == "[::]"
 }
 
 /// Determines if the provided quack connection URI targets a loopback address (127.0.0.1, localhost, [::1]).
 pub fn is_quack_loopback(db: &str) -> bool {
-    let stripped = db
-        .strip_prefix("quack://")
-        .or_else(|| db.strip_prefix("quack:"))
-        .unwrap_or(db);
-    stripped.starts_with("127.0.0.1")
-        || stripped.starts_with("localhost")
-        || stripped.starts_with("[::1]")
+    let host = extract_quack_host(db);
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]"
 }
 
 /// Determines if SSL should be disabled for a Quack connection.
@@ -248,7 +256,7 @@ pub fn diagnose_storage_version_error(err_str: &str, db_path: &str) -> Option<St
               3. Python One-Liner (Auto-Bridged): Run using your active Python environment's DuckDB:\n\
                  $ python -c \"import duckdb, duckpack; con = duckdb.connect('{}'); duckpack.explore(con)\"\n\
               4. Serve via your local DuckDB CLI:\n\
-                 $ duckdb {} -c \"INSTALL quack; LOAD quack; CALL quack_serve('quack:localhost:9494');\"\n\
+                 $ duckdb {} -serve\n\
                  $ duckpack explore --db quack:localhost:9494",
             db_path,
             embedded_duckdb_version(),
@@ -1241,6 +1249,7 @@ pub fn apply_diff_with_lake_options(
         }
 
         let mut structure_to_apply = Vec::new();
+        let mut drop_triggers = Vec::new();
         for item in &diff.items {
             if !item.selected || item.ignored {
                 continue;
@@ -1256,14 +1265,43 @@ pub fn apply_diff_with_lake_options(
                 }
                 diff::DiffItemType::RecreateTable => {
                     if force_drop {
-                        structure_to_apply.push(item.sql.clone());
+                        if let Some(ref lake) = lake_info {
+                            let commit_msg = format_ducklake_commit_message(diff, force_drop);
+                            let safe_msg = commit_msg.replace('\'', "''");
+                            let quoted_cat = format!("\"{}\"", lake.name.replace('"', "\"\""));
+                            let tag_sql = format!(
+                                "CALL {}.set_commit_message('duckpack', '{}');\nCOMMIT;",
+                                quoted_cat, safe_msg
+                            );
+                            let tagged_recreate = if let Some(idx) = item.sql.rfind("COMMIT;") {
+                                format!(
+                                    "{}{}{}",
+                                    &item.sql[..idx],
+                                    tag_sql,
+                                    &item.sql[idx + "COMMIT;".len()..]
+                                )
+                            } else {
+                                format!(
+                                    "BEGIN TRANSACTION;\n{}\n{}",
+                                    item.sql.trim(),
+                                    tag_sql
+                                )
+                            };
+                            structure_to_apply.push(tagged_recreate);
+                        } else {
+                            structure_to_apply.push(item.sql.clone());
+                        }
+                    }
+                }
+                diff::DiffItemType::DropTrigger => {
+                    if force_drop {
+                        drop_triggers.push(item.sql.clone());
                     }
                 }
                 diff::DiffItemType::DropTable
                 | diff::DiffItemType::DropColumn
                 | diff::DiffItemType::DropView
-                | diff::DiffItemType::DropMacro
-                | diff::DiffItemType::DropTrigger => {
+                | diff::DiffItemType::DropMacro => {
                     if force_drop {
                         drops_to_apply.push(item.sql.clone());
                     }
@@ -1297,12 +1335,15 @@ pub fn apply_diff_with_lake_options(
             execute_sqls_with_retry_custom(views_to_apply, &mut execute_sql)?;
         }
 
-        // 4. Triggers
+        // 4. Triggers (drop obsolete triggers before creating/replacing so modified triggers never collide)
+        for drop_sql in drop_triggers {
+            let _ = execute_sql(&drop_sql);
+        }
         if !triggers_to_apply.is_empty() {
             execute_sqls_with_retry_custom(triggers_to_apply, &mut execute_sql)?;
         }
 
-        // 5. Drops (tables/columns/views/macros/triggers first, then sequences, then schemas)
+        // 5. Drops (tables/columns/views/macros first, then sequences, then schemas)
         for drop_sql in drops_to_apply {
             let _ = execute_sql(&drop_sql); // Ignore errors if already dropped by cascade
         }
@@ -1319,14 +1360,16 @@ pub fn apply_diff_with_lake_options(
         }
 
         if let Some(ref lake) = lake_info {
-            let commit_msg = format_ducklake_commit_message(diff, force_drop);
-            let safe_msg = commit_msg.replace('\'', "''");
-            let quoted_cat = format!("\"{}\"", lake.name.replace('"', "\"\""));
-            let tag_sql = format!(
-                "CALL {}.set_commit_message('duckpack', '{}');",
-                quoted_cat, safe_msg
-            );
-            let _ = execute_sql(&tag_sql);
+            if is_remote_effective {
+                let commit_msg = format_ducklake_commit_message(diff, force_drop);
+                let safe_msg = commit_msg.replace('\'', "''");
+                let quoted_cat = format!("\"{}\"", lake.name.replace('"', "\"\""));
+                let tag_sql = format!(
+                    "CALL {}.set_commit_message('duckpack', '{}');",
+                    quoted_cat, safe_msg
+                );
+                let _ = execute_sql(&tag_sql);
+            }
         }
 
         Ok(())
@@ -1415,21 +1458,35 @@ pub struct ResolvedTargetConfig {
     pub insecure: Option<bool>,
 }
 
-/// Formats a normalized `quack:<host>:<port>` connection endpoint.
+/// Formats a normalized `quack:<host>:<port>` connection endpoint (handling IPv6 brackets cleanly).
 pub fn format_quack_endpoint(host_raw: &str, port_raw: &str) -> String {
     let trimmed = host_raw.trim();
     let stripped = trimmed
         .strip_prefix("quack://")
         .or_else(|| trimmed.strip_prefix("quack:"))
         .unwrap_or(trimmed);
-    let endpoint = if stripped.contains(':') {
+    let port = if port_raw.trim().is_empty() {
+        "9494"
+    } else {
+        port_raw.trim()
+    };
+    let endpoint = if stripped.starts_with('[') {
+        if let Some(close_idx) = stripped.find(']') {
+            let after = &stripped[close_idx + 1..];
+            if after.starts_with(':') {
+                stripped.to_string()
+            } else {
+                format!("{}:{}", stripped, port)
+            }
+        } else {
+            stripped.to_string()
+        }
+    } else if stripped.matches(':').count() > 1 {
+        // Bare IPv6 address (e.g. "::1") without brackets
+        format!("[{}]:{}", stripped, port)
+    } else if stripped.contains(':') {
         stripped.to_string()
     } else {
-        let port = if port_raw.trim().is_empty() {
-            "9494"
-        } else {
-            port_raw.trim()
-        };
         format!("{}:{}", stripped, port)
     };
     format!("quack:{}", endpoint)
@@ -1444,7 +1501,7 @@ fn escape_ado_value(val: &str) -> String {
     }
 }
 
-fn escape_libpq_value(val: &str) -> String {
+pub(crate) fn escape_libpq_value(val: &str) -> String {
     let trimmed = val.trim();
     if trimmed.chars().any(|c| c.is_whitespace()) || trimmed.contains('\'') || trimmed.contains('\\') {
         format!("'{}'", trimmed.replace('\\', "\\\\").replace('\'', "\\'"))
@@ -1542,8 +1599,12 @@ pub fn format_ducklake_target(
                 );
             }
             let host_raw = host.trim();
-            if host_raw.starts_with("postgres:") || host_raw.starts_with("postgresql:") {
+            if host_raw.starts_with("postgresql://") || host_raw.starts_with("postgres://") {
+                format!("postgres:{}", host_raw)
+            } else if host_raw.starts_with("postgres:") {
                 host_raw.to_string()
+            } else if host_raw.starts_with("postgresql:") {
+                format!("postgres:{}", host_raw.trim_start_matches("postgresql:"))
             } else {
                 let p = if port.trim().is_empty() {
                     "5432"
@@ -1601,6 +1662,42 @@ pub fn format_ducklake_target(
     } else {
         Ok(format!("ducklake:{}", cat))
     }
+}
+
+/// Extracts Cloudflare R2 `<account_id>` from an endpoint like `<account_id>.r2.cloudflarestorage.com`.
+pub fn extract_r2_account_id(endpoint: &str) -> Option<String> {
+    let clean = endpoint
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let suffix = ".r2.cloudflarestorage.com";
+    if let Some(acct) = clean.strip_suffix(suffix) {
+        let trimmed = acct.trim();
+        if !trimmed.is_empty() && !trimmed.contains('<') && !trimmed.contains('/') {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Builds a native DuckDB v2.0 `TYPE R2` secret body (`KEY_ID`, `SECRET`, `ACCOUNT_ID`)
+/// so `r2://` URIs authenticate natively without falling back to `TYPE S3`.
+pub fn build_r2_secret_body(key_id: &str, secret_key: &str, account_id: &str) -> String {
+    let mut clauses = vec!["TYPE R2".to_string()];
+    let safe_key = key_id.trim().replace('\'', "''");
+    let safe_secret = secret_key.trim().replace('\'', "''");
+    let safe_acct = account_id.trim().replace('\'', "''");
+    if !safe_key.is_empty() {
+        clauses.push(format!("KEY_ID '{}'", safe_key));
+    }
+    if !safe_secret.is_empty() {
+        clauses.push(format!("SECRET '{}'", safe_secret));
+    }
+    if !safe_acct.is_empty() {
+        clauses.push(format!("ACCOUNT_ID '{}'", safe_acct));
+    }
+    clauses.join(", ")
 }
 
 /// Builds the inner `TYPE S3, KEY_ID ..., SECRET ..., REGION ..., ENDPOINT ..., URL_STYLE 'path', USE_SSL ...`
@@ -1710,7 +1807,7 @@ pub fn ensure_s3_secret_from_env(conn: &Connection, project_dir: Option<&Path>) 
 }
 
 /// Installs and loads the required DuckLake extensions (`ducklake`, plus `postgres`/`sqlite`/`quack`
-/// and `httpfs` when S3/HTTP storage paths are used) and binds Quack / S3 secrets on `conn`.
+/// and `httpfs`/`azure` when cloud storage paths are used) and optionally binds Quack / S3 secrets on `conn`.
 pub fn prepare_ducklake_connection(
     conn: &Connection,
     target_dsn: &str,
@@ -1718,31 +1815,70 @@ pub fn prepare_ducklake_connection(
     quack_token: Option<&str>,
     project_dir: Option<&Path>,
 ) -> Result<()> {
+    prepare_ducklake_connection_with_options(
+        conn,
+        target_dsn,
+        data_path_or_opts,
+        quack_token,
+        project_dir,
+        true,
+    )
+}
+
+/// Loads required DuckLake extensions with control over whether to mutate global Quack secrets.
+pub fn prepare_ducklake_connection_with_options(
+    conn: &Connection,
+    target_dsn: &str,
+    data_path_or_opts: &str,
+    quack_token: Option<&str>,
+    project_dir: Option<&Path>,
+    apply_global_quack_secret: bool,
+) -> Result<()> {
     ensure_extension_loaded(conn, "ducklake")
         .with_context(|| "Failed to install/load ducklake extension")?;
-    if target_dsn.contains("postgres") {
+    let stripped_dsn = target_dsn.trim().strip_prefix("ducklake:").unwrap_or(target_dsn.trim());
+    if stripped_dsn.starts_with("postgres:") || stripped_dsn.starts_with("postgresql:") {
         ensure_extension_loaded(conn, "postgres")
             .with_context(|| "Failed to install/load postgres extension for DuckLake catalog")?;
     }
-    if target_dsn.contains("sqlite") {
+    if stripped_dsn.starts_with("sqlite:") {
         ensure_extension_loaded(conn, "sqlite")
             .with_context(|| "Failed to install/load sqlite extension for DuckLake catalog")?;
     }
-    if target_dsn.contains("quack") {
+    if stripped_dsn.starts_with("quack:") || stripped_dsn.starts_with("quack://") {
         load_quack_extension(conn)
             .with_context(|| "Failed to install/load quack extension for DuckLake catalog")?;
-        let _ = apply_quack_token_secret(conn, quack_token);
+        if apply_global_quack_secret {
+            let _ = apply_quack_token_secret(conn, quack_token);
+        }
     }
     if target_dsn.contains("s3://")
+        || target_dsn.contains("r2://")
+        || target_dsn.contains("gcs://")
+        || target_dsn.contains("gs://")
         || target_dsn.contains("http://")
         || target_dsn.contains("https://")
         || data_path_or_opts.contains("s3://")
+        || data_path_or_opts.contains("r2://")
+        || data_path_or_opts.contains("gcs://")
+        || data_path_or_opts.contains("gs://")
         || data_path_or_opts.contains("http://")
         || data_path_or_opts.contains("https://")
     {
         ensure_extension_loaded(conn, "httpfs")
             .with_context(|| "Failed to install/load httpfs extension for DuckLake storage")?;
         ensure_s3_secret_from_env(conn, project_dir);
+    }
+    if target_dsn.contains("az://")
+        || target_dsn.contains("azure://")
+        || target_dsn.contains("abfss://")
+        || target_dsn.contains("abfs://")
+        || data_path_or_opts.contains("az://")
+        || data_path_or_opts.contains("azure://")
+        || data_path_or_opts.contains("abfss://")
+        || data_path_or_opts.contains("abfs://")
+    {
+        let _ = ensure_extension_loaded(conn, "azure");
     }
     Ok(())
 }
@@ -1815,7 +1951,13 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
             let data_path = tbl
                 .get("data_path")
                 .or_else(|| tbl.get("storage"))
-                .or_else(|| tbl.get("path"))
+                .or_else(|| {
+                    if matches!(backend.as_deref(), Some("file") | Some("duckdb") | Some("sqlite")) {
+                        None
+                    } else {
+                        tbl.get("path")
+                    }
+                })
                 .and_then(|v| v.as_str());
 
             let mut catalog_target = if let Some(cat) = catalog_explicit {
@@ -3828,5 +3970,34 @@ database = "FinanceDB"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_quack_loopback_ipv6_and_r2_helpers() {
+        assert!(is_quack_loopback("quack:localhost:9494"));
+        assert!(is_quack_loopback("quack:127.0.0.1:9494"));
+        assert!(is_quack_loopback("quack:[::1]:9494"));
+        assert!(!is_quack_loopback("quack:localhost.example.com:9494"));
+        assert!(!is_quack_loopback("quack:my-127.0.0.1.nip.io:9494"));
+
+        assert!(is_quack_zero_host("quack:0.0.0.0:9494"));
+        assert!(!is_quack_zero_host("quack:10.0.0.0:9494"));
+
+        assert_eq!(format_quack_endpoint("::1", "9494"), "quack:[::1]:9494");
+        assert_eq!(format_quack_endpoint("[::1]", "9494"), "quack:[::1]:9494");
+        assert_eq!(format_quack_endpoint("db.internal", "443"), "quack:db.internal:443");
+
+        assert_eq!(
+            format_ducklake_target("postgres", "postgresql://u:p@h:5432/meta", "", "", "", "", "")
+                .unwrap(),
+            "ducklake:postgres:postgresql://u:p@h:5432/meta"
+        );
+        assert_eq!(
+            extract_r2_account_id("https://acct123.r2.cloudflarestorage.com"),
+            Some("acct123".to_string())
+        );
+        let r2_body = build_r2_secret_body("k", "s", "acct123");
+        assert!(r2_body.contains("TYPE R2"));
+        assert!(r2_body.contains("ACCOUNT_ID 'acct123'"));
     }
 }

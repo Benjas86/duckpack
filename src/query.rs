@@ -36,12 +36,30 @@ pub fn wrap_remote_query_for_catalog(query: &str, catalog_alias: &str) -> (Strin
     let stripped = stripped_lines.join("\n");
     let trimmed = stripped.trim();
     let clean_stripped = trimmed.strip_suffix(';').unwrap_or(trimmed);
-    let lower = clean_stripped.to_lowercase();
-    let is_mutating_cte = lower.starts_with("with")
-        && (lower.contains(") insert into")
-            || lower.contains(") delete from")
-            || lower.contains(") update ")
-            || (lower.contains("insert into") && !lower.starts_with("with") == false && !lower.contains("select ")));
+    let lower_raw = clean_stripped.to_lowercase();
+    let mut lower = lower_raw.as_str();
+    loop {
+        if lower.starts_with("--") {
+            if let Some(idx) = lower.find('\n') {
+                lower = lower[idx..].trim_start();
+            } else {
+                lower = "";
+            }
+        } else if lower.starts_with("/*") {
+            if let Some(idx) = lower.find("*/") {
+                lower = lower[idx + 2..].trim_start();
+            } else {
+                lower = "";
+            }
+        } else {
+            break;
+        }
+    }
+    let normalized_ws = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let is_mutating_cte = normalized_ws.starts_with("with ")
+        && (normalized_ws.contains(") insert into")
+            || normalized_ws.contains(") delete from")
+            || normalized_ws.contains(") update "));
 
     let is_select = (lower.starts_with("select")
         || lower.starts_with("with")
@@ -76,7 +94,10 @@ pub fn wrap_remote_query_for_catalog(query: &str, catalog_alias: &str) -> (Strin
 /// `duckdb_settings()`, `duckdb_functions()`, `quack_active_connections()`, or `_duckpack_auth.*` macro calls).
 pub fn should_auto_route_to_quack(query: &str) -> bool {
     let lower = query.trim().to_lowercase();
-    if lower.contains(".query(") || lower.contains("quack_query(") {
+    if lower.contains(".query(")
+        || lower.contains("quack_query(")
+        || lower.contains("quack_query_by_name(")
+    {
         return false;
     }
     let mut clean_lower = lower.as_str();
@@ -105,6 +126,9 @@ pub fn should_auto_route_to_quack(query: &str) -> bool {
         || clean_lower.contains("duckdb_functions()")
         || clean_lower.contains("duckdb_settings()")
         || clean_lower.contains("quack_active_connections()")
+        || clean_lower.contains("quack_server_list()")
+        || clean_lower.contains("whoami()")
+        || clean_lower.contains("duckdb_logs_parsed('quack')")
         || clean_lower.contains("_duckpack_auth.authenticate(")
         || clean_lower.contains("_duckpack_auth.authorize(")
         || clean_lower.contains("_duckpack_auth.resolve_role(")
@@ -153,7 +177,7 @@ pub fn diagnose_remote_credential_error(err_str: &str, is_remote: bool) -> &'sta
     } else if !is_remote {
         ""
     } else if lower.contains("multiple streaming scans") || lower.contains("streaming scans + ctas") {
-        " [Hint: Quack protocol limitation. With DuckDB 2.0 native CONNECT target_db, queries run server-side natively!]"
+        " [Hint: Quack protocol limitation. Prefix query with '-- @remote' to run server-side via target_db.query(...).]"
     } else if lower.contains("s3")
         || lower.contains("403")
         || lower.contains("access denied")
@@ -162,7 +186,7 @@ pub fn diagnose_remote_credential_error(err_str: &str, is_remote: bool) -> &'sta
         || lower.contains("missing secret")
         || lower.contains("forbidden")
     {
-        " [Hint: Missing S3 secret on remote Quack? Run 'CREATE SECRET ...']"
+        " [Hint: Missing S3 secret on remote Quack? Add '-- @remote' above 'CREATE SECRET ...' to run on the server.]"
     } else {
         ""
     }

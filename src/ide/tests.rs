@@ -1257,7 +1257,7 @@ fn test_attach_modal_state_providers() {
         "postgres://postgres:pgpass@localhost:5432/analytics?sslmode=disable"
     );
 
-    // Test MySQL URI building
+    // Test MySQL key=value connection string building (DuckDB mysql extension syntax)
     modal.reset();
     modal.set_provider(5);
     modal.database = "store".to_string();
@@ -1268,7 +1268,7 @@ fn test_attach_modal_state_providers() {
     assert_eq!(mysql_alias, "store");
     assert_eq!(
         mysql_uri,
-        "mysql://root:mysqlpass@localhost:3306/store?ssl-mode=DISABLED"
+        "host=localhost port=3306 database=store user=root password=mysqlpass ssl_mode=disabled"
     );
 
     // Test Quack Target building
@@ -2184,7 +2184,7 @@ fn test_ducklake_snapshots_explorer_and_time_travel_modal() {
     assert_eq!(modal.mode, TimeTravelMode::Timestamp);
     assert_eq!(
         modal.build_sql().unwrap(),
-        "SELECT * FROM lake_db.gold_orders AT (TIMESTAMP => TIMESTAMP '2026-11-12 18:00:00') LIMIT 100;"
+        "SELECT * FROM lake_db.gold_orders AT (TIMESTAMP => TIMESTAMPTZ '2026-11-12 18:00:00') LIMIT 100;"
     );
 
     // Switch mode to TableChanges and switch table to mart.finance."revenue-daily"

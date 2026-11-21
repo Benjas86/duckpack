@@ -554,14 +554,33 @@ impl SecretModalState {
                             .to_string(),
                     );
                 } else {
-                    let _ = conn.execute("INSTALL httpfs; LOAD httpfs;", []);
-                    let secret_body = crate::engine::build_s3_secret_body(
-                        &self.key_id,
-                        &self.secret_key,
-                        &self.region,
-                        &self.endpoint,
-                        self.use_ssl,
-                    );
+                    let _ = crate::engine::ensure_extension_loaded(conn, "httpfs");
+                    let secret_body = if self.provider() == CloudProvider::CloudflareR2 {
+                        if let Some(acct_id) = crate::engine::extract_r2_account_id(&self.endpoint)
+                        {
+                            crate::engine::build_r2_secret_body(
+                                &self.key_id,
+                                &self.secret_key,
+                                &acct_id,
+                            )
+                        } else {
+                            crate::engine::build_s3_secret_body(
+                                &self.key_id,
+                                &self.secret_key,
+                                &self.region,
+                                &self.endpoint,
+                                self.use_ssl,
+                            )
+                        }
+                    } else {
+                        crate::engine::build_s3_secret_body(
+                            &self.key_id,
+                            &self.secret_key,
+                            &self.region,
+                            &self.endpoint,
+                            self.use_ssl,
+                        )
+                    };
                     let persistent_sql = format!(
                         "CREATE OR REPLACE PERSISTENT SECRET {} ({});",
                         safe_name, secret_body
@@ -695,8 +714,10 @@ pub(crate) fn populate_secret_modal_for_edit(
     secret_name: &str,
     modal: &mut SecretModalState,
 ) {
+    modal.reset();
     modal.is_open = true;
     modal.name = secret_name.to_string();
+    modal.region.clear();
     modal.active_field = 2; // Focus on Key ID by default
     modal.error_msg = None;
 

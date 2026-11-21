@@ -272,7 +272,7 @@ impl TimeTravelModalState {
                 }
                 let safe_ts = ts.replace('\'', "''");
                 Ok(format!(
-                    "SELECT * FROM {} AT (TIMESTAMP => TIMESTAMP '{}') LIMIT 100;",
+                    "SELECT * FROM {} AT (TIMESTAMP => TIMESTAMPTZ '{}') LIMIT 100;",
                     qualified_table, safe_ts
                 ))
             }

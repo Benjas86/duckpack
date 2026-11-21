@@ -324,8 +324,8 @@ pub fn load_table_columns_for(
     // 4. Query {db}.query directly if db is an attached quack DB on conn
     if cols.is_empty() {
         let direct_quack_col = format!(
-            "SELECT column_name, data_type FROM {}.query('SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = ''{}'' ORDER BY column_index')",
-            safe_db, safe_table
+            "SELECT column_name, data_type FROM {}.query('SELECT column_name, data_type FROM duckdb_columns() WHERE (schema_name = ''{}'' OR schema_name = ''{}'') AND table_name = ''{}'' ORDER BY column_index')",
+            safe_db, safe_schema, safe_leaf_schema, safe_table
         );
         if let Ok(mut stmt) = conn.prepare(&direct_quack_col) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -338,11 +338,11 @@ pub fn load_table_columns_for(
         }
     }
 
-    // 5. Query local duckdb_columns() on conn
+    // 5. Query local duckdb_columns() on conn (exact catalog & schema first, then 'temp' fallback for session temp tables)
     if cols.is_empty() {
         let col_cte_sql = format!(
-            "{} SELECT c.column_name, c.data_type FROM duckdb_columns() c LEFT JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE (c.database_name = '{}' OR c.database_name = 'temp' OR c.database_name = current_database()) AND (COALESCE(fs.full_schema_name, c.schema_name) = '{}' OR c.schema_name = '{}') AND c.table_name = '{}' ORDER BY c.column_index",
-            FULL_SCHEMAS_CTE, safe_db, safe_schema, safe_leaf_schema, safe_table
+            "{} SELECT c.column_name, c.data_type FROM duckdb_columns() c LEFT JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.database_name = '{}' AND COALESCE(fs.full_schema_name, c.schema_name) = '{}' AND c.table_name = '{}' ORDER BY c.column_index",
+            FULL_SCHEMAS_CTE, safe_db, safe_schema, safe_table
         );
         if let Ok(mut stmt) = conn.prepare(&col_cte_sql) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -355,10 +355,26 @@ pub fn load_table_columns_for(
         }
         if cols.is_empty() {
             let col_query = format!(
-                "SELECT column_name, data_type FROM duckdb_columns() WHERE (database_name = '{}' OR database_name = 'temp' OR database_name = current_database()) AND (schema_name = '{}' OR schema_name = '{}') AND table_name = '{}' ORDER BY column_index",
-                safe_db, safe_schema, safe_leaf_schema, safe_table
+                "SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = '{}' AND schema_name = '{}' AND table_name = '{}' ORDER BY column_index",
+                safe_db, safe_leaf_schema, safe_table
             );
             if let Ok(mut stmt) = conn.prepare(&col_query) {
+                if let Ok(mut rows) = stmt.query([]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                            cols.push((name, typ));
+                        }
+                    }
+                }
+            }
+        }
+        if cols.is_empty() && schema == "main" {
+            // Session temp tables/views live in catalog 'temp' while rendered under the active DB
+            let temp_col_query = format!(
+                "SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'temp' AND schema_name = 'main' AND table_name = '{}' ORDER BY column_index",
+                safe_table
+            );
+            if let Ok(mut stmt) = conn.prepare(&temp_col_query) {
                 if let Ok(mut rows) = stmt.query([]) {
                     while let Ok(Some(row)) = rows.next() {
                         if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
@@ -429,19 +445,20 @@ pub fn load_table_columns_for(
         }
     }
 
-    // Determine primary key columns for this table
+    // Determine primary key columns for this table (exact catalog + schema to avoid cross-catalog/cross-schema leakage)
     let mut pk_set = HashSet::new();
 
-    let pk_query = format!(
-        "SELECT unnest(constraint_column_names) \
-         FROM duckdb_constraints() \
-         WHERE constraint_type = 'PRIMARY KEY' \
-           AND (database_name = '{}' OR database_name = 'target_db' OR database_name = current_database()) \
-           AND (schema_name = '{}' OR schema_name = '{}' OR schema_name = 'main') \
-           AND table_name = '{}'",
-        safe_db, safe_schema, safe_leaf_schema, safe_table
+    let pk_cte_query = format!(
+        "{} SELECT unnest(c.constraint_column_names) \
+         FROM duckdb_constraints() c \
+         LEFT JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name \
+         WHERE c.constraint_type = 'PRIMARY KEY' \
+           AND c.database_name = '{}' \
+           AND COALESCE(fs.full_schema_name, c.schema_name) = '{}' \
+           AND c.table_name = '{}'",
+        FULL_SCHEMAS_CTE, safe_db, safe_schema, safe_table
     );
-    if let Ok(mut stmt) = conn.prepare(&pk_query) {
+    if let Ok(mut stmt) = conn.prepare(&pk_cte_query) {
         if let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
                 if let Ok(col) = row.get::<_, String>(0) {
@@ -451,9 +468,30 @@ pub fn load_table_columns_for(
         }
     }
 
+    if pk_set.is_empty() {
+        let pk_query = format!(
+            "SELECT unnest(constraint_column_names) \
+             FROM duckdb_constraints() \
+             WHERE constraint_type = 'PRIMARY KEY' \
+               AND database_name = '{}' \
+               AND schema_name = '{}' \
+               AND table_name = '{}'",
+            safe_db, safe_leaf_schema, safe_table
+        );
+        if let Ok(mut stmt) = conn.prepare(&pk_query) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(col) = row.get::<_, String>(0) {
+                        pk_set.insert(col.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+
     if pk_set.is_empty() && is_quack {
         let q_pk_query = format!(
-            "SELECT * FROM target_db.query('SELECT unnest(constraint_column_names) FROM duckdb_constraints() WHERE constraint_type = ''PRIMARY KEY'' AND (schema_name = ''{}'' OR schema_name = ''{}'' OR schema_name = ''main'') AND table_name = ''{}''')",
+            "SELECT * FROM target_db.query('SELECT unnest(constraint_column_names) FROM duckdb_constraints() WHERE constraint_type = ''PRIMARY KEY'' AND (schema_name = ''{}'' OR schema_name = ''{}'') AND table_name = ''{}''')",
             safe_schema, safe_leaf_schema, safe_table
         );
         if let Ok(mut stmt) = conn.prepare(&q_pk_query) {
@@ -469,41 +507,59 @@ pub fn load_table_columns_for(
 
     // Determine foreign key columns for this table: col_name -> "target_table.target_col"
     let mut fk_map: HashMap<String, String> = HashMap::new();
-    let fk_query = format!(
+    let fk_cte_query = format!(
+        "{} SELECT \
+            COALESCE(array_to_string(c.constraint_column_names, ','), ''), \
+            COALESCE(c.referenced_table, ''), \
+            COALESCE(array_to_string(c.referenced_column_names, ','), '') \
+         FROM duckdb_constraints() c \
+         LEFT JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name \
+         WHERE c.constraint_type = 'FOREIGN KEY' \
+           AND c.database_name = '{}' \
+           AND COALESCE(fs.full_schema_name, c.schema_name) = '{}' \
+           AND c.table_name = '{}'",
+        FULL_SCHEMAS_CTE, safe_db, safe_schema, safe_table
+    );
+    let fk_fallback_query = format!(
         "SELECT \
             COALESCE(array_to_string(constraint_column_names, ','), ''), \
             COALESCE(referenced_table, ''), \
             COALESCE(array_to_string(referenced_column_names, ','), '') \
          FROM duckdb_constraints() \
          WHERE constraint_type = 'FOREIGN KEY' \
-           AND (database_name = '{}' OR database_name = 'target_db' OR database_name = current_database()) \
-           AND (schema_name = '{}' OR schema_name = '{}' OR schema_name = 'main') \
+           AND database_name = '{}' \
+           AND schema_name = '{}' \
            AND table_name = '{}'",
-        safe_db, safe_schema, safe_leaf_schema, safe_table
+        safe_db, safe_leaf_schema, safe_table
     );
-    if let Ok(mut stmt) = conn.prepare(&fk_query) {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let (Ok(cols_str), Ok(ref_tbl), Ok(ref_cols_str)) = (
-                    row.get::<_, String>(0),
-                    row.get::<_, String>(1),
-                    row.get::<_, String>(2),
-                ) {
-                    let cols: Vec<&str> = cols_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-                    let ref_cols: Vec<&str> = ref_cols_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-                    for (i, c) in cols.iter().enumerate() {
-                        let target = if let Some(rc) = ref_cols.get(i) {
-                            if ref_tbl.is_empty() {
-                                rc.to_string()
+    for fk_query in [&fk_cte_query, &fk_fallback_query] {
+        if !fk_map.is_empty() {
+            break;
+        }
+        if let Ok(mut stmt) = conn.prepare(fk_query) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(cols_str), Ok(ref_tbl), Ok(ref_cols_str)) = (
+                        row.get::<_, String>(0),
+                        row.get::<_, String>(1),
+                        row.get::<_, String>(2),
+                    ) {
+                        let cols: Vec<&str> = cols_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                        let ref_cols: Vec<&str> = ref_cols_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                        for (i, c) in cols.iter().enumerate() {
+                            let target = if let Some(rc) = ref_cols.get(i) {
+                                if ref_tbl.is_empty() {
+                                    rc.to_string()
+                                } else {
+                                    format!("{}.{}", ref_tbl, rc)
+                                }
+                            } else if !ref_tbl.is_empty() {
+                                ref_tbl.clone()
                             } else {
-                                format!("{}.{}", ref_tbl, rc)
-                            }
-                        } else if !ref_tbl.is_empty() {
-                            ref_tbl.clone()
-                        } else {
-                            "unknown".to_string()
-                        };
-                        fk_map.insert(c.to_lowercase(), target);
+                                "unknown".to_string()
+                            };
+                            fk_map.insert(c.to_lowercase(), target);
+                        }
                     }
                 }
             }
@@ -516,7 +572,7 @@ pub fn load_table_columns_for(
                 COALESCE(constraint_column_names, ''), \
                 COALESCE(referenced_table, ''), \
                 COALESCE(referenced_column_names, '') \
-             FROM target_db.query('SELECT array_to_string(constraint_column_names, '','') as constraint_column_names, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type = ''FOREIGN KEY'' AND (schema_name = ''{}'' OR schema_name = ''{}'' OR schema_name = ''main'') AND table_name = ''{}''')",
+             FROM target_db.query('SELECT array_to_string(constraint_column_names, '','') as constraint_column_names, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type = ''FOREIGN KEY'' AND (schema_name = ''{}'' OR schema_name = ''{}'') AND table_name = ''{}''')",
             safe_schema, safe_leaf_schema, safe_table
         );
         if let Ok(mut stmt) = conn.prepare(&q_fk_query) {
@@ -1108,7 +1164,7 @@ pub fn load_explorer_metadata(
 
     let mut macros: Vec<String> = Vec::new();
     if is_remote_multi_db || is_quack {
-        let quack_macro_sql = "SELECT function_name FROM target_db.query('SELECT CASE WHEN schema_name = ''main'' THEN function_name ELSE schema_name || ''.'' || function_name END AS function_name FROM duckdb_functions() WHERE function_type = ''macro'' AND internal = false ORDER BY 1')";
+        let quack_macro_sql = "SELECT function_name FROM target_db.query('SELECT DISTINCT CASE WHEN schema_name = ''main'' THEN function_name ELSE schema_name || ''.'' || function_name END AS function_name FROM duckdb_functions() WHERE function_type IN (''macro'', ''table_macro'') AND internal = false ORDER BY 1')";
         if let Ok(mut stmt) = conn.prepare(quack_macro_sql) {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
@@ -1123,14 +1179,14 @@ pub fn load_explorer_metadata(
         }
     }
     if macros.is_empty() {
-        if let Ok(mut stmt) = conn.prepare("SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false ORDER BY 1") {
+        if let Ok(mut stmt) = conn.prepare("SELECT DISTINCT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END FROM duckdb_functions() WHERE function_type IN ('macro', 'table_macro') AND internal = false ORDER BY 1") {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let Ok(name) = row.get::<_, String>(0) {
                         if name.starts_with("__duckpack_") {
                             continue;
                         }
-                        macros.push(name);
+                        if !macros.contains(&name) { macros.push(name); }
                     }
                 }
             }
@@ -1231,7 +1287,7 @@ pub fn load_explorer_metadata(
     queries.sort();
 
     let mut secrets: Vec<(String, String)> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT name, type FROM duckdb_secrets() WHERE type IN ('s3', 'r2', 'gcs', 'azure', 'quack', 'motherduck')") {
+    if let Ok(mut stmt) = conn.prepare("SELECT name, type FROM duckdb_secrets() WHERE lower(type) IN ('s3', 'r2', 'gcs', 'azure', 'quack', 'motherduck', 'http', 'ducklake', 'postgres', 'mysql')") {
         if let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
                 if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
@@ -1268,31 +1324,40 @@ pub fn load_explorer_metadata(
     }
 }
 
+fn is_cloud_path_dir(file_path: &str) -> bool {
+    if file_path.ends_with('/') {
+        return true;
+    }
+    let leaf = file_path.rsplit('/').next().unwrap_or(file_path);
+    !leaf.contains('.')
+}
+
 /// Lists files and subdirectories within a cloud bucket URI using DuckDB glob, returning descriptive errors if unreachable.
 pub fn list_s3_bucket_objects(conn: &Connection, bucket_uri: &str) -> Result<Vec<(String, bool)>, String> {
     let clean_bucket = bucket_uri.trim_end_matches('/');
-    let glob_sql = format!("SELECT file FROM glob('{clean_bucket}/*') LIMIT 100;");
+    let safe_bucket = clean_bucket.replace('\'', "''");
+    let glob_sql = format!("SELECT file FROM glob('{safe_bucket}/*') LIMIT 100;");
     let mut results = Vec::new();
-    
+    let mut seen_paths = std::collections::HashSet::new();
+
     let mut stmt = conn.prepare(&glob_sql).map_err(|e| e.to_string())?;
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         if let Ok(file_path) = row.get::<_, String>(0) {
-            let is_dir = file_path.ends_with('/') || !file_path.contains('.');
-            results.push((file_path, is_dir));
+            let is_dir = is_cloud_path_dir(&file_path);
+            let normalized = file_path.trim_end_matches('/').to_string();
+            if seen_paths.insert(normalized) {
+                results.push((file_path, is_dir));
+            }
         }
     }
 
-    if !results.is_empty() {
-        return Ok(results);
-    }
-
-    // Direct glob returned 0 items; attempt recursive glob to discover nested folders/files
-    let rec_sql = format!("SELECT file FROM glob('{clean_bucket}/**') LIMIT 150;");
+    // Also probe recursive glob so nested virtual subdirectories (S3/R2/GCS prefixes) are
+    // discovered even when top-level files exist alongside nested folders.
+    let rec_sql = format!("SELECT file FROM glob('{safe_bucket}/**') LIMIT 150;");
     if let Ok(mut rec_stmt) = conn.prepare(&rec_sql) {
         if let Ok(mut rec_rows) = rec_stmt.query([]) {
             let prefix_with_slash = format!("{}/", clean_bucket);
-            let mut seen_dirs = std::collections::HashSet::new();
 
             while let Ok(Some(row)) = rec_rows.next() {
                 if let Ok(file_path) = row.get::<_, String>(0) {
@@ -1300,14 +1365,15 @@ pub fn list_s3_bucket_objects(conn: &Connection, bucket_uri: &str) -> Result<Vec
                         if let Some(slash_idx) = rel.find('/') {
                             let dir_name = &rel[..slash_idx];
                             let dir_path = format!("{}{}", prefix_with_slash, dir_name);
-                            if seen_dirs.insert(dir_path.clone()) {
+                            if seen_paths.insert(dir_path.clone()) {
                                 results.push((dir_path, true));
                             }
-                        } else {
-                            results.push((file_path, false));
+                        } else if seen_paths.insert(file_path.trim_end_matches('/').to_string()) {
+                            let is_dir = is_cloud_path_dir(&file_path);
+                            results.push((file_path, is_dir));
                         }
-                    } else {
-                        let is_dir = file_path.ends_with('/') || !file_path.contains('.');
+                    } else if seen_paths.insert(file_path.trim_end_matches('/').to_string()) {
+                        let is_dir = is_cloud_path_dir(&file_path);
                         results.push((file_path, is_dir));
                     }
                 }
@@ -1319,10 +1385,12 @@ pub fn list_s3_bucket_objects(conn: &Connection, bucket_uri: &str) -> Result<Vec
 }
 
 /// Builds the SQL statements used to invalidate/refresh cached catalog metadata
-/// for an attached external database of the given `db_type` (`mssql`, `postgres`, `mysql`, `motherduck`).
+/// for an attached external database of the given `db_type` (`quack`, `mssql`, `postgres`, `mysql`, `motherduck`).
 pub fn refresh_database_catalog_cache_sql(db_name: &str, db_type: &str) -> Vec<String> {
     let safe_name = db_name.replace('\'', "''");
-    if db_type.eq_ignore_ascii_case("mssql") {
+    if db_type.eq_ignore_ascii_case("quack") {
+        vec!["CALL quack_clear_cache();".to_string()]
+    } else if db_type.eq_ignore_ascii_case("mssql") {
         vec![
             format!("SELECT mssql_invalidate_cache('{safe_name}');"),
             format!("SELECT mssql_refresh_cache('{safe_name}');"),
@@ -1330,7 +1398,7 @@ pub fn refresh_database_catalog_cache_sql(db_name: &str, db_type: &str) -> Vec<S
     } else if db_type.eq_ignore_ascii_case("postgres")
         || db_type.eq_ignore_ascii_case("postgresql")
     {
-        vec!["CALL pg_clear_cache();".to_string()]
+        vec!["CALL postgres_clear_cache();".to_string()]
     } else if db_type.eq_ignore_ascii_case("mysql") {
         vec!["CALL mysql_clear_cache();".to_string()]
     } else if db_type.eq_ignore_ascii_case("motherduck") {
@@ -1344,24 +1412,28 @@ pub fn refresh_database_catalog_cache_sql(db_name: &str, db_type: &str) -> Vec<S
 /// explorer immediately see any new tables, views, or schema changes created on the server.
 pub fn refresh_attached_catalog(conn: &Connection, db_path: &str, quack_disable_ssl: bool) {
     if db_path.starts_with("quack:") {
-        let disable_ssl = crate::engine::should_disable_quack_ssl(db_path, quack_disable_ssl);
-        // Safety probe: Before detaching target_db, test ATTACH under a temporary probe alias.
-        // If probing fails (e.g. network timeout, TLS mismatch, server busy), we NEVER detach or drop target_db!
-        let probe_sql = format!(
-            "ATTACH '{}' AS __duckpack_quack_probe{};",
-            db_path.replace('\'', "''"),
-            if disable_ssl { " (DISABLE_SSL true)" } else { "" }
-        );
-        if conn.execute(&probe_sql, []).is_ok() {
-            let _ = conn.execute("DETACH __duckpack_quack_probe;", []);
-            let attach_sql = crate::engine::build_quack_attach_sql(db_path, disable_ssl);
-            let _ = conn.execute("USE memory;", []);
-            let _ = conn.execute("DETACH target_db;", []);
-            let _ = conn.execute(&attach_sql, []);
-            // In DuckDB v2, keep 'memory' as the default session catalog so that
-            // local prepared statements register correctly, while target_db is attached
-            // and accessible via 'target_db' qualifier or target_db.query().
-            let _ = conn.execute("SET search_path = 'target_db.main,main';", []);
+        // Prefer DuckDB v2.0 native `CALL quack_clear_cache();` so we refresh the remote
+        // catalog cache in-place without detaching `target_db` or dropping per-alias TOKEN/CLIENT_ID.
+        if conn.execute_batch("CALL quack_clear_cache();").is_err() {
+            let disable_ssl = crate::engine::should_disable_quack_ssl(db_path, quack_disable_ssl);
+            // Safety probe fallback: Before detaching target_db, test ATTACH under a temporary probe alias.
+            // If probing fails (e.g. network timeout, TLS mismatch, server busy), we NEVER detach or drop target_db!
+            let probe_sql = format!(
+                "ATTACH '{}' AS __duckpack_quack_probe{};",
+                db_path.replace('\'', "''"),
+                if disable_ssl { " (DISABLE_SSL true)" } else { "" }
+            );
+            if conn.execute(&probe_sql, []).is_ok() {
+                let _ = conn.execute("DETACH __duckpack_quack_probe;", []);
+                let attach_sql = crate::engine::build_quack_attach_sql(db_path, disable_ssl);
+                let _ = conn.execute("USE memory;", []);
+                let _ = conn.execute("DETACH target_db;", []);
+                let _ = conn.execute(&attach_sql, []);
+                // In DuckDB v2, keep 'memory' as the default session catalog so that
+                // local prepared statements register correctly, while target_db is attached
+                // and accessible via 'target_db' qualifier or target_db.query().
+                let _ = conn.execute("SET search_path = 'target_db.main,main';", []);
+            }
         }
     } else if db_path.starts_with("md:") || db_path.starts_with("motherduck:") {
         let _ = conn.execute("REFRESH DATABASES;", []);
@@ -1659,7 +1731,11 @@ mod tests {
         );
         assert_eq!(
             refresh_database_catalog_cache_sql("pg_db", "postgres"),
-            vec!["CALL pg_clear_cache();".to_string()]
+            vec!["CALL postgres_clear_cache();".to_string()]
+        );
+        assert_eq!(
+            refresh_database_catalog_cache_sql("remote_q", "quack"),
+            vec!["CALL quack_clear_cache();".to_string()]
         );
         assert_eq!(
             refresh_database_catalog_cache_sql("mysql_db", "mysql"),

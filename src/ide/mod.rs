@@ -2723,22 +2723,21 @@ pub fn run_ide_loop_with_workspace(
                                             );
                                             trigger_explorer_refresh = true;
                                         }
-                                        let hint = " (Hint: '-- @remote' is deprecated in DuckDB v2.0; queries now execute natively via CONNECT target_db.)";
                                         if count > 0 {
                                             status_msg = format!(
-                                                "Remote statement executed successfully. Returned {} rows in {:.2?}.{}",
-                                                count, elapsed, hint
+                                                "Remote statement executed on server. Returned {} rows in {:.2?}.",
+                                                count, elapsed
                                             );
                                         } else {
                                             status_msg = format!(
-                                                "Remote statement executed successfully in {:.2?}.{}",
-                                                elapsed, hint
+                                                "Remote statement executed on server in {:.2?}.",
+                                                elapsed
                                             );
                                         }
                                     } else if is_remote_db
                                         && is_unadorned_secret_or_setting(&query_to_execute)
                                     {
-                                        status_msg = "⚠️ Applied LOCALLY on DuckPack! Use '-- @remote' at top of query to apply to remote Quack.".to_string();
+                                        status_msg = "⚠️ Applied LOCALLY on DuckPack! Prefix with '-- @remote' to run session secrets/settings on the remote Quack server.".to_string();
                                     } else {
                                         if is_catalog_mutation {
                                             refresh_attached_catalog(

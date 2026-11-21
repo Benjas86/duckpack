@@ -779,32 +779,20 @@ JOIN memory.customer_categories mem ON rt.customer_id = mem.customer_id;
 ```
 Standard `SELECT` queries, aggregations, cross-database joins, and DML run natively across the connection without requiring any special annotations.
 
-### DuckDB v2.0 Native `CONNECT` Session Management
+### Remote Query Routing & The `-- @remote` Directive
 
-In DuckDB v2.0, the Quack remote protocol graduates to first-class connection sessions via the native `CONNECT target_db;` statement. When DuckPack attaches to a remote Quack server, it immediately establishes session context on the remote server:
+When connected to a remote Quack server, DuckPack keeps the local `memory` catalog attached alongside `target_db` (with `SET search_path = 'target_db.main,main'`) so that federated cross-database joins, local temp tables, and IDE metadata queries work seamlessly.
 
-```sql
-ATTACH 'quack:analytics.company.com:443' AS target_db;
-CONNECT target_db;
-```
+- **Automatic Server Pushdown:** DDL (`CREATE TABLE`, `CREATE VIEW`, `CREATE SECURE VIEW`, `CREATE SCHEMA`, `CREATE TRIGGER`, `DROP`, `ALTER`), mutating CTEs, and Quack admin functions (`quack_active_connections()`, `quack_server_list()`, `whoami()`) are automatically routed to the remote server via `target_db.query(...)`.
+- **Standard Queries & Federated Joins:** Standard `SELECT` queries, aggregations, cross-database joins (`target_db.orders JOIN memory.local_ref`), and DML execute directly across the attached Quack catalog.
+- **Explicit `-- @remote` Directive:** Session-scoped statements (`CREATE SECRET`, `SET`, `INSTALL`, `LOAD`) apply to your **local** DuckPack session by default. Prefix a query with `-- @remote` on the first line to execute it directly on the remote Quack server session:
 
-With `CONNECT target_db;` active:
-- **Zero-Friction Execution:** All standard queries, DDL (`CREATE TABLE`, `CREATE SCHEMA`), DML (`INSERT`, `UPDATE`, `DELETE`), CTEs, and session configuration commands execute directly on the remote server without manual wrappers.
-- **Native Secrets & Settings:** `CREATE SECRET (TYPE S3 ...)` and `SET variable = ...` statements apply directly to the remote server session without needing special client-side redirection.
-
-### The `-- @remote` Query Directive (Sunset & Backwards Compatibility)
-
-In DuckDB 1.x, session-scoped entities (such as secrets and configuration settings) were held in local client memory unless wrapped via `-- @remote`. 
-
-With DuckDB v2.0's native `CONNECT` architecture, **`-- @remote` is sunsetted as a requirement**. DuckPack maintains backwards-compatible support: if an existing script or query contains `-- @remote`, DuckPack strips the directive and executes the statement natively without errors.
-
-| Statement Type | DuckDB v1.x (`-- @remote`) | DuckDB v2.0 (`CONNECT target_db`) |
-| :--- | :---: | :--- |
-| `CREATE TABLE` / `CREATE VIEW` / `CREATE SECURE VIEW` | Standard SQL | Native server-side execution. |
-| `SELECT` / CTEs / DML | Standard SQL | Native server-side execution (including CTE DML). |
-| `CREATE SECRET (TYPE S3 ...)` | Required `-- @remote` | Native server-side execution via `CONNECT`. |
-| `SET variable = ...` | Required `-- @remote` | Native server-side execution via `CONNECT`. |
-| `INSTALL` / `LOAD` | Required `-- @remote` | Native server-side execution via `CONNECT`. |
+| Statement Type | Default Execution | With `-- @remote` |
+| :--- | :--- | :--- |
+| `SELECT` / Federated Joins | Executed via attached `target_db` catalog (supports `memory` joins). | Runs directly on the remote server via `target_db.query(...)`. |
+| `CREATE TABLE` / `VIEW` / `SECURE VIEW` / `TRIGGER` / `DROP` / `ALTER` | Auto-routed to the remote server. | Runs directly on the remote server. |
+| `CREATE SECRET (TYPE S3 ...)` | Local client session (for local file/bucket browsing). | Creates the secret inside the remote Quack server session. |
+| `SET variable = ...` / `INSTALL` / `LOAD` | Local client session. | Applies directly to the remote Quack server session. |
 
 
 ### SSL & Non-TLS Options
@@ -864,7 +852,7 @@ When you run `duckpack apply`, DuckPack automatically:
 Inside `duckpack explore`, press **`Ctrl+U`** (or select **`🛡️ Quack RBAC & Sessions (Ctrl+U)`** in the Explorer tree):
 
 - **Tab 1 — Live Sessions (`quack_active_connections()`)**:
-  - `c`: Cancel an active query (`quack_cancel(server_id, connection_id)`)
+  - `c`: Cancel an active query (`quack_cancel(catalog, connection_id)`)
   - `x`: Revoke or restore a session immediately (writes `revoked = true/false` into `_duckpack_auth.quack_sessions`)
   - `r`: Cycle a live session's role override (`admin` / `writer` / `reader`)
   - `u` / `F5`: Refresh active connections
@@ -891,10 +879,10 @@ duckpack apply --env prod --rbac-only --auto-approve
 
 Press **`e`** inside `Ctrl+U` to generate the ready-to-use `scripts/quack_rbac_post_start.sh` (`chmod 0755`), which retries until Quack is ready and runs `--rbac-only --auto-approve`:
 
-- **Docker Entrypoint**:
+- **Docker Entrypoint** (note `allow_other_hostname = true` for `0.0.0.0`, and `-init` + `-no-stdin` or `duckdb -serve` so the process stays running):
   ```bash
   /app/scripts/quack_rbac_post_start.sh &
-  exec duckdb /data/warehouse.duckdb -c "LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '${QUACK_MASTER_TOKEN}', disable_ssl = true);"
+  exec duckdb /data/warehouse.duckdb -init <(printf "LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '%s', disable_ssl = true, allow_other_hostname = true);\n" "${QUACK_MASTER_TOKEN}") -no-stdin
   ```
 - **Docker Compose**:
   ```yaml
@@ -904,7 +892,7 @@ Press **`e`** inside `Ctrl+U` to generate the ready-to-use `scripts/quack_rbac_p
       environment:
         DUCKPACK_ENV: prod
         QUACK_MASTER_TOKEN: ${QUACK_MASTER_TOKEN}
-      entrypoint: ["/bin/bash", "-c", "/app/scripts/quack_rbac_post_start.sh & exec duckdb /data/warehouse.duckdb -c \"LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '$QUACK_MASTER_TOKEN', disable_ssl = true);\""]
+      entrypoint: ["/bin/bash", "-c", "/app/scripts/quack_rbac_post_start.sh & exec duckdb /data/warehouse.duckdb -init <(printf \"LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '%s', disable_ssl = true, allow_other_hostname = true);\\n\" \"$QUACK_MASTER_TOKEN\") -no-stdin"]
   ```
 - **Kubernetes `lifecycle.postStart`**:
   ```yaml
@@ -916,7 +904,7 @@ Press **`e`** inside `Ctrl+U` to generate the ready-to-use `scripts/quack_rbac_p
 - **systemd (`ExecStartPost`)**:
   ```ini
   [Service]
-  ExecStart=/usr/local/bin/duckdb /var/lib/duckdb/warehouse.duckdb -c "LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '${QUACK_MASTER_TOKEN}', disable_ssl = true);"
+  ExecStart=/bin/bash -c "/usr/local/bin/duckdb /var/lib/duckdb/warehouse.duckdb -init <(printf \"LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '%s', disable_ssl = true, allow_other_hostname = true);\\n\" \"${QUACK_MASTER_TOKEN}\") -no-stdin"
   ExecStartPost=/opt/my_project/scripts/quack_rbac_post_start.sh
   ```
 
