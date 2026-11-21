@@ -124,6 +124,7 @@ pub(crate) struct AttachModalState {
     pub(crate) disable_ssl: bool,
     pub(crate) insecure: bool,
     pub(crate) trusted_connection: bool,
+    pub(crate) save_to_toml: bool,
     pub(crate) active_field: usize,
     pub(crate) error_msg: Option<String>,
 }
@@ -148,6 +149,7 @@ impl AttachModalState {
             disable_ssl: false,
             insecure: false,
             trusted_connection: false,
+            save_to_toml: false,
             active_field: 1,
             error_msg: None,
         };
@@ -173,6 +175,7 @@ impl AttachModalState {
         self.disable_ssl = false;
         self.insecure = false;
         self.trusted_connection = false;
+        self.save_to_toml = false;
         self.active_field = 1;
         self.error_msg = None;
         self.set_provider(0);
@@ -1261,10 +1264,26 @@ impl AttachModalState {
         };
         f.render_widget(ratatui::widgets::Clear, popup_area);
 
+        let save_badge = if self.save_to_toml {
+            " [X] Save to duckpack.toml (Ctrl+S) "
+        } else {
+            " [ ] Save to duckpack.toml (Ctrl+S) "
+        };
         let modal_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .title(" 🔌 Attach Database (Ctrl+A) ")
+            .title_bottom(
+                Line::from(save_badge)
+                    .alignment(Alignment::Right)
+                    .style(if self.save_to_toml {
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    }),
+            )
             .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
         f.render_widget(modal_block.clone(), popup_area);
 
@@ -2699,11 +2718,35 @@ impl AttachModalState {
                                 let quack_dsn = safe_path
                                     .strip_prefix("ducklake:")
                                     .unwrap_or(&safe_path);
+                                let mut mp: Vec<String> = Vec::new();
                                 if self.disable_ssl
                                     || self.insecure
                                     || crate::engine::should_disable_quack_ssl(quack_dsn, false)
                                 {
-                                    opts.push("METADATA_PARAMETERS MAP {'DISABLE_SSL': true}".to_string());
+                                    mp.push("'DISABLE_SSL': true".to_string());
+                                }
+                                let opt_dl_tok = if self.password.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(self.password.trim())
+                                };
+                                if let Some(tok) = crate::engine::resolve_explicit_quack_token(opt_dl_tok) {
+                                    let sec_name = format!(
+                                        "__dp_att_quack_{}",
+                                        crate::workspace::env_var_slug(&alias).to_lowercase()
+                                    );
+                                    let _ = conn.execute(
+                                        &format!(
+                                            "CREATE OR REPLACE SECRET \"{}\" (TYPE QUACK, TOKEN '{}', SCOPE '{}');",
+                                            sec_name,
+                                            tok.replace('\'', "''"),
+                                            quack_dsn.replace('\'', "''")
+                                        ),
+                                        [],
+                                    );
+                                }
+                                if !mp.is_empty() {
+                                    opts.push(format!("METADATA_PARAMETERS MAP {{{}}}", mp.join(", ")));
                                 }
                             }
                         }
@@ -2761,9 +2804,194 @@ impl AttachModalState {
         None
     }
 
+    /// Persists the currently configured attachment into `duckpack.toml` (under `[[env.<profile>.attach]]`
+    /// when `env_profile` is set, else `[[attach]]`) and stores any password/token in `.env` (`0600`).
+    pub(crate) fn persist_to_workspace(
+        &self,
+        alias: &str,
+        project_dir: &Path,
+        env_profile: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let slug = crate::workspace::env_var_slug(alias);
+        let mut env_pairs: Vec<(String, String)> = Vec::new();
+        let port_u16 = self.port.trim().parse::<u16>().ok();
+        let opt_non_empty = |s: &str| {
+            let t = s.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        };
+
+        let entry = match self.provider() {
+            AttachProvider::DuckDB => crate::workspace::WorkspaceAttachment {
+                alias: alias.to_string(),
+                attach_type: "duckdb".to_string(),
+                path: opt_non_empty(&self.path),
+                read_only: self.read_only,
+                ..Default::default()
+            },
+            AttachProvider::SQLite => crate::workspace::WorkspaceAttachment {
+                alias: alias.to_string(),
+                attach_type: "sqlite".to_string(),
+                path: opt_non_empty(&self.path),
+                read_only: self.read_only,
+                ..Default::default()
+            },
+            AttachProvider::Quack => {
+                let token_env = if !self.password.trim().is_empty() {
+                    let var = format!("QUACK_{}_TOKEN", slug);
+                    env_pairs.push((var.clone(), self.password.trim().to_string()));
+                    Some(var)
+                } else {
+                    None
+                };
+                crate::workspace::WorkspaceAttachment {
+                    alias: alias.to_string(),
+                    attach_type: "quack".to_string(),
+                    metadata: Some(crate::engine::format_quack_endpoint(&self.host, &self.port)),
+                    token_env,
+                    read_only: self.read_only,
+                    insecure: self.disable_ssl || self.insecure,
+                    ..Default::default()
+                }
+            }
+            AttachProvider::DuckLake => {
+                let backend = match self.ducklake_backend {
+                    DuckLakeBackend::Quack => "quack",
+                    DuckLakeBackend::PostgreSQL => "postgres",
+                    DuckLakeBackend::LocalFile => "file",
+                    DuckLakeBackend::SQLite => "sqlite",
+                };
+                let (metadata, host, port, database, username, token_env, password_env) =
+                    match self.ducklake_backend {
+                        DuckLakeBackend::Quack => {
+                            let tok_env = if !self.password.trim().is_empty() {
+                                let var = format!("QUACK_{}_TOKEN", slug);
+                                env_pairs.push((var.clone(), self.password.trim().to_string()));
+                                Some(var)
+                            } else {
+                                None
+                            };
+                            (
+                                Some(crate::engine::format_quack_endpoint(&self.host, &self.port)),
+                                None,
+                                None,
+                                None,
+                                None,
+                                tok_env,
+                                None,
+                            )
+                        }
+                        DuckLakeBackend::PostgreSQL => {
+                            let pass_env = if !self.password.trim().is_empty() {
+                                let var = format!("DUCKLAKE_{}_PASSWORD", slug);
+                                env_pairs.push((var.clone(), self.password.trim().to_string()));
+                                Some(var)
+                            } else {
+                                None
+                            };
+                            (
+                                None,
+                                opt_non_empty(&self.host),
+                                port_u16,
+                                opt_non_empty(&self.database),
+                                opt_non_empty(&self.username),
+                                None,
+                                pass_env,
+                            )
+                        }
+                        DuckLakeBackend::LocalFile | DuckLakeBackend::SQLite => (
+                            opt_non_empty(&self.path),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ),
+                    };
+                crate::workspace::WorkspaceAttachment {
+                    alias: alias.to_string(),
+                    attach_type: "ducklake".to_string(),
+                    backend: Some(backend.to_string()),
+                    metadata,
+                    host,
+                    port,
+                    database,
+                    username,
+                    password_env,
+                    token_env,
+                    data_path: opt_non_empty(&self.data_path),
+                    read_only: self.read_only,
+                    insecure: self.disable_ssl || self.insecure,
+                    ..Default::default()
+                }
+            }
+            AttachProvider::MotherDuck => {
+                let token_env = if !self.password.trim().is_empty() {
+                    let var = format!("MOTHERDUCK_{}_TOKEN", slug);
+                    env_pairs.push((var.clone(), self.password.trim().to_string()));
+                    Some(var)
+                } else {
+                    None
+                };
+                crate::workspace::WorkspaceAttachment {
+                    alias: alias.to_string(),
+                    attach_type: "motherduck".to_string(),
+                    database: opt_non_empty(&self.path),
+                    token_env,
+                    read_only: self.read_only,
+                    ..Default::default()
+                }
+            }
+            AttachProvider::PostgreSQL | AttachProvider::MySQL | AttachProvider::MSSQL => {
+                let ptype = match self.provider() {
+                    AttachProvider::PostgreSQL => "postgres",
+                    AttachProvider::MySQL => "mysql",
+                    _ => "mssql",
+                };
+                let pass_env = if !self.password.trim().is_empty() {
+                    let var = format!("{}_{}_PASSWORD", ptype.to_uppercase(), slug);
+                    env_pairs.push((var.clone(), self.password.trim().to_string()));
+                    Some(var)
+                } else {
+                    None
+                };
+                crate::workspace::WorkspaceAttachment {
+                    alias: alias.to_string(),
+                    attach_type: ptype.to_string(),
+                    host: opt_non_empty(&self.host),
+                    port: port_u16,
+                    database: opt_non_empty(&self.database),
+                    username: opt_non_empty(&self.username),
+                    password_env: pass_env,
+                    read_only: self.read_only,
+                    insecure: self.insecure,
+                    disable_ssl: self.disable_ssl,
+                    trusted_connection: self.trusted_connection,
+                    ..Default::default()
+                }
+            }
+        };
+
+        let pair_refs: Vec<(&str, &str)> = env_pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (toml_p, _) =
+            crate::workspace::save_attachment_to_workspace(project_dir, env_profile, &entry, &pair_refs)?;
+        Ok(format!(
+            "Saved '{}' to {}",
+            alias,
+            toml_p.file_name().unwrap_or_default().to_string_lossy()
+        ))
+    }
+
     /// Processes a keyboard event in the Attach Database modal.
     /// Returns `Some(attached_alias)` if a database was attached successfully.
     pub(crate) fn handle_key(&mut self, key: KeyEvent, conn: &Connection) -> Option<String> {
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.save_to_toml = !self.save_to_toml;
+            return None;
+        }
         if key.code == KeyCode::Esc {
             self.is_open = false;
         } else if key.code == KeyCode::Tab {

@@ -523,6 +523,8 @@ pub fn diff(
         let mut conn = spec
             .connect()
             .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
+        let _ = crate::workspace::apply_workspace_secrets(&conn, &p_dir, env)
+            .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
         let active_cat =
             schema_diff::validate_target_catalog_exec(&mut conn, req_catalog.as_deref(), false)
                 .map_err(|e| ExecutionError::new_err(e.to_string()))?;
@@ -642,6 +644,8 @@ pub fn apply(
     if target.is_none() || explicit_db.is_some() {
         let mut conn = spec
             .connect()
+            .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
+        let _ = crate::workspace::apply_workspace_secrets(&conn, &p_dir, env)
             .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
 
         if (!auto_approve || interactive) && is_interactive_terminal() {
@@ -1105,11 +1109,25 @@ pub fn explore(
     let req_catalog = spec.catalogs.first().cloned();
 
     if target.is_none() || explicit_db.is_some() {
+        let use_workspace_mode =
+            crate::workspace::should_use_workspace_mode(&p_dir, env, explicit_db.as_deref());
         if !is_interactive_terminal() {
-            let conn = spec
-                .connect()
-                .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
-            return print_non_terminal_db(&conn, &spec.db, req_catalog.as_deref());
+            let (conn, display_db, active_cat) = if use_workspace_mode {
+                let conn = engine::open_duckdb_connection()
+                    .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
+                let report = crate::workspace::apply_workspace_attachments(&conn, &p_dir, env)
+                    .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
+                let cat = req_catalog.clone().or(report.default_alias);
+                (conn, "workspace (:memory:)".to_string(), cat)
+            } else {
+                let conn = spec
+                    .connect()
+                    .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
+                let _ = crate::workspace::apply_workspace_attachments(&conn, &p_dir, env)
+                    .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
+                (conn, spec.db.clone(), req_catalog.clone())
+            };
+            return print_non_terminal_db(&conn, &display_db, active_cat.as_deref());
         }
 
         let _guard = TerminalGuard::enter().map_err(|e| {
@@ -1122,16 +1140,39 @@ pub fn explore(
             .map_err(|e| ExecutionError::new_err(format!("Terminal backend error: {}", e)))?;
 
         let ide_res = py.allow_threads(|| -> anyhow::Result<()> {
-            let conn = spec.connect()?;
-            if let Some(cat) = &req_catalog {
-                let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
-            }
+            let (conn, display_db, ws_report) = if use_workspace_mode {
+                let conn = engine::open_duckdb_connection()?;
+                let report = crate::workspace::apply_workspace_attachments(&conn, &p_dir, env)?;
+                let target_cat = req_catalog.clone().or_else(|| report.default_alias.clone());
+                if let Some(cat) = &target_cat {
+                    let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
+                }
+                let label = match env {
+                    Some(e) => format!("workspace [{}] (:memory:)", e),
+                    None => "workspace (:memory:)".to_string(),
+                };
+                (conn, label, Some(report))
+            } else {
+                let conn = spec.connect()?;
+                let report = crate::workspace::apply_workspace_attachments(&conn, &p_dir, env)?;
+                if let Some(cat) = &req_catalog {
+                    let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
+                }
+                if spec.is_quack {
+                    engine::cleanup_orphaned_quack_bridges(&conn);
+                }
+                (conn, spec.db.clone(), Some(report))
+            };
 
-            if spec.is_quack {
-                engine::cleanup_orphaned_quack_bridges(&conn);
-            }
-
-            crate::ide::run_ide_loop(&mut terminal, &conn, &p_dir, &spec.db, spec.disable_ssl)
+            crate::ide::run_ide_loop_with_workspace(
+                &mut terminal,
+                &conn,
+                &p_dir,
+                &display_db,
+                spec.disable_ssl,
+                env,
+                ws_report,
+            )
         });
 
         ide_res.map_err(|e| ExecutionError::new_err(format!("IDE error: {}", e)))?;
@@ -1175,16 +1216,20 @@ pub fn explore(
                 engine::restore_quack_temp_bridge(&conn);
             }
 
+            let ws_report = crate::workspace::apply_workspace_attachments(&conn, &p_dir, env).ok();
+
             if let Some(cat) = &req_catalog {
                 let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
             }
 
-            let loop_res = crate::ide::run_ide_loop(
+            let loop_res = crate::ide::run_ide_loop_with_workspace(
                 &mut terminal,
                 &conn,
                 &p_dir,
                 &active_db_target,
                 is_bridge,
+                env,
+                ws_report,
             );
 
             if is_bridge {
@@ -1223,6 +1268,7 @@ pub fn get_target_config(
 
     let cfg = engine::resolve_target_config(&p_dir, env);
     let token = engine::resolve_quack_token(None, cfg.token_env.as_deref());
+    let workspace_mode = crate::workspace::should_use_workspace_mode(&p_dir, env, None);
 
     let dict = pyo3::types::PyDict::new(py);
     dict.set_item("db", cfg.db)?;
@@ -1230,6 +1276,7 @@ pub fn get_target_config(
     dict.set_item("token_env", cfg.token_env)?;
     dict.set_item("insecure", cfg.insecure.unwrap_or(false))?;
     dict.set_item("token", token)?;
+    dict.set_item("workspace_mode", workspace_mode)?;
     Ok(dict.into())
 }
 

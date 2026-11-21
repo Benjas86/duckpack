@@ -343,11 +343,14 @@ def explore(
 
     if target is None:
         cfg = _native_get_target_config(project_dir=project_dir, env=env)
-        target = cfg.get("db") or "local.duckdb"
-        if not any(str(target).startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:")) and not os.path.isabs(str(target)):
-            cand = os.path.join(project_dir, str(target))
-            if os.path.exists(cand):
-                target = cand
+        if cfg.get("workspace_mode"):
+            target = None
+        else:
+            target = cfg.get("db") or "local.duckdb"
+            if not any(str(target).startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:")) and not os.path.isabs(str(target)):
+                cand = os.path.join(project_dir, str(target))
+                if os.path.exists(cand):
+                    target = cand
         if not active_cat:
             catalogs = cfg.get("catalogs") or []
             if catalogs:

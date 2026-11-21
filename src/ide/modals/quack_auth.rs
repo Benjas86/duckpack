@@ -33,6 +33,9 @@ pub(crate) struct QuackAuthModalState {
     pub(crate) is_open: bool,
     pub(crate) active_tab: QuackAuthTab,
     pub(crate) quack_alias: Option<String>,
+    pub(crate) targets: Vec<crate::workspace::QuackControlTarget>,
+    pub(crate) target_index: usize,
+    pub(crate) env_profile: Option<String>,
     pub(crate) sessions: Vec<LiveQuackSession>,
     pub(crate) session_index: usize,
     pub(crate) config: QuackAuthConfig,
@@ -56,6 +59,9 @@ impl QuackAuthModalState {
             is_open: false,
             active_tab: QuackAuthTab::LiveSessions,
             quack_alias: None,
+            targets: Vec::new(),
+            target_index: 0,
+            env_profile: None,
             sessions: Vec::new(),
             session_index: 0,
             config: QuackAuthConfig {
@@ -76,16 +82,57 @@ impl QuackAuthModalState {
         }
     }
 
+    pub(crate) fn active_target(&self) -> Option<&crate::workspace::QuackControlTarget> {
+        self.targets.get(self.target_index)
+    }
+
+    fn sync_active_quack_alias(&mut self) {
+        self.quack_alias = self
+            .active_target()
+            .map(|t| t.attached_alias.clone().unwrap_or_else(|| t.label.clone()));
+    }
+
     /// Opens the modal, loading declarative `[quack_auth]` config from `duckpack.toml`
-    /// and querying `quack_active_connections()` if a Quack server is attached.
+    /// and discovering all attached Quack & DuckLake-on-Quack targets.
+    #[allow(dead_code)]
     pub(crate) fn open(
         &mut self,
         conn: &Connection,
         project_dir: &Path,
         preferred_quack_alias: Option<&str>,
     ) {
-        let mut exec: &Connection = conn;
-        self.quack_alias = crate::diff::find_any_quack_alias(&mut exec, preferred_quack_alias);
+        self.open_with_env(conn, project_dir, preferred_quack_alias, None);
+    }
+
+    pub(crate) fn open_with_env(
+        &mut self,
+        conn: &Connection,
+        project_dir: &Path,
+        preferred_quack_alias: Option<&str>,
+        env_profile: Option<&str>,
+    ) {
+        self.env_profile = env_profile.map(String::from);
+        self.targets =
+            crate::workspace::discover_quack_control_targets(conn, project_dir, env_profile);
+
+        if let Some(pref) = preferred_quack_alias {
+            if let Some(idx) = self.targets.iter().position(|t| {
+                t.attached_alias.as_deref() == Some(pref)
+                    || t.label.starts_with(&format!("{} ", pref))
+            }) {
+                self.target_index = idx;
+            } else {
+                self.target_index = 0;
+            }
+        } else {
+            self.target_index = 0;
+        }
+        self.sync_active_quack_alias();
+
+        if self.targets.is_empty() {
+            let mut exec: &Connection = conn;
+            self.quack_alias = crate::diff::find_any_quack_alias(&mut exec, preferred_quack_alias);
+        }
 
         if let Some(cfg) = load_quack_auth_config(project_dir) {
             self.config = cfg;
@@ -106,9 +153,9 @@ impl QuackAuthModalState {
             .user_index
             .min(self.config.users.len().saturating_sub(1));
 
-        if self.quack_alias.is_some() {
+        if self.quack_alias.is_some() || !self.targets.is_empty() {
             self.active_tab = QuackAuthTab::LiveSessions;
-            self.refresh_sessions(conn);
+            self.refresh_sessions_for(conn, project_dir);
         } else {
             self.active_tab = QuackAuthTab::Users;
             self.sessions.clear();
@@ -120,7 +167,54 @@ impl QuackAuthModalState {
         }
     }
 
-    pub(crate) fn refresh_sessions(&mut self, conn: &Connection) {
+    pub(crate) fn refresh_sessions_for(&mut self, conn: &Connection, project_dir: &Path) {
+        if let Some(target) = self.active_target().cloned() {
+            if let Some(ref alias) = target.attached_alias {
+                match load_live_quack_sessions(conn, alias, Some(&self.config)) {
+                    Ok(list) => {
+                        self.sessions = list;
+                        self.session_index = self
+                            .session_index
+                            .min(self.sessions.len().saturating_sub(1));
+                        self.error_msg = None;
+                    }
+                    Err(e) => {
+                        self.sessions.clear();
+                        self.error_msg = Some(format!("Session query failed: {}", e));
+                    }
+                }
+                return;
+            }
+            if target.quack_endpoint.is_some() {
+                match crate::workspace::open_quack_control_connection(
+                    &target,
+                    project_dir,
+                    self.env_profile.as_deref(),
+                ) {
+                    Ok((ctrl_conn, ctrl_alias)) => {
+                        match load_live_quack_sessions(&ctrl_conn, &ctrl_alias, Some(&self.config))
+                        {
+                            Ok(list) => {
+                                self.sessions = list;
+                                self.session_index = self
+                                    .session_index
+                                    .min(self.sessions.len().saturating_sub(1));
+                                self.error_msg = None;
+                            }
+                            Err(e) => {
+                                self.sessions.clear();
+                                self.error_msg = Some(format!("Session query failed: {}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.sessions.clear();
+                        self.error_msg = Some(format!("{}", e));
+                    }
+                }
+                return;
+            }
+        }
         let Some(ref qa) = self.quack_alias else {
             self.sessions.clear();
             self.session_index = 0;
@@ -393,15 +487,45 @@ impl QuackAuthModalState {
                 self.active_tab = match self.active_tab {
                     QuackAuthTab::LiveSessions => QuackAuthTab::Users,
                     QuackAuthTab::Users => {
-                        self.refresh_sessions(conn);
+                        self.refresh_sessions_for(conn, project_dir);
                         QuackAuthTab::LiveSessions
                     }
                 };
                 return None;
             }
+            KeyCode::Char('[') => {
+                if self.targets.len() > 1 {
+                    self.target_index = if self.target_index == 0 {
+                        self.targets.len() - 1
+                    } else {
+                        self.target_index - 1
+                    };
+                    self.sync_active_quack_alias();
+                    self.refresh_sessions_for(conn, project_dir);
+                    if let Some(t) = self.active_target() {
+                        let msg = format!("Switched Quack monitor target -> {}", t.label);
+                        self.status_msg = Some(msg.clone());
+                        return Some(msg);
+                    }
+                }
+                return None;
+            }
+            KeyCode::Char(']') => {
+                if self.targets.len() > 1 {
+                    self.target_index = (self.target_index + 1) % self.targets.len();
+                    self.sync_active_quack_alias();
+                    self.refresh_sessions_for(conn, project_dir);
+                    if let Some(t) = self.active_target() {
+                        let msg = format!("Switched Quack monitor target -> {}", t.label);
+                        self.status_msg = Some(msg.clone());
+                        return Some(msg);
+                    }
+                }
+                return None;
+            }
             KeyCode::Char('1') => {
                 self.active_tab = QuackAuthTab::LiveSessions;
-                self.refresh_sessions(conn);
+                self.refresh_sessions_for(conn, project_dir);
                 return None;
             }
             KeyCode::Char('2') => {
@@ -412,12 +536,45 @@ impl QuackAuthModalState {
         }
 
         match self.active_tab {
-            QuackAuthTab::LiveSessions => self.handle_sessions_key(key, conn),
+            QuackAuthTab::LiveSessions => self.handle_sessions_key(key, conn, project_dir),
             QuackAuthTab::Users => self.handle_users_key(key, conn, project_dir),
         }
     }
 
-    fn handle_sessions_key(&mut self, key: KeyEvent, conn: &Connection) -> Option<String> {
+    fn execute_on_active_quack<T, F>(
+        &self,
+        conn: &Connection,
+        project_dir: &Path,
+        op: F,
+    ) -> anyhow::Result<T>
+    where
+        F: FnOnce(&Connection, &str) -> anyhow::Result<T>,
+    {
+        if let Some(target) = self.active_target() {
+            if let Some(ref alias) = target.attached_alias {
+                return op(conn, alias);
+            }
+            if target.quack_endpoint.is_some() {
+                let (ctrl_conn, ctrl_alias) = crate::workspace::open_quack_control_connection(
+                    target,
+                    project_dir,
+                    self.env_profile.as_deref(),
+                )?;
+                return op(&ctrl_conn, &ctrl_alias);
+            }
+        }
+        if let Some(ref qa) = self.quack_alias {
+            return op(conn, qa);
+        }
+        anyhow::bail!("No Quack server attached.")
+    }
+
+    fn handle_sessions_key(
+        &mut self,
+        key: KeyEvent,
+        conn: &Connection,
+        project_dir: &Path,
+    ) -> Option<String> {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.session_index = self.session_index.saturating_sub(1);
@@ -430,7 +587,7 @@ impl QuackAuthModalState {
                 None
             }
             KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::F(5) => {
-                self.refresh_sessions(conn);
+                self.refresh_sessions_for(conn, project_dir);
                 if self.error_msg.is_none() {
                     let msg = format!(
                         "Refreshed {} live Quack session(s).",
@@ -443,16 +600,14 @@ impl QuackAuthModalState {
                 }
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {
-                let Some(qa) = self.quack_alias.clone() else {
-                    self.error_msg = Some("No Quack server attached.".to_string());
-                    return None;
-                };
                 let Some(sess) = self.sessions.get(self.session_index).cloned() else {
                     return None;
                 };
-                match cancel_quack_session_query(conn, &qa, &sess.server_id, &sess.connection_id) {
+                match self.execute_on_active_quack(conn, project_dir, |c, qa| {
+                    cancel_quack_session_query(c, qa, &sess.server_id, &sess.connection_id)
+                }) {
                     Ok(()) => {
-                        self.refresh_sessions(conn);
+                        self.refresh_sessions_for(conn, project_dir);
                         let msg = format!(
                             "Cancelled active query for session {} ({}).",
                             short_id(&sess.connection_id),
@@ -469,10 +624,6 @@ impl QuackAuthModalState {
                 }
             }
             KeyCode::Char('x') | KeyCode::Char('X') => {
-                let Some(qa) = self.quack_alias.clone() else {
-                    self.error_msg = Some("No Quack server attached.".to_string());
-                    return None;
-                };
                 let Some(sess) = self.sessions.get(self.session_index).cloned() else {
                     return None;
                 };
@@ -482,16 +633,18 @@ impl QuackAuthModalState {
                 } else {
                     sess.role.as_str()
                 };
-                match set_quack_session_override(
-                    conn,
-                    &qa,
-                    &sess.connection_id,
-                    &sess.username,
-                    preserved_role,
-                    new_revoked,
-                ) {
+                match self.execute_on_active_quack(conn, project_dir, |c, qa| {
+                    set_quack_session_override(
+                        c,
+                        qa,
+                        &sess.connection_id,
+                        &sess.username,
+                        preserved_role,
+                        new_revoked,
+                    )
+                }) {
                     Ok(()) => {
-                        self.refresh_sessions(conn);
+                        self.refresh_sessions_for(conn, project_dir);
                         let action = if new_revoked { "REVOKED" } else { "RESTORED" };
                         let msg = format!(
                             "{} session {} ({}).",
@@ -510,24 +663,22 @@ impl QuackAuthModalState {
                 }
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                let Some(qa) = self.quack_alias.clone() else {
-                    self.error_msg = Some("No Quack server attached.".to_string());
-                    return None;
-                };
                 let Some(sess) = self.sessions.get(self.session_index).cloned() else {
                     return None;
                 };
                 let next_role = QuackRole::from_str(&sess.role).next();
-                match set_quack_session_override(
-                    conn,
-                    &qa,
-                    &sess.connection_id,
-                    &sess.username,
-                    next_role.as_str(),
-                    false,
-                ) {
+                match self.execute_on_active_quack(conn, project_dir, |c, qa| {
+                    set_quack_session_override(
+                        c,
+                        qa,
+                        &sess.connection_id,
+                        &sess.username,
+                        next_role.as_str(),
+                        false,
+                    )
+                }) {
                     Ok(()) => {
-                        self.refresh_sessions(conn);
+                        self.refresh_sessions_for(conn, project_dir);
                         let msg = format!(
                             "Set session {} ({}) role override -> {}.",
                             short_id(&sess.connection_id),
@@ -719,12 +870,37 @@ impl QuackAuthModalState {
                 Some(msg)
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                let mut exec: &Connection = conn;
-                match deploy_quack_rbac_now(&mut exec, self.quack_alias.as_deref(), project_dir) {
-                    Ok(count) => {
-                        self.refresh_sessions(conn);
+                let deploy_res = if let Some(target) = self.active_target().cloned() {
+                    if let Some(ref alias) = target.attached_alias {
+                        let mut exec: &Connection = conn;
+                        deploy_quack_rbac_now(&mut exec, Some(alias.as_str()), project_dir)
+                            .map(|n| (n, target.label))
+                    } else if target.quack_endpoint.is_some() {
+                        crate::workspace::open_quack_control_connection(
+                            &target,
+                            project_dir,
+                            self.env_profile.as_deref(),
+                        )
+                        .and_then(|(ctrl_conn, ctrl_alias)| {
+                            let mut exec: &Connection = &ctrl_conn;
+                            deploy_quack_rbac_now(&mut exec, Some(ctrl_alias.as_str()), project_dir)
+                                .map(|n| (n, target.label))
+                        })
+                    } else {
+                        let mut exec: &Connection = conn;
+                        deploy_quack_rbac_now(&mut exec, self.quack_alias.as_deref(), project_dir)
+                            .map(|n| (n, self.quack_alias.clone().unwrap_or_else(|| "local".to_string())))
+                    }
+                } else {
+                    let mut exec: &Connection = conn;
+                    deploy_quack_rbac_now(&mut exec, self.quack_alias.as_deref(), project_dir)
+                        .map(|n| (n, self.quack_alias.clone().unwrap_or_else(|| "local".to_string())))
+                };
+
+                match deploy_res {
+                    Ok((count, target_lbl)) => {
+                        self.refresh_sessions_for(conn, project_dir);
                         self.error_msg = None;
-                        let target_lbl = self.quack_alias.as_deref().unwrap_or("local");
                         let msg = format!(
                             "✓ Synced {} Quack RBAC user(s) & activated hooks on '{}'.",
                             count, target_lbl
@@ -739,7 +915,7 @@ impl QuackAuthModalState {
                 }
             }
             KeyCode::Char('e') | KeyCode::Char('E') => {
-                match export_quack_rbac_post_start_script(project_dir, None) {
+                match export_quack_rbac_post_start_script(project_dir, self.env_profile.as_deref()) {
                     Ok(sh_path) => {
                         let sql_note = match export_quack_rbac_bootstrap_script(
                             &self.config,
@@ -791,9 +967,23 @@ impl QuackAuthModalState {
         };
         f.render_widget(Clear, popup_area);
 
-        let target_badge = match &self.quack_alias {
-            Some(qa) => format!("Quack: {}", qa),
-            None => "Offline (no Quack attached)".to_string(),
+        let target_badge = if self.targets.len() > 1 {
+            let lbl = self
+                .active_target()
+                .map(|t| t.label.as_str())
+                .unwrap_or("unknown");
+            format!(
+                "◄ [{}/{}] {} ► ([/]: switch)",
+                self.target_index + 1,
+                self.targets.len(),
+                lbl
+            )
+        } else if let Some(t) = self.active_target() {
+            t.label.clone()
+        } else if let Some(ref qa) = self.quack_alias {
+            format!("Quack: {}", qa)
+        } else {
+            "Offline (no Quack attached)".to_string()
         };
         let rbac_badge = if self.config.enabled {
             "RBAC: ON"

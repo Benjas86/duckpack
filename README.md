@@ -1013,10 +1013,66 @@ token_env = "PROD_QUACK_TOKEN" # Look up token from PROD_QUACK_TOKEN in .env
 
 Deploy, diff, or explore against any profile:
 ```bash
-duckpack explore                   # Automatically connects using [target] settings
+duckpack explore                   # Automatically connects using [target] or [[attach]] Workspace Mode
 duckpack explore --env staging     # Connects to staging Quack server with no flags needed
 duckpack apply --env prod          # Applies migrations to prod with secrets loaded from .env
 ```
+
+#### Declarative Workspace Secrets (`[[secrets]]`) & Multi-Attach (`[[attach]]`)
+
+For multi-catalog setups (such as **one DuckDB + Quack container per DuckLake catalog** backed by S3/MinIO/R2, plus Postgres/MSSQL/SQLite sources), declare `[[secrets]]` and `[[attach]]` in `duckpack.toml` so every `duckpack explore` session starts with all catalogs ready:
+
+```toml
+# Declarative secrets (auto-loaded across explore, diff, apply, and Python API)
+# Strict hygiene: only *_env references are allowed in duckpack.toml — raw secrets are rejected.
+[[secrets]]
+name = "lake_minio"
+type = "s3"
+scope = "s3://lakehouse/"         # Optional per-bucket/prefix SCOPE isolation
+endpoint_env = "S3_ENDPOINT"
+key_id_env = "S3_ACCESS_KEY"
+secret_env = "S3_SECRET_KEY"
+url_style = "path"
+use_ssl = false
+
+# Declarative multi-catalog attachments (auto-loaded in `duckpack explore` & `duckpack.explore()`)
+[[attach]]
+alias = "sales_lake"
+type = "ducklake"
+backend = "quack"
+metadata = "quack:sales-catalog.internal:9494"
+data_path = "s3://lakehouse/sales/"
+token_env = "QUACK_SALES_TOKEN"
+client_id = "ben_admin"
+insecure = true
+default = true                    # Sets initial active catalog tab in Workspace Mode
+
+[[attach]]
+alias = "finance_lake"
+type = "ducklake"
+backend = "quack"
+metadata = "quack:finance-catalog.internal:9494"
+data_path = "s3://lakehouse/finance/"
+token_env = "QUACK_FINANCE_TOKEN"
+client_id = "ben_admin"
+insecure = true
+
+# Optional per-environment overrides merge by `name`/`alias` (`enabled = false` disables an inherited entry)
+[[env.prod.attach]]
+alias = "sales_lake"
+type = "ducklake"
+backend = "quack"
+metadata = "quack:sales-prod.internal:9494"
+data_path = "s3://prod-lakehouse/sales/"
+token_env = "QUACK_PROD_SALES_TOKEN"
+client_id = "ben_admin"
+default = true
+```
+
+- **In-Memory Workspace Mode:** When `[[attach]]` is defined and no `--db` or `[target].db` is set, `duckpack explore` opens a clean in-memory DuckDB session (no stray `local.duckdb` file created) and mounts every declared catalog.
+- **Resilient Startup & Shared Team Configs:** Offline containers (`⚠️ sales_lake (offline — Enter/r to retry)`) and missing `*_env` tokens (`🔒 hr_lake (missing QUACK_HR_TOKEN)`) never abort startup; press `Enter` or `r` on a placeholder node in Explorer to reconnect live.
+- **TUI Round-Trip (`Ctrl+S` in `Ctrl+A` / `Ctrl+K`):** Toggle **`[X] Save to duckpack.toml (Ctrl+S)`** inside the Attach or Cloud Secrets modal to persist new connections/secrets cleanly to `duckpack.toml` (env-aware) and `.env` (`0600` perms).
+- **Multi-Catalog `Ctrl+U`:** Press `[` / `]` inside `Ctrl+U` to cycle across all attached Quack servers **and** DuckLake-on-Quack catalogs (connecting lazily on-demand to each DuckLake's underlying `quack:` endpoint without cluttering Explorer).
 
 ### Environment Variables & Credentials (`.env`)
 

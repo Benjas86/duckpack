@@ -197,6 +197,10 @@ fn main() -> Result<()> {
     let dp_ver = duckpack::engine::duckpack_version();
     let version_str: &'static str = Box::leak(format!("v{} (DuckDB engine: {})", dp_ver, embedded_ver).into_boxed_str());
     let matches = Cli::command().version(version_str).get_matches();
+    let explore_has_explicit_db = matches
+        .subcommand_matches("explore")
+        .and_then(|m| m.value_source("db"))
+        == Some(clap::parser::ValueSource::CommandLine);
     let mut cli = Cli::from_arg_matches(&matches)?;
 
     let default_dir = PathBuf::from(".");
@@ -287,6 +291,7 @@ fn main() -> Result<()> {
 
             let configured_catalog = database.clone().or_else(|| resolve_project_catalog(project_dir, cli.env.as_deref()));
             let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+            let _ = duckpack::workspace::apply_workspace_secrets(&target_conn, project_dir, cli.env.as_deref())?;
             let active_catalog = diff::validate_target_catalog_exec(&mut target_conn, configured_catalog.as_deref(), false)?;
             let diff_result = diff::diff_project(project_dir, &mut target_conn, Some(&active_catalog))?;
 
@@ -313,6 +318,7 @@ fn main() -> Result<()> {
 
             if *rbac_only {
                 let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                let _ = duckpack::workspace::apply_workspace_secrets(&target_conn, project_dir, cli.env.as_deref())?;
                 let user_count = duckpack::quack_auth::deploy_quack_rbac_now(
                     &mut target_conn,
                     database.as_deref(),
@@ -343,6 +349,7 @@ fn main() -> Result<()> {
                 let mut total_applied = 0;
                 for target_cat in &configured_catalogs {
                     let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                    let _ = duckpack::workspace::apply_workspace_secrets(&target_conn, project_dir, cli.env.as_deref())?;
                     let active_catalog = diff::validate_target_catalog_exec(&mut target_conn, Some(target_cat), true)?;
                     let diff_result = diff::diff_project(project_dir, &mut target_conn, Some(&active_catalog))?;
 
@@ -496,23 +503,70 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
+            let use_workspace_mode = duckpack::workspace::should_use_workspace_mode(
+                &project_dir,
+                cli.env.as_deref(),
+                if explore_has_explicit_db {
+                    Some(db.as_str())
+                } else {
+                    None
+                },
+            );
+
+            // Validate workspace TOML hygiene & connect BEFORE entering alternate screen so any error prints cleanly
+            let (target_conn, display_db, ws_report) = if use_workspace_mode {
+                let conn = open_duckdb_connection()?;
+                let report = duckpack::workspace::apply_workspace_attachments(
+                    &conn,
+                    &project_dir,
+                    cli.env.as_deref(),
+                )?;
+                let target_cat = database
+                    .clone()
+                    .or_else(|| resolve_project_catalog(&project_dir, cli.env.as_deref()))
+                    .or_else(|| report.default_alias.clone());
+                if let Some(cat) = target_cat {
+                    let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
+                }
+                let label = match cli.env.as_deref() {
+                    Some(env_name) => format!("workspace [{}] (:memory:)", env_name),
+                    None => "workspace (:memory:)".to_string(),
+                };
+                (conn, label, Some(report))
+            } else {
+                let conn = connect_target_db(&db, quack_token.as_deref(), *quack_disable_ssl)?;
+                let report = duckpack::workspace::apply_workspace_attachments(
+                    &conn,
+                    &project_dir,
+                    cli.env.as_deref(),
+                )?;
+                let configured_catalog = database
+                    .clone()
+                    .or_else(|| resolve_project_catalog(&project_dir, cli.env.as_deref()));
+                if let Some(cat) = configured_catalog {
+                    let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
+                }
+                if db.starts_with("quack:") {
+                    cleanup_orphaned_quack_bridges(&conn);
+                }
+                (conn, db.clone(), Some(report))
+            };
+
             ratatui::crossterm::terminal::enable_raw_mode()?;
             let mut stdout = std::io::stdout();
             ratatui::crossterm::execute!(stdout, ratatui::crossterm::terminal::EnterAlternateScreen, ratatui::crossterm::event::EnableMouseCapture)?;
             let backend = ratatui::backend::CrosstermBackend::new(stdout);
             let mut terminal = ratatui::Terminal::new(backend)?;
 
-            let target_conn = connect_target_db(&db, quack_token.as_deref(), *quack_disable_ssl)?;
-            let configured_catalog = database.clone().or_else(|| resolve_project_catalog(&project_dir, cli.env.as_deref()));
-            if let Some(cat) = configured_catalog {
-                let _ = target_conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
-            }
-
-            if db.starts_with("quack:") {
-                cleanup_orphaned_quack_bridges(&target_conn);
-            }
-
-            let ide_res = ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db, *quack_disable_ssl);
+            let ide_res = ide::run_ide_loop_with_workspace(
+                &mut terminal,
+                &target_conn,
+                &project_dir,
+                &display_db,
+                *quack_disable_ssl,
+                cli.env.as_deref(),
+                ws_report,
+            );
 
             ratatui::crossterm::terminal::disable_raw_mode()?;
             ratatui::crossterm::execute!(
@@ -857,6 +911,7 @@ fn run_diff_review_tui(
         .map(String::from)
         .or_else(|| resolve_project_catalog(project_dir, env));
     let conn = connect_target_db(db, quack_token, quack_disable_ssl)?;
+    let _ = duckpack::workspace::apply_workspace_secrets(&conn, project_dir, env)?;
     if db.starts_with("quack:") {
         cleanup_orphaned_quack_bridges(&conn);
     }

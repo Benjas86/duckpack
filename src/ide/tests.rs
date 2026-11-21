@@ -2325,3 +2325,112 @@ fn test_quack_auth_modal_user_lifecycle_lockout_guard_and_export() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_workspace_failed_nodes_ctrl_a_save_and_multi_target_ctrl_u() {
+    use ratatui::crossterm::event::KeyEvent;
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "dp_ide_ws_e2e_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+
+    // 1. Verify Ctrl+A Ctrl+S toggle + persist_to_workspace saves DuckLake-on-Quack cleanly with *_env only
+    let mut attach_modal = AttachModalState::new();
+    attach_modal.reset();
+    attach_modal.set_provider(7); // DuckLake
+    attach_modal.set_ducklake_backend(DuckLakeBackend::Quack);
+    attach_modal.host = "sales-catalog.internal".to_string();
+    attach_modal.port = "9494".to_string();
+    attach_modal.password = "super_secret_sales_tok".to_string();
+    attach_modal.data_path = "s3://lakehouse/sales/".to_string();
+    attach_modal.alias = "sales_lake".to_string();
+    attach_modal.disable_ssl = true;
+    assert!(!attach_modal.save_to_toml);
+    attach_modal.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &conn);
+    assert!(attach_modal.save_to_toml);
+
+    let save_msg = attach_modal
+        .persist_to_workspace("sales_lake", &temp_dir, Some("prod"))
+        .unwrap();
+    assert!(save_msg.contains("duckpack.toml"));
+
+    // Persist a second DuckLake-on-Quack catalog directly via workspace API
+    crate::workspace::save_attachment_to_workspace(
+        &temp_dir,
+        Some("prod"),
+        &crate::workspace::WorkspaceAttachment {
+            alias: "finance_lake".to_string(),
+            attach_type: "ducklake".to_string(),
+            backend: Some("quack".to_string()),
+            metadata: Some("quack:finance-catalog.internal:9494".to_string()),
+            data_path: Some("s3://lakehouse/finance/".to_string()),
+            token_env: Some("QUACK_FINANCE_TOKEN".to_string()),
+            insecure: true,
+            ..Default::default()
+        },
+        &[],
+    )
+    .unwrap();
+
+    // Verify no plaintext token ever ended up in duckpack.toml
+    let toml_content = std::fs::read_to_string(temp_dir.join("duckpack.toml")).unwrap();
+    assert!(!toml_content.contains("super_secret_sales_tok"));
+    assert!(toml_content.contains("QUACK_SALES_LAKE_TOKEN"));
+
+    // 2. Verify Ctrl+U discovers BOTH DuckLake-on-Quack targets and cycles them with '[' and ']'
+    let mut q_modal = QuackAuthModalState::new();
+    q_modal.open_with_env(&conn, &temp_dir, Some("sales_lake"), Some("prod"));
+    assert_eq!(q_modal.targets.len(), 2);
+    assert_eq!(q_modal.target_index, 0);
+    assert!(q_modal.targets[0].label.contains("sales_lake"));
+
+    q_modal.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), &conn, &temp_dir);
+    assert_eq!(q_modal.target_index, 1);
+    assert!(q_modal.targets[1].label.contains("finance_lake"));
+
+    q_modal.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), &conn, &temp_dir);
+    assert_eq!(q_modal.target_index, 0);
+
+    // 3. Verify Explorer renders FailedAttachment placeholder nodes for offline & missing-env catalogs
+    let meta = load_explorer_metadata(&conn, &temp_dir, false);
+    let mut items = rebuild_explorer_nodes(&meta, &HashSet::new(), &HashSet::new(), &conn, false);
+    let failed = vec![
+        crate::workspace::FailedAttachment {
+            alias: "hr_lake".to_string(),
+            attach_type: "ducklake".to_string(),
+            kind: crate::workspace::AttachmentIssueKind::MissingEnv(vec![
+                "QUACK_HR_TOKEN".to_string(),
+            ]),
+            entry: crate::workspace::WorkspaceAttachment::default(),
+        },
+        crate::workspace::FailedAttachment {
+            alias: "ops_quack".to_string(),
+            attach_type: "quack".to_string(),
+            kind: crate::workspace::AttachmentIssueKind::ConnectionFailed(
+                "Connection refused".to_string(),
+            ),
+            entry: crate::workspace::WorkspaceAttachment::default(),
+        },
+    ];
+    insert_failed_workspace_nodes(&mut items, &failed);
+    assert!(items.iter().any(|n| {
+        matches!(
+            &n.node_type,
+            NodeType::FailedAttachment { alias, is_missing_env: true } if alias == "hr_lake"
+        ) && n.display.contains("QUACK_HR_TOKEN")
+    }));
+    assert!(items.iter().any(|n| {
+        matches!(
+            &n.node_type,
+            NodeType::FailedAttachment { alias, is_missing_env: false } if alias == "ops_quack"
+        ) && n.display.contains("offline")
+    }));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

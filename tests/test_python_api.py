@@ -4,7 +4,7 @@ import pytest
 import duckpack
 
 def test_duckpack_version_and_exports():
-    assert duckpack.__version__ == "0.3.5_dev17"
+    assert duckpack.__version__ == "0.3.5_dev18"
     assert hasattr(duckpack, "explore")
     assert hasattr(duckpack, "apply")
     assert hasattr(duckpack, "diff")
@@ -711,4 +711,41 @@ def test_live_quack_pk_diff_and_apply_idempotency(tmp_path):
             con.execute(f"CALL target_db.query('DROP TABLE IF EXISTS {test_tbl};');")
         except Exception:
             pass
+
+
+def test_workspace_mode_explore_no_local_duckdb_and_multi_attach(tmp_path, capfd):
+    proj_dir = tmp_path / "ws_proj"
+    duckpack.init(str(proj_dir))
+
+    sales_db = proj_dir / "sales.duckdb"
+    c = duckdb.connect(str(sales_db))
+    c.execute("CREATE TABLE ws_sales_orders (id INT, amount DOUBLE);")
+    c.close()
+
+    with open(proj_dir / "duckpack.toml", "w") as f:
+        f.write(
+            """
+[project]
+name = "ws_proj"
+
+[[attach]]
+alias = "sales_cat"
+type = "duckdb"
+path = "sales.duckdb"
+default = true
+
+[[attach]]
+alias = "missing_quack"
+type = "quack"
+host = "127.0.0.1"
+port = 19998
+token_env = "NON_EXISTENT_TEST_TOKEN_999"
+"""
+        )
+
+    duckpack.explore(None, project_dir=str(proj_dir))
+    captured = capfd.readouterr().out
+    assert "ws_sales_orders" in captured
+    assert not (proj_dir / "local.duckdb").exists(), "Workspace mode must not create local.duckdb"
+
 

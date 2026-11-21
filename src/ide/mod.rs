@@ -14,8 +14,8 @@ pub use editor::{
 };
 pub(crate) use explorer::{
     ExplorerMode, NodeType, compute_ide_diff_for_catalog, db_icon,
-    get_git_branch_and_status, rebuild_explorer_nodes, rebuild_project_nodes,
-    render_explorer_node_line,
+    get_git_branch_and_status, insert_failed_workspace_nodes, rebuild_explorer_nodes,
+    rebuild_project_nodes, render_explorer_node_line,
 };
 #[cfg(test)]
 pub(crate) use explorer::{
@@ -93,6 +93,51 @@ fn open_query_in_tabs(
     tabs[*active_tab_index].load_content(&query, None);
 }
 
+fn build_db_explorer_items(
+    meta: &ExplorerMetadata,
+    expanded_groups: &HashSet<String>,
+    expanded_tables: &HashSet<String>,
+    conn: &Connection,
+    is_quack: bool,
+    failed_attachments: &[crate::workspace::FailedAttachment],
+) -> Vec<explorer::ExplorerNode> {
+    let mut items = rebuild_explorer_nodes(meta, expanded_groups, expanded_tables, conn, is_quack);
+    insert_failed_workspace_nodes(&mut items, failed_attachments);
+    items
+}
+
+fn retry_failed_workspace_attachment(
+    alias: &str,
+    failed_attachments: &mut Vec<crate::workspace::FailedAttachment>,
+    conn: &Connection,
+    project_dir: &std::path::Path,
+    env_profile: Option<&str>,
+) -> (bool, String) {
+    let Some(pos) = failed_attachments
+        .iter()
+        .position(|f| f.alias.eq_ignore_ascii_case(alias))
+    else {
+        return (false, format!("Attachment '{}' is not in the retry queue.", alias));
+    };
+    crate::engine::load_env_files(project_dir, env_profile);
+    let _ = crate::workspace::apply_workspace_secrets(conn, project_dir, env_profile);
+    let entry = failed_attachments[pos].entry.clone();
+    match crate::workspace::attach_single_workspace_entry(conn, &entry, project_dir, env_profile) {
+        Ok(()) => {
+            failed_attachments.remove(pos);
+            (
+                true,
+                format!("✓ Reconnected workspace catalog '{}' successfully!", alias),
+            )
+        }
+        Err(kind) => {
+            failed_attachments[pos].kind = kind;
+            let detail = failed_attachments[pos].detail_message();
+            (false, format!("⚠️ {}", detail))
+        }
+    }
+}
+
 /// The main execution loop for the IDE/Explorer feature.
 /// Handles rendering the UI layout, capturing keyboard/mouse events, managing tabs,
 /// and securely executing raw DuckDB queries from the active text buffer.
@@ -102,6 +147,28 @@ pub fn run_ide_loop(
     project_dir: &PathBuf,
     db_path: &str,
     quack_disable_ssl: bool,
+) -> Result<()> {
+    run_ide_loop_with_workspace(
+        terminal,
+        conn,
+        project_dir,
+        db_path,
+        quack_disable_ssl,
+        None,
+        None,
+    )
+}
+
+/// Workspace-aware IDE entrypoint supporting `--env <profile>` persistence and resilient
+/// offline/missing-env placeholder nodes in Explorer.
+pub fn run_ide_loop_with_workspace(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    conn: &Connection,
+    project_dir: &PathBuf,
+    db_path: &str,
+    quack_disable_ssl: bool,
+    env_profile: Option<&str>,
+    workspace_report: Option<crate::workspace::WorkspaceApplyReport>,
 ) -> Result<()> {
     let is_quack = db_path.starts_with("quack:");
     let is_remote_db = is_quack || db_path.starts_with("md:") || db_path.starts_with("motherduck:") || db_path.starts_with("ducklake:");
@@ -123,6 +190,14 @@ pub fn run_ide_loop(
         None
     };
 
+    let mut failed_attachments: Vec<crate::workspace::FailedAttachment> = workspace_report
+        .as_ref()
+        .map(|r| r.failed_attachments.clone())
+        .unwrap_or_default();
+    let initial_ws_summary = workspace_report
+        .as_ref()
+        .and_then(|r| r.status_summary());
+
     let mut meta = load_explorer_metadata(conn, project_dir, is_quack);
     let mut tabs: Vec<EditorTab> = vec![EditorTab::new(meta.active_database.clone())];
     let mut active_tab_index: usize = 0;
@@ -130,7 +205,8 @@ pub fn run_ide_loop(
     let mut exit_confirm_modal = ExitConfirmationModalState::new();
 
     let mut focus = FocusPane::Editor;
-    let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
+    let mut status_msg = initial_ws_summary
+        .unwrap_or_else(|| String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit."));
 
     let mut expanded_groups: HashSet<String> = if meta.databases.len() > 1 {
         let mut set = HashSet::new();
@@ -189,8 +265,14 @@ pub fn run_ide_loop(
     let mut explorer_state = ListState::default();
     let mut explorer_horizontal_scroll: usize = 0;
     let mut explorer_width_percent: u16 = 25;
-    let mut explorer_items =
-        rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+    let mut explorer_items = build_db_explorer_items(
+        &meta,
+        &expanded_groups,
+        &expanded_tables,
+        conn,
+        is_quack,
+        &failed_attachments,
+    );
 
     if !explorer_items.is_empty() {
         explorer_state.select(Some(0));
@@ -784,12 +866,13 @@ pub fn run_ide_loop(
                             && mouse.column <= current_explorer_rect.left() + 8
                         {
                             explorer_mode = ExplorerMode::Database;
-                            explorer_items = rebuild_explorer_nodes(
+                            explorer_items = build_db_explorer_items(
                                 &meta,
                                 &expanded_groups,
                                 &expanded_tables,
                                 conn,
                                 is_quack,
+                                &failed_attachments,
                             );
                             explorer_state.select(Some(0));
                             status_msg = "Switched to Database Catalog view".to_string();
@@ -1094,9 +1177,17 @@ pub fn run_ide_loop(
                         }
                     } else if let Some(alias) = attach_modal.handle_key(key, conn) {
                         tabs[active_tab_index].target_database = alias.clone();
+                        let save_note = if attach_modal.save_to_toml {
+                            match attach_modal.persist_to_workspace(&alias, project_dir, env_profile) {
+                                Ok(msg) => format!(" ({})", msg),
+                                Err(e) => format!(" (⚠️ save to duckpack.toml failed: {})", e),
+                            }
+                        } else {
+                            String::new()
+                        };
                         status_msg = format!(
-                            "Attached database '{}' successfully and switched active tab context.",
-                            alias
+                            "Attached database '{}' successfully and switched active tab context.{}",
+                            alias, save_note
                         );
                         trigger_explorer_refresh = true;
                     }
@@ -1107,7 +1198,9 @@ pub fn run_ide_loop(
                         if let Some(text) = get_clipboard_text(&mut os_clipboard) {
                             secret_modal.paste_text(&text);
                         }
-                    } else if let Some(msg) = secret_modal.handle_key(key, conn, project_dir) {
+                    } else if let Some(msg) =
+                        secret_modal.handle_key_with_env(key, conn, project_dir, env_profile)
+                    {
                         status_msg = msg;
                         trigger_explorer_refresh = true;
                     }
@@ -1163,7 +1256,7 @@ pub fn run_ide_loop(
                         .get(active_tab_index)
                         .map(|t| t.target_database.as_str())
                         .filter(|c| !c.is_empty() && *c != "memory");
-                    quack_auth_modal.open(conn, project_dir, tab_cat);
+                    quack_auth_modal.open_with_env(conn, project_dir, tab_cat, env_profile);
                 } else if show_help || show_schema_visualizer {
                     if key.code == KeyCode::Esc
                         || key.code == KeyCode::Char('q')
@@ -1207,12 +1300,13 @@ pub fn run_ide_loop(
 
                     if key.code == KeyCode::F(3) {
                         explorer_mode = ExplorerMode::Database;
-                        explorer_items = rebuild_explorer_nodes(
+                        explorer_items = build_db_explorer_items(
                             &meta,
                             &expanded_groups,
                             &expanded_tables,
                             conn,
                             is_quack,
+                            &failed_attachments,
                         );
                         explorer_state.select(Some(0));
                         status_msg = "Switched to Database Catalog view".to_string();
@@ -1483,12 +1577,13 @@ pub fn run_ide_loop(
                                 trigger_explorer_action = true;
                             } else if key.code == KeyCode::Char('1') {
                                 explorer_mode = ExplorerMode::Database;
-                                explorer_items = rebuild_explorer_nodes(
+                                explorer_items = build_db_explorer_items(
                                     &meta,
                                     &expanded_groups,
                                     &expanded_tables,
                                     conn,
                                     is_quack,
+                                    &failed_attachments,
                                 );
                                 explorer_state.select(Some(0));
                                 status_msg = "Switched to Database Catalog view".to_string();
@@ -1574,9 +1669,33 @@ pub fn run_ide_loop(
                                     status_msg =
                                         "Project files and git status refreshed.".to_string();
                                 } else {
-                                    refresh_attached_catalog(conn, db_path, quack_disable_ssl);
-                                    trigger_explorer_refresh = true;
-                                    status_msg = "Explorer refreshed.".to_string();
+                                    let selected_failed_alias = explorer_state
+                                        .selected()
+                                        .and_then(|idx| explorer_items.get(idx))
+                                        .and_then(|node| match &node.node_type {
+                                            NodeType::FailedAttachment { alias, .. } => {
+                                                Some(alias.clone())
+                                            }
+                                            _ => None,
+                                        });
+                                    if let Some(alias) = selected_failed_alias {
+                                        let (ok, msg) = retry_failed_workspace_attachment(
+                                            &alias,
+                                            &mut failed_attachments,
+                                            conn,
+                                            project_dir,
+                                            env_profile,
+                                        );
+                                        if ok {
+                                            tabs[active_tab_index].target_database = alias;
+                                        }
+                                        status_msg = msg;
+                                        trigger_explorer_refresh = true;
+                                    } else {
+                                        refresh_attached_catalog(conn, db_path, quack_disable_ssl);
+                                        trigger_explorer_refresh = true;
+                                        status_msg = "Explorer refreshed.".to_string();
+                                    }
                                 }
                             } else if key.code == KeyCode::Char('q')
                                 || key.code == KeyCode::Char('s')
@@ -2879,12 +2998,13 @@ pub fn run_ide_loop(
                 } else {
                     expanded_groups.insert("Tables".to_string());
                 }
-                explorer_items = rebuild_explorer_nodes(
+                explorer_items = build_db_explorer_items(
                     &meta,
                     &expanded_groups,
                     &expanded_tables,
                     conn,
                     is_quack,
+                    &failed_attachments,
                 );
             }
             if let Some(sel) = prev_selected {
@@ -2927,12 +3047,13 @@ pub fn run_ide_loop(
                             } else {
                                 expanded_groups.insert(item_name);
                             }
-                            explorer_items = rebuild_explorer_nodes(
+                            explorer_items = build_db_explorer_items(
                                 &meta,
                                 &expanded_groups,
                                 &expanded_tables,
                                 conn,
                                 is_quack,
+                                &failed_attachments,
                             );
                             explorer_state
                                 .select(Some(selected.min(explorer_items.len().saturating_sub(1))));
@@ -2970,12 +3091,13 @@ pub fn run_ide_loop(
                                 } else {
                                     expanded_groups.insert(item_name);
                                 }
-                                explorer_items = rebuild_explorer_nodes(
+                                explorer_items = build_db_explorer_items(
                                     &meta,
                                     &expanded_groups,
                                     &expanded_tables,
                                     conn,
                                     is_quack,
+                                    &failed_attachments,
                                 );
                                 explorer_state.select(Some(
                                     selected.min(explorer_items.len().saturating_sub(1)),
@@ -3006,12 +3128,13 @@ pub fn run_ide_loop(
                             } else {
                                 expanded_tables.insert(key);
                             }
-                            explorer_items = rebuild_explorer_nodes(
+                            explorer_items = build_db_explorer_items(
                                 &meta,
                                 &expanded_groups,
                                 &expanded_tables,
                                 conn,
                                 is_quack,
+                                &failed_attachments,
                             );
                             explorer_state
                                 .select(Some(selected.min(explorer_items.len().saturating_sub(1))));
@@ -3070,7 +3193,35 @@ pub fn run_ide_loop(
                                 .get(active_tab_index)
                                 .map(|t| t.target_database.as_str())
                                 .filter(|c| !c.is_empty() && *c != "memory");
-                            quack_auth_modal.open(conn, project_dir, tab_cat);
+                            quack_auth_modal.open_with_env(conn, project_dir, tab_cat, env_profile);
+                        }
+                        NodeType::FailedAttachment { alias, .. } => {
+                            let (ok, msg) = retry_failed_workspace_attachment(
+                                &alias,
+                                &mut failed_attachments,
+                                conn,
+                                project_dir,
+                                env_profile,
+                            );
+                            if ok {
+                                tabs[active_tab_index].target_database = alias.clone();
+                                meta = load_explorer_metadata(conn, project_dir, is_quack);
+                                dictionary = meta.dictionary.clone();
+                                expanded_groups.insert(format!("db:{}", alias));
+                                expanded_groups.insert(format!("{}:Tables", alias));
+                            }
+                            explorer_items = build_db_explorer_items(
+                                &meta,
+                                &expanded_groups,
+                                &expanded_tables,
+                                conn,
+                                is_quack,
+                                &failed_attachments,
+                            );
+                            explorer_state.select(Some(
+                                selected.min(explorer_items.len().saturating_sub(1)),
+                            ));
+                            status_msg = msg;
                         }
                         NodeType::CloudSecret { name, .. } => {
                             let query =
@@ -3086,12 +3237,13 @@ pub fn run_ide_loop(
                             } else {
                                 expanded_groups.insert(key);
                             }
-                            explorer_items = rebuild_explorer_nodes(
+                            explorer_items = build_db_explorer_items(
                                 &meta,
                                 &expanded_groups,
                                 &expanded_tables,
                                 conn,
                                 is_quack,
+                                &failed_attachments,
                             );
                             explorer_state
                                 .select(Some(selected.min(explorer_items.len().saturating_sub(1))));
@@ -3104,12 +3256,13 @@ pub fn run_ide_loop(
                                 } else {
                                     expanded_groups.insert(key);
                                 }
-                                explorer_items = rebuild_explorer_nodes(
+                                explorer_items = build_db_explorer_items(
                                     &meta,
                                     &expanded_groups,
                                     &expanded_tables,
                                     conn,
                                     is_quack,
+                                    &failed_attachments,
                                 );
                                 explorer_state.select(Some(
                                     selected.min(explorer_items.len().saturating_sub(1)),

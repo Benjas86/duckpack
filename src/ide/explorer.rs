@@ -54,6 +54,7 @@ pub(crate) enum NodeType {
     AddSecretAction,
     AddBucketAction,
     QuackRbacAction,
+    FailedAttachment { alias: String, is_missing_env: bool },
 }
 
 /// Represents a single renderable node in the Explorer sidebar.
@@ -1059,13 +1060,13 @@ pub(crate) fn rebuild_explorer_nodes(
         }
     }
 
-    // Quack RBAC & Live Sessions shortcut node (shown whenever a Quack server is attached)
+    // Quack RBAC & Live Sessions shortcut node (shown whenever a Quack server or DuckLake-on-Quack is attached)
     let has_quack_db = is_quack
         || meta.databases.iter().any(|d| {
             d.db_type.eq_ignore_ascii_case("quack")
                 || d.path
                     .as_deref()
-                    .map(|p| p.starts_with("quack:"))
+                    .map(|p| p.starts_with("quack:") || p.contains("quack:"))
                     .unwrap_or(false)
         });
     if has_quack_db {
@@ -1184,6 +1185,48 @@ pub(crate) fn rebuild_explorer_nodes(
     }
 
     items
+}
+
+/// Inserts offline or missing-env workspace attachment placeholder nodes into the Explorer tree
+/// so users can see skipped catalogs at a glance and press `Enter` or `r` to retry mounting them.
+pub(crate) fn insert_failed_workspace_nodes(
+    items: &mut Vec<ExplorerNode>,
+    failed: &[crate::workspace::FailedAttachment],
+) {
+    if failed.is_empty() {
+        return;
+    }
+    // Insert right before the first non-database top-level utility section (Macros/Queries/RBAC/Secrets)
+    let insert_pos = items
+        .iter()
+        .position(|n| {
+            matches!(
+                n.node_type,
+                NodeType::QuackRbacAction
+            ) || (n.level == 0
+                && matches!(
+                    n.name.as_str(),
+                    "Macros" | "Queries" | "Secrets & Cloud Buckets"
+                ))
+        })
+        .unwrap_or(items.len());
+
+    let mut placeholder_nodes = Vec::with_capacity(failed.len());
+    for f in failed {
+        let is_missing_env = matches!(f.kind, crate::workspace::AttachmentIssueKind::MissingEnv(_));
+        placeholder_nodes.push(ExplorerNode {
+            name: f.alias.clone(),
+            display: f.explorer_display(),
+            level: 0,
+            is_expandable: false,
+            is_expanded: false,
+            node_type: NodeType::FailedAttachment {
+                alias: f.alias.clone(),
+                is_missing_env,
+            },
+        });
+    }
+    items.splice(insert_pos..insert_pos, placeholder_nodes);
 }
 
 /// Recursively renders cloud files and directory nodes with expandable folder support.

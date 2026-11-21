@@ -51,6 +51,7 @@ pub(crate) struct SecretModalState {
     pub(crate) cursor_pos: usize,
     pub(crate) use_ssl: bool,
     pub(crate) save_to_env: bool,
+    pub(crate) save_to_toml: bool,
     pub(crate) active_field: usize, // 0: provider, 1: name, 2: key_id, 3: secret_key, 4: region, 5: endpoint, 6: bucket, 7: use_ssl, 8: save_to_env, 9: submit, 10: cancel
     pub(crate) error_msg: Option<String>,
 }
@@ -69,6 +70,7 @@ impl SecretModalState {
             cursor_pos: 0,
             use_ssl: true,
             save_to_env: true,
+            save_to_toml: false,
             active_field: 2,
             error_msg: None,
         }
@@ -86,6 +88,7 @@ impl SecretModalState {
         self.cursor_pos = 0;
         self.use_ssl = true;
         self.save_to_env = true;
+        self.save_to_toml = false;
         self.active_field = 2;
         self.error_msg = None;
     }
@@ -368,7 +371,11 @@ impl SecretModalState {
 
         let toggle_cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([
+                Constraint::Percentage(32),
+                Constraint::Percentage(32),
+                Constraint::Percentage(36),
+            ])
             .split(field_layout[6]);
 
         let f7_ssl_style = if self.active_field == 7 {
@@ -377,7 +384,7 @@ impl SecretModalState {
             Style::default().fg(Color::White)
         };
         let ssl_label = format!(
-            "  [{}] Use SSL / HTTPS (Space)",
+            "  [{}] SSL (Space)",
             if self.use_ssl { "X" } else { " " }
         );
         f.render_widget(Paragraph::new(ssl_label).style(f7_ssl_style), toggle_cols[0]);
@@ -388,10 +395,21 @@ impl SecretModalState {
             Style::default().fg(Color::White)
         };
         let env_label = format!(
-            "  [{}] Persist in .env (Space)",
+            "[{}] Save .env",
             if self.save_to_env { "X" } else { " " }
         );
         f.render_widget(Paragraph::new(env_label).style(f8_env_style), toggle_cols[1]);
+
+        let toml_style = if self.save_to_toml {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let toml_label = format!(
+            "[{}] Save toml (Ctrl+S)",
+            if self.save_to_toml { "X" } else { " " }
+        );
+        f.render_widget(Paragraph::new(toml_label).style(toml_style), toggle_cols[2]);
 
         if let Some(ref err) = self.error_msg {
             f.render_widget(
@@ -440,12 +458,27 @@ impl SecretModalState {
 
     /// Processes a keyboard event in the Cloud Secret modal.
     /// Returns `Some(status_msg)` if a secret was saved and the explorer should refresh.
+    #[allow(dead_code)]
     pub(crate) fn handle_key(
         &mut self,
         key: KeyEvent,
         conn: &Connection,
         project_dir: &Path,
     ) -> Option<String> {
+        self.handle_key_with_env(key, conn, project_dir, None)
+    }
+
+    pub(crate) fn handle_key_with_env(
+        &mut self,
+        key: KeyEvent,
+        conn: &Connection,
+        project_dir: &Path,
+        env_profile: Option<&str>,
+    ) -> Option<String> {
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.save_to_toml = !self.save_to_toml;
+            return None;
+        }
         if key.code == KeyCode::Esc {
             self.is_open = false;
         } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
@@ -565,10 +598,75 @@ impl SecretModalState {
                                 }
                             }
 
+                            let mut toml_note = String::new();
+                            if self.save_to_toml {
+                                let slug = crate::workspace::env_var_slug(safe_name);
+                                let key_env = format!("S3_{}_KEY_ID", slug);
+                                let sec_env = format!("S3_{}_SECRET_KEY", slug);
+                                let mut pairs: Vec<(String, String)> = Vec::new();
+                                let key_id_env = if !self.key_id.trim().is_empty() {
+                                    pairs.push((key_env.clone(), self.key_id.trim().to_string()));
+                                    Some(key_env)
+                                } else {
+                                    None
+                                };
+                                let secret_env = if !self.secret_key.trim().is_empty() {
+                                    pairs.push((sec_env.clone(), self.secret_key.trim().to_string()));
+                                    Some(sec_env)
+                                } else {
+                                    None
+                                };
+                                let bucket_clean = {
+                                    let b = self.bucket.trim();
+                                    if b.is_empty() {
+                                        None
+                                    } else if b.starts_with("s3://")
+                                        || b.starts_with("r2://")
+                                        || b.starts_with("gcs://")
+                                    {
+                                        Some(b.to_string())
+                                    } else {
+                                        Some(format!("s3://{}", b))
+                                    }
+                                };
+                                let ws_sec = crate::workspace::WorkspaceSecret {
+                                    name: safe_name.to_string(),
+                                    secret_type: if self.provider() == CloudProvider::CloudflareR2 {
+                                        "r2".to_string()
+                                    } else {
+                                        "s3".to_string()
+                                    },
+                                    scope: bucket_clean.clone(),
+                                    key_id_env,
+                                    secret_env,
+                                    region: (!self.region.trim().is_empty())
+                                        .then(|| self.region.trim().to_string()),
+                                    endpoint: (!self.endpoint.trim().is_empty())
+                                        .then(|| self.endpoint.trim().to_string()),
+                                    use_ssl: Some(self.use_ssl),
+                                    bucket: bucket_clean,
+                                    ..Default::default()
+                                };
+                                let pair_refs: Vec<(&str, &str)> = pairs
+                                    .iter()
+                                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                                    .collect();
+                                if crate::workspace::save_secret_to_workspace(
+                                    project_dir,
+                                    env_profile,
+                                    &ws_sec,
+                                    &pair_refs,
+                                )
+                                .is_ok()
+                                {
+                                    toml_note = " & saved to duckpack.toml + .env".to_string();
+                                }
+                            }
+
                             self.is_open = false;
                             return Some(format!(
-                                "Configured cloud secret '{}' successfully.",
-                                safe_name
+                                "Configured cloud secret '{}' successfully{}.",
+                                safe_name, toml_note
                             ));
                         }
                         Err(e) => {
