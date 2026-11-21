@@ -2715,6 +2715,9 @@ impl AttachModalState {
                     let mut opts = Vec::new();
                     match provider {
                         AttachProvider::DuckLake => {
+                            if !safe_path.starts_with("ducklake:") {
+                                opts.push("TYPE ducklake".to_string());
+                            }
                             if !self.data_path.trim().is_empty() {
                                 opts.push(format!(
                                     "DATA_PATH '{}'",

@@ -1287,7 +1287,7 @@ pub fn load_explorer_metadata(
     queries.sort();
 
     let mut secrets: Vec<(String, String)> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT name, type FROM duckdb_secrets() WHERE lower(type) IN ('s3', 'r2', 'gcs', 'azure', 'quack', 'motherduck', 'http', 'ducklake', 'postgres', 'mysql')") {
+    if let Ok(mut stmt) = conn.prepare("SELECT name, type FROM duckdb_secrets() WHERE lower(type) IN ('s3', 'r2', 'gcs', 'azure', 'quack', 'motherduck', 'http', 'ducklake', 'postgres', 'mysql', 'mssql')") {
         if let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
                 if let (Ok(name), Ok(typ)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {

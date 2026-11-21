@@ -710,9 +710,15 @@ pub fn connect_target_db(
             .with_context(|| "Failed to open in-memory DB for MSSQL ATTACH")?;
         ensure_extension_loaded(&conn, "mssql")
             .with_context(|| "Failed to install/load mssql extension")?;
-        let conn_str = db.strip_prefix("mssql:").unwrap_or(db);
+        let is_mssql_uri = db.to_ascii_lowercase().starts_with("mssql://");
+        let conn_str = if is_mssql_uri {
+            db
+        } else {
+            db.strip_prefix("mssql:").unwrap_or(db)
+        };
         let mut final_conn_str = conn_str.to_string();
-        if cfg!(target_os = "windows")
+        if !is_mssql_uri
+            && cfg!(target_os = "windows")
             && !final_conn_str.to_lowercase().contains("trusted_connection=")
             && !final_conn_str.to_lowercase().contains("integrated security=")
             && !final_conn_str.to_lowercase().contains("authenticator=")
@@ -1523,8 +1529,19 @@ pub fn format_mssql_connection_string(
     disable_ssl: bool,
 ) -> String {
     let host_trimmed = host_raw.trim();
+    // Preserve native mssql:// URIs untouched (do not wrap in Server=... or append ADO.NET semicolons)
+    if host_trimmed.to_ascii_lowercase().starts_with("mssql://") {
+        return host_trimmed.to_string();
+    }
     let mut conn_str = if host_trimmed.contains('=') {
         host_trimmed.to_string()
+    } else if host_trimmed.contains(',') {
+        format!("Server={}", escape_ado_value(host_trimmed))
+    } else if host_trimmed.contains('\\')
+        && (port_raw.trim().is_empty() || port_raw.trim() == "1433")
+    {
+        // Named SQL Server instance (e.g. myhost\SQLEXPRESS): omit default port 1433 so SQL Server Browser (UDP 1434) resolves the dynamic port
+        format!("Server={}", escape_ado_value(host_trimmed))
     } else {
         let port = if port_raw.trim().is_empty() {
             "1433"
@@ -1575,7 +1592,24 @@ pub fn format_mssql_connection_string(
     conn_str
 }
 
+/// Returns true if `path` is a remote HTTP(S) or cloud-storage URL for a frozen DuckLake file
+/// (which DuckLake attaches as `ATTACH '<url>' (TYPE ducklake)` rather than `ducklake:<url>`).
+pub fn is_remote_ducklake_url(path: &str) -> bool {
+    let lower = path.trim().to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("s3://")
+        || lower.starts_with("r2://")
+        || lower.starts_with("gcs://")
+        || lower.starts_with("gs://")
+        || lower.starts_with("az://")
+        || lower.starts_with("azure://")
+        || lower.starts_with("abfss://")
+}
+
 /// Formats a normalized `ducklake:<catalog_dsn>` target string for the selected metadata backend.
+/// For remote/frozen DuckLake URLs (`https://...`, `s3://...`, etc.), returns the raw URL without
+/// a `ducklake:` prefix so callers attach it with `(TYPE ducklake)`.
 pub fn format_ducklake_target(
     backend: &str,
     host: &str,
@@ -1632,13 +1666,17 @@ pub fn format_ducklake_target(
             }
         }
         "file" | "duckdb" | "local" => {
-            if path.trim().is_empty() {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
                 return Err(
                     "Metadata file path cannot be empty for DuckLake Local File backend."
                         .to_string(),
                 );
             }
-            path.trim().to_string()
+            if is_remote_ducklake_url(trimmed) {
+                return Ok(trimmed.to_string());
+            }
+            trimmed.to_string()
         }
         "sqlite" => {
             if path.trim().is_empty() {
@@ -1657,7 +1695,7 @@ pub fn format_ducklake_target(
         other => other.to_string(),
     };
 
-    if cat.starts_with("ducklake:") {
+    if cat.starts_with("ducklake:") || is_remote_ducklake_url(&cat) {
         Ok(cat)
     } else {
         Ok(format!("ducklake:{}", cat))
@@ -3999,5 +4037,67 @@ database = "FinanceDB"
         let r2_body = build_r2_secret_body("k", "s", "acct123");
         assert!(r2_body.contains("TYPE R2"));
         assert!(r2_body.contains("ACCOUNT_ID 'acct123'"));
+
+        // Frozen remote DuckLake URLs omit the ducklake: prefix so callers pass (TYPE ducklake)
+        assert_eq!(
+            format_ducklake_target(
+                "file",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "https://blobs.duckdb.org/datalake/tpch-sf1.ducklake"
+            )
+            .unwrap(),
+            "https://blobs.duckdb.org/datalake/tpch-sf1.ducklake"
+        );
+        assert!(is_remote_ducklake_url("s3://bucket/frozen.ducklake"));
+        assert!(!is_remote_ducklake_url("./local.ducklake"));
+
+        // MSSQL named instance preserves dynamic port resolution (omits default ,1433)
+        let named_inst = format_mssql_connection_string(
+            "myhost\\SQLEXPRESS",
+            "1433",
+            "mydb",
+            "app",
+            "secret",
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            named_inst,
+            "Server=myhost\\SQLEXPRESS;Database=mydb;User Id=app;Password=secret"
+        );
+
+        // MSSQL pre-ported host does not duplicate port
+        let pre_ported = format_mssql_connection_string(
+            "sql.internal,14330",
+            "1433",
+            "mydb",
+            "app",
+            "secret",
+            false,
+            false,
+            false,
+        );
+        assert!(pre_ported.starts_with("Server=sql.internal,14330;Database=mydb"));
+
+        // MSSQL native URI passes through untouched
+        let mssql_uri = format_mssql_connection_string(
+            "mssql://app:secret@sql.internal:1433/mydb?encrypt=true",
+            "1433",
+            "mydb",
+            "app",
+            "secret",
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            mssql_uri,
+            "mssql://app:secret@sql.internal:1433/mydb?encrypt=true"
+        );
     }
 }
