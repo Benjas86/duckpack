@@ -164,23 +164,19 @@ pub fn calculate_status_height(status_msg: &str, content_width: usize, total_hei
 pub fn set_clipboard_text(text: &str, os_clipboard: &mut Option<arboard::Clipboard>) -> bool {
     let mut success = false;
 
-    // 1. Wayland CLI (wl-copy)
+    // 1. Wayland CLI (wl-copy) — always pipe via stdin so clipboard text is never exposed in argv/ps aux (L4)
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        let res = if text.len() < 65536 {
-            std::process::Command::new("wl-copy").arg("--").arg(text).status()
-        } else {
-            std::process::Command::new("wl-copy")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-                .and_then(|mut child| {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        use std::io::Write;
-                        let _ = stdin.write_all(text.as_bytes());
-                        drop(stdin);
-                    }
-                    child.wait()
-                })
-        };
+        let res = std::process::Command::new("wl-copy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(mut stdin) = child.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(text.as_bytes());
+                    drop(stdin);
+                }
+                child.wait()
+            });
         if let Ok(status) = res {
             if status.success() {
                 success = true;

@@ -1,14 +1,15 @@
 pub mod editor;
+pub mod execution;
 pub mod explorer;
 pub mod modals;
 
 pub use crate::catalog::*;
 pub use crate::query::*;
 pub(crate) use editor::{
-    EditorTab, FocusPane, build_paginated_sql, format_duckdb_value, generate_schema_visualizer,
+    EditorTab, FocusPane, generate_schema_visualizer,
 };
 #[cfg(test)]
-pub(crate) use editor::extract_explicit_sql_limit;
+pub(crate) use editor::{build_paginated_sql, extract_explicit_sql_limit, format_duckdb_value};
 pub use editor::{
     calculate_status_height, get_clipboard_text, handle_sql_error_position, set_clipboard_text,
 };
@@ -1803,19 +1804,7 @@ pub fn run_ide_loop_with_workspace(
                                                     format!("Queried table '{}'", display_table);
                                             }
                                             NodeType::CloudFile { path, is_dir } if !*is_dir => {
-                                                let ext = path
-                                                    .rsplit('.')
-                                                    .next()
-                                                    .unwrap_or("")
-                                                    .to_lowercase();
-                                                let read_fn = match ext.as_str() {
-                                                    "parquet" => "read_parquet",
-                                                    "csv" => "read_csv",
-                                                    "json" | "jsonl" | "ndjson" => "read_json",
-                                                    _ => "read_parquet",
-                                                };
-                                                let query =
-                                                    format!("SELECT * FROM {}('{}');", read_fn, path);
+                                                let query = execution::build_cloud_file_select_sql(path);
                                                 open_query_in_tabs(
                                                     &mut tabs,
                                                     &mut active_tab_index,
@@ -1988,7 +1977,10 @@ pub fn run_ide_loop_with_workspace(
                                                         .strip_prefix("db:")
                                                         .unwrap_or(&explorer_items[selected].name);
                                                     match conn.execute(
-                                                        &format!("DETACH {};", db_name),
+                                                        &format!(
+                                                            "DETACH {};",
+                                                            crate::sql_utils::quote_ident(db_name)
+                                                        ),
                                                         [],
                                                     ) {
                                                         Ok(_) => {
@@ -2001,7 +1993,8 @@ pub fn run_ide_loop_with_workspace(
                                                         Err(e) => {
                                                             status_msg = format!(
                                                                 "Failed to detach '{}': {}",
-                                                                db_name, e
+                                                                db_name,
+                                                                crate::sql_utils::redact_connection_credentials(&e.to_string())
                                                             );
                                                         }
                                                     }
@@ -2009,7 +2002,10 @@ pub fn run_ide_loop_with_workspace(
                                             }
                                             NodeType::CloudSecret { name, .. } => {
                                                 match conn.execute(
-                                                    &format!("DROP SECRET IF EXISTS {};", name),
+                                                    &format!(
+                                                        "DROP SECRET IF EXISTS {};",
+                                                        crate::sql_utils::quote_ident(name)
+                                                    ),
                                                     [],
                                                 ) {
                                                     Ok(_) => {
@@ -2022,7 +2018,8 @@ pub fn run_ide_loop_with_workspace(
                                                     Err(e) => {
                                                         status_msg = format!(
                                                             "Failed to drop secret '{}': {}",
-                                                            name, e
+                                                            name,
+                                                            crate::sql_utils::redact_connection_credentials(&e.to_string())
                                                         );
                                                     }
                                                 }
@@ -2432,542 +2429,20 @@ pub fn run_ide_loop_with_workspace(
 
         if execute_query || trigger_pagination.is_some() {
             let active_tab = &mut tabs[active_tab_index];
-            if !active_tab.target_database.is_empty() {
-                let _ = conn.execute(
-                    &format!(
-                        "USE \"{}\";",
-                        active_tab.target_database.replace('"', "\"\"")
-                    ),
-                    [],
-                );
-                meta.active_database = active_tab.target_database.clone();
-                for db in &mut meta.databases {
-                    db.is_active = db.name == active_tab.target_database;
-                }
-            }
-
-            let query_to_execute = if let Some(dir) = trigger_pagination {
-                if let Some(bq) = &active_tab.base_query {
-                    if dir == 0 {
-                        active_tab.pagination_offset = 0;
-                    } else {
-                        let new_offset = (active_tab.pagination_offset as i64
-                            + (dir as i64 * active_tab.pagination_limit as i64))
-                            .max(0) as usize;
-                        active_tab.pagination_offset = new_offset;
-                    }
-                    bq.clone()
-                } else {
-                    String::new()
-                }
-            } else {
-                let mut query = if let Some(((start_row, start_col), (end_row, end_col))) =
-                    active_tab.textarea.selection_range()
-                {
-                    let lines = active_tab.textarea.lines();
-                    let mut selected_text = Vec::new();
-                    for row in start_row..=end_row {
-                        if row >= lines.len() {
-                            continue;
-                        }
-                        let chars: Vec<char> = lines[row].chars().collect();
-                        let s = if row == start_row { start_col } else { 0 };
-                        let e = if row == end_row { end_col } else { chars.len() };
-                        let s = s.min(chars.len());
-                        let e = e.min(chars.len());
-                        if s <= e {
-                            selected_text.push(chars[s..e].iter().collect::<String>());
-                        }
-                    }
-                    selected_text.join("\n")
-                } else {
-                    active_tab.textarea.lines().join("\n")
-                };
-                if query.is_empty() {
-                    query = active_tab.textarea.lines().join("\n");
-                }
-                active_tab.pagination_offset = 0;
-                active_tab.base_query = Some(query.clone());
-                query
-            };
-
-            if query_to_execute.trim().is_empty() {
-                if trigger_pagination.is_none() {
-                    status_msg = "Error: Query is empty".to_string();
-                }
-            } else {
-                active_tab.query_results.clear();
-                active_tab.column_names.clear();
-                active_tab.horizontal_scroll = 0;
-
-                active_tab
-                    .textarea
-                    .set_search_pattern(SQL_KEYWORD_PATTERN)
-                    .unwrap_or(());
-                active_tab.textarea.set_search_style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                );
-
-                let is_explicit_remote = is_remote_directive_query(&query_to_execute);
-                let active_tab_is_quack = meta
-                    .databases
-                    .iter()
-                    .find(|d| d.name == active_tab.target_database)
-                    .map(|d| {
-                        d.db_type.eq_ignore_ascii_case("quack")
-                            || d.path
-                                .as_deref()
-                                .map(|p| p.starts_with("quack:"))
-                                .unwrap_or(false)
-                    })
-                    .unwrap_or(false)
-                    || (is_quack && active_tab.target_database == "target_db");
-
-                let remote_quack_alias = if active_tab_is_quack {
-                    Some(active_tab.target_database.clone())
-                } else {
-                    let mut exec_ref: &Connection = conn;
-                    crate::diff::find_any_quack_alias(
-                        &mut exec_ref,
-                        Some(&active_tab.target_database),
-                    )
-                };
-
-                let should_route_via_quack = is_explicit_remote
-                    || (active_tab_is_quack && should_auto_route_to_quack(&query_to_execute));
-
-                let (exec_query, is_paginatable, is_mutation) = if should_route_via_quack {
-                    let alias = remote_quack_alias.as_deref().unwrap_or("target_db");
-                    let (eq, is_pag) = wrap_remote_query_for_catalog(&query_to_execute, alias);
-                    (eq, is_pag, false)
-                } else {
-                    let mut clean_lower = query_to_execute.trim().to_lowercase();
-                    loop {
-                        if clean_lower.starts_with("--") {
-                            if let Some(idx) = clean_lower.find('\n') {
-                                clean_lower = clean_lower[idx..].trim_start().to_string();
-                            } else {
-                                clean_lower = String::new();
-                            }
-                        } else if clean_lower.starts_with("/*") {
-                            if let Some(idx) = clean_lower.find("*/") {
-                                clean_lower = clean_lower[idx + 2..].trim_start().to_string();
-                            } else {
-                                clean_lower = String::new();
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    let is_pag = clean_lower.starts_with("select")
-                        || clean_lower.starts_with("with")
-                        || clean_lower.starts_with("values")
-                        || clean_lower.starts_with("from");
-                    let is_mut = clean_lower.starts_with("insert")
-                        || clean_lower.starts_with("update")
-                        || clean_lower.starts_with("delete")
-                        || clean_lower.starts_with("create")
-                        || clean_lower.starts_with("drop")
-                        || clean_lower.starts_with("alter")
-                        || clean_lower.starts_with("truncate")
-                        || clean_lower.starts_with("attach")
-                        || clean_lower.starts_with("detach")
-                        || clean_lower.starts_with("use")
-                        || clean_lower.starts_with("set")
-                        || clean_lower.starts_with("reset")
-                        || clean_lower.starts_with("copy")
-                        || clean_lower.starts_with("checkpoint")
-                        || clean_lower.starts_with("vacuum")
-                        || clean_lower.starts_with("install")
-                        || clean_lower.starts_with("load");
-                    (query_to_execute.clone(), is_pag, is_mut)
-                };
-
-                if is_mutation {
-                    active_tab.is_paginated = false;
-                    let start_time = std::time::Instant::now();
-                    let mut exec_batch_res = conn.execute_batch(&exec_query);
-                    if let Err(ref e) = exec_batch_res {
-                        let err_str = e.to_string();
-                        let lower_exec = exec_query.trim().to_lowercase();
-                        if let Some(ext) = extract_autoload_extension_name(&err_str) {
-                            if crate::engine::ensure_extension_loaded(conn, &ext).is_ok() {
-                                exec_batch_res = Ok(());
-                            }
-                        } else if lower_exec.starts_with("install ") {
-                            let after = lower_exec["install ".len()..].trim();
-                            let ext = after
-                                .trim_matches(|c| c == '\'' || c == '"' || c == ';')
-                                .split_whitespace()
-                                .next()
-                                .unwrap_or("");
-                            if !ext.is_empty()
-                                && !ext.starts_with("http")
-                                && crate::engine::ensure_extension_loaded(conn, ext).is_ok()
-                            {
-                                exec_batch_res = Ok(());
-                            }
-                        }
-                    }
-                    match exec_batch_res {
-                        Ok(()) => {
-                            active_tab.query_results.clear();
-                            active_tab.column_names.clear();
-                            let elapsed = start_time.elapsed();
-
-                            trigger_explorer_refresh = true;
-                            status_msg =
-                                format!("Statement executed successfully in {:.2?}.", elapsed);
-
-                            let history_path = queries_dir.join(".history.sql");
-                            let timestamp =
-                                chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                            let history_entry = format!(
-                                "-- Executed at {} (Took {:.2?})\n{};\n\n",
-                                timestamp,
-                                elapsed,
-                                query_to_execute.trim()
-                            );
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(history_path)
-                            {
-                                let _ = f.write_all(history_entry.as_bytes());
-                            }
-                        }
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            handle_sql_error_position(
-                                &mut tabs[active_tab_index].textarea,
-                                &err_str,
-                            );
-                            let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
-                            status_msg = format!("Execution Error: {}{}", e, diag);
-                        }
-                    }
-                } else {
-                    let final_query = if is_paginatable {
-                        let (pag_sql, is_paginated) = build_paginated_sql(
-                            &exec_query,
-                            active_tab.pagination_limit,
-                            active_tab.pagination_offset,
-                        );
-                        active_tab.is_paginated = is_paginated;
-                        pag_sql
-                    } else {
-                        active_tab.is_paginated = false;
-                        exec_query.clone()
-                    };
-
-                    let mut prepare_res = conn.prepare(&final_query);
-                    if let Err(ref e) = prepare_res {
-                        let err_str = e.to_string();
-                        if let Some(ext) = extract_autoload_extension_name(&err_str) {
-                            if crate::engine::ensure_extension_loaded(conn, &ext).is_ok() {
-                                prepare_res = conn.prepare(&final_query);
-                            }
-                        }
-                    }
-
-                    match prepare_res {
-                        Ok(mut stmt) => {
-                            let mut exec_rows = Vec::new();
-                            let mut count = 0;
-
-                            let start_time = std::time::Instant::now();
-                            match stmt.query([]) {
-                                Ok(mut rows) => {
-                                    let mut cols = Vec::new();
-                                    if let Some(stmt_ref) = rows.as_ref() {
-                                        for col in stmt_ref.column_names() {
-                                            cols.push(col.to_string());
-                                        }
-                                    }
-                                    active_tab.column_names = cols;
-
-                                    while let Ok(Some(row)) = rows.next() {
-                                        count += 1;
-                                        let mut str_row = Vec::new();
-                                        for i in 0..active_tab.column_names.len() {
-                                            let val: String = match row.get(i) {
-                                                Ok(v) => format_duckdb_value(v),
-                                                Err(_) => "NULL".to_string(),
-                                            };
-                                            str_row.push(val);
-                                        }
-                                        exec_rows.push(str_row);
-                                    }
-                                    active_tab.query_results = exec_rows;
-                                    active_tab.results_state.select(Some(0));
-                                    active_tab.horizontal_scroll = 0;
-                                    let elapsed = start_time.elapsed();
-
-                                    let lower = query_to_execute.to_lowercase();
-                                    let is_catalog_mutation = lower.contains("attach ")
-                                        || lower.contains("detach ")
-                                        || lower.contains("create ")
-                                        || lower.contains("drop ")
-                                        || lower.contains("alter ")
-                                        || lower.contains("use ");
-
-                                    if is_explicit_remote {
-                                        if is_catalog_mutation {
-                                            refresh_attached_catalog(
-                                                conn,
-                                                db_path,
-                                                quack_disable_ssl,
-                                            );
-                                            trigger_explorer_refresh = true;
-                                        }
-                                        if count > 0 {
-                                            status_msg = format!(
-                                                "Remote statement executed on server. Returned {} rows in {:.2?}.",
-                                                count, elapsed
-                                            );
-                                        } else {
-                                            status_msg = format!(
-                                                "Remote statement executed on server in {:.2?}.",
-                                                elapsed
-                                            );
-                                        }
-                                    } else if is_remote_db
-                                        && is_unadorned_secret_or_setting(&query_to_execute)
-                                    {
-                                        status_msg = "⚠️ Applied LOCALLY on DuckPack! Prefix with '-- @remote' to run session secrets/settings on the remote Quack server.".to_string();
-                                    } else {
-                                        if is_catalog_mutation {
-                                            refresh_attached_catalog(
-                                                conn,
-                                                db_path,
-                                                quack_disable_ssl,
-                                            );
-                                            trigger_explorer_refresh = true;
-                                        }
-                                        status_msg = format!(
-                                            "Query executed successfully. Returned {} rows in {:.2?}.",
-                                            count, elapsed
-                                        );
-                                    }
-
-                                    let history_path = queries_dir.join(".history.sql");
-                                    let timestamp = chrono::Local::now()
-                                        .format("%Y-%m-%d %H:%M:%S")
-                                        .to_string();
-                                    let sanitized_query =
-                                        if crate::engine::should_redact_sql_history(
-                                            &query_to_execute,
-                                        ) {
-                                            crate::engine::redact_connection_credentials(
-                                                query_to_execute.trim(),
-                                            )
-                                        } else {
-                                            query_to_execute.trim().to_string()
-                                        };
-                                    let history_entry = format!(
-                                        "-- Executed at {} (Took {:.2?})\n{};\n\n",
-                                        timestamp, elapsed, sanitized_query
-                                    );
-                                    use std::io::Write;
-                                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open(&history_path)
-                                    {
-                                        #[cfg(unix)]
-                                        {
-                                            use std::os::unix::fs::PermissionsExt;
-                                            let _ = f.set_permissions(
-                                                std::fs::Permissions::from_mode(0o600),
-                                            );
-                                        }
-                                        let _ = f.write_all(history_entry.as_bytes());
-                                    }
-                                }
-                                Err(e) => {
-                                    let err_str = e.to_string();
-                                    handle_sql_error_position(
-                                        &mut tabs[active_tab_index].textarea,
-                                        &err_str,
-                                    );
-                                    let diag =
-                                        diagnose_remote_credential_error(&err_str, is_remote_db);
-                                    status_msg = format!("Execution Error: {}{}", e, diag);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let mut executed_remote_fallback = false;
-                            let local_err_str = e.to_string();
-                            let is_syntax_error = local_err_str.contains("syntax error at or near");
-                            let lower_q = query_to_execute.to_lowercase();
-                            let is_temp_mutation = lower_q.contains("temp table")
-                                || lower_q.contains("temporary table")
-                                || lower_q.contains("temp view")
-                                || lower_q.contains("temporary view");
-                            if is_quack
-                                && !is_explicit_remote
-                                && !is_syntax_error
-                                && !is_temp_mutation
-                            {
-                                let clean_query = query_to_execute
-                                    .trim()
-                                    .strip_suffix(';')
-                                    .unwrap_or(query_to_execute.trim());
-                                let remote_sql = if is_paginatable {
-                                    let inner = format!(
-                                        "SELECT * FROM target_db.query('{}')",
-                                        clean_query.replace("'", "''")
-                                    );
-                                    if active_tab.is_paginated && active_tab.pagination_limit > 0 {
-                                        format!(
-                                            "{} LIMIT {} OFFSET {}",
-                                            inner,
-                                            active_tab.pagination_limit,
-                                            active_tab.pagination_offset
-                                        )
-                                    } else {
-                                        format!("{};", inner)
-                                    }
-                                } else {
-                                    format!(
-                                        "FROM target_db.query('{}');",
-                                        clean_query.replace("'", "''")
-                                    )
-                                };
-                                match conn.prepare(&remote_sql) {
-                                    Ok(mut remote_stmt) => {
-                                        let start_time = std::time::Instant::now();
-                                        match remote_stmt.query([]) {
-                                            Ok(mut rows) => {
-                                                let mut cols = Vec::new();
-                                                if let Some(stmt_ref) = rows.as_ref() {
-                                                    for col in stmt_ref.column_names() {
-                                                        cols.push(col.to_string());
-                                                    }
-                                                }
-                                                active_tab.column_names = cols;
-                                                let mut exec_rows = Vec::new();
-                                                let mut count = 0;
-                                                while let Ok(Some(row)) = rows.next() {
-                                                    count += 1;
-                                                    let mut str_row = Vec::new();
-                                                    for i in 0..active_tab.column_names.len() {
-                                                        let val: String = match row.get(i) {
-                                                            Ok(v) => format_duckdb_value(v),
-                                                            Err(_) => "NULL".to_string(),
-                                                        };
-                                                        str_row.push(val);
-                                                    }
-                                                    exec_rows.push(str_row);
-                                                }
-                                                active_tab.query_results = exec_rows;
-                                                active_tab.results_state.select(Some(0));
-                                                active_tab.horizontal_scroll = 0;
-                                                let elapsed = start_time.elapsed();
-
-                                                let lower = query_to_execute.to_lowercase();
-                                                let is_catalog_mutation = lower.contains("attach ")
-                                                    || lower.contains("detach ")
-                                                    || lower.contains("create ")
-                                                    || lower.contains("drop ")
-                                                    || lower.contains("alter ")
-                                                    || lower.contains("use ");
-                                                if is_catalog_mutation {
-                                                    refresh_attached_catalog(
-                                                        conn,
-                                                        db_path,
-                                                        quack_disable_ssl,
-                                                    );
-                                                    trigger_explorer_refresh = true;
-                                                }
-                                                if count > 0 {
-                                                    status_msg = format!(
-                                                        "Remote statement executed successfully. Returned {} rows in {:.2?}.",
-                                                        count, elapsed
-                                                    );
-                                                } else {
-                                                    status_msg = format!(
-                                                        "Remote statement executed successfully in {:.2?}.",
-                                                        elapsed
-                                                    );
-                                                }
-                                                executed_remote_fallback = true;
-
-                                                let history_path = queries_dir.join(".history.sql");
-                                                let timestamp = chrono::Local::now()
-                                                    .format("%Y-%m-%d %H:%M:%S")
-                                                    .to_string();
-                                                let sanitized_query =
-                                                    if crate::engine::should_redact_sql_history(
-                                                        &query_to_execute,
-                                                    ) {
-                                                        crate::engine::redact_connection_credentials(
-                                                            query_to_execute.trim(),
-                                                        )
-                                                    } else {
-                                                        query_to_execute.trim().to_string()
-                                                    };
-                                                let history_entry = format!(
-                                                    "-- Executed at {} (Took {:.2?})\n{};\n\n",
-                                                    timestamp, elapsed, sanitized_query
-                                                );
-                                                use std::io::Write;
-                                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                                    .create(true)
-                                                    .append(true)
-                                                    .open(&history_path)
-                                                {
-                                                    #[cfg(unix)]
-                                                    {
-                                                        use std::os::unix::fs::PermissionsExt;
-                                                        let _ = f.set_permissions(
-                                                            std::fs::Permissions::from_mode(0o600),
-                                                        );
-                                                    }
-                                                    let _ = f.write_all(history_entry.as_bytes());
-                                                }
-                                            }
-                                            Err(query_err) => {
-                                                let err_str = query_err.to_string();
-                                                let diag = diagnose_remote_credential_error(
-                                                    &err_str,
-                                                    is_remote_db,
-                                                );
-                                                status_msg = format!(
-                                                    "Execution Error: {}{}",
-                                                    query_err, diag
-                                                );
-                                                executed_remote_fallback = true;
-                                            }
-                                        }
-                                    }
-                                    Err(prep_err) => {
-                                        let err_str = prep_err.to_string();
-                                        let diag = diagnose_remote_credential_error(
-                                            &err_str,
-                                            is_remote_db,
-                                        );
-                                        status_msg = format!("Prepare Error: {}{}", prep_err, diag);
-                                        executed_remote_fallback = true;
-                                    }
-                                }
-                            }
-
-                            if !executed_remote_fallback {
-                                let err_str = e.to_string();
-                                handle_sql_error_position(
-                                    &mut tabs[active_tab_index].textarea,
-                                    &err_str,
-                                );
-                                let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
-                                status_msg = format!("Prepare Error: {}{}", e, diag);
-                            }
-                        }
-                    }
+            if let Some(outcome) = execution::execute_ide_query(
+                conn,
+                active_tab,
+                &mut meta,
+                &queries_dir,
+                db_path,
+                is_quack,
+                is_remote_db,
+                quack_disable_ssl,
+                trigger_pagination,
+            ) {
+                status_msg = outcome.status_msg;
+                if outcome.trigger_explorer_refresh {
+                    trigger_explorer_refresh = true;
                 }
             }
         }
@@ -3223,8 +2698,10 @@ pub fn run_ide_loop_with_workspace(
                             status_msg = msg;
                         }
                         NodeType::CloudSecret { name, .. } => {
-                            let query =
-                                format!("SELECT * FROM duckdb_secrets() WHERE name = '{}';", name);
+                            let query = format!(
+                                "SELECT * FROM duckdb_secrets() WHERE name = {};",
+                                crate::sql_utils::quote_literal(&name)
+                            );
                             open_query_in_tabs(&mut tabs, &mut active_tab_index, query, None);
                             focus = FocusPane::Editor;
                             status_msg = format!("Inspecting secret '{}'", name);
@@ -3267,15 +2744,7 @@ pub fn run_ide_loop_with_workspace(
                                     selected.min(explorer_items.len().saturating_sub(1)),
                                 ));
                             } else {
-                                let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
-                                let read_fn = match ext.as_str() {
-                                    "parquet" => "read_parquet",
-                                    "csv" => "read_csv",
-                                    "json" | "jsonl" | "ndjson" => "read_json",
-                                    _ => "read_parquet",
-                                };
-                                let query =
-                                    format!("SELECT * FROM {}('{}');", read_fn, path);
+                                let query = execution::build_cloud_file_select_sql(&path);
                                 let fname = path.split('/').last().unwrap_or(&path).to_string();
                                 open_query_in_tabs(&mut tabs, &mut active_tab_index, query, None);
                                 focus = FocusPane::Editor;
