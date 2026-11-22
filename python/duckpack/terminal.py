@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 
 
 from ._duckpack import SessionBridge, stage_host_temp_tables, sync_back_host_temp_objects
@@ -39,12 +40,13 @@ def find_terminal_emulator():
     Returns (terminal_name, command_prefix_list) or None.
     """
     if sys.platform == "darwin":
-        # macOS: Use AppleScript to tell Terminal.app to run the command
-        return ("Terminal.app", ["osascript", "-e"])
+        # macOS: Pipe AppleScript to osascript over stdin (never exposes secrets in argv/ps)
+        return ("Terminal.app", ["osascript", "-"])
     elif sys.platform == "win32":
         if shutil.which("wt.exe"):
             return ("Windows Terminal", ["wt.exe"])
-        return ("Command Prompt", ["cmd.exe", "/c", "start"])
+        # H2: Direct CREATE_NEW_CONSOLE spawn avoids cmd.exe /c start metacharacter injection
+        return ("Command Prompt", [])
     else:
         # Linux / BSD (Wayland & X11)
         # Check if a display server is present
@@ -156,14 +158,45 @@ def launch_terminal_window(
     try:
         if sys.platform == "darwin":
             shell_parts = [shlex.quote(str(arg)) for arg in cli_cmd]
+            cmd_prefix = ""
             if token_arg:
-                shell_parts.insert(0, f"QUACK_TOKEN={shlex.quote(str(token_arg))}")
-            cmd_str = " ".join(shell_parts)
-            apple_escaped = cmd_str.replace("\\", "\\\\").replace('"', '\\"')
-            script = f'tell application "Terminal" to do script "{apple_escaped}"'
-            proc = subprocess.Popen(["osascript", "-e", script], env=child_env)
+                clean_tok = str(token_arg).replace("\r", "").replace("\n", "").replace("\0", "")
+                fd, tok_path = tempfile.mkstemp(prefix="duckpack_tok_", suffix=".sh")
+                try:
+                    os.chmod(tok_path, 0o600)
+                    with os.fdopen(fd, "w") as tf:
+                        tf.write(f"export QUACK_TOKEN={shlex.quote(clean_tok)}\n")
+                except Exception:
+                    try:
+                        os.unlink(tok_path)
+                    except OSError:
+                        pass
+                    raise
+                quoted_tok_path = shlex.quote(tok_path)
+                cmd_prefix = f". {quoted_tok_path} && rm -f {quoted_tok_path} && "
+            cmd_str = cmd_prefix + " ".join(shell_parts)
+            # H2: Strip CR/LF and pipe AppleScript over stdin so neither command nor token enters argv
+            apple_escaped = (
+                cmd_str.replace("\r", "")
+                .replace("\n", " ")
+                .replace("\\", "\\\\")
+                .replace('"', '\\"')
+            )
+            script = f'tell application "Terminal" to do script "{apple_escaped}"\n'
+            proc = subprocess.Popen(
+                ["osascript", "-"],
+                stdin=subprocess.PIPE,
+                env=child_env,
+            )
+            if proc.stdin is not None:
+                proc.stdin.write(script.encode("utf-8"))
+                proc.stdin.close()
         elif sys.platform == "win32" and "wt.exe" in term_prefix:
             proc = subprocess.Popen(term_prefix + cli_cmd, env=child_env)
+        elif sys.platform == "win32":
+            # H2: Launch directly in a new console window without cmd.exe shell parsing
+            creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+            proc = subprocess.Popen(cli_cmd, env=child_env, creationflags=creationflags)
         else:
             # Linux (Ghostty, Foot, Kitty, Alacritty, etc.)
             full_cmd = term_prefix + cli_cmd

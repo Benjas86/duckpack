@@ -8,6 +8,7 @@ pub mod project;
 pub mod quack_auth;
 pub mod query;
 pub mod rbac_bundle;
+pub mod session;
 pub mod sql_utils;
 pub mod syntax;
 pub mod tui;

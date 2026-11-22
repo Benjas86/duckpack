@@ -215,6 +215,7 @@ pub struct DiffReviewSession {
     pub db_target: String,
     pub active_catalog: String,
     pub force_drop: bool,
+    pub allow_lake_rewrite: bool,
     pub status_msg: String,
     pub inspect_data: Option<(String, Vec<String>, Vec<Vec<String>>, i64)>,
     pub target_snapshot: Option<CatalogSnapshot>,
@@ -231,12 +232,25 @@ impl DiffReviewSession {
         initial_catalog: Option<&str>,
         force_drop: bool,
     ) -> Result<Self> {
+        Self::new_with_options(exec, project_dir, db_target, initial_catalog, force_drop, false)
+    }
+
+    /// Initializes a `DiffReviewSession` with explicit `allow_lake_rewrite` control (no process-global env mutation).
+    pub fn new_with_options(
+        exec: &mut dyn DbExecutor,
+        project_dir: &Path,
+        db_target: &str,
+        initial_catalog: Option<&str>,
+        force_drop: bool,
+        allow_lake_rewrite: bool,
+    ) -> Result<Self> {
         let active_catalog = diff::validate_target_catalog_exec(exec, initial_catalog, true)?;
         let mut session = Self {
             project_dir: project_dir.to_path_buf(),
             db_target: db_target.to_string(),
             active_catalog,
             force_drop,
+            allow_lake_rewrite,
             status_msg: String::from(
                 "Ready. Press 'Enter' to Apply, 'r' to Refresh, 'b' to switch catalog, 'q' to Quit.",
             ),
@@ -454,10 +468,11 @@ impl DiffReviewSession {
             None
         };
 
-        let apply_res = engine::apply_diff_with_executor(
+        let apply_res = engine::apply_diff_with_lake_options(
             exec,
             &self.diff_result,
             self.force_drop,
+            self.allow_lake_rewrite,
             remote,
             &self.project_dir,
             Some(&self.active_catalog),
@@ -510,9 +525,39 @@ pub fn run_diff_review_session(
     force_drop: bool,
     quack_disable_ssl: bool,
 ) -> Result<DiffReviewSummary> {
+    run_diff_review_session_with_options(
+        terminal,
+        conn,
+        project_dir,
+        db_target,
+        initial_catalog,
+        force_drop,
+        false,
+        quack_disable_ssl,
+    )
+}
+
+/// Runs the interactive diff review TUI session with explicit `allow_lake_rewrite` control.
+#[allow(clippy::too_many_arguments)]
+pub fn run_diff_review_session_with_options(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    conn: &Connection,
+    project_dir: &Path,
+    db_target: &str,
+    initial_catalog: Option<&str>,
+    force_drop: bool,
+    allow_lake_rewrite: bool,
+    quack_disable_ssl: bool,
+) -> Result<DiffReviewSummary> {
     let mut exec = conn;
-    let mut session =
-        DiffReviewSession::new(&mut exec, project_dir, db_target, initial_catalog, force_drop)?;
+    let mut session = DiffReviewSession::new_with_options(
+        &mut exec,
+        project_dir,
+        db_target,
+        initial_catalog,
+        force_drop,
+        allow_lake_rewrite,
+    )?;
     let project_dir_buf = project_dir.to_path_buf();
 
     loop {

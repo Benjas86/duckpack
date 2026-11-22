@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 use crate::diff as schema_diff;
 use crate::engine::{self, DbExecutor};
+use crate::session::{
+    apply_catalogs_with_executor, format_non_terminal_summary, open_explore_session, TerminalGuard,
+};
 
 create_exception!(duckpack, Error, PyException);
 create_exception!(duckpack, SchemaError, Error);
@@ -88,43 +91,6 @@ impl DbExecutor for PyDbExecutor {
     }
 }
 
-/// RAII Guard that ensures terminal raw mode and alternate screen are restored
-/// even if a panic or KeyboardInterrupt occurs during an interactive session.
-pub struct TerminalGuard;
-
-impl TerminalGuard {
-    pub fn enter() -> anyhow::Result<Self> {
-        ratatui::crossterm::terminal::enable_raw_mode().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to initialize terminal (raw mode): {}. \
-                duckpack.explore() requires an interactive terminal (TTY). \
-                Interactive full-screen TUI cannot run inside non-TTY environments \
-                (such as Jupyter notebooks, web cells, or piped stdout). \
-                Please run from a terminal shell.",
-                e
-            )
-        })?;
-        let mut stdout = std::io::stdout();
-        ratatui::crossterm::execute!(
-            stdout,
-            ratatui::crossterm::terminal::EnterAlternateScreen,
-            ratatui::crossterm::event::EnableMouseCapture
-        )?;
-        Ok(Self)
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = ratatui::crossterm::terminal::disable_raw_mode();
-        let _ = ratatui::crossterm::execute!(
-            std::io::stdout(),
-            ratatui::crossterm::terminal::LeaveAlternateScreen,
-            ratatui::crossterm::event::DisableMouseCapture
-        );
-    }
-}
-
 fn is_interactive_terminal() -> bool {
     std::io::stdout().is_terminal() && std::io::stdin().is_terminal()
 }
@@ -136,258 +102,14 @@ fn find_available_port() -> u16 {
         .unwrap_or(9494)
 }
 
-fn print_non_terminal_explorer(executor: &mut PyDbExecutor, catalog: Option<&str>) -> PyResult<()> {
-    let snapshot = schema_diff::CatalogSnapshot::introspect(executor, catalog)
-        .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-    let table_map = snapshot.tables;
-    let view_map = snapshot.views;
-    let macro_map = snapshot.macros;
-
-    // Discover temporary tables
-    let mut temp_tables: Vec<(String, Vec<(String, String)>)> = Vec::new();
-    if let Ok((_, rows)) = executor.query_rows("SELECT table_name FROM duckdb_tables() WHERE temporary = true AND internal = false ORDER BY table_name") {
-        for r in rows {
-            if let Some(tname) = r.into_iter().next() {
-                let mut cols = Vec::new();
-                if let Ok((_, col_rows)) = executor.query_rows(&format!(
-                    "SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '{}' ORDER BY column_index",
-                    tname.replace('\'', "''")
-                )) {
-                    for crow in col_rows {
-                        if crow.len() >= 2 {
-                            cols.push((crow[0].clone(), crow[1].clone()));
-                        }
-                    }
-                }
-                temp_tables.push((tname, cols));
-            }
-        }
-    }
-
-    // Discover temporary views
-    let mut temp_views: Vec<String> = Vec::new();
-    if let Ok((_, rows)) = executor.query_rows("SELECT view_name FROM duckdb_views() WHERE temporary = true AND internal = false ORDER BY view_name") {
-        for r in rows {
-            if let Some(vname) = r.into_iter().next() {
-                temp_views.push(vname);
-            }
-        }
-    }
-
-    println!("======================================================================");
-    if let Some(cat) = catalog {
-        println!(
-            "🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: catalog '{}')",
-            cat
-        );
-    } else {
-        println!("🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode)");
-    }
-    println!("======================================================================");
-
-    let total_tables = table_map.len() + temp_tables.len();
-    if total_tables == 0 {
-        println!("📊 Tables: (none)");
-    } else {
-        println!("📊 Tables ({}):", total_tables);
-        let mut sorted_tables: Vec<_> = table_map.iter().collect();
-        sorted_tables.sort_by_key(|(name, _)| (*name).clone());
-        for (name, schema) in sorted_tables {
-            let quoted_name = schema_diff::quote_qualified_identifier(name);
-            let row_count = executor
-                .query_rows(&format!("SELECT count(*) FROM {}", quoted_name))
-                .ok()
-                .and_then(|(_, rows)| rows.into_iter().next())
-                .and_then(|r| r.into_iter().next())
-                .unwrap_or_else(|| "?".to_string());
-
-            println!("  • {} ({} rows)", name, row_count);
-            let mut sorted_cols: Vec<_> = schema.columns.iter().collect();
-            sorted_cols.sort_by_key(|(col, _)| (*col).clone());
-            for (col, dtype) in sorted_cols {
-                println!("    - {}: {}", col, dtype);
-            }
-        }
-
-        for (tname, cols) in &temp_tables {
-            let row_count = executor
-                .query_rows(&format!(
-                    "SELECT count(*) FROM \"{}\"",
-                    tname.replace('\"', "\"\"")
-                ))
-                .ok()
-                .and_then(|(_, rows)| rows.into_iter().next())
-                .and_then(|r| r.into_iter().next())
-                .unwrap_or_else(|| "?".to_string());
-
-            println!("  • {} [temp] ({} rows)", tname, row_count);
-            for (col, dtype) in cols {
-                println!("    - {}: {}", col, dtype);
-            }
-        }
-    }
-
-    let total_views = view_map.len() + temp_views.len();
-    if total_views > 0 {
-        println!("\n🔍 Views ({}):", total_views);
-        for name in view_map.keys() {
-            println!("  • {}", name);
-        }
-        for name in &temp_views {
-            println!("  • {} [temp]", name);
-        }
-    }
-
-    if !macro_map.is_empty() {
-        println!("\n🔧 Macros ({}):", macro_map.len());
-        for name in macro_map.keys() {
-            println!("  • {}", name);
-        }
-    }
-
-    println!("======================================================================");
-    println!("💡 Note: Full interactive TUI (multi-tab SQL editor, autocompletion,");
-    println!("   ERD diagram) requires an interactive terminal (TTY).");
-    println!("   To launch the interactive IDE, run your script from a terminal shell:");
-    println!(
-        "   $ python -c \"import duckdb, duckpack; con = duckdb.connect(...); duckpack.explore(con)\""
-    );
-    println!("======================================================================");
-
-    Ok(())
-}
-
-fn print_non_terminal_db(
-    conn: &duckdb::Connection,
-    db_name: &str,
+fn print_non_terminal_summary_exec(
+    exec: &mut dyn DbExecutor,
+    db_label: Option<&str>,
     catalog: Option<&str>,
 ) -> PyResult<()> {
-    let tables = schema_diff::get_schema(conn, catalog).unwrap_or_default();
-    let views = schema_diff::get_views(conn, catalog).unwrap_or_default();
-    let macros = schema_diff::get_macros(conn, catalog).unwrap_or_default();
-
-    // Discover temporary tables
-    let mut temp_tables: Vec<(String, Vec<(String, String)>)> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT table_name FROM duckdb_tables() WHERE temporary = true AND internal = false ORDER BY table_name") {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(tname) = row.get::<_, String>(0) {
-                    let mut cols = Vec::new();
-                    let col_sql = format!(
-                        "SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'temp' AND table_name = '{}' ORDER BY column_index",
-                        tname.replace('\'', "''")
-                    );
-                    if let Ok(mut cstmt) = conn.prepare(&col_sql) {
-                        if let Ok(mut crows) = cstmt.query([]) {
-                            while let Ok(Some(crow)) = crows.next() {
-                                if let (Ok(cname), Ok(ctype)) = (crow.get::<_, String>(0), crow.get::<_, String>(1)) {
-                                    cols.push((cname, ctype));
-                                }
-                            }
-                        }
-                    }
-                    temp_tables.push((tname, cols));
-                }
-            }
-        }
-    }
-
-    // Discover temporary views
-    let mut temp_views: Vec<String> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT view_name FROM duckdb_views() WHERE temporary = true AND internal = false ORDER BY view_name") {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(vname) = row.get::<_, String>(0) {
-                    temp_views.push(vname);
-                }
-            }
-        }
-    }
-
-    println!("======================================================================");
-    if let Some(cat) = catalog {
-        println!(
-            "🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: {} [catalog '{}'])",
-            db_name, cat
-        );
-    } else {
-        println!(
-            "🦆 DuckPack Database Explorer (Notebook / Non-TTY Mode: {})",
-            db_name
-        );
-    }
-    println!("======================================================================");
-
-    let total_tables = tables.len() + temp_tables.len();
-    if total_tables == 0 {
-        println!("📊 Tables: (none)");
-    } else {
-        println!("📊 Tables ({}):", total_tables);
-        let mut sorted_tables: Vec<_> = tables.iter().collect();
-        sorted_tables.sort_by_key(|(name, _)| (*name).clone());
-        for (name, schema) in sorted_tables {
-            let quoted_name = schema_diff::quote_qualified_identifier(name);
-            let row_count: String = conn
-                .query_row(&format!("SELECT count(*) FROM {}", quoted_name), [], |r| {
-                    let c: i64 = r.get(0)?;
-                    Ok(c.to_string())
-                })
-                .unwrap_or_else(|_| "?".to_string());
-
-            println!("  • {} ({} rows)", name, row_count);
-            let mut sorted_cols: Vec<_> = schema.columns.iter().collect();
-            sorted_cols.sort_by_key(|(col, _)| (*col).clone());
-            for (col, dtype) in sorted_cols {
-                println!("    - {}: {}", col, dtype);
-            }
-        }
-
-        for (tname, cols) in &temp_tables {
-            let row_count: String = conn
-                .query_row(
-                    &format!("SELECT count(*) FROM \"{}\"", tname.replace('\"', "\"\"")),
-                    [],
-                    |r| {
-                        let c: i64 = r.get(0)?;
-                        Ok(c.to_string())
-                    },
-                )
-                .unwrap_or_else(|_| "?".to_string());
-
-            println!("  • {} [temp] ({} rows)", tname, row_count);
-            for (col, dtype) in cols {
-                println!("    - {}: {}", col, dtype);
-            }
-        }
-    }
-
-    let total_views = views.len() + temp_views.len();
-    if total_views > 0 {
-        println!("\n🔍 Views ({}):", total_views);
-        for name in views.keys() {
-            println!("  • {}", name);
-        }
-        for name in &temp_views {
-            println!("  • {} [temp]", name);
-        }
-    }
-
-    if !macros.is_empty() {
-        println!("\n🔧 Macros ({}):", macros.len());
-        for name in macros.keys() {
-            println!("  • {}", name);
-        }
-    }
-
-    println!("======================================================================");
-    println!("💡 Note: Full interactive TUI (multi-tab SQL editor, autocompletion,");
-    println!("   ERD diagram) requires an interactive terminal (TTY).");
-    println!("   To launch the interactive IDE, run your script from a terminal shell:");
-    println!(
-        "   $ python -c \"import duckdb, duckpack; con = duckdb.connect(...); duckpack.explore(con)\""
-    );
-    println!("======================================================================");
-
+    let summary = format_non_terminal_summary(exec, db_label, catalog)
+        .map_err(|e| ExecutionError::new_err(e.to_string()))?;
+    println!("{}", summary);
     Ok(())
 }
 
@@ -571,6 +293,7 @@ fn run_apply_tui(
     project_dir: &PathBuf,
     db_target: &str,
     force_drop: bool,
+    allow_lake_rewrite: bool,
     catalog: Option<&str>,
 ) -> PyResult<ApplyResult> {
     let _guard = TerminalGuard::enter()
@@ -581,13 +304,14 @@ fn run_apply_tui(
     let mut terminal = ratatui::Terminal::new(backend)
         .map_err(|e| ExecutionError::new_err(format!("Terminal backend error: {}", e)))?;
 
-    let summary = crate::tui::run_diff_review_session(
+    let summary = crate::tui::run_diff_review_session_with_options(
         &mut terminal,
         conn,
         project_dir,
         db_target,
         catalog,
         force_drop,
+        allow_lake_rewrite,
         false,
     )
     .map_err(|e| ExecutionError::new_err(format!("TUI error: {}", e)))?;
@@ -616,11 +340,6 @@ pub fn apply(
     insecure: bool,
     env: Option<&str>,
 ) -> PyResult<ApplyResult> {
-    if allow_lake_rewrite {
-        unsafe {
-            std::env::set_var("DUCKPACK_ALLOW_LAKE_REWRITE", "true");
-        }
-    }
     let p_dir = PathBuf::from(project_dir);
     if !p_dir.exists() {
         return Err(SchemaError::new_err(format!(
@@ -650,7 +369,14 @@ pub fn apply(
 
         if (!auto_approve || interactive) && is_interactive_terminal() {
             let start_cat = req_catalogs.first().map(|s| s.as_str());
-            return run_apply_tui(&conn, &p_dir, &spec.db, force_drop, start_cat);
+            return run_apply_tui(
+                &conn,
+                &p_dir,
+                &spec.db,
+                force_drop,
+                allow_lake_rewrite,
+                start_cat,
+            );
         } else if !auto_approve {
             return Err(ExecutionError::new_err(
                 "Cannot apply schema changes: auto_approve is False in a non-interactive environment. \
@@ -658,58 +384,22 @@ pub fn apply(
             ));
         }
 
-        let catalogs_to_apply = if req_catalogs.is_empty() {
-            let active = schema_diff::validate_target_catalog_exec(&mut conn, None, true)
-                .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-            vec![active]
-        } else {
-            req_catalogs
-        };
+        let report = apply_catalogs_with_executor(
+            &mut conn,
+            &p_dir,
+            &req_catalogs,
+            force_drop,
+            allow_lake_rewrite,
+            engine::is_remote(&spec.db),
+            false,
+        )
+        .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
 
-        let remote = engine::is_remote(&spec.db);
-        let mut total_applied_items = Vec::new();
-
-        for target_cat in &catalogs_to_apply {
-            let active_catalog =
-                schema_diff::validate_target_catalog_exec(&mut conn, Some(target_cat), true)
-                    .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-            let diff_result = schema_diff::diff_project(&p_dir, &mut conn, Some(&active_catalog))
-                .map_err(|e| SchemaError::new_err(format!("Diff failed: {}", e)))?;
-
-            let pending_items: Vec<_> = diff_result
-                .items
-                .iter()
-                .filter(|i| i.selected && !i.ignored && (!i.is_destructive() || force_drop))
-                .collect();
-            if pending_items.is_empty() {
-                continue;
-            }
-
-            engine::apply_diff_with_executor(
-                &mut conn,
-                &diff_result,
-                force_drop,
-                remote,
-                &p_dir,
-                Some(&active_catalog),
-            )
-            .map_err(|e| {
-                ExecutionError::new_err(format!(
-                    "Apply error for catalog '{}': {}",
-                    active_catalog, e
-                ))
-            })?;
-
-            for i in pending_items {
-                total_applied_items.push(i.obj_name.clone());
-            }
-        }
-
-        let applied_count = total_applied_items.len();
+        let applied_count = report.applied_items.len();
         Ok(ApplyResult {
             success: true,
             applied_count,
-            items: total_applied_items,
+            items: report.applied_items,
         })
     } else {
         let target = target.unwrap();
@@ -742,7 +432,14 @@ pub fn apply(
 
             let start_cat = req_catalogs.first().map(|s| s.as_str());
             if let Some(conn) = direct_conn {
-                return run_apply_tui(&conn, &p_dir, &db_name, force_drop, start_cat);
+                return run_apply_tui(
+                    &conn,
+                    &p_dir,
+                    &db_name,
+                    force_drop,
+                    allow_lake_rewrite,
+                    start_cat,
+                );
             }
 
             let mut bridge = SessionBridge::new(target.clone(), None, None);
@@ -758,7 +455,14 @@ pub fn apply(
                 })?;
 
             engine::restore_quack_temp_bridge(&conn);
-            let res = run_apply_tui(&conn, &p_dir, &active_db_target, force_drop, start_cat);
+            let res = run_apply_tui(
+                &conn,
+                &p_dir,
+                &active_db_target,
+                force_drop,
+                allow_lake_rewrite,
+                start_cat,
+            );
             engine::sync_back_quack_temp_bridge(&conn);
             drop(conn);
             let _ = bridge.stop(py);
@@ -771,58 +475,22 @@ pub fn apply(
         }
 
         let mut executor = PyDbExecutor::new(target.clone().unbind());
-        let catalogs_to_apply = if req_catalogs.is_empty() {
-            let active = schema_diff::validate_target_catalog_exec(&mut executor, None, true)
-                .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-            vec![active]
-        } else {
-            req_catalogs
-        };
+        let report = apply_catalogs_with_executor(
+            &mut executor,
+            &p_dir,
+            &req_catalogs,
+            force_drop,
+            allow_lake_rewrite,
+            false,
+            false,
+        )
+        .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
 
-        let mut total_applied_items = Vec::new();
-
-        for target_cat in &catalogs_to_apply {
-            let active_catalog =
-                schema_diff::validate_target_catalog_exec(&mut executor, Some(target_cat), true)
-                    .map_err(|e| ExecutionError::new_err(e.to_string()))?;
-            let diff_result =
-                schema_diff::diff_project(&p_dir, &mut executor, Some(&active_catalog))
-                    .map_err(|e| SchemaError::new_err(format!("Diff failed: {}", e)))?;
-
-            let pending_items: Vec<_> = diff_result
-                .items
-                .iter()
-                .filter(|i| i.selected && !i.ignored && (!i.is_destructive() || force_drop))
-                .collect();
-            if pending_items.is_empty() {
-                continue;
-            }
-
-            engine::apply_diff_with_executor(
-                &mut executor,
-                &diff_result,
-                force_drop,
-                false,
-                &p_dir,
-                Some(&active_catalog),
-            )
-            .map_err(|e| {
-                ExecutionError::new_err(format!(
-                    "Apply error for catalog '{}': {}",
-                    active_catalog, e
-                ))
-            })?;
-
-            for i in pending_items {
-                total_applied_items.push(i.obj_name.clone());
-            }
-        }
-
-        let applied_count = total_applied_items.len();
+        let applied_count = report.applied_items.len();
         Ok(ApplyResult {
             success: true,
             applied_count,
-            items: total_applied_items,
+            items: report.applied_items,
         })
     }
 }
@@ -1109,25 +777,21 @@ pub fn explore(
     let req_catalog = spec.catalogs.first().cloned();
 
     if target.is_none() || explicit_db.is_some() {
-        let use_workspace_mode =
-            crate::workspace::should_use_workspace_mode(&p_dir, env, explicit_db.as_deref());
         if !is_interactive_terminal() {
-            let (conn, display_db, active_cat) = if use_workspace_mode {
-                let conn = engine::open_duckdb_connection()
-                    .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
-                let report = crate::workspace::apply_workspace_attachments(&conn, &p_dir, env)
-                    .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
-                let cat = req_catalog.clone().or(report.default_alias);
-                (conn, "workspace (:memory:)".to_string(), cat)
-            } else {
-                let conn = spec
-                    .connect()
-                    .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
-                let _ = crate::workspace::apply_workspace_attachments(&conn, &p_dir, env)
-                    .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
-                (conn, spec.db.clone(), req_catalog.clone())
-            };
-            return print_non_terminal_db(&conn, &display_db, active_cat.as_deref());
+            let mut opened = open_explore_session(
+                &p_dir,
+                env,
+                &spec,
+                explicit_db.as_deref(),
+                req_catalog.as_deref(),
+                false,
+            )
+            .map_err(|e| ExecutionError::new_err(format!("{:#}", e)))?;
+            return print_non_terminal_summary_exec(
+                &mut opened.conn,
+                Some(&opened.display_db),
+                opened.active_catalog.as_deref(),
+            );
         }
 
         let _guard = TerminalGuard::enter().map_err(|e| {
@@ -1140,38 +804,23 @@ pub fn explore(
             .map_err(|e| ExecutionError::new_err(format!("Terminal backend error: {}", e)))?;
 
         let ide_res = py.allow_threads(|| -> anyhow::Result<()> {
-            let (conn, display_db, ws_report) = if use_workspace_mode {
-                let conn = engine::open_duckdb_connection()?;
-                let report = crate::workspace::apply_workspace_attachments(&conn, &p_dir, env)?;
-                let target_cat = req_catalog.clone().or_else(|| report.default_alias.clone());
-                if let Some(cat) = &target_cat {
-                    let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
-                }
-                let label = match env {
-                    Some(e) => format!("workspace [{}] (:memory:)", e),
-                    None => "workspace (:memory:)".to_string(),
-                };
-                (conn, label, Some(report))
-            } else {
-                let conn = spec.connect()?;
-                let report = crate::workspace::apply_workspace_attachments(&conn, &p_dir, env)?;
-                if let Some(cat) = &req_catalog {
-                    let _ = conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
-                }
-                if spec.is_quack {
-                    engine::cleanup_orphaned_quack_bridges(&conn);
-                }
-                (conn, spec.db.clone(), Some(report))
-            };
+            let opened = open_explore_session(
+                &p_dir,
+                env,
+                &spec,
+                explicit_db.as_deref(),
+                req_catalog.as_deref(),
+                true,
+            )?;
 
             crate::ide::run_ide_loop_with_workspace(
                 &mut terminal,
-                &conn,
+                &opened.conn,
                 &p_dir,
-                &display_db,
+                &opened.display_db,
                 spec.disable_ssl,
                 env,
-                ws_report,
+                opened.ws_report,
             )
         });
 
@@ -1184,7 +833,7 @@ pub fn explore(
         let mut executor = PyDbExecutor::new(target.clone().unbind());
 
         if !is_interactive_terminal() {
-            return print_non_terminal_explorer(&mut executor, req_catalog.as_deref());
+            return print_non_terminal_summary_exec(&mut executor, None, req_catalog.as_deref());
         }
 
         let _guard = TerminalGuard::enter().map_err(|e| {

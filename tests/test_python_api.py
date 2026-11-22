@@ -4,7 +4,7 @@ import pytest
 import duckpack
 
 def test_duckpack_version_and_exports():
-    assert duckpack.__version__ == "0.3.5_dev25"
+    assert duckpack.__version__ == "0.3.5_dev26"
     assert hasattr(duckpack, "explore")
     assert hasattr(duckpack, "apply")
     assert hasattr(duckpack, "diff")
@@ -747,5 +747,44 @@ token_env = "NON_EXISTENT_TEST_TOKEN_999"
     captured = capfd.readouterr().out
     assert "ws_sales_orders" in captured
     assert not (proj_dir / "local.duckdb").exists(), "Workspace mode must not create local.duckdb"
+
+
+def test_notebook_card_omits_remote_token_and_uses_safe_data_cmd_attribute(monkeypatch):
+    from duckpack.notebook import render_notebook_card
+
+    rendered_html = []
+    monkeypatch.setattr("duckpack.notebook.is_notebook_environment", lambda: True)
+    monkeypatch.setattr("IPython.display.display", lambda obj: rendered_html.append(obj.data))
+
+    res = render_notebook_card(
+        "quack:prod.example.com:9494",
+        project_dir="my'dir;alert(1)",
+        mode="explore",
+        quack_token="super_secret_prod_token_999",
+    )
+    assert res is True
+    card = rendered_html[0]
+    # H3: Persistent remote tokens must NEVER be embedded in notebook HTML outputs
+    assert "super_secret_prod_token_999" not in card
+    assert "--quack-token" not in card
+    assert "QUACK_TOKEN" in card
+    # L2: Copy button uses safe data-cmd attribute instead of inline JS string interpolation
+    assert 'data-cmd="' in card
+    assert "navigator.clipboard.writeText(this.dataset.cmd)" in card
+
+
+def test_apply_allow_lake_rewrite_does_not_mutate_process_env(tmp_path):
+    os.environ.pop("DUCKPACK_ALLOW_LAKE_REWRITE", None)
+    proj_dir = str(tmp_path / "m3_proj")
+    duckpack.init(proj_dir)
+    with open(os.path.join(proj_dir, "tables", "items.sql"), "w") as f:
+        f.write("CREATE TABLE items (id INT, label VARCHAR);")
+
+    con = duckdb.connect()
+    res = duckpack.apply(con, proj_dir, allow_lake_rewrite=True)
+    assert res.success is True
+    assert res.applied_count == 1
+    assert "DUCKPACK_ALLOW_LAKE_REWRITE" not in os.environ
+
 
 
