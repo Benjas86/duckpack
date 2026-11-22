@@ -1124,7 +1124,7 @@ pub fn attach_single_workspace_entry(
                 }
             });
 
-            let mut meta_params: Vec<String> = Vec::new();
+            let mut extra_attach_opts: Vec<String> = Vec::new();
             let target_dsn: String = match inferred_backend.as_str() {
                 "quack" => {
                     load_quack_extension(conn)
@@ -1136,28 +1136,26 @@ pub fn attach_single_workspace_entry(
                     })?;
                     let disable_ssl =
                         should_disable_quack_ssl(&ep, entry.insecure || entry.disable_ssl);
+                    // Use DuckLake's native typed META_* parameters (META_DISABLE_SSL, META_TOKEN, META_CLIENT_ID)
+                    // for full per-alias RBAC isolation without touching global QUACK secrets or client_id.
                     if disable_ssl {
-                        meta_params.push("'DISABLE_SSL': true".to_string());
+                        extra_attach_opts.push("META_DISABLE_SSL true".to_string());
                     }
                     if let Some(ref tok) = token {
-                        // Endpoint-scoped Quack secret isolated strictly to this DuckLake's metadata server
-                        // (DuckDB MAP values are homogeneous, so DISABLE_SSL stays boolean in METADATA_PARAMETERS
-                        // while TOKEN is bound cleanly via SCOPE '<quack_endpoint>'.)
-                        let sec_name = format!(
-                            "__dp_ws_quack_{}",
-                            entry
-                                .alias
-                                .chars()
-                                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                                .collect::<String>()
-                        );
-                        let sec_sql = format!(
-                            "CREATE OR REPLACE SECRET \"{}\" (TYPE QUACK, TOKEN '{}', SCOPE '{}');",
-                            sec_name,
-                            tok.replace('\'', "''"),
-                            ep.replace('\'', "''")
-                        );
-                        let _ = conn.execute(&sec_sql, []);
+                        extra_attach_opts
+                            .push(format!("META_TOKEN '{}'", tok.replace('\'', "''")));
+                        let effective_cid = entry
+                            .client_id
+                            .as_deref()
+                            .map(|s| s.trim())
+                            .filter(|s| s.chars().count() >= 4)
+                            .unwrap_or(tok.as_str());
+                        if effective_cid.chars().count() >= 4 {
+                            extra_attach_opts.push(format!(
+                                "META_CLIENT_ID '{}'",
+                                effective_cid.replace('\'', "''")
+                            ));
+                        }
                     }
                     format!("ducklake:{}", ep)
                 }
@@ -1260,12 +1258,7 @@ pub fn attach_single_workspace_entry(
             if !data_path.is_empty() {
                 opts.push(format!("DATA_PATH '{}'", data_path.replace('\'', "''")));
             }
-            if !meta_params.is_empty() {
-                opts.push(format!(
-                    "METADATA_PARAMETERS MAP {{{}}}",
-                    meta_params.join(", ")
-                ));
-            }
+            opts.extend(extra_attach_opts);
             if entry.read_only {
                 opts.push("READ_ONLY".to_string());
             }

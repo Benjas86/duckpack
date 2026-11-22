@@ -78,6 +78,12 @@ enum Commands {
         /// Sync ONLY the declarative Quack RBAC policy (_duckpack_auth + live client_id_hash + global hooks) without running user schema migrations
         #[arg(long)]
         rbac_only: bool,
+        /// Apply RBAC policy from a portable .duckpack bundle compiled with `duckpack compile --rbac-only` (requires no project directory)
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Optional path to an environment file (e.g. /run/secrets/quack.env) loaded before resolving RBAC tokens
+        #[arg(long)]
+        env_file: Option<PathBuf>,
     },
     /// Show schema differences between project and target database
     Diff {
@@ -113,6 +119,12 @@ enum Commands {
         /// The path to output the compiled .duckpack artifact
         #[arg(short, long)]
         out: String,
+        /// Compile ONLY the zero-secret declarative [quack_auth] RBAC bundle (policy + token_env refs, no user schema or tokens)
+        #[arg(long)]
+        rbac_only: bool,
+        /// Embed the zero-secret [quack_auth] RBAC bundle tables alongside compiled schema declarations
+        #[arg(long)]
+        include_rbac: bool,
     },
     /// Deploy a DB project to a remote server via SCP/SSH
     Deploy {
@@ -216,6 +228,11 @@ fn main() -> Result<()> {
     };
     let project_dir = &project_dir;
 
+    // Pre-load explicit --env-file (if provided on `apply`) before resolving target tokens/endpoints
+    if let Commands::Apply { env_file: Some(ref ef), .. } = cli.command {
+        duckpack::rbac_bundle::load_env_file_override(ef)?;
+    }
+
     // Apply target/env configuration overrides, defaults, and token resolution via unified TargetResolver
     match &mut cli.command {
         Commands::Apply { db, quack_token, quack_disable_ssl, .. } |
@@ -305,12 +322,35 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Apply { project_dir, db, database, force_drop, allow_lake_rewrite, auto_approve, interactive: _, out, quack_token, quack_disable_ssl, rbac_only } => {
+        Commands::Apply { project_dir, db, database, force_drop, allow_lake_rewrite, auto_approve, interactive: _, out, quack_token, quack_disable_ssl, rbac_only, from, env_file } => {
             if *allow_lake_rewrite {
                 unsafe {
                     std::env::set_var("DUCKPACK_ALLOW_LAKE_REWRITE", "true");
                 }
             }
+
+            if let Some(bundle_path) = from {
+                if !*rbac_only {
+                    anyhow::bail!(
+                        "Portable bundle deployment via --from currently requires --rbac-only (e.g. `duckpack apply --from {} --rbac-only --db quack:... --auto-approve`).",
+                        bundle_path.display()
+                    );
+                }
+                let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                let user_count = duckpack::rbac_bundle::deploy_quack_rbac_from_bundle(
+                    &mut target_conn,
+                    database.as_deref(),
+                    bundle_path,
+                    env_file.as_deref(),
+                )?;
+                println!(
+                    "🦆 DuckPack RBAC Bundle: Synced {} declarative user(s) from '{}' and activated Quack authentication/authorization hooks.",
+                    user_count,
+                    bundle_path.display()
+                );
+                return Ok(());
+            }
+
             if !project_dir.exists() {
                 eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
                 return Ok(());
@@ -383,7 +423,16 @@ fn main() -> Result<()> {
                 out.as_deref(),
             )?;
         }
-        Commands::Compile { project_dir, out } => {
+        Commands::Compile { project_dir, out, rbac_only, include_rbac } => {
+            if *rbac_only {
+                println!("Compiling zero-secret Quack RBAC bundle from {} into: {}", project_dir.display(), out);
+                let user_count = duckpack::rbac_bundle::compile_rbac_bundle(project_dir, Path::new(out))?;
+                println!(
+                    "RBAC bundle compilation complete! Packaged {} declarative user reference(s) (zero secrets) into {}",
+                    user_count, out
+                );
+                return Ok(());
+            }
             println!("Compiling project {} into DuckPack: {}", project_dir.display(), out);
             let _shadow_conn = build_shadow_db(project_dir)?;
             
@@ -392,6 +441,12 @@ fn main() -> Result<()> {
             let mut out_conn = Connection::open(&out).with_context(|| "Failed to create .duckpack file")?;
             println!("Packaging schemas, macros, tables, views, and triggers...");
             compile_project_declarations(&mut out_conn, project_dir)?;
+            if *include_rbac {
+                if let Some(cfg) = duckpack::quack_auth::load_quack_auth_config(project_dir) {
+                    let user_count = duckpack::rbac_bundle::write_rbac_bundle_tables(&out_conn, &cfg)?;
+                    println!("Embedded zero-secret Quack RBAC bundle ({} user reference(s)).", user_count);
+                }
+            }
             println!("Compilation complete! Artifact: {}", out);
         }
         Commands::Explore { project_dir, db, database, remote, port, auto_install, quack_token, quack_disable_ssl } => {

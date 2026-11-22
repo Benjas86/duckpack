@@ -63,6 +63,8 @@ Compute schema diffs and apply declarative migrations to the target database. La
 | `--force-drop` | `false` | Permit destructive drops (`DropTable`, `DropColumn`, `DropView`, `DropMacro`, `DropTrigger`, `DropSequence`, `DropSchema`) and copy-and-swap table recreations (`RecreateTable`). |
 | `--allow-lake-rewrite` | `false` | Permit physical Parquet copy-and-swap table rewrites on DuckLake catalogs (also via `DUCKPACK_ALLOW_LAKE_REWRITE=true`). |
 | `--rbac-only` | `false` | Sync **only** `[quack_auth]` RBAC tables, salted `client_id_hash` values, and global Quack hooks without running user DDL migrations. |
+| `--from <BUNDLE>` | `None` | Apply portable RBAC bundle compiled with `duckpack compile --rbac-only` (requires `--rbac-only`; no `--project-dir` needed). |
+| `--env-file <FILE>` | `None` | Load runtime tokens from a specific `.env` file (e.g. `/run/secrets/quack.env`) before resolving RBAC env vars. |
 | `--out <FILE>` | `None` | Dry-run mode: write computed migration SQL to `<FILE>` instead of executing. |
 | `--quack-token <TOKEN>` | `None` | Quack auth token. |
 | `--quack-disable-ssl, --insecure` | `false` | Disable TLS for Quack connections. |
@@ -92,6 +94,8 @@ Package a declarative project into a single immutable `.duckpack` snapshot artif
 | :--- | :--- | :--- |
 | `-p, --project-dir <DIR>` | `.` | Project directory path. |
 | `-o, --out <FILE>` | *(Required)* | Output `.duckpack` file path. |
+| `--rbac-only` | `false` | Compile **only** the zero-secret `[quack_auth]` RBAC bundle (`_duckpack_rbac_bundle_*` tables with `token_env` references only). |
+| `--include-rbac` | `false` | Embed `_duckpack_rbac_bundle_*` alongside compiled schema declarations in a full `.duckpack` snapshot. |
 
 ---
 

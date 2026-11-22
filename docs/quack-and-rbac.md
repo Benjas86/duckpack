@@ -79,6 +79,7 @@ flowchart TD
 ```toml
 [quack_auth]
 enabled = true
+ducklake_mode = false                # Set true when Quack hosts a DuckLake metadata catalog
 default_role = "reader"              # "admin" | "writer" | "reader" | "none"
 writer_allow_temp_tables = true
 reader_allow_explain_describe = true
@@ -127,7 +128,28 @@ QUACK_USER_BI_TOKEN=<64_hex_char_token>
 
 The authorization macro strips `--` line comments, `/* ... */` block comments, `'...'` string literals, and `$$...$$` dollar-quoted strings before evaluating permissions.
 
-### 3. Deploy & Multi-Alias Session Isolation
+### 3. DuckLake-Aware Quack RBAC (`ducklake_mode = true`)
+
+When a Quack server hosts a **DuckLake metadata catalog**, both DuckLake DDL (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`) and DuckLake DML (`INSERT`, `UPDATE`, `DELETE`) arrive at the Quack server as SQL DML against `ducklake_*` tables.
+
+Enable `ducklake_mode = true` under `[quack_auth]` to separate DuckLake schema DDL from data DML cleanly:
+
+- **`admin`**: Full access to all DuckLake metadata tables and `_duckpack_auth`.
+- **`writer`**: Allowed data & snapshot DML (`ducklake_snapshot`, `ducklake_snapshot_changes`, `ducklake_data_file`, `ducklake_delete_file`, `ducklake_files_scheduled_for_deletion`, `ducklake_file_column_stats`, `ducklake_file_variant_stats`, `ducklake_file_partition_value`, `ducklake_table_stats`, `ducklake_table_column_stats`, `ducklake_inlined_data_tables`, `ducklake_inlined_data_*`, `ducklake_inlined_delete_*`, including automatic inlined-table creation) and `SELECT` on all metadata tables — **blocked** from mutating catalog DDL metadata tables (`ducklake_schema`, `ducklake_schema_versions`, `ducklake_table`, `ducklake_column`, `ducklake_column_mapping`, `ducklake_name_mapping`, `ducklake_view`, `ducklake_metadata`, `ducklake_partition_*`, `ducklake_sort_*`, `ducklake_macro*`, `ducklake_tag`, `ducklake_column_tag`).
+- **`reader`**: Strictly read-only (zero snapshot commits). Pair with read-only S3/R2 IAM credentials on the client for full object-storage defense-in-depth.
+
+Attach per-role DuckLake-on-Quack clients using DuckLake's native typed `META_*` parameters (automatically emitted by DuckPack's `[[attach]]` and `Ctrl+A`):
+
+```sql
+ATTACH 'ducklake:quack:sales-meta.internal:9494' AS sales_writer (
+    DATA_PATH 's3://warehouse/sales/',
+    META_DISABLE_SSL true,
+    META_TOKEN '<writer_token>',
+    META_CLIENT_ID 'dbt_runner'
+);
+```
+
+### 4. Deploy & Multi-Alias Session Isolation
 
 Running `duckpack apply --env prod --auto-approve`:
 1. Hashes each resolved token with **SHA-256** locally (cleartext tokens never reach the server).
@@ -175,6 +197,24 @@ Use **`--rbac-only`** to re-sync **only** `_duckpack_auth` (fresh salted hashes 
 ```bash
 duckpack apply --env prod --rbac-only --auto-approve
 ```
+
+### Portable Zero-Secret RBAC Bundles (`.duckpack`) for Container Fleets
+
+When bootstrapping multiple DuckLake/Quack containers without shipping your project directory or `duckpack.toml` into every image:
+
+1. **Build a zero-secret bundle in CI** (stores policy + `token_env` references only — **never** plaintext tokens or hashes):
+   ```bash
+   duckpack compile --project-dir ./warehouse --rbac-only --out rbac.duckpack
+   ```
+2. **Apply at container startup with zero project directory** (resolves tokens from container OS env vars or an optional `--env-file`):
+   ```bash
+   duckpack apply --from /app/rbac.duckpack --rbac-only --db quack:127.0.0.1:9494 --insecure --auto-approve
+
+   # Or load tokens from a mounted Kubernetes secret file:
+   duckpack apply --from /app/rbac.duckpack --rbac-only --env-file /run/secrets/quack.env --db quack:127.0.0.1:9494 --insecure --auto-approve
+   ```
+
+The exported `scripts/quack_rbac_post_start.sh` supports both modes automatically: set `DUCKPACK_RBAC_BUNDLE=/app/rbac.duckpack` and `DUCKPACK_QUACK_DB=quack:127.0.0.1:9494` to use bundle mode without any project tree.
 
 Press **`e`** inside `Ctrl+U` to export a ready-to-run `scripts/quack_rbac_post_start.sh` (`chmod 0755`) that waits until Quack is reachable and executes `--rbac-only --auto-approve`.
 

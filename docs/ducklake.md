@@ -53,7 +53,7 @@ insecure = true
 default = true
 ```
 
-> **Per-Endpoint Secret Isolation:** DuckPack binds each DuckLake-on-Quack token via an endpoint-scoped `CREATE OR REPLACE SECRET ... (TYPE QUACK, TOKEN '...', SCOPE 'quack:host:port')` while passing `METADATA_PARAMETERS MAP {'DISABLE_SSL': true}` when `insecure = true`. This lets you mount multiple independent DuckLake-on-Quack containers with distinct tokens in the same session.
+> **Per-Alias Credential & RBAC Isolation:** DuckPack attaches DuckLake-on-Quack catalogs using DuckLake's native typed `META_DISABLE_SSL`, `META_TOKEN`, and `META_CLIENT_ID` parameters. This lets you mount multiple independent DuckLake-on-Quack containers — or distinct RBAC roles (`admin`, `writer`, `reader`) against the same DuckLake server — in the same session with zero global secret or client-ID collisions. See [Quack RBAC `ducklake_mode`](./quack-and-rbac.md#3-ducklake-aware-quack-rbac-ducklake_mode--true).
 
 #### DuckLake on PostgreSQL + AWS S3
 ```toml

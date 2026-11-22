@@ -2728,12 +2728,11 @@ impl AttachModalState {
                                 let quack_dsn = safe_path
                                     .strip_prefix("ducklake:")
                                     .unwrap_or(&safe_path);
-                                let mut mp: Vec<String> = Vec::new();
                                 if self.disable_ssl
                                     || self.insecure
                                     || crate::engine::should_disable_quack_ssl(quack_dsn, false)
                                 {
-                                    mp.push("'DISABLE_SSL': true".to_string());
+                                    opts.push("META_DISABLE_SSL true".to_string());
                                 }
                                 let opt_dl_tok = if self.password.trim().is_empty() {
                                     None
@@ -2741,22 +2740,10 @@ impl AttachModalState {
                                     Some(self.password.trim())
                                 };
                                 if let Some(tok) = crate::engine::resolve_explicit_quack_token(opt_dl_tok) {
-                                    let sec_name = format!(
-                                        "__dp_att_quack_{}",
-                                        crate::workspace::env_var_slug(&alias).to_lowercase()
-                                    );
-                                    let _ = conn.execute(
-                                        &format!(
-                                            "CREATE OR REPLACE SECRET \"{}\" (TYPE QUACK, TOKEN '{}', SCOPE '{}');",
-                                            sec_name,
-                                            tok.replace('\'', "''"),
-                                            quack_dsn.replace('\'', "''")
-                                        ),
-                                        [],
-                                    );
-                                }
-                                if !mp.is_empty() {
-                                    opts.push(format!("METADATA_PARAMETERS MAP {{{}}}", mp.join(", ")));
+                                    opts.push(format!("META_TOKEN '{}'", tok.replace('\'', "''")));
+                                    if tok.chars().count() >= 4 {
+                                        opts.push(format!("META_CLIENT_ID '{}'", tok.replace('\'', "''")));
+                                    }
                                 }
                             }
                         }

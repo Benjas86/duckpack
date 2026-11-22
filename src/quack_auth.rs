@@ -66,6 +66,7 @@ pub struct QuackAuthUser {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuackAuthConfig {
     pub enabled: bool,
+    pub ducklake_mode: bool,
     pub default_role: QuackRole,
     pub writer_allow_temp_tables: bool,
     pub reader_allow_explain_describe: bool,
@@ -77,6 +78,7 @@ impl Default for QuackAuthConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            ducklake_mode: false,
             default_role: QuackRole::Reader,
             writer_allow_temp_tables: true,
             reader_allow_explain_describe: true,
@@ -208,6 +210,10 @@ pub fn load_quack_auth_config(project_dir: &Path) -> Option<QuackAuthConfig> {
     let qa = parsed.get("quack_auth")?;
 
     let enabled = qa.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let ducklake_mode = qa
+        .get("ducklake_mode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let default_role = qa
         .get("default_role")
         .and_then(|v| v.as_str())
@@ -267,6 +273,7 @@ pub fn load_quack_auth_config(project_dir: &Path) -> Option<QuackAuthConfig> {
 
     Some(QuackAuthConfig {
         enabled,
+        ducklake_mode,
         default_role,
         writer_allow_temp_tables,
         reader_allow_explain_describe,
@@ -275,36 +282,43 @@ pub fn load_quack_auth_config(project_dir: &Path) -> Option<QuackAuthConfig> {
     })
 }
 
-/// Resolves a user's cleartext token from process environment variables or `project_dir/.env`.
-pub fn resolve_user_token(project_dir: &Path, token_env: &str) -> Option<String> {
+/// Resolves a user's cleartext token from process environment variables or an optional `project_dir/.env`.
+pub fn resolve_user_token_opt(project_dir: Option<&Path>, token_env: &str) -> Option<String> {
     if let Ok(val) = std::env::var(token_env) {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
         }
     }
-    let env_path = project_dir.join(".env");
-    if let Ok(content) = std::fs::read_to_string(env_path) {
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            if let Some((k, v)) = trimmed.split_once('=') {
-                if k.trim() == token_env {
-                    let clean_v = v
-                        .trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .trim();
-                    if !clean_v.is_empty() {
-                        return Some(clean_v.to_string());
+    if let Some(dir) = project_dir {
+        let env_path = dir.join(".env");
+        if let Ok(content) = std::fs::read_to_string(env_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    if k.trim() == token_env {
+                        let clean_v = v
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .trim();
+                        if !clean_v.is_empty() {
+                            return Some(clean_v.to_string());
+                        }
                     }
                 }
             }
         }
     }
     None
+}
+
+/// Resolves a user's cleartext token from process environment variables or `project_dir/.env`.
+pub fn resolve_user_token(project_dir: &Path, token_env: &str) -> Option<String> {
+    resolve_user_token_opt(Some(project_dir), token_env)
 }
 
 /// Generates a 256-bit cryptographic random token and persists `<token_env>=<token>` in `project_dir/.env`
@@ -364,6 +378,12 @@ pub fn save_quack_auth_config(project_dir: &Path, config: &QuackAuthConfig) -> R
 
     let mut qa_table = toml::map::Map::new();
     qa_table.insert("enabled".to_string(), toml::Value::Boolean(config.enabled));
+    if config.ducklake_mode {
+        qa_table.insert(
+            "ducklake_mode".to_string(),
+            toml::Value::Boolean(config.ducklake_mode),
+        );
+    }
     qa_table.insert(
         "default_role".to_string(),
         toml::Value::String(config.default_role.as_str().to_string()),
@@ -419,16 +439,18 @@ pub fn save_quack_auth_config(project_dir: &Path, config: &QuackAuthConfig) -> R
 
 /// Validates a `QuackAuthConfig` before compiling or deploying to a server, enforcing the
 /// Admin Lockout Prevention Guard (at least one enabled `admin` user with a resolved token).
-pub fn validate_quack_auth_config(
+/// When `project_dir` is `None` (e.g. deploying from a portable `.duckpack` RBAC bundle),
+/// tokens are resolved solely from process environment variables.
+pub fn validate_quack_auth_config_opt(
     config: &QuackAuthConfig,
-    project_dir: &Path,
+    project_dir: Option<&Path>,
 ) -> Result<Vec<(QuackAuthUser, String, String)>> {
     let mut resolved_users = Vec::new();
     let mut has_enabled_admin = config.default_role == QuackRole::Admin;
 
     for user in &config.users {
         validate_safe_username(&user.username)?;
-        let token = resolve_user_token(project_dir, &user.token_env).ok_or_else(|| {
+        let token = resolve_user_token_opt(project_dir, &user.token_env).ok_or_else(|| {
             anyhow::anyhow!(
                 "Quack RBAC user '{}' references token_env '{}', which is not set in environment or .env.",
                 user.username,
@@ -454,6 +476,14 @@ pub fn validate_quack_auth_config(
     Ok(resolved_users)
 }
 
+/// Validates a `QuackAuthConfig` against `project_dir` (and OS env vars).
+pub fn validate_quack_auth_config(
+    config: &QuackAuthConfig,
+    project_dir: &Path,
+) -> Result<Vec<(QuackAuthUser, String, String)>> {
+    validate_quack_auth_config_opt(config, Some(project_dir))
+}
+
 /// Compiles the idempotent `_duckpack_auth` schema, tables, user upserts, and hardened
 /// `_duckpack_auth.authenticate` + `_duckpack_auth.authorize` SQL macros.
 /// If `deploying_sid` is provided, automatically registers that session ID as `admin` in
@@ -476,20 +506,18 @@ pub fn compile_quack_auth_sql(
     )
 }
 
-/// Full compiler for `_duckpack_auth` with separate control over `quack_server_mode`
-/// (uses `quack_check_token` and `quack_active_connections()`) vs `include_global_hooks`
-/// (appends `SET GLOBAL quack_authentication_function / quack_authorization_function`,
-/// which MUST only be run outside a transaction after `COMMIT`).
-pub fn compile_quack_auth_sql_with_options(
+/// Full compiler for `_duckpack_auth` with optional `project_dir` (pass `None` for zero-project-dir
+/// `.duckpack` RBAC bundle deployments).
+pub fn compile_quack_auth_sql_with_options_opt(
     config: &QuackAuthConfig,
-    project_dir: &Path,
+    project_dir: Option<&Path>,
     deploying_sid: Option<&str>,
     master_client_id_hash: Option<&str>,
     live_client_id_hashes: &std::collections::HashMap<String, String>,
     quack_server_mode: bool,
     include_global_hooks: bool,
 ) -> Result<String> {
-    let resolved_users = validate_quack_auth_config(config, project_dir)?;
+    let resolved_users = validate_quack_auth_config_opt(config, project_dir)?;
 
     let mut sql = String::new();
     sql.push_str("-- DuckPack Declarative Quack RBAC (_duckpack_auth)\n");
@@ -639,11 +667,60 @@ pub fn compile_quack_auth_sql_with_options(
     );
 
     // 4. Hardened Authorization Macro: _duckpack_auth.authorize(p_sid, p_query)
-    let writer_create_rule = if config.writer_allow_temp_tables {
-        "AND (NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\bcreate\\b') \
-              OR regexp_matches(_duckpack_auth.sanitize_sql(p_query), '^create\\s+(or\\s+replace\\s+)?(temp|temporary)\\s+(table|view)\\b'))"
+    // In `ducklake_mode`, DuckLake flushes every DML transaction to the metadata catalog as a
+    // `BEGIN TRANSACTION; ...; COMMIT;` multi-statement batch, and may create
+    // `ducklake_inlined_(data|delete)_*` tables mid-batch on first small insert/delete.
+    // We allow multi-statement batches ONLY when wrapped in `BEGIN [TRANSACTION]; ...; COMMIT|ROLLBACK|ABORT`,
+    // and we validate EVERY semicolon-delimited statement independently via `list_bool_and` + `string_split`
+    // so statement smuggling (e.g. a second `CREATE TABLE evil`, `PRAGMA`, or `SET`) is impossible.
+    const DUCKLAKE_INLINED_CREATE_RE: &str = "^create\\s+table\\s+(if\\s+not\\s+exists\\s+)?([a-z0-9_\"]+\\s*\\.\\s*)*(\"ducklake_inlined_(data|delete)_[a-z0-9_]+\"|ducklake_inlined_(data|delete)_[a-z0-9_]+\\b)";
+    const TEMP_CREATE_RE: &str = "^create\\s+(or\\s+replace\\s+)?(temp|temporary)\\s+(table|view)\\b";
+
+    let writer_batch_and_create_rule = if config.ducklake_mode {
+        let per_stmt_create_ok = if config.writer_allow_temp_tables {
+            format!(
+                "(NOT regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '\\bcreate\\b') \
+                  OR regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '{TEMP_CREATE_RE}') \
+                  OR regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '{DUCKLAKE_INLINED_CREATE_RE}'))"
+            )
+        } else {
+            format!(
+                "(NOT regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '\\bcreate\\b') \
+                  OR regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '{DUCKLAKE_INLINED_CREATE_RE}'))"
+            )
+        };
+        format!(
+            "AND (strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0 \
+                  OR regexp_matches(_duckpack_auth.sanitize_sql(p_query), '^begin(\\s+transaction)?\\s*;[\\s\\S]*;\\s*(commit|rollback|abort)$')) \
+             AND list_bool_and(list_transform(string_split(_duckpack_auth.sanitize_sql(p_query), ';'), lambda _stmt: (\
+                  regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g') = '' \
+                  OR ((strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0 \
+                       OR regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '^(begin(\\s+transaction)?|commit|rollback|abort|select|with|values|insert|update|delete|merge|create)\\b')) \
+                      AND {per_stmt_create_ok})\
+             )))"
+        )
+    } else if config.writer_allow_temp_tables {
+        format!(
+            "AND strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0 \
+             AND (NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\bcreate\\b') \
+                  OR regexp_matches(_duckpack_auth.sanitize_sql(p_query), '{TEMP_CREATE_RE}'))"
+        )
     } else {
-        "AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\bcreate\\b')"
+        "AND strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0 \
+         AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\bcreate\\b')"
+            .to_string()
+    };
+
+    // In `ducklake_mode`, block `writer` from mutating DuckLake catalog/schema DDL metadata tables
+    // (while permitting SELECT reads on them and DML on snapshot/data_file/delete_file/stats/inlined tables).
+    // Matches both unquoted (`main.ducklake_table(`) and double-quoted (`"main" . "ducklake_table"(`) forms.
+    const DUCKLAKE_DDL_TABLES: &str = "ducklake_schema|ducklake_schema_versions|ducklake_table|ducklake_column|ducklake_column_mapping|ducklake_name_mapping|ducklake_view|ducklake_metadata|ducklake_partition_info|ducklake_partition_column|ducklake_sort_info|ducklake_sort_expression|ducklake_macro|ducklake_macro_impl|ducklake_macro_parameters|ducklake_tag|ducklake_column_tag";
+    let writer_ducklake_ddl_rule = if config.ducklake_mode {
+        format!(
+            "AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(insert(\\s+or\\s+(replace|ignore))?\\s+into|update|delete\\s+from|merge\\s+into)\\s+([a-z0-9_\"]+\\s*\\.\\s*)*(\"({DUCKLAKE_DDL_TABLES})\"|({DUCKLAKE_DDL_TABLES})\\b)')"
+        )
+    } else {
+        String::new()
     };
 
     let writer_copy_rule = if config.allow_copy {
@@ -664,12 +741,12 @@ pub fn compile_quack_auth_sql_with_options(
          \x20       WHEN 'admin' THEN true\n\
          \x20       WHEN 'writer' THEN (\n\
          \x20           _duckpack_auth.sanitize_sql(p_query) <> ''\n\
-         \x20           AND strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0\n\
          \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(_duckpack_auth|quack_users|quack_sessions|quack_authentication_function|quack_authorization_function|quack_serve|quack_stop|quack_cancel|quack_query|quack_query_by_name|quack_generate_keys|quack_identify|enable_logging|disable_logging)\\b')\n\
          \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(attach|detach|install|load|export|import|drop|alter|truncate|vacuum|rename|grant|revoke|call)\\b')\n\
          \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(set|reset)\\s+(global|session)\\b')\n\
          \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(create|drop)\\s+(or\\s+replace\\s+)?(persistent\\s+|temporary\\s+|temp\\s+)?secret\\b')\n\
-         \x20           {writer_create_rule}\n\
+         \x20           {writer_batch_and_create_rule}\n\
+         \x20           {writer_ducklake_ddl_rule}\n\
          \x20           {writer_copy_rule}\n\
          \x20       )\n\
          \x20       WHEN 'reader' THEN (\n\
@@ -704,6 +781,27 @@ pub fn compile_quack_auth_sql_with_options(
     Ok(sql)
 }
 
+/// Full compiler for `_duckpack_auth` using a local `project_dir` (for `.env` fallback).
+pub fn compile_quack_auth_sql_with_options(
+    config: &QuackAuthConfig,
+    project_dir: &Path,
+    deploying_sid: Option<&str>,
+    master_client_id_hash: Option<&str>,
+    live_client_id_hashes: &std::collections::HashMap<String, String>,
+    quack_server_mode: bool,
+    include_global_hooks: bool,
+) -> Result<String> {
+    compile_quack_auth_sql_with_options_opt(
+        config,
+        Some(project_dir),
+        deploying_sid,
+        master_client_id_hash,
+        live_client_id_hashes,
+        quack_server_mode,
+        include_global_hooks,
+    )
+}
+
 /// Writes a standalone server startup bootstrap SQL script to `project_dir/scripts/quack_rbac_init.sql`.
 pub fn export_quack_rbac_bootstrap_script(
     config: &QuackAuthConfig,
@@ -722,11 +820,11 @@ pub fn export_quack_rbac_bootstrap_script(
 ///    server-salted `client_id_hash` (used to bind `__duckpack_master` as `admin`).
 /// 2. Each configured user's exact server-salted `client_id_hash` by probing the Quack server via
 ///    `quack_query(..., client_id = '<raw_client_id>')`.
-fn harvest_quack_client_id_hashes(
+fn harvest_quack_client_id_hashes_opt(
     target_exec: &mut dyn DbExecutor,
     qa: &str,
     config: &QuackAuthConfig,
-    project_dir: &Path,
+    project_dir: Option<&Path>,
 ) -> (
     Option<String>,
     Option<String>,
@@ -793,7 +891,7 @@ fn harvest_quack_client_id_hashes(
         let safe_uri = uri.replace('\'', "''");
         let ambient_master_token = crate::engine::resolve_quack_token(None, None);
         for (idx, u) in config.users.iter().enumerate() {
-            let Some(user_token) = resolve_user_token(project_dir, &u.token_env) else {
+            let Some(user_token) = resolve_user_token_opt(project_dir, &u.token_env) else {
                 continue;
             };
             let raw_cid = u.client_id.as_deref().unwrap_or(&user_token);
@@ -897,10 +995,19 @@ pub fn append_quack_auth_diff_items(
     // Query existing _duckpack_auth.quack_users FIRST so we can detect non-admin (Authorization failed)
     // callers immediately without probing or emitting misleading RBAC diffs.
     let query = "SELECT username, role, token_sha256, lower(client_id_hash), CAST(enabled AS VARCHAR) FROM _duckpack_auth.quack_users WHERE username <> '__duckpack_master' ORDER BY username";
-    let macros_query = if is_quack_target {
-        "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authenticate' OR COALESCE(macro_definition, '') LIKE '%quack_check_token%') AND (function_name <> 'authorize' OR COALESCE(macro_definition, '') LIKE '%abort|set%') AND (function_name <> 'resolve_role' OR COALESCE(macro_definition, '') LIKE '%ac.connection_id%') AND (function_name <> 'sanitize_sql' OR strpos(COALESCE(macro_definition, ''), '^\\s+|\\s+$') > 0)"
+    let ducklake_macro_check = if config.ducklake_mode {
+        "AND COALESCE(macro_definition, '') LIKE '%ducklake_schema%'"
     } else {
-        "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authorize' OR COALESCE(macro_definition, '') LIKE '%abort|set%') AND (function_name <> 'sanitize_sql' OR strpos(COALESCE(macro_definition, ''), '^\\s+|\\s+$') > 0)"
+        "AND COALESCE(macro_definition, '') NOT LIKE '%ducklake_schema%'"
+    };
+    let macros_query = if is_quack_target {
+        format!(
+            "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authenticate' OR COALESCE(macro_definition, '') LIKE '%quack_check_token%') AND (function_name <> 'authorize' OR (COALESCE(macro_definition, '') LIKE '%abort|set%' {ducklake_macro_check})) AND (function_name <> 'resolve_role' OR COALESCE(macro_definition, '') LIKE '%ac.connection_id%') AND (function_name <> 'sanitize_sql' OR strpos(COALESCE(macro_definition, ''), '^\\s+|\\s+$') > 0)"
+        )
+    } else {
+        format!(
+            "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authorize' OR (COALESCE(macro_definition, '') LIKE '%abort|set%' {ducklake_macro_check})) AND (function_name <> 'sanitize_sql' OR strpos(COALESCE(macro_definition, ''), '^\\s+|\\s+$') > 0)"
+        )
     };
     let wrapper_query = "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = 'main' AND function_name IN ('_duckpack_quack_authenticate', '_duckpack_quack_authorize')";
     let hooks_query = "SELECT count(*) FROM duckdb_settings() WHERE (name = 'quack_authentication_function' AND value = '_duckpack_quack_authenticate') OR (name = 'quack_authorization_function' AND value = '_duckpack_quack_authorize')";
@@ -936,7 +1043,7 @@ pub fn append_quack_auth_diff_items(
         );
         let m_count = target_exec
             .query_rows(&remote_m)
-            .or_else(|_| target_exec.query_rows(macros_query))
+            .or_else(|_| target_exec.query_rows(&macros_query))
             .ok()
             .and_then(|(_, r)| r.into_iter().next())
             .and_then(|r| r.into_iter().next())
@@ -973,7 +1080,7 @@ pub fn append_quack_auth_diff_items(
     } else {
         let rows = target_exec.query_rows(query).ok().map(|(_, rows)| rows);
         let m_count = target_exec
-            .query_rows(macros_query)
+            .query_rows(&macros_query)
             .ok()
             .and_then(|(_, r)| r.into_iter().next())
             .and_then(|r| r.into_iter().next())
@@ -991,7 +1098,7 @@ pub fn append_quack_auth_diff_items(
 
     // Harvest the live Quack server's salted client_id_hash values for deployer & every user
     let (deploying_sid, master_cid_hash, live_hashes) = if let Some(ref qa) = q_alias {
-        harvest_quack_client_id_hashes(target_exec, qa, &config, project_dir)
+        harvest_quack_client_id_hashes_opt(target_exec, qa, &config, Some(project_dir))
     } else {
         (None, None, std::collections::HashMap::new())
     };
@@ -1270,33 +1377,28 @@ pub fn set_quack_session_override(
     Ok(())
 }
 
-/// Deploys or syncs ONLY the declarative Quack RBAC policy (`_duckpack_auth` tables, harvested live
-/// salted `client_id_hash` values, macros, and post-COMMIT `SET GLOBAL` hooks) without touching any
-/// user tables, views, or pending schema migrations.
-/// Used by both `duckpack apply --rbac-only` and the `Ctrl+U` TUI Deploy action.
-pub fn deploy_quack_rbac_now(
+/// Deploys or syncs ONLY the declarative Quack RBAC policy from an already-loaded `QuackAuthConfig`
+/// (`_duckpack_auth` tables, harvested live salted `client_id_hash` values, macros, and post-COMMIT
+/// `SET GLOBAL` hooks) without touching any user tables, views, or pending schema migrations.
+/// When `project_dir` is `None` (portable `.duckpack` bundle mode), tokens are resolved purely from OS env vars.
+pub fn deploy_quack_rbac_from_config(
     exec: &mut dyn DbExecutor,
     quack_alias: Option<&str>,
-    project_dir: &Path,
+    config: &QuackAuthConfig,
+    project_dir: Option<&Path>,
 ) -> Result<usize> {
-    let config = load_quack_auth_config(project_dir).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No [quack_auth] section found in {}/duckpack.toml.",
-            project_dir.display()
-        )
-    })?;
-    let resolved_users = validate_quack_auth_config(&config, project_dir)?;
+    let resolved_users = validate_quack_auth_config_opt(config, project_dir)?;
     let qa_opt = crate::diff::find_any_quack_alias(exec, quack_alias);
     let is_quack = qa_opt.is_some();
 
     let (deploying_sid, master_cid_hash, live_hashes) = if let Some(ref qa) = qa_opt {
-        harvest_quack_client_id_hashes(exec, qa, &config, project_dir)
+        harvest_quack_client_id_hashes_opt(exec, qa, config, project_dir)
     } else {
         (None, None, std::collections::HashMap::new())
     };
 
-    let compiled_sql = compile_quack_auth_sql_with_options(
-        &config,
+    let compiled_sql = compile_quack_auth_sql_with_options_opt(
+        config,
         project_dir,
         deploying_sid.as_deref(),
         master_cid_hash.as_deref(),
@@ -1353,6 +1455,22 @@ pub fn deploy_quack_rbac_now(
     Ok(resolved_users.len())
 }
 
+/// Deploys or syncs ONLY the declarative Quack RBAC policy from `project_dir/duckpack.toml`.
+/// Used by both `duckpack apply --rbac-only` and the `Ctrl+U` TUI Deploy action.
+pub fn deploy_quack_rbac_now(
+    exec: &mut dyn DbExecutor,
+    quack_alias: Option<&str>,
+    project_dir: &Path,
+) -> Result<usize> {
+    let config = load_quack_auth_config(project_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No [quack_auth] section found in {}/duckpack.toml.",
+            project_dir.display()
+        )
+    })?;
+    deploy_quack_rbac_from_config(exec, quack_alias, &config, Some(project_dir))
+}
+
 /// Generates an executable, idempotent post-start shell script (`scripts/quack_rbac_post_start.sh`)
 /// ready for Docker `ENTRYPOINT`, Compose, Kubernetes `postStart`, or `systemd ExecStartPost`.
 /// Waits for the Quack server to accept connections and runs `duckpack apply --env <profile> --rbac-only --auto-approve`
@@ -1400,15 +1518,28 @@ set -euo pipefail
 PROJECT_DIR="${{DUCKPACK_PROJECT_DIR:-$(cd "$(dirname "${{BASH_SOURCE[0]}}")/.." && pwd)}}"
 DUCKPACK_ENV="${{DUCKPACK_ENV:-{default_env}}}"
 DUCKPACK_BIN="${{DUCKPACK_BIN:-duckpack}}"
+RBAC_BUNDLE="${{DUCKPACK_RBAC_BUNDLE:-}}"
+QUACK_DB="${{DUCKPACK_QUACK_DB:-quack:127.0.0.1:9494}}"
 MAX_RETRIES="${{QUACK_RBAC_MAX_RETRIES:-30}}"
 SLEEP_SECS="${{QUACK_RBAC_RETRY_SLEEP:-1}}"
 
-echo "[duckpack-rbac] Waiting for Quack server (env=${{DUCKPACK_ENV}}, project=${{PROJECT_DIR}})..."
+if [ -n "${{RBAC_BUNDLE}}" ]; then
+    echo "[duckpack-rbac] Waiting for Quack server (bundle=${{RBAC_BUNDLE}}, db=${{QUACK_DB}})..."
+else
+    echo "[duckpack-rbac] Waiting for Quack server (env=${{DUCKPACK_ENV}}, project=${{PROJECT_DIR}})..."
+fi
 
 for attempt in $(seq 1 "${{MAX_RETRIES}}"); do
-    if "${{DUCKPACK_BIN}}" apply --project-dir "${{PROJECT_DIR}}" --env "${{DUCKPACK_ENV}}" --rbac-only --auto-approve; then
-        echo "[duckpack-rbac] Quack RBAC synced and global hooks activated (attempt ${{attempt}}/${{MAX_RETRIES}})."
-        exit 0
+    if [ -n "${{RBAC_BUNDLE}}" ]; then
+        if "${{DUCKPACK_BIN}}" apply --from "${{RBAC_BUNDLE}}" --rbac-only --db "${{QUACK_DB}}" --auto-approve; then
+            echo "[duckpack-rbac] Quack RBAC synced from bundle and global hooks activated (attempt ${{attempt}}/${{MAX_RETRIES}})."
+            exit 0
+        fi
+    else
+        if "${{DUCKPACK_BIN}}" apply --project-dir "${{PROJECT_DIR}}" --env "${{DUCKPACK_ENV}}" --rbac-only --auto-approve; then
+            echo "[duckpack-rbac] Quack RBAC synced and global hooks activated (attempt ${{attempt}}/${{MAX_RETRIES}})."
+            exit 0
+        fi
     fi
     if [ "${{attempt}}" -lt "${{MAX_RETRIES}}" ]; then
         sleep "${{SLEEP_SECS}}"
@@ -1464,6 +1595,7 @@ mod tests {
 
         let config = QuackAuthConfig {
             enabled: true,
+            ducklake_mode: false,
             default_role: QuackRole::Reader,
             writer_allow_temp_tables: true,
             reader_allow_explain_describe: true,
@@ -1679,6 +1811,138 @@ mod tests {
             untouched_exists, 0,
             "deploy_quack_rbac_now (--rbac-only) must NOT create pending user tables"
         );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_ducklake_mode_rbac_ddl_vs_dml_separation() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_ducklake_rbac_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        save_env_key_value(&temp_dir, "DL_ADMIN_TOK", "dl_admin_secret_111").unwrap();
+        save_env_key_value(&temp_dir, "DL_WRITER_TOK", "dl_writer_secret_222").unwrap();
+        save_env_key_value(&temp_dir, "DL_READER_TOK", "dl_reader_secret_333").unwrap();
+
+        let cfg = QuackAuthConfig {
+            enabled: true,
+            ducklake_mode: true,
+            default_role: QuackRole::Reader,
+            writer_allow_temp_tables: true,
+            reader_allow_explain_describe: true,
+            allow_copy: false,
+            users: vec![
+                QuackAuthUser {
+                    username: "admin".to_string(),
+                    role: QuackRole::Admin,
+                    token_env: "DL_ADMIN_TOK".to_string(),
+                    client_id: Some("admin".to_string()),
+                    enabled: true,
+                },
+                QuackAuthUser {
+                    username: "writer".to_string(),
+                    role: QuackRole::Writer,
+                    token_env: "DL_WRITER_TOK".to_string(),
+                    client_id: Some("writer".to_string()),
+                    enabled: true,
+                },
+                QuackAuthUser {
+                    username: "reader".to_string(),
+                    role: QuackRole::Reader,
+                    token_env: "DL_READER_TOK".to_string(),
+                    client_id: Some("reader".to_string()),
+                    enabled: true,
+                },
+            ],
+        };
+        save_quack_auth_config(&temp_dir, &cfg).unwrap();
+        let reloaded = load_quack_auth_config(&temp_dir).unwrap();
+        assert!(reloaded.ducklake_mode);
+
+        let sql = compile_quack_auth_sql(&cfg, &temp_dir, Some("sid_admin"), false).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&sql).unwrap();
+        conn.execute_batch(
+            "INSERT INTO _duckpack_auth.quack_sessions (sid, username, role, revoked) VALUES
+                ('sid_w', 'writer', 'writer', false),
+                ('sid_r', 'reader', 'reader', false);",
+        )
+        .unwrap();
+
+        let check = |sid: &str, q: &str| -> bool {
+            conn.query_row("SELECT _duckpack_auth.authorize(?, ?);", [sid, q], |r| r.get(0))
+                .unwrap()
+        };
+
+        // Admin: full DuckLake DDL & DML access
+        assert!(check("sid_admin", "INSERT INTO ducklake_table VALUES (1, 'uuid', 2, NULL, 0, 'orders');"));
+        assert!(check("sid_admin", "UPDATE ducklake_schema SET end_snapshot = 5 WHERE schema_id = 1;"));
+
+        // Writer: ALLOWED DuckLake DML, snapshot commits, stats, data-inlining tables, and SELECT on DDL metadata
+        assert!(check("sid_w", "SELECT table_id, table_name FROM ducklake_table WHERE end_snapshot IS NULL;"));
+        assert!(check("sid_w", "INSERT INTO ducklake_snapshot VALUES (5, now(), 1, 2, 3);"));
+        assert!(check("sid_w", "INSERT INTO ducklake_snapshot_changes VALUES (5, 'inserted_into_table:1', NULL, NULL, NULL);"));
+        assert!(check("sid_w", "INSERT INTO ducklake_data_file VALUES (1, 1, 5, NULL, 'a.parquet', true, 'parquet', 10, 100, 10, 0);"));
+        assert!(check("sid_w", "INSERT INTO ducklake_delete_file VALUES (1, 1, 5, NULL, 1, 'd.parquet', true, 'parquet', 1, 50, 10);"));
+        assert!(check("sid_w", "UPDATE ducklake_table_stats SET record_count = 10 WHERE table_id = 1;"));
+        assert!(check("sid_w", "INSERT INTO ducklake_file_column_stats VALUES (1, 1, 1, 10, 0, '1', '10', false);"));
+        assert!(check("sid_w", "INSERT INTO ducklake_inlined_data_tables VALUES (1, 'ducklake_inlined_data_1_1', 1);"));
+        assert!(check("sid_w", "CREATE TABLE IF NOT EXISTS main.ducklake_inlined_data_1_1 (row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, id INT);"));
+        assert!(check("sid_w", "INSERT INTO ducklake_inlined_data_1_1 VALUES (0, 5, NULL, 42);"));
+        assert!(check("sid_w", "UPDATE ducklake_inlined_data_1_1 SET end_snapshot = 6 WHERE row_id = 0;"));
+        // Exact multi-statement BEGIN TRANSACTION; ...; COMMIT; batches emitted by DuckLake v2.0
+        assert!(check(
+            "sid_w",
+            "BEGIN TRANSACTION;\nINSERT INTO \"main\".ducklake_snapshot VALUES (4, NOW(), 1, 2, 3);UPDATE \"main\".ducklake_table_stats SET record_count=28 WHERE table_id=1;INSERT INTO \"main\".ducklake_inlined_data_1_1 VALUES (26, 4, NULL, 2, 'a;b');INSERT INTO \"main\".ducklake_snapshot_changes VALUES (4, 'inlined_insert:1', NULL, NULL, NULL);\nCOMMIT;"
+        ));
+        assert!(check(
+            "sid_w",
+            "BEGIN TRANSACTION;\nINSERT INTO \"main\".ducklake_snapshot VALUES (4, NOW(), 1, 2, 2);CREATE TABLE IF NOT EXISTS \"main\".ducklake_inlined_delete_1(file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT);\nINSERT INTO \"main\".ducklake_inlined_delete_1 VALUES (1, 6, 4);INSERT INTO \"main\".ducklake_snapshot_changes VALUES (4, 'inlined_delete:1', NULL, NULL, NULL);\nCOMMIT;"
+        ));
+        assert!(check(
+            "sid_w",
+            "BEGIN TRANSACTION;\nINSERT INTO \"main\".ducklake_snapshot VALUES (4, NOW(), 1, 2, 2);\nWITH deleted_row_list(deleted_row_id) AS (VALUES (0)) UPDATE \"main\".ducklake_inlined_data_1_1 SET _ducklake_end_snapshot = 4 FROM deleted_row_list WHERE _ducklake_row_id = deleted_row_id;\nINSERT INTO \"main\".ducklake_snapshot_changes VALUES (4, 'inlined_delete:1', NULL, NULL, NULL);\nCOMMIT;"
+        ));
+
+        // Writer: BLOCKED from DuckLake DDL metadata tables (CREATE/ALTER/DROP table, schema, view, metadata, partition, sort, tag, macro)
+        assert!(!check("sid_w", "INSERT INTO ducklake_table VALUES (2, 'uuid', 5, NULL, 0, 'evil');"));
+        assert!(!check("sid_w", "INSERT INTO \"main\" . \"ducklake_table\"(table_id) VALUES (2);"));
+        assert!(!check("sid_w", "UPDATE main.ducklake_table SET end_snapshot = 5 WHERE table_id = 1;"));
+        assert!(!check("sid_w", "INSERT INTO \"ducklake_column\" VALUES (1, 5, NULL, 1, 0, 'x', 'int32', true);"));
+        assert!(!check("sid_w", "INSERT INTO ducklake_schema VALUES (2, 'uuid', 5, NULL, 'bad_schema');"));
+        assert!(!check("sid_w", "UPDATE ducklake_schema SET end_snapshot = 5 WHERE schema_id = 1;"));
+        assert!(!check("sid_w", "INSERT INTO ducklake_view VALUES (1, 'uuid', 5, NULL, 0, 'v', 'duckdb', 'SELECT 1');"));
+        assert!(!check("sid_w", "UPDATE ducklake_metadata SET value = 'hacked' WHERE key = 'data_path';"));
+        assert!(!check("sid_w", "INSERT INTO ducklake_partition_info VALUES (1, 1, 5, NULL);"));
+        assert!(!check("sid_w", "INSERT INTO ducklake_sort_info VALUES (1, 1, 5, NULL);"));
+        assert!(!check("sid_w", "INSERT INTO ducklake_tag VALUES (1, 5, NULL, 'k', 'v');"));
+        assert!(!check("sid_w", "CREATE TABLE main.regular_user_table (id INT);"));
+        // Writer: BLOCKED from DDL or statement smuggling inside BEGIN TRANSACTION; ...; COMMIT; batches
+        assert!(!check(
+            "sid_w",
+            "BEGIN TRANSACTION; INSERT INTO \"main\".ducklake_snapshot VALUES (4, NOW(), 2, 3, 2); INSERT INTO \"main\".ducklake_table VALUES (2, 'uuid', 4, NULL, 0, 'evil', 'evil/', true); COMMIT;"
+        ));
+        assert!(!check(
+            "sid_w",
+            "BEGIN TRANSACTION; CREATE TABLE IF NOT EXISTS \"main\".ducklake_inlined_delete_1(id BIGINT); CREATE TABLE \"main\".evil_tbl(id INT); COMMIT;"
+        ));
+        assert!(!check(
+            "sid_w",
+            "BEGIN TRANSACTION; SELECT 1; PRAGMA enable_profiling; COMMIT;"
+        ));
+        assert!(!check("sid_w", "SELECT 1; SELECT 2;"));
+
+        // Reader: strictly read-only
+        assert!(check("sid_r", "SELECT * FROM ducklake_snapshot;"));
+        assert!(check("sid_r", "SELECT * FROM ducklake_table;"));
+        assert!(!check("sid_r", "INSERT INTO ducklake_snapshot VALUES (6, now(), 1, 2, 3);"));
+        assert!(!check("sid_r", "INSERT INTO ducklake_data_file VALUES (2, 1, 6, NULL, 'b.parquet', true, 'parquet', 1, 10, 5, 0);"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

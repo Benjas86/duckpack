@@ -4,6 +4,7 @@ pub mod engine;
 pub mod ide;
 pub mod quack_auth;
 pub mod query;
+pub mod rbac_bundle;
 pub mod syntax;
 pub mod tui;
 pub mod workspace;
