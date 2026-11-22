@@ -81,7 +81,10 @@ def _auto_attach_toml_target_if_needed(target, project_dir=".", env=None):
 
     # If no explicit warehouse catalog is specified and db_target is just the local default database file,
     # do NOT auto-attach it to an explicit in-memory connection session.
-    is_remote = any(db_target.startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:"))
+    is_remote = any(
+        db_target.startswith(p)
+        for p in ("quack:", "quack://", "md:", "motherduck:", "ducklake:", "mssql:")
+    )
     if not catalog_alias and not is_remote and env is None:
         return
 
@@ -101,26 +104,40 @@ def _auto_attach_toml_target_if_needed(target, project_dir=".", env=None):
 
     token = cfg.get("token")
     insecure = cfg.get("insecure", False)
+    safe_alias = str(catalog_alias).replace('"', '""')
 
     try:
         if db_target.startswith("quack:") or db_target.startswith("quack://"):
             target.execute("INSTALL quack; LOAD quack;")
+            opts = []
+            if insecure:
+                opts.append("DISABLE_SSL true")
             if token:
                 safe_token = str(token).replace("'", "''")
-                target.execute(f"CREATE SECRET (TYPE QUACK, TOKEN '{safe_token}');")
-            disable_ssl = "true" if insecure else "false"
+                opts.append(f"TOKEN '{safe_token}'")
+                opts.append(f"CLIENT_ID '{safe_token}'")
             safe_db = db_target.replace("'", "''")
-            target.execute(f"ATTACH '{safe_db}' AS \"{catalog_alias}\" (DISABLE_SSL {disable_ssl});")
+            opt_clause = f" ({', '.join(opts)})" if opts else ""
+            target.execute(f"ATTACH '{safe_db}' AS \"{safe_alias}\"{opt_clause};")
+        elif db_target.startswith("mssql:"):
+            target.execute("INSTALL mssql; LOAD mssql;")
+            conn_str = db_target if db_target.lower().startswith("mssql://") else db_target[len("mssql:"):]
+            safe_db = conn_str.replace("'", "''")
+            target.execute(f"ATTACH '{safe_db}' AS \"{safe_alias}\" (TYPE MSSQL);")
+        elif db_target.startswith("ducklake:"):
+            target.execute("INSTALL ducklake; LOAD ducklake;")
+            safe_db = db_target.split(" (", 1)[0].strip().replace("'", "''")
+            target.execute(f"ATTACH '{safe_db}' AS \"{safe_alias}\";")
         elif db_target.startswith("md:") or db_target.startswith("motherduck:"):
             safe_db = db_target.replace("'", "''")
-            target.execute(f"ATTACH '{safe_db}' AS \"{catalog_alias}\";")
+            target.execute(f"ATTACH '{safe_db}' AS \"{safe_alias}\";")
         else:
             safe_db = db_target.replace("'", "''")
-            target.execute(f"ATTACH '{safe_db}' AS \"{catalog_alias}\";")
+            target.execute(f"ATTACH '{safe_db}' AS \"{safe_alias}\";")
 
-        print(f"[DuckPack] Attached '{catalog_alias}' ({db_target}) to Python connection.")
+        print(f"[DuckPack] Attached '{catalog_alias}' to Python connection.")
     except Exception as e:
-        print(f"[DuckPack] Warning: Could not auto-attach '{catalog_alias}' ({db_target}): {e}. Proceeding with in-memory session.")
+        print(f"[DuckPack] Warning: Could not auto-attach '{catalog_alias}': {e}. Proceeding with in-memory session.")
 
 
 def diff(

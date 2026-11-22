@@ -4,10 +4,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::engine::{
-    build_s3_secret_body, ensure_extension_loaded, format_ducklake_target,
-    format_mssql_connection_string, format_quack_endpoint, load_env_files, load_quack_extension,
-    open_duckdb_connection, redact_connection_credentials, resolve_target_config,
-    should_disable_quack_ssl, write_restricted_env_file,
+    format_quack_endpoint, load_env_files, load_quack_extension, open_duckdb_connection,
+    redact_connection_credentials, resolve_target_config, should_disable_quack_ssl,
+    write_restricted_env_file,
 };
 
 /// Forbidden plaintext credential keys in `[[secrets]]` and `[[attach]]` inside `duckpack.toml`.
@@ -580,348 +579,114 @@ pub fn apply_workspace_secrets(
     let mut warnings = Vec::new();
 
     for sec in &cfg.secrets {
-        let safe_name = sec.name.replace('"', "\"\"");
-        let stype = sec.secret_type.to_lowercase();
-
-        match stype.as_str() {
-            "s3" | "r2" => {
-                let _ = ensure_extension_loaded(conn, "httpfs");
-                let mut missing = Vec::new();
-                let key_id = if let Some(ref k_env) = sec.key_id_env {
-                    match resolve_workspace_env_var(project_dir, env_profile, k_env) {
-                        Some(v) => v,
-                        None => {
-                            missing.push(k_env.clone());
-                            String::new()
-                        }
-                    }
-                } else {
-                    String::new()
-                };
-                let secret_val = if let Some(ref s_env) = sec.secret_env {
-                    match resolve_workspace_env_var(project_dir, env_profile, s_env) {
-                        Some(v) => v,
-                        None => {
-                            missing.push(s_env.clone());
-                            String::new()
-                        }
-                    }
-                } else {
-                    String::new()
-                };
-                if !missing.is_empty() {
-                    warnings.push(format!(
-                        "Secret '{}' skipped (missing env: {})",
-                        sec.name,
-                        missing.join(", ")
-                    ));
-                    continue;
-                }
-
-                let endpoint = if let Some(ref ep_env) = sec.endpoint_env {
-                    resolve_workspace_env_var(project_dir, env_profile, ep_env).unwrap_or_default()
-                } else {
-                    sec.endpoint.clone().unwrap_or_default()
-                };
-                let region = if let Some(ref r_env) = sec.region_env {
-                    resolve_workspace_env_var(project_dir, env_profile, r_env)
-                        .unwrap_or_else(|| "us-east-1".to_string())
-                } else {
-                    sec.region.clone().unwrap_or_else(|| {
-                        if stype == "r2" {
-                            "auto".to_string()
-                        } else {
-                            "us-east-1".to_string()
-                        }
-                    })
-                };
-
-                let mut body = if stype == "r2" {
-                    if let Some(acct_id) = crate::engine::extract_r2_account_id(&endpoint) {
-                        crate::engine::build_r2_secret_body(&key_id, &secret_val, &acct_id)
-                    } else {
-                        build_s3_secret_body(
-                            &key_id,
-                            &secret_val,
-                            &region,
-                            &endpoint,
-                            sec.use_ssl.unwrap_or(true),
-                        )
-                    }
-                } else {
-                    build_s3_secret_body(
-                        &key_id,
-                        &secret_val,
-                        &region,
-                        &endpoint,
-                        sec.use_ssl.unwrap_or(true),
-                    )
-                };
-                if stype != "r2" || !body.starts_with("TYPE R2") {
-                    if let Some(ref style) = sec.url_style {
-                        let safe_style = style.replace('\'', "''");
-                        if body.contains("URL_STYLE 'path'") {
-                            body = body.replace(
-                                "URL_STYLE 'path'",
-                                &format!("URL_STYLE '{}'", safe_style),
-                            );
-                        } else {
-                            body.push_str(&format!(", URL_STYLE '{}'", safe_style));
-                        }
-                    }
-                }
-                if let Some(ref scope) = sec.scope {
-                    body.push_str(&format!(", SCOPE '{}'", scope.replace('\'', "''")));
-                }
-
-                let sql = format!("CREATE OR REPLACE SECRET \"{}\" ({});", safe_name, body);
-                match conn.execute(&sql, []) {
-                    Ok(_) => {
-                        loaded.push(sec.name.clone());
-                        if let Some(ref bucket) = sec.bucket {
-                            let mut b = bucket.trim().to_string();
-                            if !b.is_empty()
-                                && !b.starts_with("s3://")
-                                && !b.starts_with("r2://")
-                                && !b.starts_with("gcs://")
-                            {
-                                b = format!("s3://{}", b);
-                            }
-                            if !b.is_empty() {
-                                let existing =
-                                    std::env::var("DUCKPACK_S3_BUCKETS").unwrap_or_default();
-                                let already = existing
-                                    .split(',')
-                                    .any(|p| p.trim().eq_ignore_ascii_case(&b));
-                                if !already {
-                                    let updated = if existing.trim().is_empty() {
-                                        b
-                                    } else {
-                                        format!("{},{}", existing.trim_end_matches(','), b)
-                                    };
-                                    unsafe {
-                                        std::env::set_var("DUCKPACK_S3_BUCKETS", &updated);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => warnings.push(format!(
-                        "Secret '{}' failed: {}",
-                        sec.name,
-                        redact_connection_credentials(&e.to_string())
-                    )),
-                }
-            }
-            "quack" => {
-                let _ = load_quack_extension(conn);
-                let Some(ref tok_env) = sec.token_env else {
-                    warnings.push(format!("Quack secret '{}' missing token_env", sec.name));
-                    continue;
-                };
-                let Some(tok) = resolve_workspace_env_var(project_dir, env_profile, tok_env) else {
-                    warnings.push(format!(
-                        "Secret '{}' skipped (missing env: {})",
-                        sec.name, tok_env
-                    ));
-                    continue;
-                };
-                let mut clauses = vec![
-                    "TYPE QUACK".to_string(),
-                    format!("TOKEN '{}'", tok.replace('\'', "''")),
-                ];
-                if let Some(ref scope) = sec.scope {
-                    clauses.push(format!("SCOPE '{}'", scope.replace('\'', "''")));
-                }
-                let sql = format!(
-                    "CREATE OR REPLACE SECRET \"{}\" ({});",
-                    safe_name,
-                    clauses.join(", ")
-                );
-                match conn.execute(&sql, []) {
-                    Ok(_) => loaded.push(sec.name.clone()),
-                    Err(e) => warnings.push(format!(
-                        "Secret '{}' failed: {}",
-                        sec.name,
-                        redact_connection_credentials(&e.to_string())
-                    )),
-                }
-            }
-            "gcs" => {
-                let _ = ensure_extension_loaded(conn, "httpfs");
-                let mut missing = Vec::new();
-                let mut clauses = vec!["TYPE GCS".to_string()];
-                if let Some(ref k_env) = sec.key_id_env {
-                    match resolve_workspace_env_var(project_dir, env_profile, k_env) {
-                        Some(v) => clauses.push(format!("KEY_ID '{}'", v.replace('\'', "''"))),
-                        None => missing.push(k_env.clone()),
-                    }
-                }
-                if let Some(ref s_env) = sec.secret_env {
-                    match resolve_workspace_env_var(project_dir, env_profile, s_env) {
-                        Some(v) => clauses.push(format!("SECRET '{}'", v.replace('\'', "''"))),
-                        None => missing.push(s_env.clone()),
-                    }
-                }
-                if !missing.is_empty() {
-                    warnings.push(format!(
-                        "Secret '{}' skipped (missing env: {})",
-                        sec.name,
-                        missing.join(", ")
-                    ));
-                    continue;
-                }
-                if let Some(ref region) = sec.region {
-                    clauses.push(format!("REGION '{}'", region.replace('\'', "''")));
-                }
-                let endpoint = if let Some(ref ep_env) = sec.endpoint_env {
-                    resolve_workspace_env_var(project_dir, env_profile, ep_env).unwrap_or_default()
-                } else {
-                    sec.endpoint.clone().unwrap_or_default()
-                };
-                if !endpoint.is_empty() {
-                    clauses.push(format!("ENDPOINT '{}'", endpoint.replace('\'', "''")));
-                }
-                if let Some(ref style) = sec.url_style {
-                    clauses.push(format!("URL_STYLE '{}'", style.replace('\'', "''")));
-                }
-                if let Some(ssl) = sec.use_ssl {
-                    clauses.push(format!("USE_SSL {}", ssl));
-                }
-                if let Some(ref scope) = sec.scope {
-                    clauses.push(format!("SCOPE '{}'", scope.replace('\'', "''")));
-                }
-                let sql = format!(
-                    "CREATE OR REPLACE SECRET \"{}\" ({});",
-                    safe_name,
-                    clauses.join(", ")
-                );
-                match conn.execute(&sql, []) {
-                    Ok(_) => loaded.push(sec.name.clone()),
-                    Err(e) => warnings.push(format!(
-                        "Secret '{}' failed: {}",
-                        sec.name,
-                        redact_connection_credentials(&e.to_string())
-                    )),
-                }
-            }
-            "azure" => {
-                let _ = ensure_extension_loaded(conn, "azure");
-                let mut missing = Vec::new();
-                let mut clauses = vec!["TYPE AZURE".to_string()];
-                // Support connection_string (via secret_env), access_token (via token_env), or credential_chain fallback
-                let conn_str = if let Some(ref s_env) = sec.secret_env {
-                    match resolve_workspace_env_var(project_dir, env_profile, s_env) {
-                        Some(v) => Some(v),
-                        None => {
-                            missing.push(s_env.clone());
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let access_tok = if let Some(ref t_env) = sec.token_env {
-                    match resolve_workspace_env_var(project_dir, env_profile, t_env) {
-                        Some(v) => Some(v),
-                        None => {
-                            missing.push(t_env.clone());
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let account_name = if let Some(ref k_env) = sec.key_id_env {
-                    resolve_workspace_env_var(project_dir, env_profile, k_env)
-                } else {
-                    None
-                };
-                if !missing.is_empty() {
-                    warnings.push(format!(
-                        "Secret '{}' skipped (missing env: {})",
-                        sec.name,
-                        missing.join(", ")
-                    ));
-                    continue;
-                }
-                if let Some(tok) = access_tok {
-                    clauses.push("PROVIDER access_token".to_string());
-                    clauses.push(format!("ACCESS_TOKEN '{}'", tok.replace('\'', "''")));
-                } else if let Some(cs) = conn_str {
-                    clauses.push(format!("CONNECTION_STRING '{}'", cs.replace('\'', "''")));
-                } else {
-                    clauses.push("PROVIDER credential_chain".to_string());
-                }
-                if let Some(acct) = account_name {
-                    clauses.push(format!("ACCOUNT_NAME '{}'", acct.replace('\'', "''")));
-                }
-                let endpoint = if let Some(ref ep_env) = sec.endpoint_env {
-                    resolve_workspace_env_var(project_dir, env_profile, ep_env).unwrap_or_default()
-                } else {
-                    sec.endpoint.clone().unwrap_or_default()
-                };
-                if !endpoint.is_empty() {
-                    clauses.push(format!("ENDPOINT '{}'", endpoint.replace('\'', "''")));
-                }
-                if let Some(ref scope) = sec.scope {
-                    clauses.push(format!("SCOPE '{}'", scope.replace('\'', "''")));
-                }
-                let sql = format!(
-                    "CREATE OR REPLACE SECRET \"{}\" ({});",
-                    safe_name,
-                    clauses.join(", ")
-                );
-                match conn.execute(&sql, []) {
-                    Ok(_) => loaded.push(sec.name.clone()),
-                    Err(e) => warnings.push(format!(
-                        "Secret '{}' failed: {}",
-                        sec.name,
-                        redact_connection_credentials(&e.to_string())
-                    )),
-                }
-            }
-            "http" => {
-                let _ = ensure_extension_loaded(conn, "httpfs");
-                let mut missing = Vec::new();
-                let mut clauses = vec!["TYPE HTTP".to_string()];
-                if let Some(ref t_env) = sec.token_env {
-                    match resolve_workspace_env_var(project_dir, env_profile, t_env) {
-                        Some(v) => clauses.push(format!("BEARER_TOKEN '{}'", v.replace('\'', "''"))),
-                        None => missing.push(t_env.clone()),
-                    }
-                }
-                if !missing.is_empty() {
-                    warnings.push(format!(
-                        "Secret '{}' skipped (missing env: {})",
-                        sec.name,
-                        missing.join(", ")
-                    ));
-                    continue;
-                }
-                if let Some(ref scope) = sec.scope {
-                    clauses.push(format!("SCOPE '{}'", scope.replace('\'', "''")));
-                }
-                let sql = format!(
-                    "CREATE OR REPLACE SECRET \"{}\" ({});",
-                    safe_name,
-                    clauses.join(", ")
-                );
-                match conn.execute(&sql, []) {
-                    Ok(_) => loaded.push(sec.name.clone()),
-                    Err(e) => warnings.push(format!(
-                        "Secret '{}' failed: {}",
-                        sec.name,
-                        redact_connection_credentials(&e.to_string())
-                    )),
-                }
-            }
-            other => {
+        let kind = match crate::connectors::SecretKind::from_type_str(&sec.secret_type) {
+            Ok(k) => k,
+            Err(_) => {
                 warnings.push(format!(
                     "Secret '{}' has unsupported type '{}'",
-                    sec.name, other
+                    sec.name, sec.secret_type
                 ));
+                continue;
             }
+        };
+
+        let mut missing = Vec::new();
+        let mut resolve_req = |env_opt: &Option<String>| -> Option<String> {
+            let var = env_opt.as_ref()?;
+            match resolve_workspace_env_var(project_dir, env_profile, var) {
+                Some(v) => Some(v),
+                None => {
+                    missing.push(var.clone());
+                    None
+                }
+            }
+        };
+
+        let key_id = if kind == crate::connectors::SecretKind::Azure {
+            sec.key_id_env
+                .as_deref()
+                .and_then(|k| resolve_workspace_env_var(project_dir, env_profile, k))
+        } else {
+            resolve_req(&sec.key_id_env)
+        };
+        let secret = resolve_req(&sec.secret_env);
+        let token = if kind == crate::connectors::SecretKind::Quack && sec.token_env.is_none() {
+            warnings.push(format!("Quack secret '{}' missing token_env", sec.name));
+            continue;
+        } else {
+            resolve_req(&sec.token_env)
+        };
+
+        if !missing.is_empty() {
+            warnings.push(format!(
+                "Secret '{}' skipped (missing env: {})",
+                sec.name,
+                missing.join(", ")
+            ));
+            continue;
+        }
+
+        let endpoint = sec
+            .endpoint_env
+            .as_deref()
+            .and_then(|e| resolve_workspace_env_var(project_dir, env_profile, e))
+            .or_else(|| sec.endpoint.clone());
+        let region = sec
+            .region_env
+            .as_deref()
+            .and_then(|r| resolve_workspace_env_var(project_dir, env_profile, r))
+            .or_else(|| sec.region.clone());
+
+        let spec = crate::connectors::SecretSpec {
+            name: sec.name.clone(),
+            kind,
+            persistent: false,
+            key_id,
+            secret,
+            token,
+            region,
+            endpoint,
+            url_style: sec.url_style.clone(),
+            use_ssl: sec.use_ssl,
+            scope: sec.scope.clone(),
+        };
+
+        match crate::connectors::plan_secret(&spec)
+            .and_then(|plan| crate::connectors::execute_secret_plan(conn, &plan))
+        {
+            Ok(_) => {
+                loaded.push(sec.name.clone());
+                if matches!(
+                    kind,
+                    crate::connectors::SecretKind::S3 | crate::connectors::SecretKind::R2
+                ) {
+                    if let Some(b) = sec
+                        .bucket
+                        .as_deref()
+                        .and_then(crate::connectors::normalize_bucket_uri)
+                    {
+                        let existing = std::env::var("DUCKPACK_S3_BUCKETS").unwrap_or_default();
+                        let already = existing
+                            .split(',')
+                            .any(|p| p.trim().eq_ignore_ascii_case(&b));
+                        if !already {
+                            let updated = if existing.trim().is_empty() {
+                                b
+                            } else {
+                                format!("{},{}", existing.trim_end_matches(','), b)
+                            };
+                            unsafe {
+                                std::env::set_var("DUCKPACK_S3_BUCKETS", &updated);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => warnings.push(format!(
+                "Secret '{}' failed: {}",
+                sec.name,
+                redact_connection_credentials(&e.to_string())
+            )),
         }
     }
 
@@ -978,8 +743,8 @@ pub fn attach_single_workspace_entry(
     project_dir: &Path,
     env_profile: Option<&str>,
 ) -> std::result::Result<(), AttachmentIssueKind> {
-    let quoted_alias = format!("\"{}\"", entry.alias.replace('"', "\"\""));
-    let t = entry.attach_type.to_lowercase();
+    let provider = crate::connectors::AttachProviderKind::from_type_str(&entry.attach_type)
+        .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
 
     // Check required *_env vars up front
     let mut missing = Vec::new();
@@ -1006,427 +771,36 @@ pub fn attach_single_workspace_entry(
         return Err(AttachmentIssueKind::MissingEnv(missing));
     }
 
-    let effective_user = user_from_env.or_else(|| entry.username.clone()).unwrap_or_default();
-
-    let attach_sql: String = match t.as_str() {
-        "duckdb" => {
-            let raw_path = entry
-                .path
-                .as_deref()
-                .or(entry.database.as_deref())
-                .unwrap_or(":memory:");
-            let resolved_path = if raw_path == ":memory:" || Path::new(raw_path).is_absolute() {
-                raw_path.to_string()
-            } else {
-                project_dir.join(raw_path).to_string_lossy().to_string()
-            };
-            let safe_path = resolved_path.replace('\'', "''");
-            if entry.read_only {
-                format!("ATTACH '{}' AS {} (READ_ONLY);", safe_path, quoted_alias)
-            } else {
-                format!("ATTACH '{}' AS {};", safe_path, quoted_alias)
-            }
-        }
-        "sqlite" => {
-            ensure_extension_loaded(conn, "sqlite")
-                .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
-            let raw_path = entry
-                .path
-                .as_deref()
-                .or(entry.database.as_deref())
-                .ok_or_else(|| {
-                    AttachmentIssueKind::ConnectionFailed(
-                        "SQLite attachment requires 'path'.".to_string(),
-                    )
-                })?;
-            let resolved_path = if Path::new(raw_path).is_absolute() {
-                raw_path.to_string()
-            } else {
-                project_dir.join(raw_path).to_string_lossy().to_string()
-            };
-            let safe_path = resolved_path.replace('\'', "''");
-            if entry.read_only {
-                format!(
-                    "ATTACH '{}' AS {} (TYPE SQLITE, READ_ONLY);",
-                    safe_path, quoted_alias
-                )
-            } else {
-                format!("ATTACH '{}' AS {} (TYPE SQLITE);", safe_path, quoted_alias)
-            }
-        }
-        "quack" => {
-            load_quack_extension(conn)
-                .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
-            let endpoint = resolve_attachment_quack_endpoint(entry).ok_or_else(|| {
-                AttachmentIssueKind::ConnectionFailed(
-                    "Quack attachment requires 'metadata', 'path', or 'host'.".to_string(),
-                )
-            })?;
-            let disable_ssl =
-                should_disable_quack_ssl(&endpoint, entry.insecure || entry.disable_ssl);
-            let mut opts = Vec::new();
-            if disable_ssl {
-                opts.push("DISABLE_SSL true".to_string());
-            }
-            if let Some(ref tok) = token {
-                opts.push(format!("TOKEN '{}'", tok.replace('\'', "''")));
-            }
-            let effective_cid = entry
-                .client_id
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| token.clone());
-            if let Some(ref cid) = effective_cid {
-                opts.push(format!("CLIENT_ID '{}'", cid.replace('\'', "''")));
-            }
-            if entry.read_only {
-                opts.push("READ_ONLY".to_string());
-            }
-            let safe_ep = endpoint.replace('\'', "''");
-            if opts.is_empty() {
-                format!("ATTACH '{}' AS {};", safe_ep, quoted_alias)
-            } else {
-                format!("ATTACH '{}' AS {} ({});", safe_ep, quoted_alias, opts.join(", "))
-            }
-        }
-        "ducklake" => {
-            ensure_extension_loaded(conn, "ducklake")
-                .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
-            let data_path = entry.data_path.as_deref().unwrap_or("").trim();
-            if data_path.starts_with("s3://")
-                || data_path.starts_with("r2://")
-                || data_path.starts_with("http://")
-                || data_path.starts_with("https://")
-            {
-                let _ = ensure_extension_loaded(conn, "httpfs");
-            }
-
-            let inferred_backend = entry.backend.clone().unwrap_or_else(|| {
-                if let Some(ref m) = entry.metadata {
-                    let ml = m.to_lowercase();
-                    if ml.contains("quack:") {
-                        "quack".to_string()
-                    } else if ml.contains("postgres") {
-                        "postgres".to_string()
-                    } else if ml.contains("sqlite") {
-                        "sqlite".to_string()
-                    } else {
-                        "file".to_string()
-                    }
-                } else if entry.host.is_some() {
-                    if entry.port == Some(5432) {
-                        "postgres".to_string()
-                    } else {
-                        "quack".to_string()
-                    }
-                } else {
-                    "file".to_string()
-                }
-            });
-
-            let mut extra_attach_opts: Vec<String> = Vec::new();
-            let target_dsn: String = match inferred_backend.as_str() {
-                "quack" => {
-                    load_quack_extension(conn)
-                        .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
-                    let ep = resolve_attachment_quack_endpoint(entry).ok_or_else(|| {
-                        AttachmentIssueKind::ConnectionFailed(
-                            "DuckLake Quack backend requires 'metadata' or 'host'.".to_string(),
-                        )
-                    })?;
-                    let disable_ssl =
-                        should_disable_quack_ssl(&ep, entry.insecure || entry.disable_ssl);
-                    // Use DuckLake's native typed META_* parameters (META_DISABLE_SSL, META_TOKEN, META_CLIENT_ID)
-                    // for full per-alias RBAC isolation without touching global QUACK secrets or client_id.
-                    if disable_ssl {
-                        extra_attach_opts.push("META_DISABLE_SSL true".to_string());
-                    }
-                    if let Some(ref tok) = token {
-                        extra_attach_opts
-                            .push(format!("META_TOKEN '{}'", tok.replace('\'', "''")));
-                        let effective_cid = entry
-                            .client_id
-                            .as_deref()
-                            .map(|s| s.trim())
-                            .filter(|s| s.chars().count() >= 4)
-                            .unwrap_or(tok.as_str());
-                        if effective_cid.chars().count() >= 4 {
-                            extra_attach_opts.push(format!(
-                                "META_CLIENT_ID '{}'",
-                                effective_cid.replace('\'', "''")
-                            ));
-                        }
-                    }
-                    format!("ducklake:{}", ep)
-                }
-                "postgres" | "postgresql" => {
-                    ensure_extension_loaded(conn, "postgres")
-                        .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
-                    if let Some(ref dsn) = dsn_from_env {
-                        let clean = dsn.trim().strip_prefix("ducklake:").unwrap_or(dsn.trim());
-                        if clean.starts_with("postgresql://") || clean.starts_with("postgres://") {
-                            format!("ducklake:postgres:{}", clean)
-                        } else if clean.starts_with("postgres:") {
-                            format!("ducklake:{}", clean)
-                        } else if clean.starts_with("postgresql:") {
-                            format!("ducklake:postgres:{}", clean.trim_start_matches("postgresql:"))
-                        } else {
-                            format!("ducklake:postgres:{}", clean)
-                        }
-                    } else if let Some(ref meta) = entry.metadata {
-                        let clean = meta.trim().strip_prefix("ducklake:").unwrap_or(meta.trim());
-                        if clean.starts_with("postgresql://") || clean.starts_with("postgres://") {
-                            format!("ducklake:postgres:{}", clean)
-                        } else if clean.starts_with("postgres:") {
-                            format!("ducklake:{}", clean)
-                        } else if clean.starts_with("postgresql:") {
-                            format!("ducklake:postgres:{}", clean.trim_start_matches("postgresql:"))
-                        } else {
-                            format!("ducklake:postgres:{}", clean)
-                        }
-                    } else {
-                        let host = entry.host.as_deref().unwrap_or("localhost");
-                        let port_str = entry.port.unwrap_or(5432).to_string();
-                        let db = entry.database.as_deref().unwrap_or("ducklake");
-                        let pass = password.as_deref().unwrap_or("");
-                        format_ducklake_target("postgres", host, &port_str, db, &effective_user, pass, "")
-                            .map_err(AttachmentIssueKind::ConnectionFailed)?
-                    }
-                }
-                "sqlite" => {
-                    ensure_extension_loaded(conn, "sqlite")
-                        .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
-                    let raw_p = entry
-                        .metadata
-                        .as_deref()
-                        .or(entry.path.as_deref())
-                        .unwrap_or("metadata.db")
-                        .trim();
-                    let no_dl = raw_p.strip_prefix("ducklake:").unwrap_or(raw_p);
-                    let clean_p = no_dl.strip_prefix("sqlite:").unwrap_or(no_dl);
-                    let abs_p = if Path::new(clean_p).is_absolute() {
-                        clean_p.to_string()
-                    } else {
-                        project_dir.join(clean_p).to_string_lossy().to_string()
-                    };
-                    format!("ducklake:sqlite:{}", abs_p)
-                }
-                _ => {
-                    let raw_p = entry
-                        .metadata
-                        .as_deref()
-                        .or(entry.path.as_deref())
-                        .unwrap_or("metadata.ducklake")
-                        .trim();
-                    let clean_p = raw_p.strip_prefix("ducklake:").unwrap_or(raw_p);
-                    let is_remote_url = clean_p.starts_with("s3://")
-                        || clean_p.starts_with("r2://")
-                        || clean_p.starts_with("gcs://")
-                        || clean_p.starts_with("gs://")
-                        || clean_p.starts_with("az://")
-                        || clean_p.starts_with("azure://")
-                        || clean_p.starts_with("abfss://")
-                        || clean_p.starts_with("abfs://")
-                        || clean_p.starts_with("http://")
-                        || clean_p.starts_with("https://");
-                    if is_remote_url {
-                        if clean_p.starts_with("az://")
-                            || clean_p.starts_with("azure://")
-                            || clean_p.starts_with("abfss://")
-                            || clean_p.starts_with("abfs://")
-                        {
-                            let _ = ensure_extension_loaded(conn, "azure");
-                        } else {
-                            let _ = ensure_extension_loaded(conn, "httpfs");
-                        }
-                        clean_p.to_string()
-                    } else {
-                        let abs_p = if Path::new(clean_p).is_absolute() {
-                            clean_p.to_string()
-                        } else {
-                            project_dir.join(clean_p).to_string_lossy().to_string()
-                        };
-                        format!("ducklake:{}", abs_p)
-                    }
-                }
-            };
-
-            let mut opts = Vec::new();
-            if !target_dsn.starts_with("ducklake:") {
-                opts.push("TYPE ducklake".to_string());
-            }
-            if !data_path.is_empty() {
-                opts.push(format!("DATA_PATH '{}'", data_path.replace('\'', "''")));
-            }
-            opts.extend(extra_attach_opts);
-            if entry.read_only {
-                opts.push("READ_ONLY".to_string());
-            }
-            let safe_dsn = target_dsn.replace('\'', "''");
-            if opts.is_empty() {
-                format!("ATTACH '{}' AS {};", safe_dsn, quoted_alias)
-            } else {
-                format!("ATTACH '{}' AS {} ({});", safe_dsn, quoted_alias, opts.join(", "))
-            }
-        }
-        "motherduck" | "md" => {
-            ensure_extension_loaded(conn, "motherduck")
-                .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
-            let db_name = entry
-                .database
-                .as_deref()
-                .or(entry.path.as_deref())
-                .unwrap_or("");
-            let mut target = if db_name.starts_with("md:") || db_name.starts_with("motherduck:") {
-                db_name.to_string()
-            } else {
-                format!("md:{}", db_name)
-            };
-            if let Some(ref tok) = token {
-                if !target.to_lowercase().contains("motherduck_token=") {
-                    let sep = if target.contains('?') { '&' } else { '?' };
-                    target.push_str(&format!("{}motherduck_token={}", sep, tok));
-                }
-            }
-            let safe_t = target.replace('\'', "''");
-            if entry.read_only {
-                format!("ATTACH '{}' AS {} (READ_ONLY);", safe_t, quoted_alias)
-            } else {
-                format!("ATTACH '{}' AS {};", safe_t, quoted_alias)
-            }
-        }
-        "postgres" | "postgresql" => {
-            ensure_extension_loaded(conn, "postgres")
-                .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
-            let mut conn_str = if let Some(ref dsn) = dsn_from_env {
-                dsn.clone()
-            } else {
-                let host = entry.host.as_deref().unwrap_or("localhost");
-                let port = entry.port.unwrap_or(5432);
-                let db = entry.database.as_deref().unwrap_or("postgres");
-                let mut s = format!(
-                    "host={} port={} dbname={}",
-                    crate::engine::escape_libpq_value(host),
-                    port,
-                    crate::engine::escape_libpq_value(db)
-                );
-                if !effective_user.is_empty() {
-                    s.push_str(&format!(" user={}", crate::engine::escape_libpq_value(&effective_user)));
-                }
-                if let Some(ref pass) = password {
-                    s.push_str(&format!(" password={}", crate::engine::escape_libpq_value(pass)));
-                }
-                s
-            };
-            if !conn_str.to_lowercase().contains("sslmode=") {
-                if entry.disable_ssl {
-                    let sep = if conn_str.contains("://") {
-                        if conn_str.contains('?') { "&" } else { "?" }
-                    } else {
-                        " "
-                    };
-                    conn_str.push_str(&format!("{}sslmode=disable", sep));
-                } else if entry.insecure {
-                    let sep = if conn_str.contains("://") {
-                        if conn_str.contains('?') { "&" } else { "?" }
-                    } else {
-                        " "
-                    };
-                    conn_str.push_str(&format!("{}sslmode=prefer", sep));
-                }
-            }
-            let safe_cs = conn_str.replace('\'', "''");
-            if entry.read_only {
-                format!(
-                    "ATTACH '{}' AS {} (TYPE POSTGRES, READ_ONLY);",
-                    safe_cs, quoted_alias
-                )
-            } else {
-                format!("ATTACH '{}' AS {} (TYPE POSTGRES);", safe_cs, quoted_alias)
-            }
-        }
-        "mysql" => {
-            ensure_extension_loaded(conn, "mysql")
-                .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
-            let mut conn_str = if let Some(ref dsn) = dsn_from_env {
-                dsn.clone()
-            } else {
-                let host = entry.host.as_deref().unwrap_or("localhost");
-                let port = entry.port.unwrap_or(3306);
-                let db = entry.database.as_deref().unwrap_or("mysql");
-                let mut s = format!(
-                    "host={} port={} database={}",
-                    crate::engine::escape_libpq_value(host),
-                    port,
-                    crate::engine::escape_libpq_value(db)
-                );
-                if !effective_user.is_empty() {
-                    s.push_str(&format!(" user={}", crate::engine::escape_libpq_value(&effective_user)));
-                }
-                if let Some(ref pass) = password {
-                    s.push_str(&format!(" password={}", crate::engine::escape_libpq_value(pass)));
-                }
-                s
-            };
-            if (entry.disable_ssl || entry.insecure)
-                && !conn_str.to_lowercase().contains("ssl_mode=")
-            {
-                conn_str.push_str(" ssl_mode=disabled");
-            }
-            let safe_cs = conn_str.replace('\'', "''");
-            if entry.read_only {
-                format!(
-                    "ATTACH '{}' AS {} (TYPE MYSQL, READ_ONLY);",
-                    safe_cs, quoted_alias
-                )
-            } else {
-                format!("ATTACH '{}' AS {} (TYPE MYSQL);", safe_cs, quoted_alias)
-            }
-        }
-        "mssql" | "sqlserver" => {
-            ensure_extension_loaded(conn, "mssql")
-                .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
-            let conn_str = if let Some(ref dsn) = dsn_from_env {
-                dsn.clone()
-            } else {
-                let host = entry.host.as_deref().unwrap_or("localhost");
-                let port_str = entry.port.unwrap_or(1433).to_string();
-                let db = entry.database.as_deref().unwrap_or("");
-                let pass = password.as_deref().unwrap_or("");
-                format_mssql_connection_string(
-                    host,
-                    &port_str,
-                    db,
-                    &effective_user,
-                    pass,
-                    entry.trusted_connection,
-                    entry.insecure,
-                    entry.disable_ssl,
-                )
-            };
-            let safe_cs = conn_str.replace('\'', "''");
-            if entry.read_only {
-                format!(
-                    "ATTACH '{}' AS {} (TYPE MSSQL, READ_ONLY);",
-                    safe_cs, quoted_alias
-                )
-            } else {
-                format!("ATTACH '{}' AS {} (TYPE MSSQL);", safe_cs, quoted_alias)
-            }
-        }
-        other => {
-            return Err(AttachmentIssueKind::ConnectionFailed(format!(
-                "Unsupported attachment type '{}'",
-                other
-            )));
-        }
+    let effective_user = user_from_env.or_else(|| entry.username.clone());
+    let spec = crate::connectors::AttachSpec {
+        provider: Some(provider),
+        alias: entry.alias.clone(),
+        path: entry.path.clone(),
+        metadata: entry.metadata.clone(),
+        data_path: entry.data_path.clone(),
+        ducklake_backend: crate::connectors::DuckLakeBackendKind::from_str_opt(
+            entry.backend.as_deref(),
+        ),
+        host: entry.host.clone(),
+        port: entry.port.map(|p| p.to_string()),
+        database: entry.database.clone(),
+        username: effective_user,
+        password,
+        token,
+        client_id: entry.client_id.clone(),
+        dsn: dsn_from_env,
+        read_only: entry.read_only,
+        disable_ssl: entry.disable_ssl,
+        insecure: entry.insecure,
+        trusted_connection: entry.trusted_connection,
+        detach_first: true,
+        base_dir: Some(project_dir.to_path_buf()),
     };
 
-    // Detach any stale alias first if retrying
-    let _ = conn.execute(&format!("DETACH IF EXISTS {};", quoted_alias), []);
-    conn.execute(&attach_sql, []).map_err(|e| {
-        AttachmentIssueKind::ConnectionFailed(redact_connection_credentials(&e.to_string()))
-    })?;
+    let plan = crate::connectors::plan_attach(&spec)
+        .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
+    crate::connectors::execute_attach_plan(conn, &plan, Some(project_dir))
+        .map_err(|e| AttachmentIssueKind::ConnectionFailed(e.to_string()))?;
     Ok(())
 }
 

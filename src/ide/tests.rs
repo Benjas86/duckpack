@@ -1243,7 +1243,7 @@ fn test_attach_modal_state_providers() {
     assert!(modal.trusted_connection);
     assert_eq!(modal.username, "");
 
-    // Test Postgres URI building
+    // Test Postgres escaped libpq connection string building (L1: safe for special-char passwords)
     modal.reset();
     modal.set_provider(4);
     modal.database = "analytics".to_string();
@@ -1254,7 +1254,7 @@ fn test_attach_modal_state_providers() {
     assert_eq!(pg_alias, "analytics");
     assert_eq!(
         pg_uri,
-        "postgres://postgres:pgpass@localhost:5432/analytics?sslmode=disable"
+        "host=localhost port=5432 dbname=analytics user=postgres password=pgpass sslmode=disable"
     );
 
     // Test MySQL key=value connection string building (DuckDB mysql extension syntax)

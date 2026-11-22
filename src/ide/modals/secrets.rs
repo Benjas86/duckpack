@@ -554,42 +554,25 @@ impl SecretModalState {
                             .to_string(),
                     );
                 } else {
-                    let _ = crate::engine::ensure_extension_loaded(conn, "httpfs");
-                    let secret_body = if self.provider() == CloudProvider::CloudflareR2 {
-                        if let Some(acct_id) = crate::engine::extract_r2_account_id(&self.endpoint)
-                        {
-                            crate::engine::build_r2_secret_body(
-                                &self.key_id,
-                                &self.secret_key,
-                                &acct_id,
-                            )
+                    let secret_spec = crate::connectors::SecretSpec {
+                        name: safe_name.to_string(),
+                        kind: if self.provider() == CloudProvider::CloudflareR2 {
+                            crate::connectors::SecretKind::R2
                         } else {
-                            crate::engine::build_s3_secret_body(
-                                &self.key_id,
-                                &self.secret_key,
-                                &self.region,
-                                &self.endpoint,
-                                self.use_ssl,
-                            )
-                        }
-                    } else {
-                        crate::engine::build_s3_secret_body(
-                            &self.key_id,
-                            &self.secret_key,
-                            &self.region,
-                            &self.endpoint,
-                            self.use_ssl,
-                        )
+                            crate::connectors::SecretKind::S3
+                        },
+                        persistent: true,
+                        key_id: Some(self.key_id.clone()),
+                        secret: Some(self.secret_key.clone()),
+                        token: None,
+                        region: Some(self.region.clone()),
+                        endpoint: Some(self.endpoint.clone()),
+                        url_style: None,
+                        use_ssl: Some(self.use_ssl),
+                        scope: None,
                     };
-                    let persistent_sql = format!(
-                        "CREATE OR REPLACE PERSISTENT SECRET {} ({});",
-                        safe_name, secret_body
-                    );
-                    let create_res = conn.execute(&persistent_sql, []).or_else(|_| {
-                        let temp_sql =
-                            format!("CREATE OR REPLACE SECRET {} ({});", safe_name, secret_body);
-                        conn.execute(&temp_sql, [])
-                    });
+                    let create_res = crate::connectors::plan_secret(&secret_spec)
+                        .and_then(|plan| crate::connectors::execute_secret_plan(conn, &plan));
 
                     match create_res {
                         Ok(_) => {
@@ -604,14 +587,7 @@ impl SecretModalState {
                                 );
                             }
 
-                            let mut bucket = self.bucket.trim().to_string();
-                            if !bucket.is_empty() {
-                                if !bucket.starts_with("s3://")
-                                    && !bucket.starts_with("r2://")
-                                    && !bucket.starts_with("gcs://")
-                                {
-                                    bucket = format!("s3://{}", bucket);
-                                }
+                            if let Some(bucket) = crate::connectors::normalize_bucket_uri(&self.bucket) {
                                 unsafe {
                                     std::env::set_var("DUCKPACK_S3_BUCKET", &bucket);
                                 }
@@ -635,19 +611,7 @@ impl SecretModalState {
                                 } else {
                                     None
                                 };
-                                let bucket_clean = {
-                                    let b = self.bucket.trim();
-                                    if b.is_empty() {
-                                        None
-                                    } else if b.starts_with("s3://")
-                                        || b.starts_with("r2://")
-                                        || b.starts_with("gcs://")
-                                    {
-                                        Some(b.to_string())
-                                    } else {
-                                        Some(format!("s3://{}", b))
-                                    }
-                                };
+                                let bucket_clean = crate::connectors::normalize_bucket_uri(&self.bucket);
                                 let ws_sec = crate::workspace::WorkspaceSecret {
                                     name: safe_name.to_string(),
                                     secret_type: if self.provider() == CloudProvider::CloudflareR2 {

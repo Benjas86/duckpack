@@ -1093,47 +1093,15 @@ impl AttachModalState {
                         "Host / Server address cannot be empty for PostgreSQL.".to_string()
                     );
                 }
-                let host_raw = self.host.trim();
-                let mut uri = if host_raw.contains("://") {
-                    host_raw.to_string()
-                } else {
-                    let port = if self.port.trim().is_empty() {
-                        "5432"
-                    } else {
-                        self.port.trim()
-                    };
-                    let user_part =
-                        if !self.username.trim().is_empty() && !self.password.trim().is_empty() {
-                            format!("{}:{}@", self.username.trim(), self.password.trim())
-                        } else if !self.username.trim().is_empty() {
-                            format!("{}@", self.username.trim())
-                        } else {
-                            String::new()
-                        };
-                    let db_part = if !self.database.trim().is_empty() {
-                        format!("/{}", self.database.trim())
-                    } else {
-                        String::new()
-                    };
-                    format!("postgres://{}{}:{}{}", user_part, host_raw, port, db_part)
-                };
-                if self.disable_ssl {
-                    if uri.contains('?') {
-                        if !uri.to_lowercase().contains("sslmode=") {
-                            uri.push_str("&sslmode=disable");
-                        }
-                    } else {
-                        uri.push_str("?sslmode=disable");
-                    }
-                } else if self.insecure {
-                    if uri.contains('?') {
-                        if !uri.to_lowercase().contains("sslmode=") {
-                            uri.push_str("&sslmode=prefer");
-                        }
-                    } else {
-                        uri.push_str("?sslmode=prefer");
-                    }
-                }
+                let conn_str = crate::connectors::format_postgres_conn_str(
+                    &self.host,
+                    &self.port,
+                    &self.database,
+                    &self.username,
+                    &self.password,
+                    self.disable_ssl,
+                    self.insecure,
+                );
                 let alias = if self.alias.trim().is_empty() {
                     if !self.database.trim().is_empty() {
                         self.database.trim().to_string()
@@ -1143,48 +1111,21 @@ impl AttachModalState {
                 } else {
                     self.alias.trim().to_string()
                 };
-                Ok((uri.replace('\'', "''"), alias))
+                Ok((conn_str.replace('\'', "''"), alias))
             }
             AttachProvider::MySQL => {
                 if self.host.trim().is_empty() {
                     return Err("Host / Server address cannot be empty for MySQL.".to_string());
                 }
-                let host_raw = self.host.trim();
-                let mut conn_str = if host_raw.contains('=') {
-                    host_raw.to_string()
-                } else {
-                    let port = if self.port.trim().is_empty() {
-                        "3306"
-                    } else {
-                        self.port.trim()
-                    };
-                    let mut parts = vec![
-                        format!("host={}", crate::engine::escape_libpq_value(host_raw)),
-                        format!("port={}", port),
-                    ];
-                    if !self.database.trim().is_empty() {
-                        parts.push(format!(
-                            "database={}",
-                            crate::engine::escape_libpq_value(&self.database)
-                        ));
-                    }
-                    if !self.username.trim().is_empty() {
-                        parts.push(format!(
-                            "user={}",
-                            crate::engine::escape_libpq_value(&self.username)
-                        ));
-                    }
-                    if !self.password.trim().is_empty() {
-                        parts.push(format!(
-                            "password={}",
-                            crate::engine::escape_libpq_value(&self.password)
-                        ));
-                    }
-                    parts.join(" ")
-                };
-                if self.disable_ssl && !conn_str.to_lowercase().contains("ssl_mode=") {
-                    conn_str.push_str(" ssl_mode=disabled");
-                }
+                let conn_str = crate::connectors::format_mysql_conn_str(
+                    &self.host,
+                    &self.port,
+                    &self.database,
+                    &self.username,
+                    &self.password,
+                    self.disable_ssl,
+                    self.insecure,
+                );
                 let alias = if self.alias.trim().is_empty() {
                     if !self.database.trim().is_empty() {
                         self.database.trim().to_string()
@@ -1200,7 +1141,7 @@ impl AttachModalState {
                 if self.host.trim().is_empty() {
                     return Err("Host / Server cannot be empty for Remote Quack.".to_string());
                 }
-                let target = crate::engine::format_quack_endpoint(&self.host, &self.port);
+                let target = crate::connectors::format_quack_endpoint(&self.host, &self.port);
                 let alias = if self.alias.trim().is_empty() {
                     "quack_remote".to_string()
                 } else {
@@ -1213,17 +1154,12 @@ impl AttachModalState {
                     return Err("MotherDuck database name cannot be empty.".to_string());
                 }
                 let raw = self.path.trim();
-                let mut target = if raw.starts_with("md:") || raw.starts_with("motherduck:") {
-                    raw.to_string()
+                let tok = if self.password.trim().is_empty() {
+                    None
                 } else {
-                    format!("md:{}", raw)
+                    Some(self.password.trim())
                 };
-                if !self.password.trim().is_empty()
-                    && !target.to_lowercase().contains("motherduck_token=")
-                {
-                    let sep = if target.contains('?') { '&' } else { '?' };
-                    target.push_str(&format!("{}motherduck_token={}", sep, self.password.trim()));
-                }
+                let target = crate::connectors::format_motherduck_target(raw, tok);
                 let alias = if self.alias.trim().is_empty() {
                     raw.strip_prefix("motherduck:")
                         .or_else(|| raw.strip_prefix("md:"))
@@ -2648,157 +2584,110 @@ impl AttachModalState {
     }
 
     pub(crate) fn execute_attach(&mut self, conn: &Connection) -> Option<String> {
-        match self.build_connection_target() {
+        // Validate required fields and compute default alias first
+        let (_, alias) = match self.build_connection_target() {
             Err(err) => {
                 self.error_msg = Some(err);
+                return None;
             }
-            Ok((safe_path, alias)) => {
-                let provider = self.provider();
-                let ext_res = match provider {
-                    AttachProvider::DuckLake => {
-                        // Do NOT mutate global QUACK secrets here; per-endpoint scoped secrets
-                        // are created below so multi-container DuckLake attaches remain isolated.
-                        crate::engine::prepare_ducklake_connection_with_options(
-                            conn,
-                            &safe_path,
-                            &self.data_path,
-                            None,
-                            None,
-                            false,
-                        )
-                    }
-                    AttachProvider::SQLite => {
-                        crate::engine::ensure_extension_loaded(conn, "sqlite")
-                    }
-                    AttachProvider::PostgreSQL => {
-                        crate::engine::ensure_extension_loaded(conn, "postgres")
-                    }
-                    AttachProvider::MySQL => {
-                        crate::engine::ensure_extension_loaded(conn, "mysql")
-                    }
-                    AttachProvider::MSSQL => {
-                        crate::engine::ensure_extension_loaded(conn, "mssql")
-                    }
-                    AttachProvider::MotherDuck => {
-                        crate::engine::ensure_extension_loaded(conn, "motherduck")
-                    }
-                    AttachProvider::Quack => crate::engine::load_quack_extension(conn),
-                    AttachProvider::DuckDB => Ok(()),
-                };
+            Ok(pair) => pair,
+        };
 
-                if let Err(e) = ext_res {
-                    self.error_msg = Some(format!(
-                        "Failed to load required extension for {}: {}",
-                        provider.name(),
-                        e
-                    ));
+        let provider = self.provider();
+        let kind = match provider {
+            AttachProvider::DuckDB => crate::connectors::AttachProviderKind::DuckDb,
+            AttachProvider::SQLite => crate::connectors::AttachProviderKind::Sqlite,
+            AttachProvider::Quack => crate::connectors::AttachProviderKind::Quack,
+            AttachProvider::DuckLake => crate::connectors::AttachProviderKind::DuckLake,
+            AttachProvider::MotherDuck => crate::connectors::AttachProviderKind::MotherDuck,
+            AttachProvider::PostgreSQL => crate::connectors::AttachProviderKind::Postgres,
+            AttachProvider::MySQL => crate::connectors::AttachProviderKind::Mysql,
+            AttachProvider::MSSQL => crate::connectors::AttachProviderKind::Mssql,
+        };
+        let dl_backend = if provider == AttachProvider::DuckLake {
+            Some(match self.ducklake_backend {
+                DuckLakeBackend::Quack => crate::connectors::DuckLakeBackendKind::Quack,
+                DuckLakeBackend::PostgreSQL => crate::connectors::DuckLakeBackendKind::Postgres,
+                DuckLakeBackend::LocalFile => crate::connectors::DuckLakeBackendKind::File,
+                DuckLakeBackend::SQLite => crate::connectors::DuckLakeBackendKind::Sqlite,
+            })
+        } else {
+            None
+        };
+
+        let opt_str = |s: &str| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+
+        let has_explicit_password = !self.password.trim().is_empty();
+        let resolved_token = if provider == AttachProvider::Quack
+            || (provider == AttachProvider::DuckLake
+                && self.ducklake_backend == DuckLakeBackend::Quack)
+        {
+            crate::engine::resolve_explicit_quack_token(if has_explicit_password {
+                Some(self.password.trim())
+            } else {
+                None
+            })
+        } else {
+            opt_str(&self.password)
+        };
+        let resolved_cid = if provider == AttachProvider::Quack {
+            resolved_token.as_ref().map(|tok| {
+                if has_explicit_password {
+                    tok.clone()
                 } else {
-                    // MotherDuck token is passed inline via `?motherduck_token=...` in build_connection_target
-                    // (DuckDB does not support `SET motherduck_token = ...` at runtime).
-                    // Resolve the Quack token WITHOUT mutating conn's global QUACK secret or
-                    // quack_default_client_id so multiple Quack aliases (e.g. Admin target_db +
-                    // Reader quack_remote) stay completely isolated inside the same session.
-                    let has_explicit_quack_password = !self.password.trim().is_empty();
-                    let quack_applied_token = if provider == AttachProvider::Quack {
-                        let opt_token = if has_explicit_quack_password {
-                            Some(self.password.trim())
-                        } else {
-                            None
-                        };
-                        crate::engine::resolve_explicit_quack_token(opt_token)
-                    } else {
-                        None
-                    };
-
-                    let quoted_alias = format!("\"{}\"", alias.replace('"', "\"\""));
-                    let mut attach_sql = format!("ATTACH '{}' AS {}", safe_path, quoted_alias);
-                    let mut opts = Vec::new();
-                    match provider {
-                        AttachProvider::DuckLake => {
-                            if !safe_path.starts_with("ducklake:") {
-                                opts.push("TYPE ducklake".to_string());
-                            }
-                            if !self.data_path.trim().is_empty() {
-                                opts.push(format!(
-                                    "DATA_PATH '{}'",
-                                    self.data_path.trim().replace('\'', "''")
-                                ));
-                            }
-                            if self.ducklake_backend == DuckLakeBackend::Quack {
-                                let quack_dsn = safe_path
-                                    .strip_prefix("ducklake:")
-                                    .unwrap_or(&safe_path);
-                                if self.disable_ssl
-                                    || self.insecure
-                                    || crate::engine::should_disable_quack_ssl(quack_dsn, false)
-                                {
-                                    opts.push("META_DISABLE_SSL true".to_string());
-                                }
-                                let opt_dl_tok = if self.password.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(self.password.trim())
-                                };
-                                if let Some(tok) = crate::engine::resolve_explicit_quack_token(opt_dl_tok) {
-                                    opts.push(format!("META_TOKEN '{}'", tok.replace('\'', "''")));
-                                    if tok.chars().count() >= 4 {
-                                        opts.push(format!("META_CLIENT_ID '{}'", tok.replace('\'', "''")));
-                                    }
-                                }
-                            }
-                        }
-                        AttachProvider::SQLite => opts.push("TYPE SQLITE".to_string()),
-                        AttachProvider::PostgreSQL => {
-                            opts.push("TYPE POSTGRES".to_string())
-                        }
-                        AttachProvider::MySQL => opts.push("TYPE MYSQL".to_string()),
-                        AttachProvider::MSSQL => opts.push("TYPE MSSQL".to_string()),
-                        AttachProvider::Quack => {
-                            if self.disable_ssl
-                                || self.insecure
-                                || crate::engine::should_disable_quack_ssl(&safe_path, false)
-                            {
-                                opts.push("DISABLE_SSL true".to_string());
-                            }
-                            if let Some(ref tok) = quack_applied_token {
-                                opts.push(format!("TOKEN '{}'", tok.replace('\'', "''")));
-                                // When an explicit token is entered in Ctrl+A, bind CLIENT_ID to that
-                                // exact token so an ambient QUACK_CLIENT_ID env var cannot bleed across roles.
-                                let cid = if has_explicit_quack_password {
-                                    tok.clone()
-                                } else {
-                                    crate::engine::resolve_quack_client_id(Some(tok))
-                                        .unwrap_or_else(|| tok.clone())
-                                };
-                                opts.push(format!("CLIENT_ID '{}'", cid.replace('\'', "''")));
-                            }
-                        }
-                        _ => {}
-                    }
-                    if self.read_only {
-                        opts.push("READ_ONLY".to_string());
-                    }
-                    if !opts.is_empty() {
-                        attach_sql.push_str(&format!(" ({})", opts.join(", ")));
-                    }
-                    attach_sql.push(';');
-
-                    match conn.execute(&attach_sql, []) {
-                        Ok(_) => {
-                            self.is_open = false;
-                            return Some(alias);
-                        }
-                        Err(e) => {
-                            self.error_msg = Some(format!(
-                                "Attach Error: {}",
-                                crate::engine::redact_connection_credentials(&e.to_string())
-                            ));
-                        }
-                    }
+                    crate::engine::resolve_quack_client_id(Some(tok))
+                        .unwrap_or_else(|| tok.clone())
                 }
+            })
+        } else {
+            None
+        };
+
+        let spec = crate::connectors::AttachSpec {
+            provider: Some(kind),
+            alias: alias.clone(),
+            path: opt_str(&self.path),
+            metadata: None,
+            data_path: opt_str(&self.data_path),
+            ducklake_backend: dl_backend,
+            host: opt_str(&self.host),
+            port: opt_str(&self.port),
+            database: opt_str(&self.database),
+            username: opt_str(&self.username),
+            password: opt_str(&self.password),
+            token: resolved_token,
+            client_id: resolved_cid,
+            dsn: None,
+            read_only: self.read_only,
+            disable_ssl: self.disable_ssl,
+            insecure: self.insecure,
+            trusted_connection: self.trusted_connection,
+            detach_first: false,
+            base_dir: None,
+        };
+
+        match crate::connectors::plan_attach(&spec)
+            .and_then(|plan| crate::connectors::execute_attach_plan(conn, &plan, None))
+        {
+            Ok(_) => {
+                self.is_open = false;
+                Some(alias)
+            }
+            Err(e) => {
+                self.error_msg = Some(format!(
+                    "Attach Error: {}",
+                    crate::sql_utils::redact_connection_credentials(&e.to_string())
+                ));
+                None
             }
         }
-        None
     }
 
     /// Persists the currently configured attachment into `duckpack.toml` (under `[[env.<profile>.attach]]`

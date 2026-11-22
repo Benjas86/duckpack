@@ -312,6 +312,7 @@ pub fn get_duckdb_version_info(conn: &Connection) -> (String, Option<String>) {
 /// (e.g. ~/.duckdb/extensions/v2.0.0 vs dev commit hashes) and automatically installing
 /// from the official release CDN repository if DuckDB's internal autoload returns HTTP 404.
 pub fn ensure_extension_loaded(conn: &Connection, ext_name: &str) -> Result<()> {
+    crate::sql_utils::validate_safe_extension_name(ext_name)?;
     let res = ensure_extension_loaded_inner(conn, ext_name);
     if res.is_ok() && ext_name.eq_ignore_ascii_case("mssql") {
         let _ = conn.execute("SET mssql_exec_invalidate_cache = true;", []);
@@ -513,50 +514,7 @@ pub fn load_quack_extension(conn: &Connection) -> Result<()> {
     ensure_extension_loaded(conn, "quack")
 }
 
-/// Redacts sensitive credentials (`Password=...`, `Pwd=...`, `password=...`, `SECRET '...'`,
-/// `TOKEN '...'`, and `scheme://user:password@host`) from connection strings, SQL statements, or error messages.
-pub fn redact_connection_credentials(input: &str) -> String {
-    static ADO_PASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    static LIBPQ_PASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    static URI_PASS_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    static SQL_SECRET_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-
-    let ado_re = ADO_PASS_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(password|pwd)\s*=\s*(\{[^}]*\}|[^;'\s)]+)").unwrap()
-    });
-    let libpq_re = LIBPQ_PASS_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(password)\s*=\s*('(?:\\'|[^'])*'|[^\s';)]+)").unwrap()
-    });
-    let uri_re = URI_PASS_RE
-        .get_or_init(|| regex::Regex::new(r"([a-zA-Z0-9+.-]+://[^:/@\s]+):([^@\s]+)@").unwrap());
-    let sql_sec_re = SQL_SECRET_RE.get_or_init(|| {
-        regex::Regex::new(
-            r"(?i)\b(SECRET|TOKEN|CLIENT_ID|motherduck_token|quack_default_client_id)\s*(=|\s+)\s*'([^']|'')*'",
-        )
-        .unwrap()
-    });
-
-    let s = ado_re.replace_all(input, "$1=***");
-    let s = libpq_re.replace_all(&s, "$1=***");
-    let s = uri_re.replace_all(&s, "$1:***@");
-    sql_sec_re.replace_all(&s, "$1$2'***'").into_owned()
-}
-
-/// Returns `true` if a SQL statement contains secret definitions or inline credentials
-/// that should be redacted before writing to `.history.sql`.
-pub fn should_redact_sql_history(sql: &str) -> bool {
-    let lower = sql.to_lowercase();
-    lower.contains("create secret")
-        || lower.contains("create persistent secret")
-        || lower.contains("create or replace secret")
-        || lower.contains("create or replace persistent secret")
-        || lower.contains("motherduck_token")
-        || lower.contains("quack_default_client_id")
-        || lower.contains("password=")
-        || lower.contains("pwd=")
-        || lower.contains("secret '")
-        || lower.contains("token '")
-}
+pub use crate::sql_utils::{redact_connection_credentials, should_redact_sql_history};
 
 /// Cleans an explicit Quack token input (trimming surrounding quotes and expanding `$VAR`/`${VAR}` or
 /// uppercase env var names) and falls back to `resolve_quack_token(None, None)` when empty.
@@ -678,7 +636,8 @@ pub fn connect_target_db(
 
         let attach_res = conn.execute(&attach_sql, []);
         if let Err(e) = attach_res {
-            let err_msg = e.to_string();
+            let safe_db = redact_connection_credentials(db);
+            let err_msg = redact_connection_credentials(&e.to_string());
             if err_msg.contains("Could not find a Quack authentication token")
                 || err_msg.contains("Authentication failed")
             {
@@ -688,13 +647,13 @@ pub fn connect_target_db(
                       1. Check that your Quack token is set in .env (QUACK_TOKEN) or duckpack.toml (token_env).\n\
                       2. If using --env <profile>, ensure either .env or .env.<profile> contains the token.\n\
                       3. Alternatively, pass --quack-token <token> directly.",
-                    db,
+                    safe_db,
                     err_msg
                 ));
             }
             return Err(anyhow::anyhow!(
                 "Failed to attach remote database '{}': {}",
-                db,
+                safe_db,
                 err_msg
             ));
         }
@@ -746,50 +705,35 @@ pub fn connect_target_db(
     } else if db.starts_with("ducklake:") {
         let conn = open_duckdb_connection()
             .with_context(|| "Failed to open in-memory DB for DuckLake ATTACH")?;
-        let (target_path, options) = if let Some(idx) = db.find(" (") {
-            let (target, opts) = db.split_at(idx);
-            (target.trim(), opts.trim())
-        } else {
-            (db.trim(), "")
-        };
+        let (target_path, data_path, read_only) =
+            crate::connectors::parse_ducklake_cli_string(db);
         let resolved_token = resolve_quack_token(quack_token, None);
-        prepare_ducklake_connection(
-            &conn,
-            target_path,
-            options,
-            resolved_token.as_deref(),
-            None,
-        )?;
-        let safe_target = target_path.replace('\'', "''");
-        let mut opts_str = options.to_string();
-        if safe_target.contains("quack:") {
-            let quack_dsn = safe_target
-                .strip_prefix("ducklake:")
-                .unwrap_or(&safe_target);
-            if should_disable_quack_ssl(quack_dsn, quack_disable_ssl)
-                && !opts_str.to_lowercase().contains("metadata_parameters")
-            {
-                if opts_str.is_empty() {
-                    opts_str = "(METADATA_PARAMETERS MAP {'DISABLE_SSL': true})".to_string();
-                } else if opts_str.ends_with(')') {
-                    opts_str.pop();
-                    opts_str.push_str(", METADATA_PARAMETERS MAP {'DISABLE_SSL': true})");
-                }
-            }
-        }
-        let attach_sql = if opts_str.is_empty() {
-            format!("ATTACH '{}' AS target_db;", safe_target)
-        } else {
-            format!("ATTACH '{}' AS target_db {};", safe_target, opts_str)
+        let spec = crate::connectors::AttachSpec {
+            provider: Some(crate::connectors::AttachProviderKind::DuckLake),
+            alias: "target_db".to_string(),
+            metadata: Some(target_path),
+            data_path,
+            token: resolved_token.clone(),
+            client_id: resolve_quack_client_id(resolved_token.as_deref()),
+            read_only,
+            disable_ssl: quack_disable_ssl,
+            insecure: quack_disable_ssl,
+            ..Default::default()
         };
-        let attach_res = conn.execute(&attach_sql, []);
-        if let Err(e) = attach_res {
-            return Err(anyhow::anyhow!(
+        let plan = crate::connectors::plan_attach(&spec).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to plan DuckLake lakehouse '{}': {}",
+                redact_connection_credentials(db),
+                redact_connection_credentials(&e.to_string())
+            )
+        })?;
+        crate::connectors::execute_attach_plan(&conn, &plan, None).map_err(|e| {
+            anyhow::anyhow!(
                 "Failed to attach DuckLake lakehouse '{}': {}",
                 redact_connection_credentials(db),
                 redact_connection_credentials(&e.to_string())
-            ));
-        }
+            )
+        })?;
         if conn.execute("CONNECT target_db;", []).is_err() {
             let _ = conn.execute("USE target_db;", []);
         }
@@ -1464,322 +1408,11 @@ pub struct ResolvedTargetConfig {
     pub insecure: Option<bool>,
 }
 
-/// Formats a normalized `quack:<host>:<port>` connection endpoint (handling IPv6 brackets cleanly).
-pub fn format_quack_endpoint(host_raw: &str, port_raw: &str) -> String {
-    let trimmed = host_raw.trim();
-    let stripped = trimmed
-        .strip_prefix("quack://")
-        .or_else(|| trimmed.strip_prefix("quack:"))
-        .unwrap_or(trimmed);
-    let port = if port_raw.trim().is_empty() {
-        "9494"
-    } else {
-        port_raw.trim()
-    };
-    let endpoint = if stripped.starts_with('[') {
-        if let Some(close_idx) = stripped.find(']') {
-            let after = &stripped[close_idx + 1..];
-            if after.starts_with(':') {
-                stripped.to_string()
-            } else {
-                format!("{}:{}", stripped, port)
-            }
-        } else {
-            stripped.to_string()
-        }
-    } else if stripped.matches(':').count() > 1 {
-        // Bare IPv6 address (e.g. "::1") without brackets
-        format!("[{}]:{}", stripped, port)
-    } else if stripped.contains(':') {
-        stripped.to_string()
-    } else {
-        format!("{}:{}", stripped, port)
-    };
-    format!("quack:{}", endpoint)
-}
-
-fn escape_ado_value(val: &str) -> String {
-    let trimmed = val.trim();
-    if trimmed.contains(';') || trimmed.contains('{') || trimmed.contains('}') {
-        format!("{{{}}}", trimmed.replace('}', "}}"))
-    } else {
-        trimmed.to_string()
-    }
-}
-
-pub(crate) fn escape_libpq_value(val: &str) -> String {
-    let trimmed = val.trim();
-    if trimmed.chars().any(|c| c.is_whitespace()) || trimmed.contains('\'') || trimmed.contains('\\') {
-        format!("'{}'", trimmed.replace('\\', "\\\\").replace('\'', "\\'"))
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// Formats an MSSQL ADO.NET connection string (without the `mssql:` prefix) from individual fields.
-#[allow(clippy::too_many_arguments)]
-pub fn format_mssql_connection_string(
-    host_raw: &str,
-    port_raw: &str,
-    database: &str,
-    username: &str,
-    password: &str,
-    trusted_connection: bool,
-    insecure: bool,
-    disable_ssl: bool,
-) -> String {
-    let host_trimmed = host_raw.trim();
-    // Preserve native mssql:// URIs untouched (do not wrap in Server=... or append ADO.NET semicolons)
-    if host_trimmed.to_ascii_lowercase().starts_with("mssql://") {
-        return host_trimmed.to_string();
-    }
-    let mut conn_str = if host_trimmed.contains('=') {
-        host_trimmed.to_string()
-    } else if host_trimmed.contains(',') {
-        format!("Server={}", escape_ado_value(host_trimmed))
-    } else if host_trimmed.contains('\\')
-        && (port_raw.trim().is_empty() || port_raw.trim() == "1433")
-    {
-        // Named SQL Server instance (e.g. myhost\SQLEXPRESS): omit default port 1433 so SQL Server Browser (UDP 1434) resolves the dynamic port
-        format!("Server={}", escape_ado_value(host_trimmed))
-    } else {
-        let port = if port_raw.trim().is_empty() {
-            "1433"
-        } else {
-            port_raw.trim()
-        };
-        format!("Server={},{}", escape_ado_value(host_trimmed), port)
-    };
-    if !database.trim().is_empty() && !conn_str.to_lowercase().contains("database=") {
-        conn_str.push_str(&format!(";Database={}", escape_ado_value(database)));
-    }
-    let use_trusted = trusted_connection
-        || (cfg!(target_os = "windows")
-            && username.trim().is_empty()
-            && password.trim().is_empty());
-
-    if use_trusted {
-        let lower = conn_str.to_lowercase();
-        if !lower.contains("trusted_connection=")
-            && !lower.contains("integrated security=")
-            && !lower.contains("authenticator=")
-        {
-            conn_str.push_str(";Trusted_Connection=yes");
-        }
-    } else {
-        let lower = conn_str.to_lowercase();
-        if !username.trim().is_empty()
-            && !lower.contains("user id=")
-            && !lower.contains("uid=")
-        {
-            conn_str.push_str(&format!(";User Id={}", escape_ado_value(username)));
-        }
-        if !password.trim().is_empty()
-            && !lower.contains("password=")
-            && !lower.contains("pwd=")
-        {
-            conn_str.push_str(&format!(";Password={}", escape_ado_value(password)));
-        }
-    }
-    if (insecure || conn_str.contains("localhost") || conn_str.contains("127.0.0.1"))
-        && !conn_str.to_lowercase().contains("trustservercertificate=")
-    {
-        conn_str.push_str(";TrustServerCertificate=yes");
-    }
-    if disable_ssl && !conn_str.to_lowercase().contains("encrypt=") {
-        conn_str.push_str(";Encrypt=no");
-    }
-    conn_str
-}
-
-/// Returns true if `path` is a remote HTTP(S) or cloud-storage URL for a frozen DuckLake file
-/// (which DuckLake attaches as `ATTACH '<url>' (TYPE ducklake)` rather than `ducklake:<url>`).
-pub fn is_remote_ducklake_url(path: &str) -> bool {
-    let lower = path.trim().to_ascii_lowercase();
-    lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("s3://")
-        || lower.starts_with("r2://")
-        || lower.starts_with("gcs://")
-        || lower.starts_with("gs://")
-        || lower.starts_with("az://")
-        || lower.starts_with("azure://")
-        || lower.starts_with("abfss://")
-}
-
-/// Formats a normalized `ducklake:<catalog_dsn>` target string for the selected metadata backend.
-/// For remote/frozen DuckLake URLs (`https://...`, `s3://...`, etc.), returns the raw URL without
-/// a `ducklake:` prefix so callers attach it with `(TYPE ducklake)`.
-pub fn format_ducklake_target(
-    backend: &str,
-    host: &str,
-    port: &str,
-    database: &str,
-    username: &str,
-    password: &str,
-    path: &str,
-) -> std::result::Result<String, String> {
-    let cat = match backend.to_ascii_lowercase().as_str() {
-        "quack" => {
-            if host.trim().is_empty() {
-                return Err("Catalog host cannot be empty for DuckLake Quack backend.".to_string());
-            }
-            format_quack_endpoint(host, port)
-        }
-        "postgres" | "postgresql" => {
-            if host.trim().is_empty() {
-                return Err(
-                    "Catalog host cannot be empty for DuckLake PostgreSQL backend.".to_string(),
-                );
-            }
-            let host_raw = host.trim();
-            if host_raw.starts_with("postgresql://") || host_raw.starts_with("postgres://") {
-                format!("postgres:{}", host_raw)
-            } else if host_raw.starts_with("postgres:") {
-                host_raw.to_string()
-            } else if host_raw.starts_with("postgresql:") {
-                format!("postgres:{}", host_raw.trim_start_matches("postgresql:"))
-            } else {
-                let p = if port.trim().is_empty() {
-                    "5432"
-                } else {
-                    port.trim()
-                };
-                let db = if database.trim().is_empty() {
-                    "ducklake".to_string()
-                } else {
-                    escape_libpq_value(database)
-                };
-                let mut s = format!(
-                    "postgres:host={} port={} dbname={}",
-                    escape_libpq_value(host_raw),
-                    p,
-                    db
-                );
-                if !username.trim().is_empty() {
-                    s.push_str(&format!(" user={}", escape_libpq_value(username)));
-                }
-                if !password.trim().is_empty() {
-                    s.push_str(&format!(" password={}", escape_libpq_value(password)));
-                }
-                s
-            }
-        }
-        "file" | "duckdb" | "local" => {
-            let trimmed = path.trim();
-            if trimmed.is_empty() {
-                return Err(
-                    "Metadata file path cannot be empty for DuckLake Local File backend."
-                        .to_string(),
-                );
-            }
-            if is_remote_ducklake_url(trimmed) {
-                return Ok(trimmed.to_string());
-            }
-            trimmed.to_string()
-        }
-        "sqlite" => {
-            if path.trim().is_empty() {
-                return Err(
-                    "SQLite metadata database path cannot be empty for DuckLake SQLite backend."
-                        .to_string(),
-                );
-            }
-            let p = path.trim();
-            if p.starts_with("sqlite:") {
-                p.to_string()
-            } else {
-                format!("sqlite:{}", p)
-            }
-        }
-        other => other.to_string(),
-    };
-
-    if cat.starts_with("ducklake:") || is_remote_ducklake_url(&cat) {
-        Ok(cat)
-    } else {
-        Ok(format!("ducklake:{}", cat))
-    }
-}
-
-/// Extracts Cloudflare R2 `<account_id>` from an endpoint like `<account_id>.r2.cloudflarestorage.com`.
-pub fn extract_r2_account_id(endpoint: &str) -> Option<String> {
-    let clean = endpoint
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-    let suffix = ".r2.cloudflarestorage.com";
-    if let Some(acct) = clean.strip_suffix(suffix) {
-        let trimmed = acct.trim();
-        if !trimmed.is_empty() && !trimmed.contains('<') && !trimmed.contains('/') {
-            return Some(trimmed.to_string());
-        }
-    }
-    None
-}
-
-/// Builds a native DuckDB v2.0 `TYPE R2` secret body (`KEY_ID`, `SECRET`, `ACCOUNT_ID`)
-/// so `r2://` URIs authenticate natively without falling back to `TYPE S3`.
-pub fn build_r2_secret_body(key_id: &str, secret_key: &str, account_id: &str) -> String {
-    let mut clauses = vec!["TYPE R2".to_string()];
-    let safe_key = key_id.trim().replace('\'', "''");
-    let safe_secret = secret_key.trim().replace('\'', "''");
-    let safe_acct = account_id.trim().replace('\'', "''");
-    if !safe_key.is_empty() {
-        clauses.push(format!("KEY_ID '{}'", safe_key));
-    }
-    if !safe_secret.is_empty() {
-        clauses.push(format!("SECRET '{}'", safe_secret));
-    }
-    if !safe_acct.is_empty() {
-        clauses.push(format!("ACCOUNT_ID '{}'", safe_acct));
-    }
-    clauses.join(", ")
-}
-
-/// Builds the inner `TYPE S3, KEY_ID ..., SECRET ..., REGION ..., ENDPOINT ..., URL_STYLE 'path', USE_SSL ...`
-/// body for `CREATE SECRET (...)` in DuckDB.
-pub fn build_s3_secret_body(
-    key_id: &str,
-    secret_key: &str,
-    region: &str,
-    endpoint: &str,
-    use_ssl_default: bool,
-) -> String {
-    let safe_key = key_id.trim().replace('\'', "''");
-    let safe_secret = secret_key.trim().replace('\'', "''");
-    let safe_region = region.trim().replace('\'', "''");
-    let safe_endpoint = endpoint.trim().replace('\'', "''");
-
-    let mut clauses = vec!["TYPE S3".to_string()];
-    if !safe_key.is_empty() {
-        clauses.push(format!("KEY_ID '{}'", safe_key));
-    }
-    if !safe_secret.is_empty() {
-        clauses.push(format!("SECRET '{}'", safe_secret));
-    }
-    if !safe_region.is_empty() {
-        clauses.push(format!("REGION '{}'", safe_region));
-    }
-    let mut use_ssl = use_ssl_default;
-    if !safe_endpoint.is_empty() {
-        let clean_ep = safe_endpoint
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .trim_end_matches('/');
-        clauses.push(format!("ENDPOINT '{}'", clean_ep));
-        clauses.push("URL_STYLE 'path'".to_string());
-        if safe_endpoint.starts_with("http://")
-            || clean_ep.starts_with("localhost")
-            || clean_ep.starts_with("127.0.0.1")
-        {
-            use_ssl = false;
-        }
-    }
-    clauses.push(format!("USE_SSL {}", use_ssl));
-    clauses.join(", ")
-}
+pub use crate::connectors::{
+    build_r2_secret_body, build_s3_secret_body, escape_ado_value, escape_libpq_value,
+    extract_r2_account_id, format_ducklake_target, format_mssql_connection_string,
+    format_quack_endpoint, is_remote_ducklake_url,
+};
 
 /// Checks if an S3 secret is already registered in `conn`; if not, inspects process env vars and `.env`
 /// in `project_dir` (defaulting to current working directory) for `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
@@ -2083,7 +1716,10 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
             };
 
             if let Some(dp) = data_path {
-                catalog_target.push_str(&format!(" (DATA_PATH '{}')", dp));
+                catalog_target.push_str(&format!(
+                    " (DATA_PATH {})",
+                    crate::sql_utils::quote_literal(dp)
+                ));
             }
             cfg.db = Some(catalog_target);
         }
