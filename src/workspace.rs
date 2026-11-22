@@ -1,21 +1,26 @@
 use anyhow::{Context, Result};
 use duckdb::Connection;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::engine::{
     format_quack_endpoint, load_env_files, load_quack_extension, open_duckdb_connection,
     redact_connection_credentials, resolve_target_config, should_disable_quack_ssl,
-    write_restricted_env_file,
 };
 
 /// Forbidden plaintext credential keys in `[[secrets]]` and `[[attach]]` inside `duckpack.toml`.
 const FORBIDDEN_SECRET_KEYS: &[(&str, &str)] = &[
     ("token", "token_env"),
     ("admin_token", "admin_token_env"),
+    ("bearer_token", "token_env"),
+    ("access_token", "token_env"),
+    ("session_token", "token_env"),
+    ("sas_token", "token_env"),
     ("secret", "secret_env"),
     ("secret_key", "secret_env"),
     ("secret_access_key", "secret_env"),
+    ("client_secret", "secret_env"),
+    ("account_key", "secret_env"),
+    ("api_key", "secret_env"),
     ("password", "password_env"),
     ("pwd", "password_env"),
     ("key_id", "key_id_env"),
@@ -240,14 +245,18 @@ fn validate_no_raw_secret_keys(tbl: &toml::value::Table, section_label: &str) ->
             );
         }
     }
-    // Reject inline credentials embedded in metadata/path/host fields
-    for field in ["metadata", "path", "host"] {
+    // Reject inline credentials embedded in string fields (including scheme://user:pass@ URIs) (M5)
+    static URI_CRED_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let uri_cred_re = URI_CRED_RE
+        .get_or_init(|| regex::Regex::new(r"[a-zA-Z0-9+.-]+://[^:/@\s]+:[^@\s]+@").unwrap());
+    for field in ["metadata", "path", "host", "data_path", "database", "endpoint", "scope"] {
         if let Some(val) = tbl.get(field).and_then(|v| v.as_str()) {
             let lower = val.to_lowercase();
             if lower.contains("password=")
                 || lower.contains("pwd=")
                 || lower.contains("token=")
                 || lower.contains("secret=")
+                || uri_cred_re.is_match(val)
             {
                 anyhow::bail!(
                     "Secret Hygiene Error in {}.{}: inline credentials are not allowed in duckpack.toml. Store credentials in .env and use *_env fields.",
@@ -509,61 +518,13 @@ pub fn should_use_workspace_mode(
     has_workspace_attachments(project_dir, env_profile)
 }
 
-fn parse_env_file_map(path: &Path) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            let stripped = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
-            if let Some((k, v)) = stripped.split_once('=') {
-                let key = k.trim().to_string();
-                let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
-                if !key.is_empty() {
-                    map.insert(key, val);
-                }
-            }
-        }
-    }
-    map
-}
-
-/// Resolves an env var by checking process environment first, then `.env.<profile>` (if set), then `.env`.
+/// Resolves an env var by checking process environment first, then `.env.<profile>` (validated), then `.env`.
 pub fn resolve_workspace_env_var(
     project_dir: &Path,
     env_profile: Option<&str>,
     key: &str,
 ) -> Option<String> {
-    let k = key.trim();
-    if k.is_empty() {
-        return None;
-    }
-    if let Ok(val) = std::env::var(k) {
-        if !val.trim().is_empty() {
-            return Some(val);
-        }
-    }
-    if let Some(profile) = env_profile.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let p = project_dir.join(format!(".env.{}", profile));
-        if p.exists() {
-            if let Some(v) = parse_env_file_map(&p).get(k).cloned() {
-                if !v.trim().is_empty() {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    let base = project_dir.join(".env");
-    if base.exists() {
-        if let Some(v) = parse_env_file_map(&base).get(k).cloned() {
-            if !v.trim().is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
+    crate::env_store::resolve_env_var(Some(project_dir), env_profile, key)
 }
 
 /// Registers all declarative `[[secrets]]` (and `[[env.<profile>.secrets]]`) on `conn`.
@@ -1006,66 +967,14 @@ pub fn open_quack_control_connection(
     Ok((conn, alias))
 }
 
-fn target_env_file_path(project_dir: &Path, env_profile: Option<&str>) -> PathBuf {
-    if let Some(profile) = env_profile.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let env_prof_path = project_dir.join(format!(".env.{}", profile));
-        if env_prof_path.exists() {
-            return env_prof_path;
-        }
-    }
-    project_dir.join(".env")
-}
-
-/// Upserts key/value pairs into the target `.env` (or `.env.<profile>` if it exists) with `0600` perms.
+/// Upserts key/value pairs into the target `.env` (or validated `.env.<profile>` if it exists)
+/// atomically with `0600` perms and newline/control-char sanitization (M1, M4).
 pub fn save_workspace_env_pairs(
     project_dir: &Path,
     env_profile: Option<&str>,
     pairs: &[(&str, &str)],
 ) -> Result<PathBuf> {
-    let env_path = target_env_file_path(project_dir, env_profile);
-    if pairs.is_empty() {
-        return Ok(env_path);
-    }
-    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
-    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
-
-    for (raw_k, raw_v) in pairs {
-        let k = raw_k.trim();
-        let v = raw_v.trim();
-        if k.is_empty() || v.is_empty() {
-            continue;
-        }
-        let prefix = format!("{}=", k);
-        let new_line = format!("{}={}", k, v);
-        let mut updated = false;
-        for line in &mut lines {
-            if line.trim_start().starts_with(&prefix) {
-                *line = new_line.clone();
-                updated = true;
-                break;
-            }
-        }
-        if !updated {
-            lines.push(new_line);
-        }
-    }
-
-    let mut out = lines.join("\n");
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    write_restricted_env_file(&env_path, &out)?;
-    // Also mirror into current process env so immediate retries pick up the value
-    for (raw_k, raw_v) in pairs {
-        let k = raw_k.trim();
-        let v = raw_v.trim();
-        if !k.is_empty() && !v.is_empty() {
-            unsafe {
-                std::env::set_var(k, v);
-            }
-        }
-    }
-    Ok(env_path)
+    crate::env_store::upsert_env_pairs(project_dir, env_profile, pairs)
 }
 
 fn secret_to_toml_value(sec: &WorkspaceSecret) -> toml::Value {

@@ -18,6 +18,10 @@ pub fn read_sql_with_env<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
 
     let replaced = re.replace_all(&content, |caps: &regex::Captures| {
         let var_name = &caps[1];
+        // H4: Never bake credential/secret env vars into compiled SQL definitions.
+        if crate::env_store::is_sensitive_env_var_name(var_name) {
+            return caps[0].to_string();
+        }
         std::env::var(var_name).unwrap_or_else(|_| caps[0].to_string())
     });
 

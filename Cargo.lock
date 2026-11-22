@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "duckpack"
-version = "0.3.5-dev23"
+version = "0.3.5-dev24"
 dependencies = [
  "anyhow",
  "arboard",
@@ -648,6 +648,7 @@ dependencies = [
  "crossterm",
  "dotenvy",
  "duckdb",
+ "getrandom 0.2.17",
  "pyo3",
  "ratatui",
  "regex",

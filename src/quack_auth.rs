@@ -295,36 +295,7 @@ pub fn load_quack_auth_config(project_dir: &Path) -> Option<QuackAuthConfig> {
 
 /// Resolves a user's cleartext token from process environment variables or an optional `project_dir/.env`.
 pub fn resolve_user_token_opt(project_dir: Option<&Path>, token_env: &str) -> Option<String> {
-    if let Ok(val) = std::env::var(token_env) {
-        let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    if let Some(dir) = project_dir {
-        let env_path = dir.join(".env");
-        if let Ok(content) = std::fs::read_to_string(env_path) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    continue;
-                }
-                if let Some((k, v)) = trimmed.split_once('=') {
-                    if k.trim() == token_env {
-                        let clean_v = v
-                            .trim()
-                            .trim_matches('"')
-                            .trim_matches('\'')
-                            .trim();
-                        if !clean_v.is_empty() {
-                            return Some(clean_v.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+    crate::env_store::resolve_env_var(project_dir, None, token_env)
 }
 
 /// Resolves a user's cleartext token from process environment variables or `project_dir/.env`.
@@ -335,7 +306,7 @@ pub fn resolve_user_token(project_dir: &Path, token_env: &str) -> Option<String>
 /// Generates a 256-bit cryptographic random token and persists `<token_env>=<token>` in `project_dir/.env`
 /// with `0600` permissions on Unix.
 pub fn generate_and_save_user_token(project_dir: &Path, token_env: &str) -> Result<String> {
-    let token = crate::engine::generate_random_hex_token();
+    let token = crate::env_store::generate_random_hex_token();
     save_env_key_value(project_dir, token_env, &token)?;
     Ok(token)
 }
@@ -343,38 +314,11 @@ pub fn generate_and_save_user_token(project_dir: &Path, token_env: &str) -> Resu
 /// Upserts `<key>=<value>` into `project_dir/.env` atomically with `0600` permissions on Unix
 /// and newline/control-character sanitization to prevent `.env` line injection.
 pub fn save_env_key_value(project_dir: &Path, key: &str, value: &str) -> Result<()> {
-    let clean_key = crate::engine::sanitize_env_value(key.trim());
+    let clean_key = crate::env_store::sanitize_env_value(key.trim());
     if clean_key.is_empty() || clean_key.contains('=') {
         anyhow::bail!("Invalid environment variable name '{}'.", key);
     }
-    let clean_val = crate::engine::sanitize_env_value(value);
-
-    let env_path = project_dir.join(".env");
-    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
-    let mut found = false;
-    let mut new_lines: Vec<String> = Vec::new();
-
-    for line in existing.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with('#') {
-            if let Some((k, _)) = trimmed.split_once('=') {
-                if k.trim() == clean_key {
-                    new_lines.push(format!("{}={}", clean_key, clean_val));
-                    found = true;
-                    continue;
-                }
-            }
-        }
-        new_lines.push(line.to_string());
-    }
-    if !found {
-        new_lines.push(format!("{}={}", clean_key, clean_val));
-    }
-
-    let mut out = new_lines.join("\n");
-    out.push('\n');
-    crate::engine::write_restricted_env_file(&env_path, &out)
-        .with_context(|| format!("Failed writing {} to {}", clean_key, env_path.display()))?;
+    crate::env_store::upsert_env_pairs(project_dir, None, &[(&clean_key, value)])?;
     Ok(())
 }
 
