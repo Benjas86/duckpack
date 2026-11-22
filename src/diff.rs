@@ -1,3 +1,4 @@
+use crate::sql_utils::{quote_ident, quote_literal};
 use anyhow::Result;
 use duckdb::Connection;
 use regex::Regex;
@@ -640,22 +641,31 @@ pub fn get_schema_exec(
 
     if quack_alias.is_some() || tables.is_empty() {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_tbl = format!(
+            "{} SELECT fs.full_schema_name, t.table_name, t.sql FROM duckdb_tables() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE t.internal = false AND (t.database_name = {} OR t.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_sql = format!(
             "SELECT CASE WHEN full_schema_name = 'main' THEN table_name ELSE full_schema_name || '.' || table_name END, \
              COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
-             FROM {}.query('{} SELECT fs.full_schema_name, t.table_name, t.sql FROM duckdb_tables() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE t.internal = false AND (t.database_name = ''{}'' OR t.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+             FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_tbl)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_sql = format!(
                 "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
                  COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
-                 FROM {}.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                 FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
         };
@@ -715,26 +725,35 @@ pub fn get_schema_exec(
     let any_col_empty = tables.values().any(|t| t.columns.is_empty());
     if quack_alias.is_some() || any_col_empty {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_col = format!(
+            "{} SELECT fs.full_schema_name, c.table_name, c.column_name, c.data_type, c.column_default, c.is_generated FROM duckdb_columns() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.internal = false AND (c.database_name = {} OR c.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_col_sql = format!(
             "SELECT CASE WHEN full_schema_name = 'main' THEN table_name ELSE full_schema_name || '.' || table_name END, \
              column_name, data_type, \
              CASE WHEN column_default IS NULL THEN '0' ELSE '1' END, COALESCE(column_default, ''), \
              CASE WHEN COALESCE(is_generated, false) THEN '1' ELSE '0' END \
-             FROM {}.query('{} SELECT fs.full_schema_name, c.table_name, c.column_name, c.data_type, c.column_default, c.is_generated FROM duckdb_columns() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.internal = false AND (c.database_name = ''{}'' OR c.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+             FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_col)
         );
         let q_col_rows = if let Ok((_, rows)) = exec.query_rows(&q_col_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, table_name, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_col = format!(
                 "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
                  column_name, data_type, \
                  CASE WHEN column_default IS NULL THEN '0' ELSE '1' END, COALESCE(column_default, ''), \
                  '0' \
-                 FROM {}.query('SELECT schema_name, table_name, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                 FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_col).ok().map(|(_, r)| r)
         };
@@ -836,6 +855,11 @@ pub fn get_schema_exec(
     }
 
     if let Some(ref q_alias) = quack_alias {
+        let inner_constr = format!(
+            "{} SELECT fs.full_schema_name, c.table_name, c.constraint_type, c.constraint_name, array_to_string(c.constraint_column_names, ',') as constraint_column_names, c.expression, c.referenced_table, array_to_string(c.referenced_column_names, ',') as referenced_column_names FROM duckdb_constraints() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK') AND (c.database_name = {} OR c.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_constr_sql = format!(
             "SELECT CASE WHEN full_schema_name = 'main' THEN table_name ELSE full_schema_name || '.' || table_name END, \
              constraint_type, \
@@ -844,14 +868,17 @@ pub fn get_schema_exec(
              COALESCE(expression, ''), \
              COALESCE(referenced_table, ''), \
              COALESCE(referenced_column_names, '') \
-             FROM {}.query('{} SELECT fs.full_schema_name, c.table_name, c.constraint_type, c.constraint_name, array_to_string(c.constraint_column_names, '','') as constraint_column_names, c.expression, c.referenced_table, array_to_string(c.referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (c.database_name = ''{}'' OR c.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+             FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_constr)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_constr_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, ',') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, ',') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK') AND (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_constr = format!(
                 "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
                  constraint_type, \
@@ -860,8 +887,9 @@ pub fn get_schema_exec(
                  COALESCE(expression, ''), \
                  COALESCE(referenced_table, ''), \
                  COALESCE(referenced_column_names, '') \
-                 FROM {}.query('SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, '','') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                 FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_constr).ok().map(|(_, r)| r)
         };
@@ -966,22 +994,31 @@ pub fn get_views_exec(
 
     if views.is_empty() {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_v = format!(
+            "{} SELECT fs.full_schema_name, v.view_name, v.sql FROM duckdb_views() v JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name WHERE v.internal = false AND (v.database_name = {} OR v.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_sql = format!(
             "SELECT CASE WHEN full_schema_name = 'main' THEN view_name ELSE full_schema_name || '.' || view_name END, \
              COALESCE(sql, '/* Remote view: ' || view_name || ' */') \
-             FROM {}.query('{} SELECT fs.full_schema_name, v.view_name, v.sql FROM duckdb_views() v JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name WHERE v.internal = false AND (v.database_name = ''{}'' OR v.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+             FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_v)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, view_name, sql FROM duckdb_views() WHERE internal = false AND (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_sql = format!(
                 "SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, \
                  COALESCE(sql, '/* Remote view: ' || view_name || ' */') \
-                 FROM {}.query('SELECT schema_name, view_name, sql FROM duckdb_views() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                 FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
         };
@@ -1101,18 +1138,27 @@ pub fn get_schemas_exec(
 
     if schemas.is_empty() {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_s = format!(
+            "{} SELECT full_schema_name FROM full_schemas WHERE (database_name = {} OR database_name = current_database()) AND full_schema_name NOT IN ('information_schema', 'pg_catalog', 'main') ORDER BY depth ASC",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_sql = format!(
-            "SELECT full_schema_name FROM {}.query('{} SELECT full_schema_name FROM full_schemas WHERE (database_name = ''{}'' OR database_name = current_database()) AND full_schema_name NOT IN (''information_schema'', ''pg_catalog'', ''main'') ORDER BY depth ASC')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+            "SELECT full_schema_name FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_s)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND (database_name = {} OR database_name = current_database()) AND schema_name NOT IN ('information_schema', 'pg_catalog', 'main')",
+                quote_literal(&target_cat)
+            );
             let fallback_q_sql = format!(
-                "SELECT schema_name FROM {}.query('SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database()) AND schema_name NOT IN (''information_schema'', ''pg_catalog'', ''main'')')",
-                q_alias, safe_cat
+                "SELECT schema_name FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
         };
@@ -1171,20 +1217,27 @@ pub fn get_sequences_exec(
 
     if sequences.is_empty() {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_seq = format!(
+            "{} SELECT fs.full_schema_name, s.sequence_name, s.sql FROM duckdb_sequences() s JOIN full_schemas fs ON s.schema_oid = fs.oid AND s.database_name = fs.database_name WHERE s.temporary = false AND (s.database_name = {} OR s.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_sql = format!(
-            "SELECT full_schema_name, sequence_name, COALESCE(sql, '') \
-             FROM {}.query('{} SELECT fs.full_schema_name, s.sequence_name, s.sql FROM duckdb_sequences() s JOIN full_schemas fs ON s.schema_oid = fs.oid AND s.database_name = fs.database_name WHERE s.temporary = false AND (s.database_name = ''{}'' OR s.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+            "SELECT full_schema_name, sequence_name, COALESCE(sql, '') FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_seq)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, sequence_name, sql FROM duckdb_sequences() WHERE temporary = false AND (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_sql = format!(
-                "SELECT schema_name, sequence_name, COALESCE(sql, '') \
-                 FROM {}.query('SELECT schema_name, sequence_name, sql FROM duckdb_sequences() WHERE temporary = false AND (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                "SELECT schema_name, sequence_name, COALESCE(sql, '') FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
         };
@@ -1315,20 +1368,27 @@ pub fn get_triggers_exec(
 
     if triggers.is_empty() {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_trg = format!(
+            "{} SELECT fs.full_schema_name, t.trigger_name, t.table_name, t.sql FROM duckdb_triggers() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE (t.database_name = {} OR t.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_sql = format!(
-            "SELECT full_schema_name, trigger_name, table_name, COALESCE(sql, '') \
-             FROM {}.query('{} SELECT fs.full_schema_name, t.trigger_name, t.table_name, t.sql FROM duckdb_triggers() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE (t.database_name = ''{}'' OR t.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+            "SELECT full_schema_name, trigger_name, table_name, COALESCE(sql, '') FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_trg)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, trigger_name, table_name, sql FROM duckdb_triggers() WHERE (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_sql = format!(
-                "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') \
-                 FROM {}.query('SELECT schema_name, trigger_name, table_name, sql FROM duckdb_triggers() WHERE (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
         };

@@ -38,6 +38,145 @@ pub fn wrap_quack_alias_query(alias: &str, inner_sql: &str) -> String {
     )
 }
 
+/// Builds `CALL "<alias>".query('<escaped_inner_sql>');` safely with quoted alias and escaped SQL.
+pub fn wrap_quack_call_query(alias: &str, inner_sql: &str) -> String {
+    format!(
+        "CALL {}.query({});",
+        quote_ident(alias),
+        quote_literal(inner_sql)
+    )
+}
+
+/// Validates that a staged temporary view DDL statement (retrieved from a Quack bridge registry)
+/// is strictly a single `CREATE [OR REPLACE] TEMP[ORARY] VIEW ...` statement with no chained `;`
+/// statements outside string literals, quoted identifiers, or SQL comments (H1).
+pub fn validate_safe_temp_view_ddl(sql: &str) -> Result<()> {
+    static TEMP_VIEW_HEAD_RE: OnceLock<Regex> = OnceLock::new();
+    let head_re = TEMP_VIEW_HEAD_RE.get_or_init(|| {
+        Regex::new(r"(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?TEMP(?:ORARY)?\s+VIEW\s+").unwrap()
+    });
+
+    let trimmed = sql.trim();
+    if trimmed.is_empty() || !head_re.is_match(trimmed) {
+        anyhow::bail!("Rejected staged temp view DDL: must start with CREATE [OR REPLACE] TEMP[ORARY] VIEW");
+    }
+
+    // Single-pass lexical scan to reject any semicolon followed by another SQL token
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    let mut saw_semicolon = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Line comment -- ... \n
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                i += 1;
+            }
+            continue;
+        }
+        // Nested block comment /* ... */
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let mut depth = 1usize;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if depth > 0 {
+                anyhow::bail!("Rejected staged temp view DDL: unclosed block comment");
+            }
+            continue;
+        }
+        if saw_semicolon {
+            if b.is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            anyhow::bail!("Rejected staged temp view DDL: chained SQL statements are forbidden");
+        }
+        // Single-quoted literal
+        if b == b'\'' {
+            i += 1;
+            let mut closed = false;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    closed = true;
+                    break;
+                }
+                i += 1;
+            }
+            if !closed {
+                anyhow::bail!("Rejected staged temp view DDL: unclosed string literal");
+            }
+            continue;
+        }
+        // Double-quoted identifier
+        if b == b'"' {
+            i += 1;
+            let mut closed = false;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    closed = true;
+                    break;
+                }
+                i += 1;
+            }
+            if !closed {
+                anyhow::bail!("Rejected staged temp view DDL: unclosed quoted identifier");
+            }
+            continue;
+        }
+        // Dollar-quoted literal $tag$...$tag$
+        if b == b'$' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                let tag = &bytes[i..=j];
+                i = j + 1;
+                let mut closed = false;
+                while i + tag.len() <= bytes.len() {
+                    if &bytes[i..i + tag.len()] == tag {
+                        i += tag.len();
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    anyhow::bail!("Rejected staged temp view DDL: unclosed dollar-quoted literal");
+                }
+                continue;
+            }
+        }
+        if b == b';' {
+            saw_semicolon = true;
+        }
+        i += 1;
+    }
+
+    Ok(())
+}
+
 /// Quotes a potentially dot-separated nested schema path (e.g. `analytics.silver` -> `"analytics"."silver"`).
 pub fn quote_schema_path(schema_path: &str) -> String {
     schema_path
@@ -205,5 +344,21 @@ mod tests {
         let uri_sql = "ATTACH 'postgres://admin:s3cr3t@db.example.com:5432/app' AS pg;";
         assert!(should_redact_sql_history(uri_sql));
         assert!(!redact_connection_credentials(uri_sql).contains("s3cr3t"));
+    }
+
+    #[test]
+    fn test_validate_safe_temp_view_ddl_blocks_statement_chaining() {
+        assert!(validate_safe_temp_view_ddl("CREATE TEMP VIEW v1 AS SELECT 1 AS a;").is_ok());
+        assert!(validate_safe_temp_view_ddl(
+            "CREATE OR REPLACE TEMPORARY VIEW \"v;1\" AS SELECT 'a; DROP TABLE x' AS txt;"
+        )
+        .is_ok());
+        assert!(validate_safe_temp_view_ddl("CREATE TEMP VIEW v2 AS SELECT $tag$a;b$tag$ -- comment\n;").is_ok());
+
+        // Reject chained statements and non-temp-view DDL
+        assert!(validate_safe_temp_view_ddl("CREATE TEMP VIEW v1 AS SELECT 1; DROP TABLE prod;").is_err());
+        assert!(validate_safe_temp_view_ddl("CREATE VIEW v1 AS SELECT 1;").is_err());
+        assert!(validate_safe_temp_view_ddl("DROP TABLE users;").is_err());
+        assert!(validate_safe_temp_view_ddl("CREATE TEMP VIEW v1 AS SELECT 'unclosed").is_err());
     }
 }

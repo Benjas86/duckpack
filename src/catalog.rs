@@ -1,4 +1,5 @@
 use crate::diff::{quote_qualified_identifier, FULL_SCHEMAS_CTE};
+use crate::sql_utils::{quote_ident, quote_literal, wrap_quack_alias_query};
 use duckdb::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -178,14 +179,16 @@ pub fn load_ducklake_snapshots(
     }
 
     if snapshots.is_empty() && is_quack {
-        let remote_with_msg = format!(
-            "SELECT * FROM target_db.query('SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) AS snapshot_time, CAST(schema_version AS BIGINT) AS schema_version, COALESCE(CAST(changes AS VARCHAR), '''') AS changes, COALESCE(CAST(commit_message AS VARCHAR), '''') AS commit_message FROM ducklake_snapshots(''{}'') ORDER BY snapshot_id DESC LIMIT 50')",
-            safe_db
+        let inner_with_msg = format!(
+            "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) AS snapshot_time, CAST(schema_version AS BIGINT) AS schema_version, COALESCE(CAST(changes AS VARCHAR), '') AS changes, COALESCE(CAST(commit_message AS VARCHAR), '') AS commit_message FROM ducklake_snapshots({}) ORDER BY snapshot_id DESC LIMIT 50",
+            quote_literal(db_name)
         );
-        let remote_basic = format!(
-            "SELECT * FROM target_db.query('SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) AS snapshot_time, CAST(schema_version AS BIGINT) AS schema_version, COALESCE(CAST(changes AS VARCHAR), '''') AS changes FROM ducklake_snapshots(''{}'') ORDER BY snapshot_id DESC LIMIT 50')",
-            safe_db
+        let inner_basic = format!(
+            "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) AS snapshot_time, CAST(schema_version AS BIGINT) AS schema_version, COALESCE(CAST(changes AS VARCHAR), '') AS changes FROM ducklake_snapshots({}) ORDER BY snapshot_id DESC LIMIT 50",
+            quote_literal(db_name)
         );
+        let remote_with_msg = wrap_quack_alias_query("target_db", &inner_with_msg);
+        let remote_basic = wrap_quack_alias_query("target_db", &inner_basic);
         if !parse_rows(&remote_with_msg, true, &mut snapshots) {
             let _ = parse_rows(&remote_basic, false, &mut snapshots);
         }
@@ -272,9 +275,16 @@ pub fn load_table_columns_for(
 
     // 1. Direct query on db if it is target_db
     if is_quack && db == "target_db" {
+        let inner_sql = format!(
+            "SELECT column_name, data_type FROM duckdb_columns() WHERE (schema_name = {} OR schema_name = {}) AND table_name = {} ORDER BY column_index",
+            quote_literal(schema),
+            quote_literal(leaf_schema),
+            quote_literal(table)
+        );
         let col_query = format!(
-            "SELECT column_name, data_type FROM target_db.query('SELECT column_name, data_type FROM duckdb_columns() WHERE (schema_name = ''{}'' OR schema_name = ''{}'') AND table_name = ''{}'' ORDER BY column_index')",
-            safe_schema, safe_leaf_schema, safe_table
+            "SELECT column_name, data_type FROM {}.query({})",
+            quote_ident("target_db"),
+            quote_literal(&inner_sql)
         );
         if let Ok(mut stmt) = conn.prepare(&col_query) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -289,9 +299,17 @@ pub fn load_table_columns_for(
 
     // 2. Check duckdb_columns() via target_db.query (for remote multi-database mode)
     if cols.is_empty() && is_quack {
+        let inner_sql = format!(
+            "SELECT column_name, data_type FROM duckdb_columns() WHERE (database_name = {} OR database_name = 'temp') AND (schema_name = {} OR schema_name = {}) AND table_name = {} ORDER BY column_index",
+            quote_literal(db),
+            quote_literal(schema),
+            quote_literal(leaf_schema),
+            quote_literal(table)
+        );
         let col_query = format!(
-            "SELECT column_name, data_type FROM target_db.query('SELECT column_name, data_type FROM duckdb_columns() WHERE (database_name = ''{}'' OR database_name = ''temp'') AND (schema_name = ''{}'' OR schema_name = ''{}'') AND table_name = ''{}'' ORDER BY column_index')",
-            safe_db, safe_schema, safe_leaf_schema, safe_table
+            "SELECT column_name, data_type FROM {}.query({})",
+            quote_ident("target_db"),
+            quote_literal(&inner_sql)
         );
         if let Ok(mut stmt) = conn.prepare(&col_query) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -306,10 +324,16 @@ pub fn load_table_columns_for(
 
     // 3. Nested quack query if on remote multi-db (e.g. remote_db attached inside target_db)
     if cols.is_empty() && is_quack && db != "target_db" && db != "memory" {
-        let nested_col_query = format!(
-            "SELECT * FROM target_db.query('SELECT column_name, data_type FROM {}.query(''SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = ''''{}'''' ORDER BY column_index'')')",
-            safe_db, safe_table
+        let deepest_sql = format!(
+            "SELECT column_name, data_type FROM duckdb_columns() WHERE table_name = {} ORDER BY column_index",
+            quote_literal(table)
         );
+        let mid_sql = format!(
+            "SELECT column_name, data_type FROM {}.query({})",
+            quote_ident(db),
+            quote_literal(&deepest_sql)
+        );
+        let nested_col_query = wrap_quack_alias_query("target_db", &mid_sql);
         if let Ok(mut stmt) = conn.prepare(&nested_col_query) {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
@@ -323,9 +347,16 @@ pub fn load_table_columns_for(
 
     // 4. Query {db}.query directly if db is an attached quack DB on conn
     if cols.is_empty() {
+        let inner_sql = format!(
+            "SELECT column_name, data_type FROM duckdb_columns() WHERE (schema_name = {} OR schema_name = {}) AND table_name = {} ORDER BY column_index",
+            quote_literal(schema),
+            quote_literal(leaf_schema),
+            quote_literal(table)
+        );
         let direct_quack_col = format!(
-            "SELECT column_name, data_type FROM {}.query('SELECT column_name, data_type FROM duckdb_columns() WHERE (schema_name = ''{}'' OR schema_name = ''{}'') AND table_name = ''{}'' ORDER BY column_index')",
-            safe_db, safe_schema, safe_leaf_schema, safe_table
+            "SELECT column_name, data_type FROM {}.query({})",
+            quote_ident(db),
+            quote_literal(&inner_sql)
         );
         if let Ok(mut stmt) = conn.prepare(&direct_quack_col) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -396,21 +427,21 @@ pub fn load_table_columns_for(
         } else {
             format!("{}.{}.{}", quoted_db, quoted_schema, quoted_table)
         };
-        let safe_pragma_target = pragma_target.replace('\'', "''");
         let pragma_queries = if is_quack && db == "target_db" {
             vec![
-                format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_table}'')')"),
-                format!("PRAGMA table_info('{}')", safe_pragma_target),
+                wrap_quack_alias_query("target_db", &format!("PRAGMA table_info({})", quote_literal(table))),
+                format!("PRAGMA table_info({})", quote_literal(&pragma_target)),
             ]
         } else if is_quack {
             vec![
-                format!("SELECT * FROM target_db.query('PRAGMA table_info(''{safe_pragma_target}'')')"),
-                format!("PRAGMA table_info('{}')", safe_pragma_target),
+                wrap_quack_alias_query(
+                    "target_db",
+                    &format!("PRAGMA table_info({})", quote_literal(&pragma_target)),
+                ),
+                format!("PRAGMA table_info({})", quote_literal(&pragma_target)),
             ]
         } else {
-            vec![
-                format!("PRAGMA table_info('{}')", safe_pragma_target),
-            ]
+            vec![format!("PRAGMA table_info({})", quote_literal(&pragma_target))]
         };
 
         for query in &pragma_queries {
@@ -490,10 +521,13 @@ pub fn load_table_columns_for(
     }
 
     if pk_set.is_empty() && is_quack {
-        let q_pk_query = format!(
-            "SELECT * FROM target_db.query('SELECT unnest(constraint_column_names) FROM duckdb_constraints() WHERE constraint_type = ''PRIMARY KEY'' AND (schema_name = ''{}'' OR schema_name = ''{}'') AND table_name = ''{}''')",
-            safe_schema, safe_leaf_schema, safe_table
+        let inner_pk = format!(
+            "SELECT unnest(constraint_column_names) FROM duckdb_constraints() WHERE constraint_type = 'PRIMARY KEY' AND (schema_name = {} OR schema_name = {}) AND table_name = {}",
+            quote_literal(schema),
+            quote_literal(leaf_schema),
+            quote_literal(table)
         );
+        let q_pk_query = wrap_quack_alias_query("target_db", &inner_pk);
         if let Ok(mut stmt) = conn.prepare(&q_pk_query) {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
@@ -567,13 +601,16 @@ pub fn load_table_columns_for(
     }
 
     if fk_map.is_empty() && is_quack {
+        let inner_fk = format!(
+            "SELECT array_to_string(constraint_column_names, ',') as constraint_column_names, referenced_table, array_to_string(referenced_column_names, ',') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY' AND (schema_name = {} OR schema_name = {}) AND table_name = {}",
+            quote_literal(schema),
+            quote_literal(leaf_schema),
+            quote_literal(table)
+        );
         let q_fk_query = format!(
-            "SELECT \
-                COALESCE(constraint_column_names, ''), \
-                COALESCE(referenced_table, ''), \
-                COALESCE(referenced_column_names, '') \
-             FROM target_db.query('SELECT array_to_string(constraint_column_names, '','') as constraint_column_names, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type = ''FOREIGN KEY'' AND (schema_name = ''{}'' OR schema_name = ''{}'') AND table_name = ''{}''')",
-            safe_schema, safe_leaf_schema, safe_table
+            "SELECT COALESCE(constraint_column_names, ''), COALESCE(referenced_table, ''), COALESCE(referenced_column_names, '') FROM {}.query({})",
+            quote_ident("target_db"),
+            quote_literal(&inner_fk)
         );
         if let Ok(mut stmt) = conn.prepare(&q_fk_query) {
             if let Ok(mut rows) = stmt.query([]) {
@@ -755,16 +792,21 @@ pub fn load_explorer_metadata(
             if is_quack && name == "target_db" {
                 continue;
             }
-            let safe_name = name.replace('\'', "''");
+            let inner_tbl = "SELECT schema_name, table_name, estimated_size, temporary FROM duckdb_tables() WHERE internal = false";
             let sql = if is_remote_multi_db {
-                format!(
-                    "SELECT * FROM target_db.query('SELECT ''{}'' AS database_name, schema_name, table_name, estimated_size, temporary FROM {}.query(''SELECT schema_name, table_name, estimated_size, temporary FROM duckdb_tables() WHERE internal = false'')')",
-                    safe_name, safe_name
-                )
+                let mid_sql = format!(
+                    "SELECT {} AS database_name, schema_name, table_name, estimated_size, temporary FROM {}.query({})",
+                    quote_literal(name),
+                    quote_ident(name),
+                    quote_literal(inner_tbl)
+                );
+                wrap_quack_alias_query("target_db", &mid_sql)
             } else {
                 format!(
-                    "SELECT '{}' AS database_name, schema_name, table_name, estimated_size, temporary FROM {}.query('SELECT schema_name, table_name, estimated_size, temporary FROM duckdb_tables() WHERE internal = false')",
-                    safe_name, safe_name
+                    "SELECT {} AS database_name, schema_name, table_name, estimated_size, temporary FROM {}.query({})",
+                    quote_literal(name),
+                    quote_ident(name),
+                    quote_literal(inner_tbl)
                 )
             };
             if let Ok(mut stmt) = conn.prepare(&sql) {
@@ -855,7 +897,10 @@ pub fn load_explorer_metadata(
             && remote_dbs.iter().any(|d| d.0.eq_ignore_ascii_case(&t.database))
             && t.database != "memory"
         {
-            format!("SELECT * FROM target_db.query('SELECT count(*) FROM {}.{}.{}')", quoted_db, quoted_schema, quoted_table)
+            wrap_quack_alias_query(
+                "target_db",
+                &format!("SELECT count(*) FROM {}.{}.{}", quoted_db, quoted_schema, quoted_table),
+            )
         } else {
             format!("SELECT count(*) FROM {}.{}.{}", quoted_db, quoted_schema, quoted_table)
         };
@@ -1248,16 +1293,21 @@ pub fn load_explorer_metadata(
 
     for (name, typ, _, _) in &raw_dbs {
         if typ.eq_ignore_ascii_case("quack") {
-            let safe_name = name.replace('\'', "''");
+            let inner_cols = "SELECT schema_name, table_name, column_name FROM duckdb_columns() WHERE internal = false";
             let sql = if is_remote_multi_db {
-                format!(
-                    "SELECT * FROM target_db.query('SELECT ''{}'' AS database_name, schema_name, table_name, column_name FROM {}.query(''SELECT schema_name, table_name, column_name FROM duckdb_columns() WHERE internal = false'')')",
-                    safe_name, safe_name
-                )
+                let mid_sql = format!(
+                    "SELECT {} AS database_name, schema_name, table_name, column_name FROM {}.query({})",
+                    quote_literal(name),
+                    quote_ident(name),
+                    quote_literal(inner_cols)
+                );
+                wrap_quack_alias_query("target_db", &mid_sql)
             } else {
                 format!(
-                    "SELECT '{}' AS database_name, schema_name, table_name, column_name FROM {}.query('SELECT schema_name, table_name, column_name FROM duckdb_columns() WHERE internal = false')",
-                    safe_name, safe_name
+                    "SELECT {} AS database_name, schema_name, table_name, column_name FROM {}.query({})",
+                    quote_literal(name),
+                    quote_ident(name),
+                    quote_literal(inner_cols)
                 )
             };
             if let Ok(mut stmt) = conn.prepare(&sql) {

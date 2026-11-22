@@ -817,28 +817,29 @@ pub fn restore_quack_temp_bridge(conn: &Connection) {
         }
         for bt in bridges {
             if let Some(orig) = bt.strip_prefix("__duckpack_temp_bridge_") {
-                let safe_orig = orig.replace('\"', "\"\"");
-                let safe_bt = bt.replace('\"', "\"\"");
+                let q_orig = crate::sql_utils::quote_ident(orig);
+                let q_bt = crate::sql_utils::quote_ident(&bt);
                 let restore_sql = format!(
-                    "CREATE OR REPLACE TEMP TABLE \"{}\" AS SELECT * FROM target_db.query('SELECT * FROM memory.\"{}\"');",
-                    safe_orig, safe_bt
+                    "CREATE OR REPLACE TEMP TABLE {} AS {};",
+                    q_orig,
+                    crate::sql_utils::wrap_quack_alias_query(
+                        "target_db",
+                        &format!("SELECT * FROM memory.{}", q_bt)
+                    )
                 );
                 let _ = conn.execute(&restore_sql, []);
+                let _ = conn.execute(&format!("DROP TABLE IF EXISTS target_db.{};", q_bt), []);
                 let _ = conn.execute(
-                    &format!("DROP TABLE IF EXISTS target_db.\"{}\";", safe_bt),
-                    [],
-                );
-                let _ = conn.execute(
-                    &format!(
-                        "CALL target_db.query('DROP TABLE IF EXISTS \"{}\";');",
-                        safe_bt.replace('\'', "''")
+                    &crate::sql_utils::wrap_quack_call_query(
+                        "target_db",
+                        &format!("DROP TABLE IF EXISTS {};", q_bt),
                     ),
                     [],
                 );
                 let _ = conn.execute(
-                    &format!(
-                        "CALL target_db.query('DROP TABLE IF EXISTS memory.\"{}\";');",
-                        safe_bt.replace('\'', "''")
+                    &crate::sql_utils::wrap_quack_call_query(
+                        "target_db",
+                        &format!("DROP TABLE IF EXISTS memory.{};", q_bt),
                     ),
                     [],
                 );
@@ -846,7 +847,7 @@ pub fn restore_quack_temp_bridge(conn: &Connection) {
         }
     }
 
-    // 2. Restore views
+    // 2. Restore views (H1: strictly validate staged view DDL is a single CREATE TEMP VIEW)
     let view_sql = "SELECT * FROM target_db.query('SELECT view_name, view_sql FROM memory.__duckpack_temp_views_registry;')";
     if let Ok(mut stmt) = conn.prepare(view_sql) {
         let mut views = Vec::new();
@@ -858,7 +859,9 @@ pub fn restore_quack_temp_bridge(conn: &Connection) {
             }
         }
         for (_vname, vsql) in views {
-            let _ = conn.execute(&vsql, []);
+            if crate::sql_utils::validate_safe_temp_view_ddl(&vsql).is_ok() {
+                let _ = conn.execute(&vsql, []);
+            }
         }
         let _ = conn.execute(
             "CALL target_db.query('DROP TABLE IF EXISTS memory.__duckpack_temp_views_registry;');",
@@ -880,22 +883,19 @@ pub fn cleanup_orphaned_quack_bridges(conn: &Connection) {
             }
         }
         for bt in bridges {
-            let safe_bt = bt.replace('\"', "\"\"");
+            let q_bt = crate::sql_utils::quote_ident(&bt);
+            let _ = conn.execute(&format!("DROP TABLE IF EXISTS target_db.{};", q_bt), []);
             let _ = conn.execute(
-                &format!("DROP TABLE IF EXISTS target_db.\"{}\";", safe_bt),
-                [],
-            );
-            let _ = conn.execute(
-                &format!(
-                    "CALL target_db.query('DROP TABLE IF EXISTS \"{}\";');",
-                    safe_bt.replace('\'', "''")
+                &crate::sql_utils::wrap_quack_call_query(
+                    "target_db",
+                    &format!("DROP TABLE IF EXISTS {};", q_bt),
                 ),
                 [],
             );
             let _ = conn.execute(
-                &format!(
-                    "CALL target_db.query('DROP TABLE IF EXISTS memory.\"{}\";');",
-                    safe_bt.replace('\'', "''")
+                &crate::sql_utils::wrap_quack_call_query(
+                    "target_db",
+                    &format!("DROP TABLE IF EXISTS memory.{};", q_bt),
                 ),
                 [],
             );
@@ -917,10 +917,10 @@ pub fn sync_back_quack_temp_bridge(conn: &Connection) {
     }
 
     for t in &client_temp_tables {
-        let safe_t = t.replace('\"', "\"\"");
         let stage_sql = format!(
-            "CREATE OR REPLACE TABLE target_db.\"__duckpack_temp_bridge_{}\" AS SELECT * FROM \"{}\";",
-            safe_t, safe_t
+            "CREATE OR REPLACE TABLE target_db.{} AS SELECT * FROM {};",
+            crate::sql_utils::quote_ident(&format!("__duckpack_temp_bridge_{}", t)),
+            crate::sql_utils::quote_ident(t)
         );
         let _ = conn.execute(&stage_sql, []);
     }
@@ -939,12 +939,12 @@ pub fn sync_back_quack_temp_bridge(conn: &Connection) {
     if !client_temp_views.is_empty() {
         let _ = conn.execute("CALL target_db.query('CREATE OR REPLACE TABLE memory.__duckpack_temp_views_sync_back (view_name VARCHAR, view_sql VARCHAR);');", []);
         for (vname, vsql) in &client_temp_views {
-            let safe_vname = vname.replace('\'', "''");
-            let safe_vsql = vsql.replace('\'', "''");
-            let ins_sql = format!(
-                "CALL target_db.query('INSERT INTO memory.__duckpack_temp_views_sync_back VALUES (''{}'', ''{}'');');",
-                safe_vname, safe_vsql
+            let inner_ins = format!(
+                "INSERT INTO memory.__duckpack_temp_views_sync_back VALUES ({}, {});",
+                crate::sql_utils::quote_literal(vname),
+                crate::sql_utils::quote_literal(vsql)
             );
+            let ins_sql = crate::sql_utils::wrap_quack_call_query("target_db", &inner_ins);
             let _ = conn.execute(&ins_sql, []);
         }
     }
@@ -1107,31 +1107,25 @@ pub fn apply_diff_with_lake_options(
     let result = (|| -> Result<()> {
         let mut execute_sql = |sql: &str| -> Result<()> {
             if is_quack {
-                let safe_cat = target_cat.replace('\'', "''");
-                let safe_sql = sql.replace('\'', "''");
-                if !safe_cat.is_empty() {
-                    exec.execute_batch(&format!(
-                        "CALL {}.query('USE \"{}\"; {}')",
-                        quoted_q_alias, safe_cat, safe_sql
-                    ))
-                    .with_context(|| {
-                        format!(
-                            "Failed executing DDL on catalog '{}' via Quack ('{}')",
-                            target_cat, q_alias
-                        )
-                    })?;
+                let inner = if !target_cat.is_empty() {
+                    format!("USE {}; {}", crate::sql_utils::quote_ident(target_cat), sql)
                 } else {
-                    exec.execute_batch(&format!(
-                        "CALL {}.query('{}')",
-                        quoted_q_alias, safe_sql
-                    ))
-                    .with_context(|| "Failed executing DDL via Quack".to_string())?;
-                }
+                    sql.to_string()
+                };
+                exec.execute_batch(&crate::sql_utils::wrap_quack_call_query(q_alias, &inner))
+                    .with_context(|| {
+                        if !target_cat.is_empty() {
+                            format!(
+                                "Failed executing DDL on catalog '{}' via Quack ('{}')",
+                                target_cat, q_alias
+                            )
+                        } else {
+                            "Failed executing DDL via Quack".to_string()
+                        }
+                    })?;
             } else if sql.contains("_duckpack_auth") {
                 if let Some(ref qa) = any_quack_alias {
-                    let quoted_qa = format!("\"{}\"", qa.replace('"', "\"\""));
-                    let safe_sql = sql.replace('\'', "''");
-                    exec.execute_batch(&format!("CALL {}.query('{}')", quoted_qa, safe_sql))
+                    exec.execute_batch(&crate::sql_utils::wrap_quack_call_query(qa, sql))
                         .with_context(|| {
                             format!("Failed deploying _duckpack_auth to Quack catalog '{}'", qa)
                         })?;
@@ -1139,13 +1133,13 @@ pub fn apply_diff_with_lake_options(
                     // DuckLake storage catalogs do not implement CreateFunction (CREATE MACRO);
                     // execute _duckpack_auth in the primary DuckDB catalog and switch back.
                     let _ = exec.execute_batch(&format!(
-                        "USE \"{}\";",
-                        orig_db.replace('"', "\"\"")
+                        "USE {};",
+                        crate::sql_utils::quote_ident(&orig_db)
                     ));
                     let res = exec.execute_batch(sql);
                     let _ = exec.execute_batch(&format!(
-                        "USE \"{}\";",
-                        target_cat.replace('"', "\"\"")
+                        "USE {};",
+                        crate::sql_utils::quote_ident(target_cat)
                     ));
                     res?;
                 } else {

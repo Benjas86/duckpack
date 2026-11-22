@@ -603,7 +603,9 @@ pub fn sync_back_host_temp_objects(target: &Bound<'_, PyAny>) {
         .unwrap_or_default();
 
     for (_vname, vsql) in views_to_sync {
-        let _ = target.call_method1("execute", (vsql,));
+        if crate::sql_utils::validate_safe_temp_view_ddl(&vsql).is_ok() {
+            let _ = target.call_method1("execute", (vsql,));
+        }
     }
     let _ = target.call_method1(
         "execute",

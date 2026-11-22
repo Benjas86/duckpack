@@ -234,6 +234,35 @@ pub struct QuackControlTarget {
     pub disable_ssl: bool,
 }
 
+impl QuackControlTarget {
+    /// Executes `op(conn, alias)` against this Quack control target, reusing `base_conn` when
+    /// already attached or transparently opening a transient control connection when backed by
+    /// an unattached Quack endpoint (e.g., DuckLake-on-Quack metadata server).
+    pub fn with_connection<T, F>(
+        &self,
+        base_conn: &Connection,
+        project_dir: &Path,
+        env_profile: Option<&str>,
+        op: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&Connection, &str) -> Result<T>,
+    {
+        if let Some(ref alias) = self.attached_alias {
+            return op(base_conn, alias);
+        }
+        if self.quack_endpoint.is_some() {
+            let (ctrl_conn, ctrl_alias) =
+                open_quack_control_connection(self, project_dir, env_profile)?;
+            return op(&ctrl_conn, &ctrl_alias);
+        }
+        anyhow::bail!(
+            "Quack control target '{}' has neither an attached alias nor a Quack endpoint.",
+            self.label
+        )
+    }
+}
+
 fn validate_no_raw_secret_keys(tbl: &toml::value::Table, section_label: &str) -> Result<()> {
     for (bad_key, suggested_key) in FORBIDDEN_SECRET_KEYS {
         if tbl.contains_key(*bad_key) {

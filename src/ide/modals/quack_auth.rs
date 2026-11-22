@@ -168,59 +168,15 @@ impl QuackAuthModalState {
     }
 
     pub(crate) fn refresh_sessions_for(&mut self, conn: &Connection, project_dir: &Path) {
-        if let Some(target) = self.active_target().cloned() {
-            if let Some(ref alias) = target.attached_alias {
-                match load_live_quack_sessions(conn, alias, Some(&self.config)) {
-                    Ok(list) => {
-                        self.sessions = list;
-                        self.session_index = self
-                            .session_index
-                            .min(self.sessions.len().saturating_sub(1));
-                        self.error_msg = None;
-                    }
-                    Err(e) => {
-                        self.sessions.clear();
-                        self.error_msg = Some(format!("Session query failed: {}", e));
-                    }
-                }
-                return;
-            }
-            if target.quack_endpoint.is_some() {
-                match crate::workspace::open_quack_control_connection(
-                    &target,
-                    project_dir,
-                    self.env_profile.as_deref(),
-                ) {
-                    Ok((ctrl_conn, ctrl_alias)) => {
-                        match load_live_quack_sessions(&ctrl_conn, &ctrl_alias, Some(&self.config))
-                        {
-                            Ok(list) => {
-                                self.sessions = list;
-                                self.session_index = self
-                                    .session_index
-                                    .min(self.sessions.len().saturating_sub(1));
-                                self.error_msg = None;
-                            }
-                            Err(e) => {
-                                self.sessions.clear();
-                                self.error_msg = Some(format!("Session query failed: {}", e));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.sessions.clear();
-                        self.error_msg = Some(format!("{}", e));
-                    }
-                }
-                return;
-            }
-        }
-        let Some(ref qa) = self.quack_alias else {
+        if self.active_target().is_none() && self.quack_alias.is_none() {
             self.sessions.clear();
             self.session_index = 0;
             return;
-        };
-        match load_live_quack_sessions(conn, qa, Some(&self.config)) {
+        }
+        let cfg = self.config.clone();
+        match self.execute_on_active_quack(conn, project_dir, |c, qa| {
+            load_live_quack_sessions(c, qa, Some(&cfg))
+        }) {
             Ok(list) => {
                 self.sessions = list;
                 self.session_index = self
@@ -229,6 +185,7 @@ impl QuackAuthModalState {
                 self.error_msg = None;
             }
             Err(e) => {
+                self.sessions.clear();
                 self.error_msg = Some(format!("Session query failed: {}", e));
             }
         }
@@ -542,16 +499,8 @@ impl QuackAuthModalState {
         F: FnOnce(&Connection, &str) -> anyhow::Result<T>,
     {
         if let Some(target) = self.active_target() {
-            if let Some(ref alias) = target.attached_alias {
-                return op(conn, alias);
-            }
-            if target.quack_endpoint.is_some() {
-                let (ctrl_conn, ctrl_alias) = crate::workspace::open_quack_control_connection(
-                    target,
-                    project_dir,
-                    self.env_profile.as_deref(),
-                )?;
-                return op(&ctrl_conn, &ctrl_alias);
+            if target.attached_alias.is_some() || target.quack_endpoint.is_some() {
+                return target.with_connection(conn, project_dir, self.env_profile.as_deref(), op);
             }
         }
         if let Some(ref qa) = self.quack_alias {
@@ -861,31 +810,25 @@ impl QuackAuthModalState {
                 Some(msg)
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                let deploy_res = if let Some(target) = self.active_target().cloned() {
-                    if let Some(ref alias) = target.attached_alias {
-                        let mut exec: &Connection = conn;
-                        deploy_quack_rbac_now(&mut exec, Some(alias.as_str()), project_dir)
-                            .map(|n| (n, target.label))
-                    } else if target.quack_endpoint.is_some() {
-                        crate::workspace::open_quack_control_connection(
-                            &target,
-                            project_dir,
-                            self.env_profile.as_deref(),
-                        )
-                        .and_then(|(ctrl_conn, ctrl_alias)| {
-                            let mut exec: &Connection = &ctrl_conn;
-                            deploy_quack_rbac_now(&mut exec, Some(ctrl_alias.as_str()), project_dir)
-                                .map(|n| (n, target.label))
-                        })
-                    } else {
-                        let mut exec: &Connection = conn;
-                        deploy_quack_rbac_now(&mut exec, self.quack_alias.as_deref(), project_dir)
-                            .map(|n| (n, self.quack_alias.clone().unwrap_or_else(|| "local".to_string())))
-                    }
+                let target_lbl = self
+                    .active_target()
+                    .map(|t| t.label.clone())
+                    .or_else(|| self.quack_alias.clone())
+                    .unwrap_or_else(|| "local".to_string());
+                let deploy_res = if self
+                    .active_target()
+                    .map(|t| t.attached_alias.is_some() || t.quack_endpoint.is_some())
+                    .unwrap_or(false)
+                    || self.quack_alias.is_some()
+                {
+                    self.execute_on_active_quack(conn, project_dir, |c, qa| {
+                        let mut exec: &Connection = c;
+                        deploy_quack_rbac_now(&mut exec, Some(qa), project_dir)
+                    })
+                    .map(|n| (n, target_lbl))
                 } else {
                     let mut exec: &Connection = conn;
-                    deploy_quack_rbac_now(&mut exec, self.quack_alias.as_deref(), project_dir)
-                        .map(|n| (n, self.quack_alias.clone().unwrap_or_else(|| "local".to_string())))
+                    deploy_quack_rbac_now(&mut exec, None, project_dir).map(|n| (n, target_lbl))
                 };
 
                 match deploy_res {

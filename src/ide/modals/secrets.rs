@@ -11,8 +11,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use super::input::{
-    delete_char_at_cursor, delete_char_before_cursor, insert_char_at_cursor,
-    render_text_with_cursor,
+    centered_modal_rect, handle_text_nav_or_delete, insert_char_at_cursor, paste_single_line,
+    render_text_input_box, render_text_with_cursor,
 };
 
 /// Supported cloud storage providers for secrets and bucket exploration.
@@ -130,16 +130,9 @@ impl SecretModalState {
         if !self.is_text_field() {
             return;
         }
-        let cleaned: String = raw
-            .trim_matches(|c| c == '\r' || c == '\n')
-            .chars()
-            .filter(|&c| c != '\r' && c != '\n' && !c.is_control())
-            .collect();
         let mut cur = self.cursor_pos;
         if let Some(buf) = self.active_text_mut() {
-            for ch in cleaned.chars() {
-                insert_char_at_cursor(buf, &mut cur, ch);
-            }
+            paste_single_line(buf, &mut cur, raw);
         }
         self.cursor_pos = cur;
     }
@@ -196,14 +189,7 @@ impl SecretModalState {
     }
 
     pub(crate) fn render(&self, f: &mut Frame) {
-        let popup_width = 72.min(f.area().width.saturating_sub(4));
-        let popup_height = 26.min(f.area().height.saturating_sub(2));
-        let popup_area = Rect {
-            x: (f.area().width.saturating_sub(popup_width)) / 2,
-            y: (f.area().height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
+        let popup_area = centered_modal_rect(f.area(), 72, 26);
         f.render_widget(ratatui::widgets::Clear, popup_area);
 
         let modal_block = Block::default()
@@ -244,65 +230,39 @@ impl SecretModalState {
         );
         f.render_widget(p0, field_layout[0]);
 
-        let f1_style = if self.active_field == 1 {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let p1 = Paragraph::new(render_text_with_cursor(
+        render_text_input_box(
+            f,
+            field_layout[1],
+            " DuckDB Secret Identifier ",
             &self.name,
             self.cursor_pos,
             self.active_field == 1,
             false,
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" DuckDB Secret Identifier ")
-                .border_style(f1_style),
+            Color::Yellow,
+            true,
         );
-        f.render_widget(p1, field_layout[1]);
-
-        let f2_style = if self.active_field == 2 {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let p2 = Paragraph::new(render_text_with_cursor(
+        render_text_input_box(
+            f,
+            field_layout[2],
+            " Access Key ID (AWS_ACCESS_KEY_ID) ",
             &self.key_id,
             self.cursor_pos,
             self.active_field == 2,
             false,
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Access Key ID (AWS_ACCESS_KEY_ID) ")
-                .border_style(f2_style),
+            Color::Yellow,
+            true,
         );
-        f.render_widget(p2, field_layout[2]);
-
-        let f3_style = if self.active_field == 3 {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let p3 = Paragraph::new(render_text_with_cursor(
+        render_text_input_box(
+            f,
+            field_layout[3],
+            " Secret Access Key (AWS_SECRET_ACCESS_KEY, Masked) ",
             &self.secret_key,
             self.cursor_pos,
             self.active_field == 3,
             true,
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Secret Access Key (AWS_SECRET_ACCESS_KEY, Masked) ")
-                .border_style(f3_style),
+            Color::Yellow,
+            true,
         );
-        f.render_widget(p3, field_layout[3]);
 
         let reg_end_cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -509,26 +469,22 @@ impl SecretModalState {
             && (key.code == KeyCode::Left || key.code == KeyCode::Right)
         {
             self.active_field = if self.active_field == 9 { 10 } else { 9 };
-        } else if self.is_text_field() && key.code == KeyCode::Left {
-            self.cursor_pos = self.cursor_pos.saturating_sub(1);
-        } else if self.is_text_field() && key.code == KeyCode::Right {
-            let len = self.active_text().map(|s| s.chars().count()).unwrap_or(0);
-            self.cursor_pos = (self.cursor_pos + 1).min(len);
-        } else if self.is_text_field() && key.code == KeyCode::Home {
-            self.cursor_pos = 0;
-        } else if self.is_text_field() && key.code == KeyCode::End {
-            self.sync_cursor_to_end();
-        } else if self.is_text_field() && key.code == KeyCode::Backspace {
+        } else if self.is_text_field()
+            && matches!(
+                key.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+            )
+        {
             let mut cur = self.cursor_pos;
             if let Some(t) = self.active_text_mut() {
-                delete_char_before_cursor(t, &mut cur);
+                handle_text_nav_or_delete(t, &mut cur, key);
             }
             self.cursor_pos = cur;
-        } else if self.is_text_field() && key.code == KeyCode::Delete {
-            let cur = self.cursor_pos;
-            if let Some(t) = self.active_text_mut() {
-                delete_char_at_cursor(t, cur);
-            }
         } else if key.code == KeyCode::Char(' ') && self.active_field == 7 {
             self.use_ssl = !self.use_ssl;
         } else if key.code == KeyCode::Char(' ') && self.active_field == 8 {
@@ -1018,10 +974,10 @@ impl AddBucketModalState {
                     return Some(format!("Added bucket '{}' to explorer.", normalized));
                 }
             }
-        } else if key.code == KeyCode::Backspace && self.active_field == 0 {
-            delete_char_before_cursor(&mut self.uri, &mut self.cursor_pos);
-        } else if key.code == KeyCode::Delete && self.active_field == 0 {
-            delete_char_at_cursor(&mut self.uri, self.cursor_pos);
+        } else if self.active_field == 0
+            && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+        {
+            handle_text_nav_or_delete(&mut self.uri, &mut self.cursor_pos, key);
         } else if let KeyCode::Char(c) = key.code {
             if !key.modifiers.contains(KeyModifiers::CONTROL) && self.active_field == 0 {
                 insert_char_at_cursor(&mut self.uri, &mut self.cursor_pos, c);

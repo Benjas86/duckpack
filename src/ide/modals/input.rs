@@ -1,7 +1,105 @@
 use ratatui::{
+    crossterm::event::{KeyCode, KeyEvent},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph},
+    Frame,
 };
+
+/// Computes a centered modal rectangle clamped within `area` (with horizontal/vertical padding).
+pub(crate) fn centered_modal_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
+    let popup_width = max_width.min(area.width.saturating_sub(4));
+    let popup_height = max_height.min(area.height.saturating_sub(2));
+    Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    }
+}
+
+/// Sanitizes and pastes single-line clipboard text into `buf` at `*cursor`.
+pub(crate) fn paste_single_line(buf: &mut String, cursor: &mut usize, raw: &str) {
+    let cleaned: String = raw
+        .trim_matches(|c| c == '\r' || c == '\n')
+        .chars()
+        .filter(|&c| c != '\r' && c != '\n' && !c.is_control())
+        .collect();
+    for ch in cleaned.chars() {
+        insert_char_at_cursor(buf, cursor, ch);
+    }
+}
+
+/// Handles standard single-line cursor movement and deletion keys (`Left`, `Right`, `Home`, `End`,
+/// `Backspace`, `Delete`) for modal text inputs. Returns `true` if the key was consumed.
+pub(crate) fn handle_text_nav_or_delete(buf: &mut String, cursor: &mut usize, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Left => {
+            *cursor = cursor.saturating_sub(1);
+            true
+        }
+        KeyCode::Right => {
+            let len = buf.chars().count();
+            *cursor = (*cursor + 1).min(len);
+            true
+        }
+        KeyCode::Home => {
+            *cursor = 0;
+            true
+        }
+        KeyCode::End => {
+            *cursor = buf.chars().count();
+            true
+        }
+        KeyCode::Backspace => {
+            delete_char_before_cursor(buf, cursor);
+            true
+        }
+        KeyCode::Delete => {
+            delete_char_at_cursor(buf, *cursor);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Renders a standard bordered modal text input box with active highlight & cursor indicator.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_text_input_box(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    text: &str,
+    cursor_pos: usize,
+    is_active: bool,
+    is_masked: bool,
+    active_color: Color,
+    rounded: bool,
+) {
+    let border_style = if is_active {
+        Style::default()
+            .fg(active_color)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+    if rounded {
+        block = block.border_type(BorderType::Rounded);
+    }
+    let widget = Paragraph::new(render_text_with_cursor(
+        text,
+        cursor_pos,
+        is_active,
+        is_masked,
+    ))
+    .block(block);
+    f.render_widget(widget, area);
+}
 
 /// Inserts a character into a string at the unicode character position `*cursor`,
 /// advancing the cursor by 1.
