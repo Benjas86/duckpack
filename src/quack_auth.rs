@@ -29,7 +29,8 @@ impl QuackRole {
             "writer" => QuackRole::Writer,
             "reader" => QuackRole::Reader,
             "none" | "disabled" | "revoked" => QuackRole::None,
-            _ => QuackRole::Reader,
+            // Fail closed on unknown/typoed role strings rather than granting read access.
+            _ => QuackRole::None,
         }
     }
 
@@ -71,6 +72,10 @@ pub struct QuackAuthConfig {
     pub writer_allow_temp_tables: bool,
     pub reader_allow_explain_describe: bool,
     pub allow_copy: bool,
+    /// Opt-in escape hatch for legacy plaintext `client_id` values in `duckpack.toml`.
+    /// Defaults to `false` (secure): `client_id` binds automatically to each user's secret
+    /// `token_env` so low-privilege users cannot spoof an admin's `CLIENT_ID`.
+    pub allow_insecure_client_id: bool,
     pub users: Vec<QuackAuthUser>,
 }
 
@@ -83,6 +88,7 @@ impl Default for QuackAuthConfig {
             writer_allow_temp_tables: true,
             reader_allow_explain_describe: true,
             allow_copy: false,
+            allow_insecure_client_id: false,
             users: Vec::new(),
         }
     }
@@ -231,6 +237,10 @@ pub fn load_quack_auth_config(project_dir: &Path) -> Option<QuackAuthConfig> {
         .get("allow_copy")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let allow_insecure_client_id = qa
+        .get("allow_insecure_client_id")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut users = Vec::new();
     if let Some(arr) = qa.get("users").and_then(|v| v.as_array()) {
@@ -278,6 +288,7 @@ pub fn load_quack_auth_config(project_dir: &Path) -> Option<QuackAuthConfig> {
         writer_allow_temp_tables,
         reader_allow_explain_describe,
         allow_copy,
+        allow_insecure_client_id,
         users,
     })
 }
@@ -329,8 +340,15 @@ pub fn generate_and_save_user_token(project_dir: &Path, token_env: &str) -> Resu
     Ok(token)
 }
 
-/// Upserts `<key>=<value>` into `project_dir/.env` and enforces `0600` file permissions on Unix.
+/// Upserts `<key>=<value>` into `project_dir/.env` atomically with `0600` permissions on Unix
+/// and newline/control-character sanitization to prevent `.env` line injection.
 pub fn save_env_key_value(project_dir: &Path, key: &str, value: &str) -> Result<()> {
+    let clean_key = crate::engine::sanitize_env_value(key.trim());
+    if clean_key.is_empty() || clean_key.contains('=') {
+        anyhow::bail!("Invalid environment variable name '{}'.", key);
+    }
+    let clean_val = crate::engine::sanitize_env_value(value);
+
     let env_path = project_dir.join(".env");
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
     let mut found = false;
@@ -340,8 +358,8 @@ pub fn save_env_key_value(project_dir: &Path, key: &str, value: &str) -> Result<
         let trimmed = line.trim_start();
         if !trimmed.starts_with('#') {
             if let Some((k, _)) = trimmed.split_once('=') {
-                if k.trim() == key {
-                    new_lines.push(format!("{}={}", key, value));
+                if k.trim() == clean_key {
+                    new_lines.push(format!("{}={}", clean_key, clean_val));
                     found = true;
                     continue;
                 }
@@ -350,19 +368,13 @@ pub fn save_env_key_value(project_dir: &Path, key: &str, value: &str) -> Result<
         new_lines.push(line.to_string());
     }
     if !found {
-        new_lines.push(format!("{}={}", key, value));
+        new_lines.push(format!("{}={}", clean_key, clean_val));
     }
 
     let mut out = new_lines.join("\n");
     out.push('\n');
-    std::fs::write(&env_path, out)
-        .with_context(|| format!("Failed writing {} to {}", key, env_path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
-    }
+    crate::engine::write_restricted_env_file(&env_path, &out)
+        .with_context(|| format!("Failed writing {} to {}", clean_key, env_path.display()))?;
     Ok(())
 }
 
@@ -400,6 +412,12 @@ pub fn save_quack_auth_config(project_dir: &Path, config: &QuackAuthConfig) -> R
         "allow_copy".to_string(),
         toml::Value::Boolean(config.allow_copy),
     );
+    if config.allow_insecure_client_id {
+        qa_table.insert(
+            "allow_insecure_client_id".to_string(),
+            toml::Value::Boolean(config.allow_insecure_client_id),
+        );
+    }
 
     let mut users_arr = Vec::new();
     for u in &config.users {
@@ -447,9 +465,22 @@ pub fn validate_quack_auth_config_opt(
 ) -> Result<Vec<(QuackAuthUser, String, String)>> {
     let mut resolved_users = Vec::new();
     let mut has_enabled_admin = config.default_role == QuackRole::Admin;
+    let mut seen_token_hashes = std::collections::HashSet::new();
+    let mut seen_client_id_hashes = std::collections::HashSet::new();
 
     for user in &config.users {
         validate_safe_username(&user.username)?;
+        if !config.allow_insecure_client_id {
+            if let Some(ref cid) = user.client_id {
+                if !cid.trim().is_empty() {
+                    anyhow::bail!(
+                        "Security Guard: Quack RBAC user '{}' specifies a plaintext client_id ('{}') in duckpack.toml, which allows any authenticated user to spoof another role by supplying that CLIENT_ID. Omit client_id so Quack binds CLIENT_ID to the user's secret token_env (or set allow_insecure_client_id = true only for isolated legacy setups).",
+                        user.username,
+                        cid.trim()
+                    );
+                }
+            }
+        }
         let token = resolve_user_token_opt(project_dir, &user.token_env).ok_or_else(|| {
             anyhow::anyhow!(
                 "Quack RBAC user '{}' references token_env '{}', which is not set in environment or .env.",
@@ -458,8 +489,20 @@ pub fn validate_quack_auth_config_opt(
             )
         })?;
         let token_hash = sha256_hex(&token);
+        if !seen_token_hashes.insert(token_hash.clone()) {
+            anyhow::bail!(
+                "Security Guard: Quack RBAC user '{}' shares a duplicate secret token with another user. Each user must have a unique token.",
+                user.username
+            );
+        }
         let raw_client_id = user.client_id.as_deref().unwrap_or(&token);
         let client_id_hash = sha256_hex(raw_client_id);
+        if !seen_client_id_hashes.insert(client_id_hash.clone()) {
+            anyhow::bail!(
+                "Security Guard: Quack RBAC user '{}' shares a duplicate client_id with another user. Each user must have a unique client_id.",
+                user.username
+            );
+        }
 
         if user.enabled && user.role == QuackRole::Admin {
             has_enabled_admin = true;
@@ -593,7 +636,7 @@ pub fn compile_quack_auth_sql_with_options_opt(
     let master_token_fallback = if quack_server_mode {
         "        WHEN quack_check_token(p_sid, p_client_token, p_server_token) THEN true\n"
     } else {
-        "        WHEN p_server_token IS NOT NULL AND p_server_token <> '' AND p_client_token = p_server_token THEN true\n"
+        "        WHEN p_server_token IS NOT NULL AND p_server_token <> '' AND sha256(COALESCE(p_client_token, '')) = sha256(p_server_token) THEN true\n"
     };
     sql.push_str(&format!(
         "CREATE OR REPLACE MACRO _duckpack_auth.authenticate(p_sid, p_client_token, p_server_token) AS (\n\
@@ -618,14 +661,20 @@ pub fn compile_quack_auth_sql_with_options_opt(
     // Correlates p_sid via:
     //  1) Explicit session override / revocation in _duckpack_auth.quack_sessions
     //  2) Live Quack connection table quack_active_connections() (connection_id = p_sid)
-    //     matched against _duckpack_auth.quack_users.client_id_hash / token_sha256 (case-insensitive)
-    //  3) Direct username / client_id_hash / token_sha256 match on p_sid
+    //     matched against _duckpack_auth.quack_users.client_id_hash / token_sha256 (least-privilege tie-break)
+    //  3) Direct client_id_hash / token_sha256 match (and username only in local non-server mode)
     //  4) Configured default_role fallback
     let default_role_str = config.default_role.as_str();
     let quack_active_conn_clause = if quack_server_mode {
-        "            (SELECT u.role FROM quack_active_connections() ac JOIN _duckpack_auth.quack_users u ON u.enabled = true AND (lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) OR (u.token_sha256 <> '' AND lower(u.token_sha256) = lower(CAST(ac.client_id_hash AS VARCHAR)))) WHERE lower(CAST(ac.connection_id AS VARCHAR)) = lower(CAST(p_sid AS VARCHAR)) ORDER BY CASE u.role WHEN 'admin' THEN 1 WHEN 'writer' THEN 2 WHEN 'reader' THEN 3 ELSE 4 END LIMIT 1),\n"
+        "            (SELECT u.role FROM quack_active_connections() ac JOIN _duckpack_auth.quack_users u ON u.enabled = true AND (lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) OR (u.token_sha256 <> '' AND lower(u.token_sha256) = lower(CAST(ac.client_id_hash AS VARCHAR)))) WHERE lower(CAST(ac.connection_id AS VARCHAR)) = lower(CAST(p_sid AS VARCHAR)) ORDER BY CASE u.role WHEN 'none' THEN 1 WHEN 'reader' THEN 2 WHEN 'writer' THEN 3 WHEN 'admin' THEN 4 ELSE 1 END LIMIT 1),\n"
     } else {
         ""
+    };
+    let direct_user_match_clause = if quack_server_mode {
+        // In Quack server mode, never match p_sid against raw usernames (prevents role-enumeration oracles).
+        "            (SELECT u.role FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND (lower(u.client_id_hash) = lower(CAST(p_sid AS VARCHAR)) OR (u.token_sha256 <> '' AND lower(u.token_sha256) = sha256(COALESCE(CAST(p_sid AS VARCHAR), '')))) ORDER BY CASE u.role WHEN 'none' THEN 1 WHEN 'reader' THEN 2 WHEN 'writer' THEN 3 WHEN 'admin' THEN 4 ELSE 1 END LIMIT 1),\n"
+    } else {
+        "            (SELECT u.role FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND (u.username = CAST(p_sid AS VARCHAR) OR lower(u.client_id_hash) = lower(CAST(p_sid AS VARCHAR)) OR (u.token_sha256 <> '' AND lower(u.token_sha256) = sha256(COALESCE(CAST(p_sid AS VARCHAR), '')))) ORDER BY CASE u.role WHEN 'none' THEN 1 WHEN 'reader' THEN 2 WHEN 'writer' THEN 3 WHEN 'admin' THEN 4 ELSE 1 END LIMIT 1),\n"
     };
     sql.push_str(&format!(
         "CREATE OR REPLACE MACRO _duckpack_auth.resolve_role(p_sid) AS (\n\
@@ -637,7 +686,7 @@ pub fn compile_quack_auth_sql_with_options_opt(
          \x20       ELSE COALESCE(\n\
          \x20           (SELECT s.role FROM _duckpack_auth.quack_sessions s WHERE lower(CAST(s.sid AS VARCHAR)) = lower(CAST(p_sid AS VARCHAR)) AND s.revoked = false LIMIT 1),\n\
          {quack_active_conn_clause}\
-         \x20           (SELECT u.role FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND (u.username = CAST(p_sid AS VARCHAR) OR lower(u.client_id_hash) = lower(CAST(p_sid AS VARCHAR)) OR (u.token_sha256 <> '' AND lower(u.token_sha256) = sha256(COALESCE(CAST(p_sid AS VARCHAR), '')))) ORDER BY CASE u.role WHEN 'admin' THEN 1 WHEN 'writer' THEN 2 WHEN 'reader' THEN 3 ELSE 4 END LIMIT 1),\n\
+         {direct_user_match_clause}\
          \x20           '{}'\n\
          \x20       )\n\
          \x20   END\n\
@@ -645,69 +694,221 @@ pub fn compile_quack_auth_sql_with_options_opt(
         default_role_str
     ));
 
-    // 3. Query Sanitization Macro: _duckpack_auth.sanitize_sql(p_q)
-    // Strips /* ... */ block comments, -- ... line comments, dollar-quoted strings $$...$$,
-    // single-quoted string literals '...', and trailing semicolons, then lowercases and trims ALL whitespace.
+    // 3. Single-Pass Lexical SQL Sanitizer Macro: _duckpack_auth.sanitize_sql(p_q)
+    // Tokenizes SQL left-to-right in a single recursive pass matching DuckDB v2.0 lexical precedence:
+    //  - Single-quoted strings ('...' with '' escapes) -> ''
+    //  - Escape strings (e'...' / E'...' with \' and \\ and '' escapes) -> ''
+    //  - Tagged & untagged dollar-quoted strings ($tag$...$tag$, $$...$$) -> ''
+    //  - Double-quoted identifiers ("..." with "" escapes) -> inner non-[a-z0-9_] sanitized to '_'
+    //  - Line comments (--... to \r or \n) -> ' '
+    //  - Depth-counted nested block comments (/* ... /* ... */ ... */) -> ' '
+    // Fails CLOSED (returns '') on any unclosed string literal, identifier, dollar quote, or comment.
     sql.push_str(
         "CREATE OR REPLACE MACRO _duckpack_auth.sanitize_sql(p_q) AS (\n\
-         \x20   lower(regexp_replace(regexp_replace(\n\
-         \x20       regexp_replace(\n\
-         \x20           regexp_replace(\n\
-         \x20               regexp_replace(\n\
-         \x20                   regexp_replace(COALESCE(p_q, ''), '/\\*[\\s\\S]*?\\*/', ' ', 'g'),\n\
-         \x20                   '--[^\\r\\n]*', ' ', 'g'\n\
-         \x20               ),\n\
-         \x20               '\\$\\$[\\s\\S]*?\\$\\$', '''''', 'g'\n\
-         \x20           ),\n\
-         \x20           '''([^'']|'''')*''', '''''', 'g'\n\
-         \x20       ),\n\
-         \x20       ';\\s*$', ''\n\
-         \x20   ), '^\\s+|\\s+$', '', 'g'))\n\
+         \x20   (\n\
+         \x20       WITH RECURSIVE _lex(rem, out_sql, mode, depth) AS (\n\
+         \x20           SELECT COALESCE(p_q, ''), '', 'normal', 0\n\
+         \x20           UNION ALL\n\
+         \x20           SELECT\n\
+         \x20               CASE\n\
+         \x20                   WHEN mode = 'normal' AND rem = '' THEN ''\n\
+         \x20                   WHEN mode = 'normal' AND length(regexp_extract(rem, '^[^''\"$/-]+')) > 0\n\
+         \x20                       THEN substr(rem, length(regexp_extract(rem, '^[^''\"$/-]+')) + 1)\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '--')\n\
+         \x20                       THEN substr(rem, length(regexp_extract(rem, '^--[^\\r\\n]*')) + 1)\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '/*')\n\
+         \x20                       THEN substr(rem, 3)\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '''')\n\
+         \x20                       THEN substr(rem, 2)\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '\"')\n\
+         \x20                       THEN substr(rem, 2)\n\
+         \x20                   WHEN mode = 'normal' AND regexp_matches(rem, '^\\$[A-Za-z0-9_]*\\$')\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(substr(rem, length(regexp_extract(rem, '^\\$[A-Za-z0-9_]*\\$')) + 1), regexp_extract(rem, '^\\$[A-Za-z0-9_]*\\$')) = 0 THEN ''\n\
+         \x20                           ELSE substr(\n\
+         \x20                               substr(rem, length(regexp_extract(rem, '^\\$[A-Za-z0-9_]*\\$')) + 1),\n\
+         \x20                               strpos(substr(rem, length(regexp_extract(rem, '^\\$[A-Za-z0-9_]*\\$')) + 1), regexp_extract(rem, '^\\$[A-Za-z0-9_]*\\$')) + length(regexp_extract(rem, '^\\$[A-Za-z0-9_]*\\$'))\n\
+         \x20                           )\n\
+         \x20                       END\n\
+         \x20                   WHEN mode = 'normal'\n\
+         \x20                       THEN substr(rem, 2)\n\
+         \x20                   WHEN mode = 'squote'\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(rem, '''') = 0 THEN ''\n\
+         \x20                           WHEN substr(rem, strpos(rem, ''''), 2) = '''''' THEN substr(rem, strpos(rem, '''') + 2)\n\
+         \x20                           ELSE substr(rem, strpos(rem, '''') + 1)\n\
+         \x20                       END\n\
+         \x20                   WHEN mode = 'esquote'\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(rem, '''') = 0 THEN ''\n\
+         \x20                           WHEN strpos(rem, '\\') > 0 AND strpos(rem, '\\') < strpos(rem, '''')\n\
+         \x20                               THEN CASE WHEN strpos(rem, '\\') >= length(rem) THEN '' ELSE substr(rem, strpos(rem, '\\') + 2) END\n\
+         \x20                           WHEN substr(rem, strpos(rem, ''''), 2) = '''''' THEN substr(rem, strpos(rem, '''') + 2)\n\
+         \x20                           ELSE substr(rem, strpos(rem, '''') + 1)\n\
+         \x20                       END\n\
+         \x20                   WHEN mode = 'dquote'\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(rem, '\"') = 0 THEN ''\n\
+         \x20                           WHEN substr(rem, strpos(rem, '\"'), 2) = '\"\"' THEN substr(rem, strpos(rem, '\"') + 2)\n\
+         \x20                           ELSE substr(rem, strpos(rem, '\"') + 1)\n\
+         \x20                       END\n\
+         \x20                   WHEN mode = 'block'\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(rem, '*/') = 0 THEN ''\n\
+         \x20                           WHEN strpos(rem, '/*') > 0 AND strpos(rem, '/*') < strpos(rem, '*/') THEN substr(rem, strpos(rem, '/*') + 2)\n\
+         \x20                           ELSE substr(rem, strpos(rem, '*/') + 2)\n\
+         \x20                       END\n\
+         \x20                   ELSE ''\n\
+         \x20               END,\n\
+         \x20               CASE\n\
+         \x20                   WHEN mode = 'normal' AND rem = '' THEN out_sql\n\
+         \x20                   WHEN mode = 'normal' AND length(regexp_extract(rem, '^[^''\"$/-]+')) > 0\n\
+         \x20                       THEN out_sql || lower(regexp_extract(rem, '^[^''\"$/-]+'))\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '--')\n\
+         \x20                       THEN out_sql || ' '\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '/*')\n\
+         \x20                       THEN out_sql\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '''')\n\
+         \x20                       THEN out_sql || ''''''\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '\"')\n\
+         \x20                       THEN out_sql || '\"'\n\
+         \x20                   WHEN mode = 'normal' AND regexp_matches(rem, '^\\$[A-Za-z0-9_]*\\$')\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(substr(rem, length(regexp_extract(rem, '^\\$[A-Za-z0-9_]*\\$')) + 1), regexp_extract(rem, '^\\$[A-Za-z0-9_]*\\$')) = 0 THEN ''\n\
+         \x20                           ELSE out_sql || ''''''\n\
+         \x20                       END\n\
+         \x20                   WHEN mode = 'normal'\n\
+         \x20                       THEN out_sql || substr(rem, 1, 1)\n\
+         \x20                   WHEN mode = 'squote' OR mode = 'esquote'\n\
+         \x20                       THEN out_sql\n\
+         \x20                   WHEN mode = 'dquote'\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(rem, '\"') = 0 THEN ''\n\
+         \x20                           WHEN substr(rem, strpos(rem, '\"'), 2) = '\"\"'\n\
+         \x20                               THEN out_sql || regexp_replace(lower(substr(rem, 1, strpos(rem, '\"') - 1)), '[^a-z0-9_]', '_', 'g') || '_'\n\
+         \x20                           ELSE out_sql || regexp_replace(lower(substr(rem, 1, strpos(rem, '\"') - 1)), '[^a-z0-9_]', '_', 'g') || '\"'\n\
+         \x20                       END\n\
+         \x20                   WHEN mode = 'block'\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(rem, '*/') = 0 THEN ''\n\
+         \x20                           WHEN strpos(rem, '/*') > 0 AND strpos(rem, '/*') < strpos(rem, '*/') THEN out_sql\n\
+         \x20                           WHEN depth <= 1 THEN out_sql || ' '\n\
+         \x20                           ELSE out_sql\n\
+         \x20                       END\n\
+         \x20                   ELSE ''\n\
+         \x20               END,\n\
+         \x20               CASE\n\
+         \x20                   WHEN mode = 'normal' AND rem = '' THEN 'done'\n\
+         \x20                   WHEN mode = 'normal' AND length(regexp_extract(rem, '^[^''\"$/-]+')) > 0 THEN 'normal'\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '--') THEN 'normal'\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '/*') THEN 'block'\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '''')\n\
+         \x20                       THEN CASE WHEN regexp_matches(out_sql, '(^|[^a-z0-9_])e$') THEN 'esquote' ELSE 'squote' END\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '\"') THEN 'dquote'\n\
+         \x20                   WHEN mode = 'normal' AND regexp_matches(rem, '^\\$[A-Za-z0-9_]*\\$')\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(substr(rem, length(regexp_extract(rem, '^\\$[A-Za-z0-9_]*\\$')) + 1), regexp_extract(rem, '^\\$[A-Za-z0-9_]*\\$')) = 0 THEN 'err'\n\
+         \x20                           ELSE 'normal'\n\
+         \x20                       END\n\
+         \x20                   WHEN mode = 'normal' THEN 'normal'\n\
+         \x20                   WHEN mode = 'squote'\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(rem, '''') = 0 THEN 'err'\n\
+         \x20                           WHEN substr(rem, strpos(rem, ''''), 2) = '''''' THEN 'squote'\n\
+         \x20                           ELSE 'normal'\n\
+         \x20                       END\n\
+         \x20                   WHEN mode = 'esquote'\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(rem, '''') = 0 THEN 'err'\n\
+         \x20                           WHEN strpos(rem, '\\') > 0 AND strpos(rem, '\\') < strpos(rem, '''')\n\
+         \x20                               THEN CASE WHEN strpos(rem, '\\') >= length(rem) THEN 'err' ELSE 'esquote' END\n\
+         \x20                           WHEN substr(rem, strpos(rem, ''''), 2) = '''''' THEN 'esquote'\n\
+         \x20                           ELSE 'normal'\n\
+         \x20                       END\n\
+         \x20                   WHEN mode = 'dquote'\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(rem, '\"') = 0 THEN 'err'\n\
+         \x20                           WHEN substr(rem, strpos(rem, '\"'), 2) = '\"\"' THEN 'dquote'\n\
+         \x20                           ELSE 'normal'\n\
+         \x20                       END\n\
+         \x20                   WHEN mode = 'block'\n\
+         \x20                       THEN CASE\n\
+         \x20                           WHEN strpos(rem, '*/') = 0 THEN 'err'\n\
+         \x20                           WHEN strpos(rem, '/*') > 0 AND strpos(rem, '/*') < strpos(rem, '*/') THEN 'block'\n\
+         \x20                           WHEN depth <= 1 THEN 'normal'\n\
+         \x20                           ELSE 'block'\n\
+         \x20                       END\n\
+         \x20                   ELSE 'err'\n\
+         \x20               END,\n\
+         \x20               CASE\n\
+         \x20                   WHEN mode = 'normal' AND starts_with(rem, '/*') THEN 1\n\
+         \x20                   WHEN mode = 'block' AND strpos(rem, '*/') > 0 AND strpos(rem, '/*') > 0 AND strpos(rem, '/*') < strpos(rem, '*/') THEN depth + 1\n\
+         \x20                   WHEN mode = 'block' AND strpos(rem, '*/') > 0 AND depth > 1 THEN depth - 1\n\
+         \x20                   ELSE 0\n\
+         \x20               END\n\
+         \x20           FROM _lex\n\
+         \x20           WHERE mode NOT IN ('done', 'err')\n\
+         \x20       )\n\
+         \x20       SELECT CASE\n\
+         \x20           WHEN mode = 'err' THEN ''\n\
+         \x20           ELSE regexp_replace(regexp_replace(out_sql, ';\\s*$', ''), '^\\s+|\\s+$', '', 'g')\n\
+         \x20       END\n\
+         \x20       FROM _lex\n\
+         \x20       WHERE mode IN ('done', 'err')\n\
+         \x20       LIMIT 1\n\
+         \x20   )\n\
          );\n",
     );
 
-    // 4. Hardened Authorization Macro: _duckpack_auth.authorize(p_sid, p_query)
-    // In `ducklake_mode`, DuckLake flushes every DML transaction to the metadata catalog as a
-    // `BEGIN TRANSACTION; ...; COMMIT;` multi-statement batch, and may create
-    // `ducklake_inlined_(data|delete)_*` tables mid-batch on first small insert/delete.
-    // We allow multi-statement batches ONLY when wrapped in `BEGIN [TRANSACTION]; ...; COMMIT|ROLLBACK|ABORT`,
-    // and we validate EVERY semicolon-delimited statement independently via `list_bool_and` + `string_split`
-    // so statement smuggling (e.g. a second `CREATE TABLE evil`, `PRAGMA`, or `SET`) is impossible.
-    const DUCKLAKE_INLINED_CREATE_RE: &str = "^create\\s+table\\s+(if\\s+not\\s+exists\\s+)?([a-z0-9_\"]+\\s*\\.\\s*)*(\"ducklake_inlined_(data|delete)_[a-z0-9_]+\"|ducklake_inlined_(data|delete)_[a-z0-9_]+\\b)";
+    // 4. Hardened Authorization Macros:
+    //    - `_duckpack_auth.authorize_sanitized(p_role, p_sql)` evaluates rules against an already-lexed
+    //      `VARCHAR` string `p_sql` (so `sanitize_sql` runs at most ONCE per query and lambdas contain
+    //      zero subqueries).
+    //    - `_duckpack_auth.authorize(p_sid, p_query)` short-circuits `admin` immediately without running
+    //      the lexer, and binds `sanitize_sql(p_query)` once via a single derived table for non-admins.
+    const DUCKLAKE_INLINED_CREATE_RE: &str = "^create\\s+table\\s+(if\\s+not\\s+exists\\s+)?([a-z0-9_\"]+\\s*\\.\\s*)*(\"ducklake_inlined_(data|delete)_[a-z0-9_]+\"|ducklake_inlined_(data|delete)_[a-z0-9_]+)\\s*\\(";
     const TEMP_CREATE_RE: &str = "^create\\s+(or\\s+replace\\s+)?(temp|temporary)\\s+(table|view)\\b";
+
+    let writer_prefix_pattern = if config.allow_copy {
+        "^(select|with|values|from|table|explain|describe|desc|show|summarize|use|begin|start|commit|rollback|abort|insert|update|delete|merge|create|copy)\\b"
+    } else {
+        "^(select|with|values|from|table|explain|describe|desc|show|summarize|use|begin|start|commit|rollback|abort|insert|update|delete|merge|create)\\b"
+    };
 
     let writer_batch_and_create_rule = if config.ducklake_mode {
         let per_stmt_create_ok = if config.writer_allow_temp_tables {
             format!(
                 "(NOT regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '\\bcreate\\b') \
                   OR regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '{TEMP_CREATE_RE}') \
-                  OR regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '{DUCKLAKE_INLINED_CREATE_RE}'))"
+                  OR (regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '{DUCKLAKE_INLINED_CREATE_RE}') \
+                      AND NOT regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '\\bas\\s+(select|with|values|from|table)\\b')))"
             )
         } else {
             format!(
                 "(NOT regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '\\bcreate\\b') \
-                  OR regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '{DUCKLAKE_INLINED_CREATE_RE}'))"
+                  OR (regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '{DUCKLAKE_INLINED_CREATE_RE}') \
+                      AND NOT regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '\\bas\\s+(select|with|values|from|table)\\b')))"
             )
         };
         format!(
-            "AND (strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0 \
-                  OR regexp_matches(_duckpack_auth.sanitize_sql(p_query), '^begin(\\s+transaction)?\\s*;[\\s\\S]*;\\s*(commit|rollback|abort)$')) \
-             AND list_bool_and(list_transform(string_split(_duckpack_auth.sanitize_sql(p_query), ';'), lambda _stmt: (\
+            "AND (strpos(p_sql, ';') = 0 \
+                  OR regexp_matches(p_sql, '^begin(\\s+transaction)?\\s*;[\\s\\S]*;\\s*(commit|rollback|abort)$')) \
+             AND list_bool_and(list_transform(string_split(p_sql, ';'), lambda _stmt: (\
                   regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g') = '' \
-                  OR ((strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0 \
+                  OR ((strpos(p_sql, ';') = 0 \
                        OR regexp_matches(regexp_replace(_stmt, '^\\s+|\\s+$', '', 'g'), '^(begin(\\s+transaction)?|commit|rollback|abort|select|with|values|insert|update|delete|merge|create)\\b')) \
                       AND {per_stmt_create_ok})\
              )))"
         )
     } else if config.writer_allow_temp_tables {
         format!(
-            "AND strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0 \
-             AND (NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\bcreate\\b') \
-                  OR regexp_matches(_duckpack_auth.sanitize_sql(p_query), '{TEMP_CREATE_RE}'))"
+            "AND strpos(p_sql, ';') = 0 \
+             AND (NOT regexp_matches(p_sql, '\\bcreate\\b') \
+                  OR regexp_matches(p_sql, '{TEMP_CREATE_RE}'))"
         )
     } else {
-        "AND strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0 \
-         AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\bcreate\\b')"
+        "AND strpos(p_sql, ';') = 0 \
+         AND NOT regexp_matches(p_sql, '\\bcreate\\b')"
             .to_string()
     };
 
@@ -717,7 +918,7 @@ pub fn compile_quack_auth_sql_with_options_opt(
     const DUCKLAKE_DDL_TABLES: &str = "ducklake_schema|ducklake_schema_versions|ducklake_table|ducklake_column|ducklake_column_mapping|ducklake_name_mapping|ducklake_view|ducklake_metadata|ducklake_partition_info|ducklake_partition_column|ducklake_sort_info|ducklake_sort_expression|ducklake_macro|ducklake_macro_impl|ducklake_macro_parameters|ducklake_tag|ducklake_column_tag";
     let writer_ducklake_ddl_rule = if config.ducklake_mode {
         format!(
-            "AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(insert(\\s+or\\s+(replace|ignore))?\\s+into|update|delete\\s+from|merge\\s+into)\\s+([a-z0-9_\"]+\\s*\\.\\s*)*(\"({DUCKLAKE_DDL_TABLES})\"|({DUCKLAKE_DDL_TABLES})\\b)')"
+            "AND NOT regexp_matches(p_sql, '\\b(insert(\\s+or\\s+(replace|ignore))?\\s+into|update|delete\\s+from|merge\\s+into)\\s+([a-z0-9_\"]+\\s*\\.\\s*)*(\"({DUCKLAKE_DDL_TABLES})\"|({DUCKLAKE_DDL_TABLES})\\b)')"
         )
     } else {
         String::new()
@@ -726,39 +927,53 @@ pub fn compile_quack_auth_sql_with_options_opt(
     let writer_copy_rule = if config.allow_copy {
         ""
     } else {
-        "AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\bcopy\\b')"
+        "AND NOT regexp_matches(p_sql, '\\bcopy\\b')"
     };
 
+    // Shared internal/sensitive/exfiltration symbols blocked for all non-admin roles.
+    const SENSITIVE_IDENT_DENYLIST: &str = "\\b(_duckpack_auth|_duckpack_quack_authenticate|_duckpack_quack_authorize|quack_users|quack_sessions|quack_authentication_function|quack_authorization_function|quack_serve|quack_stop|quack_cancel|quack_query|quack_query_by_name|quack_generate_keys|quack_identify|quack_active_connections|quack_server_list|quack_check_token|quack_nop_authorization|enable_logging|disable_logging|duckdb_logs|duckdb_logs_parsed|duckdb_secrets|which_secret|getenv|current_setting|duckdb_settings|json_execute_serialized_sql|read_text|read_blob|glob)\\b";
+
+    // Block SET and PRAGMA for reader (in DuckDB v2.0 bare SET defaults to GLOBAL scope, and PRAGMA can write files).
     let reader_prefix_pattern = if config.reader_allow_explain_describe {
-        "^(select|with|values|from|table|explain|describe|desc|show|summarize|use|pragma|begin|start|commit|rollback|abort|set)\\b"
+        "^(select|with|values|from|table|explain|describe|desc|show|summarize|use|begin|start|commit|rollback|abort)\\b"
     } else {
-        "^(select|with|values|from|table|use|pragma|begin|start|commit|rollback|abort|set)\\b"
+        "^(select|with|values|from|table|use|begin|start|commit|rollback|abort)\\b"
     };
 
     sql.push_str(&format!(
-        "CREATE OR REPLACE MACRO _duckpack_auth.authorize(p_sid, p_query) AS (\n\
-         \x20   CASE _duckpack_auth.resolve_role(p_sid)\n\
+        "CREATE OR REPLACE MACRO _duckpack_auth.authorize_sanitized(p_role, p_sql) AS (\n\
+         \x20   CASE p_role\n\
          \x20       WHEN 'admin' THEN true\n\
          \x20       WHEN 'writer' THEN (\n\
-         \x20           _duckpack_auth.sanitize_sql(p_query) <> ''\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(_duckpack_auth|quack_users|quack_sessions|quack_authentication_function|quack_authorization_function|quack_serve|quack_stop|quack_cancel|quack_query|quack_query_by_name|quack_generate_keys|quack_identify|enable_logging|disable_logging)\\b')\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(attach|detach|install|load|export|import|drop|alter|truncate|vacuum|rename|grant|revoke|call)\\b')\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(set|reset)\\s+(global|session)\\b')\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(create|drop)\\s+(or\\s+replace\\s+)?(persistent\\s+|temporary\\s+|temp\\s+)?secret\\b')\n\
+         \x20           p_sql <> ''\n\
+         \x20           AND regexp_matches(p_sql, '{writer_prefix_pattern}')\n\
+         \x20           AND NOT regexp_matches(p_sql, '{SENSITIVE_IDENT_DENYLIST}')\n\
+         \x20           AND NOT regexp_matches(p_sql, '\\b(attach|detach|install|load|export|import|drop|alter|truncate|vacuum|rename|grant|revoke|call|checkpoint|pragma|prepare|execute|deallocate)\\b')\n\
+         \x20           AND NOT regexp_matches(p_sql, '\\b(update\\s+extensions|comment\\s+on)\\b')\n\
+         \x20           AND NOT regexp_matches(p_sql, '^(set|reset)\\b')\n\
+         \x20           AND NOT regexp_matches(p_sql, '\\b(set|reset)\\s+(global|session|local)\\b')\n\
+         \x20           AND NOT regexp_matches(p_sql, '\\b(create|drop)\\s+(or\\s+replace\\s+)?(persistent\\s+|temporary\\s+|temp\\s+)?secret\\b')\n\
          \x20           {writer_batch_and_create_rule}\n\
          \x20           {writer_ducklake_ddl_rule}\n\
          \x20           {writer_copy_rule}\n\
          \x20       )\n\
          \x20       WHEN 'reader' THEN (\n\
-         \x20           _duckpack_auth.sanitize_sql(p_query) <> ''\n\
-         \x20           AND strpos(_duckpack_auth.sanitize_sql(p_query), ';') = 0\n\
-         \x20           AND regexp_matches(_duckpack_auth.sanitize_sql(p_query), '{reader_prefix_pattern}')\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(_duckpack_auth|quack_users|quack_sessions|quack_authentication_function|quack_authorization_function|quack_serve|quack_stop|quack_cancel|quack_query|quack_query_by_name|quack_generate_keys|quack_identify|enable_logging|disable_logging)\\b')\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(set|reset)\\s+global\\b')\n\
-         \x20           AND NOT regexp_matches(_duckpack_auth.sanitize_sql(p_query), '\\b(insert|update|delete|merge|create|alter|drop|truncate|copy|call|vacuum|rename|grant|revoke|execute|attach|detach|install|load|export|import|reset)\\b')\n\
+         \x20           p_sql <> ''\n\
+         \x20           AND strpos(p_sql, ';') = 0\n\
+         \x20           AND regexp_matches(p_sql, '{reader_prefix_pattern}')\n\
+         \x20           AND NOT regexp_matches(p_sql, '{SENSITIVE_IDENT_DENYLIST}')\n\
+         \x20           AND NOT regexp_matches(p_sql, '\\b(insert|update|delete|merge|create|alter|drop|truncate|copy|call|vacuum|rename|grant|revoke|prepare|execute|deallocate|attach|detach|install|load|export|import|set|reset|pragma|checkpoint|comment)\\b')\n\
          \x20       )\n\
          \x20       ELSE false\n\
          \x20   END\n\
+         );\n\
+         CREATE OR REPLACE MACRO _duckpack_auth.authorize(p_sid, p_query) AS (\n\
+         \x20   (\n\
+         \x20       WITH _r AS MATERIALIZED (SELECT _duckpack_auth.resolve_role(p_sid) AS role),\n\
+         \x20            _s AS MATERIALIZED (SELECT CASE WHEN (SELECT role FROM _r) = 'admin' THEN '' ELSE _duckpack_auth.sanitize_sql(p_query) END AS q)\n\
+         \x20       SELECT _duckpack_auth.authorize_sanitized(_r.role, _s.q)\n\
+         \x20       FROM _r, _s\n\
+         \x20   )\n\
          );\n\
          CREATE OR REPLACE MACRO _duckpack_quack_authenticate(p_sid, p_client_token, p_server_token) AS (_duckpack_auth.authenticate(p_sid, p_client_token, p_server_token));\n\
          CREATE OR REPLACE MACRO _duckpack_quack_authorize(p_sid, p_query) AS (_duckpack_auth.authorize(p_sid, p_query));\n"
@@ -811,7 +1026,7 @@ pub fn export_quack_rbac_bootstrap_script(
     let scripts_dir = project_dir.join("scripts");
     std::fs::create_dir_all(&scripts_dir)?;
     let out_path = scripts_dir.join("quack_rbac_init.sql");
-    std::fs::write(&out_path, sql)?;
+    crate::engine::write_restricted_env_file(&out_path, &sql)?;
     Ok(out_path)
 }
 
@@ -923,11 +1138,8 @@ fn harvest_quack_client_id_hashes_opt(
             }
             candidate_tokens.push(None);
 
-            let ssl_modes: Vec<bool> = if disable_ssl {
-                vec![true]
-            } else {
-                vec![false, true]
-            };
+            // Never silently downgrade TLS to plaintext on a TLS endpoint (H3).
+            let ssl_modes: [bool; 1] = [disable_ssl];
 
             let mut probed: Option<String> = None;
             'probe: for &ssl_off in &ssl_modes {
@@ -1002,11 +1214,11 @@ pub fn append_quack_auth_diff_items(
     };
     let macros_query = if is_quack_target {
         format!(
-            "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authenticate' OR COALESCE(macro_definition, '') LIKE '%quack_check_token%') AND (function_name <> 'authorize' OR (COALESCE(macro_definition, '') LIKE '%abort|set%' {ducklake_macro_check})) AND (function_name <> 'resolve_role' OR COALESCE(macro_definition, '') LIKE '%ac.connection_id%') AND (function_name <> 'sanitize_sql' OR strpos(COALESCE(macro_definition, ''), '^\\s+|\\s+$') > 0)"
+            "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'authorize_sanitized', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authenticate' OR COALESCE(macro_definition, '') LIKE '%quack_check_token%') AND (function_name <> 'authorize_sanitized' OR (COALESCE(macro_definition, '') LIKE '%duckdb_secrets%' {ducklake_macro_check})) AND (function_name <> 'resolve_role' OR (COALESCE(macro_definition, '') LIKE '%ac.connection_id%' AND COALESCE(macro_definition, '') LIKE '%WHEN ''none'' THEN 1%')) AND (function_name <> 'sanitize_sql' OR COALESCE(macro_definition, '') LIKE '%_lex%')"
         )
     } else {
         format!(
-            "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authorize' OR (COALESCE(macro_definition, '') LIKE '%abort|set%' {ducklake_macro_check})) AND (function_name <> 'sanitize_sql' OR strpos(COALESCE(macro_definition, ''), '^\\s+|\\s+$') > 0)"
+            "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = '_duckpack_auth' AND function_name IN ('authenticate', 'authorize', 'authorize_sanitized', 'resolve_role', 'sanitize_sql') AND (function_name <> 'authorize_sanitized' OR (COALESCE(macro_definition, '') LIKE '%duckdb_secrets%' {ducklake_macro_check})) AND (function_name <> 'sanitize_sql' OR COALESCE(macro_definition, '') LIKE '%_lex%')"
         )
     };
     let wrapper_query = "SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE schema_name = 'main' AND function_name IN ('_duckpack_quack_authenticate', '_duckpack_quack_authorize')";
@@ -1119,7 +1331,7 @@ pub fn append_quack_auth_diff_items(
     let mut sorted_expected = expected_users.clone();
     sorted_expected.sort_by(|a, b| a.0.username.cmp(&b.0.username));
 
-    let is_in_sync = if macros_count < 4 || wrappers_count < 2 || hooks_active < 2 {
+    let is_in_sync = if macros_count < 5 || wrappers_count < 2 || hooks_active < 2 {
         false
     } else if let Some(ref rows) = actual_rows {
         if rows.len() != sorted_expected.len() {
@@ -1227,12 +1439,12 @@ pub fn load_live_quack_sessions(
             COALESCE(CAST(ac.client_id_hash AS VARCHAR), '') AS client_id_hash, \
             COALESCE( \
                 (SELECT s.username FROM _duckpack_auth.quack_sessions s WHERE lower(CAST(s.sid AS VARCHAR)) = lower(CAST(ac.connection_id AS VARCHAR)) LIMIT 1), \
-                (SELECT u.username FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) ORDER BY CASE u.role WHEN 'admin' THEN 1 WHEN 'writer' THEN 2 WHEN 'reader' THEN 3 ELSE 4 END LIMIT 1), \
+                (SELECT u.username FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) ORDER BY CASE u.role WHEN 'none' THEN 1 WHEN 'reader' THEN 2 WHEN 'writer' THEN 3 WHEN 'admin' THEN 4 ELSE 1 END LIMIT 1), \
                 '<default>' \
             ) AS username, \
             COALESCE( \
                 (SELECT CASE WHEN s.revoked THEN 'none' ELSE s.role END FROM _duckpack_auth.quack_sessions s WHERE lower(CAST(s.sid AS VARCHAR)) = lower(CAST(ac.connection_id AS VARCHAR)) LIMIT 1), \
-                (SELECT u.role FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) ORDER BY CASE u.role WHEN 'admin' THEN 1 WHEN 'writer' THEN 2 WHEN 'reader' THEN 3 ELSE 4 END LIMIT 1), \
+                (SELECT u.role FROM _duckpack_auth.quack_users u WHERE u.enabled = true AND lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) ORDER BY CASE u.role WHEN 'none' THEN 1 WHEN 'reader' THEN 2 WHEN 'writer' THEN 3 WHEN 'admin' THEN 4 ELSE 1 END LIMIT 1), \
                 '{}' \
             ) AS role, \
             COALESCE( \
@@ -1487,6 +1699,7 @@ pub fn export_quack_rbac_post_start_script(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .unwrap_or("prod");
+    crate::engine::validate_safe_env_profile(default_env)?;
 
     let script = format!(
         r#"#!/usr/bin/env bash
@@ -1600,6 +1813,7 @@ mod tests {
             writer_allow_temp_tables: true,
             reader_allow_explain_describe: true,
             allow_copy: false,
+            allow_insecure_client_id: false,
             users: vec![
                 QuackAuthUser {
                     username: "alice".to_string(),
@@ -1780,7 +1994,7 @@ mod tests {
                 username: "alice".to_string(),
                 role: QuackRole::Admin,
                 token_env: "QUACK_TEST_ADMIN".to_string(),
-                client_id: Some("alice".to_string()),
+                client_id: None,
                 enabled: true,
             }],
             ..Default::default()
@@ -1837,26 +2051,27 @@ mod tests {
             writer_allow_temp_tables: true,
             reader_allow_explain_describe: true,
             allow_copy: false,
+            allow_insecure_client_id: false,
             users: vec![
                 QuackAuthUser {
                     username: "admin".to_string(),
                     role: QuackRole::Admin,
                     token_env: "DL_ADMIN_TOK".to_string(),
-                    client_id: Some("admin".to_string()),
+                    client_id: None,
                     enabled: true,
                 },
                 QuackAuthUser {
                     username: "writer".to_string(),
                     role: QuackRole::Writer,
                     token_env: "DL_WRITER_TOK".to_string(),
-                    client_id: Some("writer".to_string()),
+                    client_id: None,
                     enabled: true,
                 },
                 QuackAuthUser {
                     username: "reader".to_string(),
                     role: QuackRole::Reader,
                     token_env: "DL_READER_TOK".to_string(),
-                    client_id: Some("reader".to_string()),
+                    client_id: None,
                     enabled: true,
                 },
             ],
@@ -1943,6 +2158,191 @@ mod tests {
         assert!(check("sid_r", "SELECT * FROM ducklake_table;"));
         assert!(!check("sid_r", "INSERT INTO ducklake_snapshot VALUES (6, now(), 1, 2, 3);"));
         assert!(!check("sid_r", "INSERT INTO ducklake_data_file VALUES (2, 1, 6, NULL, 'b.parquet', true, 'parquet', 1, 10, 5, 0);"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_quack_rbac_adversarial_security_hardening() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dp_quack_sec_adv_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // L3: Unknown role string must fail closed to None (never Reader)
+        assert_eq!(QuackRole::from_str("superadmin"), QuackRole::None);
+        assert_eq!(QuackRole::from_str("typo_role"), QuackRole::None);
+
+        // H2: Post-start script must reject shell injection / path traversal in env_profile
+        assert!(export_quack_rbac_post_start_script(&temp_dir, Some("prod}; id; #")).is_err());
+        assert!(export_quack_rbac_post_start_script(&temp_dir, Some("../../etc")).is_err());
+
+        // M4: save_env_key_value must strip newline injection and enforce 0600 perms
+        save_env_key_value(&temp_dir, "SEC_ADMIN_TOK", "admin_tok_111\nEVIL=1").unwrap();
+        let env_raw = std::fs::read_to_string(temp_dir.join(".env")).unwrap();
+        assert!(!env_raw.contains("\nEVIL=1"), "Newline injection must be stripped");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(temp_dir.join(".env")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        save_env_key_value(&temp_dir, "SEC_ADMIN_TOK", "admin_secret_1111").unwrap();
+        save_env_key_value(&temp_dir, "SEC_WRITER_TOK", "writer_secret_2222").unwrap();
+        save_env_key_value(&temp_dir, "SEC_READER_TOK", "reader_secret_3333").unwrap();
+        save_env_key_value(&temp_dir, "SEC_DUP_TOK", "admin_secret_1111").unwrap();
+
+        // C2: Reject plaintext client_id by default
+        let insecure_cid_cfg = QuackAuthConfig {
+            enabled: true,
+            users: vec![QuackAuthUser {
+                username: "alice".to_string(),
+                role: QuackRole::Admin,
+                token_env: "SEC_ADMIN_TOK".to_string(),
+                client_id: Some("alice".to_string()),
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        let err_cid = validate_quack_auth_config(&insecure_cid_cfg, &temp_dir).unwrap_err().to_string();
+        assert!(err_cid.contains("Security Guard"), "Plaintext client_id must be rejected: {err_cid}");
+
+        // C2: Reject duplicate secret token across distinct users
+        let dup_tok_cfg = QuackAuthConfig {
+            enabled: true,
+            users: vec![
+                QuackAuthUser {
+                    username: "alice".to_string(),
+                    role: QuackRole::Admin,
+                    token_env: "SEC_ADMIN_TOK".to_string(),
+                    client_id: None,
+                    enabled: true,
+                },
+                QuackAuthUser {
+                    username: "bob".to_string(),
+                    role: QuackRole::Reader,
+                    token_env: "SEC_DUP_TOK".to_string(),
+                    client_id: None,
+                    enabled: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let err_dup = validate_quack_auth_config(&dup_tok_cfg, &temp_dir).unwrap_err().to_string();
+        assert!(err_dup.contains("duplicate secret token"), "Duplicate token must be rejected: {err_dup}");
+
+        // Compile hardened policy (ducklake_mode = true to also test batch + inlined CREATE rules)
+        let cfg = QuackAuthConfig {
+            enabled: true,
+            ducklake_mode: true,
+            default_role: QuackRole::None,
+            writer_allow_temp_tables: true,
+            reader_allow_explain_describe: true,
+            allow_copy: false,
+            allow_insecure_client_id: false,
+            users: vec![
+                QuackAuthUser {
+                    username: "alice".to_string(),
+                    role: QuackRole::Admin,
+                    token_env: "SEC_ADMIN_TOK".to_string(),
+                    client_id: None,
+                    enabled: true,
+                },
+                QuackAuthUser {
+                    username: "bob".to_string(),
+                    role: QuackRole::Writer,
+                    token_env: "SEC_WRITER_TOK".to_string(),
+                    client_id: None,
+                    enabled: true,
+                },
+                QuackAuthUser {
+                    username: "carol".to_string(),
+                    role: QuackRole::Reader,
+                    token_env: "SEC_READER_TOK".to_string(),
+                    client_id: None,
+                    enabled: true,
+                },
+            ],
+        };
+        let sql = compile_quack_auth_sql(&cfg, &temp_dir, Some("sid_admin"), false).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&sql).unwrap();
+        conn.execute_batch(
+            "INSERT INTO _duckpack_auth.quack_sessions (sid, username, role, revoked) VALUES
+                ('sid_w', 'bob', 'writer', false),
+                ('sid_r', 'carol', 'reader', false);",
+        )
+        .unwrap();
+
+        let check = |sid: &str, q: &str| -> bool {
+            conn.query_row("SELECT _duckpack_auth.authorize(?, ?);", [sid, q], |r| r.get(0))
+                .unwrap()
+        };
+
+        // C1: Parser-differential bypass vectors MUST ALL BE BLOCKED for both reader & writer!
+        let c1_payloads = [
+            "SELECT '--'; DROP TABLE orders;",
+            "SELECT '/*'; DROP TABLE orders; SELECT '*/'",
+            "SELECT $a$'$a$; DROP TABLE orders; SELECT $b$'$b$",
+            "SELECT 1 AS \"x--\"; DROP TABLE orders;",
+            "SELECT 1 AS \"x/*\"; DROP TABLE orders; SELECT 1 AS \"*/\"",
+            "SELECT e'abc\\''; DROP TABLE orders; SELECT ''",
+            "SELECT e'abc\\\\'; DROP TABLE orders;",
+            "/* outer /* inner */ still comment */ DROP TABLE orders;",
+            "/* unclosed comment SELECT 1",
+            "SELECT 'unclosed string",
+            "SELECT $tag$unclosed dollar",
+            "SELECT 1 AS \"unclosed_ident",
+        ];
+        for payload in c1_payloads {
+            assert!(!check("sid_r", payload), "Reader MUST block C1 payload: {payload}");
+            assert!(!check("sid_w", payload), "Writer MUST block C1 payload: {payload}");
+        }
+
+        // Legitimate tricky SQL with comments/nested comments/dollar quotes/escaped quotes MUST STILL PASS
+        assert!(check("sid_r", "/* outer /* inner */ done */ SELECT 'DROP TABLE x', $tag$'; DROP TABLE y$tag$, e'it\\'s ok';"));
+        assert!(check("sid_r", "SELECT 1 AS \"my-col\" FROM orders WHERE note = '-- not a comment';"));
+
+        // C3: Bare SET, PRAGMA, getenv, duckdb_secrets, oracle macros, fs readers, CHECKPOINT, COMMENT, UPDATE EXTENSIONS
+        let c3_blocked_both = [
+            "SET memory_limit = '1MB';",
+            "SET lock_configuration = true;",
+            "RESET threads;",
+            "PRAGMA enable_profiling = 'json';",
+            "PRAGMA profiling_output = '/tmp/pwn';",
+            "SELECT getenv('QUACK_MASTER_TOKEN');",
+            "SELECT * FROM duckdb_secrets();",
+            "SELECT which_secret('s3://bucket', 's3');",
+            "SELECT current_setting('memory_limit');",
+            "SELECT * FROM duckdb_settings();",
+            "SELECT * FROM duckdb_logs();",
+            "SELECT * FROM quack_active_connections();",
+            "SELECT _duckpack_quack_authenticate('x', 'guess', '');",
+            "SELECT _duckpack_quack_authorize('alice', 'DROP TABLE x');",
+            "SELECT * FROM read_text('/etc/passwd');",
+            "SELECT * FROM read_blob('/etc/passwd');",
+            "SELECT * FROM glob('/etc/*');",
+            "CHECKPOINT;",
+            "FORCE CHECKPOINT;",
+            "COMMENT ON TABLE orders IS 'pwned';",
+            "PREPARE q AS SELECT 1;",
+            "EXECUTE q;",
+            "UPDATE EXTENSIONS;",
+        ];
+        for payload in c3_blocked_both {
+            assert!(!check("sid_r", payload), "Reader MUST block C3 payload: {payload}");
+            assert!(!check("sid_w", payload), "Writer MUST block C3 payload: {payload}");
+        }
+
+        // C3: DuckLake-mode hyphenated catalog DDL & CTAS inlined table abuse MUST BE BLOCKED
+        assert!(!check("sid_w", "INSERT INTO \"my-catalog\".\"main\".\"ducklake_table\" VALUES (99);"));
+        assert!(!check("sid_w", "CREATE TABLE \"main\".ducklake_inlined_data_1_1 AS SELECT 1;"));
+        assert!(!check("sid_w", "CREATE TABLE \"main\".ducklake_inlined_data_1_1(id INT) AS SELECT 1;"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

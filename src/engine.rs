@@ -2147,6 +2147,23 @@ fn parse_target_table(tbl: &toml::Value) -> ResolvedTargetConfig {
     cfg
 }
 
+/// Validates that an `--env <profile>` name contains only safe identifier characters (`[A-Za-z0-9_-]`)
+/// so it cannot traverse outside `project_dir` or inject shell metacharacters into generated scripts.
+pub fn validate_safe_env_profile(profile: &str) -> Result<()> {
+    let trimmed = profile.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        anyhow::bail!(
+            "Invalid environment profile '{}': only ASCII letters, digits, '_' and '-' are permitted.",
+            profile
+        );
+    }
+    Ok(())
+}
+
 /// Loads environment variables from project directory:
 /// 1. Always loads base `.env` if present.
 /// 2. If `env_profile` is provided (e.g. "dev"), loads `.env.<profile>` on top to override base variables.
@@ -2156,8 +2173,8 @@ pub fn load_env_files(project_dir: &std::path::Path, env_profile: Option<&str>) 
         let _ = dotenvy::from_path(&base_env);
     }
     if let Some(profile) = env_profile {
-        if !profile.is_empty() {
-            let profile_env = project_dir.join(format!(".env.{}", profile));
+        if !profile.is_empty() && validate_safe_env_profile(profile).is_ok() {
+            let profile_env = project_dir.join(format!(".env.{}", profile.trim()));
             if profile_env.exists() {
                 let _ = dotenvy::from_path_override(&profile_env);
             }
@@ -2204,7 +2221,7 @@ pub fn generate_random_hex_token() -> String {
 }
 
 /// Strips control characters (`\r`, `\n`, `\0`) from a value before writing to `.env` to prevent newline injection.
-fn sanitize_env_value(val: &str) -> String {
+pub fn sanitize_env_value(val: &str) -> String {
     val.chars().filter(|&c| c != '\r' && c != '\n' && c != '\0').collect()
 }
 

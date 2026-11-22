@@ -16,6 +16,7 @@ const RBAC_BUNDLE_VERSION: i32 = 1;
 pub fn validate_quack_auth_structure(config: &QuackAuthConfig) -> Result<()> {
     let mut has_enabled_admin = config.default_role == QuackRole::Admin;
     let mut seen_users = std::collections::HashSet::new();
+    let mut seen_token_envs = std::collections::HashSet::new();
 
     for user in &config.users {
         validate_safe_username(&user.username)?;
@@ -25,11 +26,29 @@ pub fn validate_quack_auth_structure(config: &QuackAuthConfig) -> Result<()> {
                 user.username
             );
         }
-        if user.token_env.trim().is_empty() {
+        let trimmed_env = user.token_env.trim();
+        if trimmed_env.is_empty() {
             anyhow::bail!(
                 "Quack RBAC user '{}' must specify a non-empty token_env variable name.",
                 user.username
             );
+        }
+        if !seen_token_envs.insert(trimmed_env.to_string()) {
+            anyhow::bail!(
+                "Duplicate Quack RBAC token_env '{}' across users; each user must have a distinct secret token.",
+                trimmed_env
+            );
+        }
+        if !config.allow_insecure_client_id {
+            if let Some(ref cid) = user.client_id {
+                if !cid.trim().is_empty() {
+                    anyhow::bail!(
+                        "Security Guard: Quack RBAC user '{}' specifies a plaintext client_id ('{}') in duckpack.toml, which allows any authenticated user to spoof another role by supplying that CLIENT_ID. Omit client_id so Quack binds CLIENT_ID to the user's secret token_env (or set allow_insecure_client_id = true only for isolated legacy setups).",
+                        user.username,
+                        cid.trim()
+                    );
+                }
+            }
         }
         if user.enabled && user.role == QuackRole::Admin {
             has_enabled_admin = true;
@@ -61,7 +80,8 @@ pub fn write_rbac_bundle_tables(conn: &Connection, config: &QuackAuthConfig) -> 
          \x20   default_role VARCHAR NOT NULL,\n\
          \x20   writer_allow_temp_tables BOOLEAN NOT NULL,\n\
          \x20   reader_allow_explain_describe BOOLEAN NOT NULL,\n\
-         \x20   allow_copy BOOLEAN NOT NULL\n\
+         \x20   allow_copy BOOLEAN NOT NULL,\n\
+         \x20   allow_insecure_client_id BOOLEAN NOT NULL DEFAULT false\n\
          );\n\
          CREATE TABLE IF NOT EXISTS _duckpack_rbac_bundle_users (\n\
          \x20   username VARCHAR PRIMARY KEY,\n\
@@ -77,8 +97,8 @@ pub fn write_rbac_bundle_tables(conn: &Connection, config: &QuackAuthConfig) -> 
 
     conn.execute(
         "INSERT INTO _duckpack_rbac_bundle_meta \
-         (bundle_version, enabled, ducklake_mode, default_role, writer_allow_temp_tables, reader_allow_explain_describe, allow_copy) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         (bundle_version, enabled, ducklake_mode, default_role, writer_allow_temp_tables, reader_allow_explain_describe, allow_copy, allow_insecure_client_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         duckdb::params![
             RBAC_BUNDLE_VERSION,
             config.enabled,
@@ -87,6 +107,7 @@ pub fn write_rbac_bundle_tables(conn: &Connection, config: &QuackAuthConfig) -> 
             config.writer_allow_temp_tables,
             config.reader_allow_explain_describe,
             config.allow_copy,
+            config.allow_insecure_client_id,
         ],
     )
     .with_context(|| "Failed writing _duckpack_rbac_bundle_meta")?;
@@ -213,6 +234,14 @@ pub fn load_rbac_bundle(bundle_path: &Path) -> Result<QuackAuthConfig> {
         });
     }
 
+    let allow_insecure_client_id: bool = conn
+        .query_row(
+            "SELECT allow_insecure_client_id FROM _duckpack_rbac_bundle_meta LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+
     Ok(QuackAuthConfig {
         enabled,
         ducklake_mode,
@@ -220,6 +249,7 @@ pub fn load_rbac_bundle(bundle_path: &Path) -> Result<QuackAuthConfig> {
         writer_allow_temp_tables,
         reader_allow_explain_describe,
         allow_copy,
+        allow_insecure_client_id,
         users,
     })
 }
@@ -279,19 +309,20 @@ mod tests {
             writer_allow_temp_tables: true,
             reader_allow_explain_describe: true,
             allow_copy: false,
+            allow_insecure_client_id: false,
             users: vec![
                 QuackAuthUser {
                     username: "lake_admin".to_string(),
                     role: QuackRole::Admin,
                     token_env: "DP_TEST_BUNDLE_ADMIN_TOK".to_string(),
-                    client_id: Some("lake_admin".to_string()),
+                    client_id: None,
                     enabled: true,
                 },
                 QuackAuthUser {
                     username: "etl_writer".to_string(),
                     role: QuackRole::Writer,
                     token_env: "DP_TEST_BUNDLE_WRITER_TOK".to_string(),
-                    client_id: Some("etl_writer".to_string()),
+                    client_id: None,
                     enabled: true,
                 },
             ],

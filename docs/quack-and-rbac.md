@@ -89,20 +89,19 @@ allow_copy = false
 username = "alice"
 role = "admin"
 token_env = "QUACK_USER_ALICE_TOKEN"
-client_id = "alice"
 
 [[quack_auth.users]]
 username = "dbt_runner"
 role = "writer"
 token_env = "QUACK_USER_DBT_TOKEN"
-client_id = "dbt_runner"
 
 [[quack_auth.users]]
 username = "bi_reader"
 role = "reader"
 token_env = "QUACK_USER_BI_TOKEN"
-client_id = "bi_reader"
 ```
+
+> **Security Note (Token-Bound `CLIENT_ID`)**: Leave `client_id` omitted in `[[quack_auth.users]]` so each user's `CLIENT_ID` binds automatically to their 256-bit secret `token_env`. Plaintext `client_id` values in `duckpack.toml` are rejected by default (preventing role spoofing across authenticated sessions) unless `allow_insecure_client_id = true` is explicitly set for legacy isolated setups.
 
 Store tokens in `.env` (`chmod 0600`):
 
@@ -123,10 +122,10 @@ QUACK_USER_BI_TOKEN=<64_hex_char_token>
 | `CREATE TEMP TABLE` / `CREATE TEMP VIEW` | ✅ | Configurable (`writer_allow_temp_tables`) | ❌ |
 | `CREATE` / `ALTER` / `DROP` (permanent objects) | ✅ | ❌ | ❌ |
 | `COPY` | ✅ | Configurable (`allow_copy`) | Configurable (`allow_copy`) |
-| `_duckpack_auth.*`, `SET GLOBAL`, `ATTACH`, `DETACH`, `CALL`, `quack_query*` | ✅ | ❌ | ❌ |
+| `_duckpack_auth.*`, `SET`/`RESET`, `PRAGMA`, `getenv()`, `duckdb_secrets()`, `read_text()`/`glob()`, `CHECKPOINT`, `ATTACH`, `DETACH`, `CALL`, `quack_*` | ✅ | ❌ | ❌ |
 | Multi-statement piggybacking (`SELECT 1; DROP TABLE ...`) | ✅ | ❌ | ❌ |
 
-The authorization macro strips `--` line comments, `/* ... */` block comments, `'...'` string literals, and `$$...$$` dollar-quoted strings before evaluating permissions.
+The authorization macro uses a **single-pass recursive SQL lexer** (`_duckpack_auth.sanitize_sql`) matching DuckDB v2.0 lexical precedence — neutralizing `'...'`, `e'...'`/`E'...'`, tagged/untagged `$tag$...$tag$` dollar-quoted strings, double-quoted identifiers (`"..."`), `--` line comments, and depth-counted nested `/* ... */` block comments, and **failing closed** on unclosed tokens or comments.
 
 ### 3. DuckLake-Aware Quack RBAC (`ducklake_mode = true`)
 
@@ -145,7 +144,7 @@ ATTACH 'ducklake:quack:sales-meta.internal:9494' AS sales_writer (
     DATA_PATH 's3://warehouse/sales/',
     META_DISABLE_SSL true,
     META_TOKEN '<writer_token>',
-    META_CLIENT_ID 'dbt_runner'
+    META_CLIENT_ID '<writer_token>'
 );
 ```
 
@@ -156,11 +155,11 @@ Running `duckpack apply --env prod --auto-approve`:
 2. Harvests each user's live server-salted `client_id_hash` from the running Quack server and binds the deploying master session as `admin`.
 3. Commits `_duckpack_auth` tables and hardened authorization macros **before** enabling `SET GLOBAL quack_authentication_function` and `SET GLOBAL quack_authorization_function`.
 
-You can attach multiple role aliases side by side in the same DuckDB / DuckPack session using per-alias credentials:
+You can attach multiple role aliases side by side in the same DuckDB / DuckPack session using per-alias token-bound credentials:
 
 ```sql
-ATTACH 'quack:localhost:9494' AS q_admin  (TOKEN '<alice_token>',  CLIENT_ID 'alice',     DISABLE_SSL true);
-ATTACH 'quack:localhost:9494' AS q_reader (TOKEN '<reader_token>', CLIENT_ID 'bi_reader', DISABLE_SSL true);
+ATTACH 'quack:localhost:9494' AS q_admin  (TOKEN '<alice_token>',  CLIENT_ID '<alice_token>',  DISABLE_SSL true);
+ATTACH 'quack:localhost:9494' AS q_reader (TOKEN '<reader_token>', CLIENT_ID '<reader_token>', DISABLE_SSL true);
 ```
 
 ---

@@ -261,28 +261,19 @@ impl QuackAuthModalState {
 
     fn autofill_derived_user_fields(&mut self) {
         let uname = self.new_username.trim();
-        if !uname.is_empty() {
-            if self.new_token_env.trim().is_empty() {
-                let env_key = format!(
-                    "QUACK_USER_{}_TOKEN",
-                    uname
-                        .chars()
-                        .map(|c| if c.is_ascii_alphanumeric() {
-                            c.to_ascii_uppercase()
-                        } else {
-                            '_'
-                        })
-                        .collect::<String>()
-                );
-                self.new_token_env = env_key;
-            }
-            if self.new_client_id.trim().is_empty() {
-                self.new_client_id = if uname.chars().count() >= 4 {
-                    uname.to_string()
-                } else {
-                    format!("user_{}", uname)
-                };
-            }
+        if !uname.is_empty() && self.new_token_env.trim().is_empty() {
+            let env_key = format!(
+                "QUACK_USER_{}_TOKEN",
+                uname
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    })
+                    .collect::<String>()
+            );
+            self.new_token_env = env_key;
         }
     }
 
@@ -311,19 +302,19 @@ impl QuackAuthModalState {
         let client_id = {
             let trimmed = self.new_client_id.trim();
             if trimmed.is_empty() {
-                if username.chars().count() < 4 {
-                    Some(format!("user_{}", username))
-                } else {
-                    None
-                }
+                None
+            } else if !self.config.allow_insecure_client_id {
+                self.error_msg = Some(
+                    "Leave Client ID blank (binds securely to secret token). Set allow_insecure_client_id = true in duckpack.toml only for legacy setups."
+                        .to_string(),
+                );
+                return None;
             } else if trimmed.chars().count() < 4 {
                 self.error_msg = Some(
                     "Client ID must be at least 4 characters (required by DuckDB Quack)."
                         .to_string(),
                 );
                 return None;
-            } else if trimmed == username {
-                None
             } else {
                 Some(trimmed.to_string())
             }
@@ -1247,7 +1238,7 @@ impl QuackAuthModalState {
                 } else {
                     Cell::from("○ disabled").style(Style::default().fg(Color::LightRed))
                 };
-                let cid = u.client_id.as_deref().unwrap_or(&u.username);
+                let cid = u.client_id.as_deref().unwrap_or("(token-bound)");
                 let row_style = if is_sel {
                     Style::default()
                         .bg(Color::DarkGray)
@@ -1363,7 +1354,7 @@ impl QuackAuthModalState {
             f3.extend(render_text_with_cursor(&self.new_client_id, self.cursor_pos, true, false));
         } else if self.new_client_id.is_empty() {
             f3.push(Span::styled(
-                "(auto: same as username)",
+                "(recommended: blank — binds securely to secret token)",
                 Style::default().fg(Color::DarkGray),
             ));
         } else {
