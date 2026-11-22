@@ -339,6 +339,95 @@ pub fn append_cloud_bucket_to_env(project_dir: &Path, bucket: &str) -> Result<()
     Ok(())
 }
 
+/// Process-local, thread-safe store for runtime S3/cloud bucket URIs added or removed during
+/// an IDE/workspace session — eliminates `unsafe std::env::set_var` mutations of `DUCKPACK_S3_BUCKETS`.
+#[derive(Default)]
+struct SessionBucketState {
+    added: Vec<String>,
+    removed: Vec<String>,
+}
+
+fn session_bucket_store() -> &'static std::sync::RwLock<SessionBucketState> {
+    static STORE: std::sync::OnceLock<std::sync::RwLock<SessionBucketState>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::RwLock::new(SessionBucketState::default()))
+}
+
+fn bucket_matches(a: &str, b: &str) -> bool {
+    let a_trim = a.trim();
+    let b_trim = b.trim();
+    a_trim.eq_ignore_ascii_case(b_trim)
+        || a_trim.eq_ignore_ascii_case(b_trim.trim_start_matches("s3://"))
+        || b_trim.eq_ignore_ascii_case(a_trim.trim_start_matches("s3://"))
+}
+
+/// Registers a cloud bucket URI in the active session view (thread-safe, no `std::env::set_var`).
+pub fn add_session_cloud_bucket(bucket: &str) {
+    let trimmed = bucket.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = session_bucket_store().write() {
+        guard.removed.retain(|r| !bucket_matches(r, trimmed));
+        if !guard.added.iter().any(|b| bucket_matches(b, trimmed)) {
+            guard.added.push(trimmed.to_string());
+        }
+    }
+}
+
+/// Removes a cloud bucket URI from the active session view (including buckets inherited from env).
+pub fn remove_session_cloud_bucket(bucket: &str) {
+    let trimmed = bucket.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = session_bucket_store().write() {
+        guard.added.retain(|b| !bucket_matches(b, trimmed));
+        if !guard.removed.iter().any(|r| bucket_matches(r, trimmed)) {
+            guard.removed.push(trimmed.to_string());
+        }
+    }
+}
+
+/// Replaces an existing cloud bucket URI in the active session view with a new URI.
+pub fn replace_session_cloud_bucket(old_uri: &str, new_uri: &str) {
+    remove_session_cloud_bucket(old_uri);
+    add_session_cloud_bucket(new_uri);
+}
+
+/// Returns all active cloud bucket URIs by merging `DUCKPACK_S3_BUCKET` / `DUCKPACK_S3_BUCKETS`
+/// from the environment with session-local additions/removals.
+pub fn list_active_cloud_buckets() -> Vec<String> {
+    let mut buckets = Vec::new();
+    let guard = session_bucket_store().read().ok();
+    let is_removed = |candidate: &str| -> bool {
+        guard
+            .as_ref()
+            .map(|g| g.removed.iter().any(|r| bucket_matches(r, candidate)))
+            .unwrap_or(false)
+    };
+
+    for var in ["DUCKPACK_S3_BUCKET", "DUCKPACK_S3_BUCKETS"] {
+        if let Ok(val) = std::env::var(var) {
+            for b in val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if !is_removed(b) && !buckets.iter().any(|e: &String| bucket_matches(e, b)) {
+                    buckets.push(b.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(g) = guard {
+        for b in &g.added {
+            if !buckets.iter().any(|e: &String| bucket_matches(e, b)) {
+                buckets.push(b.clone());
+            }
+        }
+    }
+
+    buckets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +469,21 @@ mod tests {
         // Reject traversal on profile write
         assert!(upsert_env_pairs(&dir, Some("../evil"), &[("K", "V")]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_session_cloud_bucket_store_add_replace_remove() {
+        let unique_a = "s3://dp-unit-test-bucket-alpha";
+        let unique_b = "r2://dp-unit-test-bucket-beta";
+        add_session_cloud_bucket(unique_a);
+        assert!(list_active_cloud_buckets().iter().any(|b| b == unique_a));
+
+        replace_session_cloud_bucket(unique_a, unique_b);
+        let after_replace = list_active_cloud_buckets();
+        assert!(!after_replace.iter().any(|b| b == unique_a));
+        assert!(after_replace.iter().any(|b| b == unique_b));
+
+        remove_session_cloud_bucket(unique_b);
+        assert!(!list_active_cloud_buckets().iter().any(|b| b == unique_b));
     }
 }

@@ -1347,14 +1347,7 @@ pub fn load_explorer_metadata(
         }
     }
 
-    let mut cloud_buckets: Vec<String> = Vec::new();
-    if let Ok(val) = std::env::var("DUCKPACK_S3_BUCKET").or_else(|_| std::env::var("DUCKPACK_S3_BUCKETS")) {
-        for b in val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            if !cloud_buckets.contains(&b.to_string()) {
-                cloud_buckets.push(b.to_string());
-            }
-        }
-    }
+    let cloud_buckets = crate::env_store::list_active_cloud_buckets();
 
     ExplorerMetadata {
         databases,

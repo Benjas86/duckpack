@@ -22,6 +22,7 @@ flowchart LR
 
 ### Why Shadow DB Compilation Matters
 - **100% DuckDB Parser Fidelity:** Any valid DuckDB v2.0 DDL (`VARIANT`, nested schemas, `CREATE SECURE VIEW`, `table_macro`, generated columns, triggers, sequences) is validated by DuckDB's own binder before diffing.
+- **Sandboxed Execution:** `build_shadow_db` locks configuration (`enable_external_access = false`, `allow_community_extensions = false`, `lock_configuration = true`) and mounts `.duckpack` artifacts read-only so compiling untrusted SQL cannot exfiltrate local files or make network calls.
 - **Zero Drift Noise:** Comparing two introspected `CatalogSnapshot` structs normalizes formatting, whitespace, and runtime sequence `START` counter advancement automatically.
 - **Unified `DbExecutor` Seam:** Both local `duckdb::Connection` instances and Python/remote adapters execute through one `DbExecutor` trait, keeping CLI, TUI, and Python behavior identical.
 
@@ -40,7 +41,7 @@ When a table change cannot be expressed as an in-place `ALTER TABLE` (such as ad
 
 ## 3. Dual-Catalog Quack & Multi-Container Isolation
 
-- **Per-Alias Credential Isolation:** Rather than relying solely on a single global `TYPE QUACK` secret, DuckPack binds credentials per endpoint/alias (`ATTACH ... (TOKEN ..., CLIENT_ID ...)` for direct Quack, and endpoint-scoped `CREATE OR REPLACE SECRET ... (TYPE QUACK, TOKEN ..., SCOPE 'quack:host:port')` for DuckLake-on-Quack). This allows mounting multiple independent Quack / DuckLake containers — or multiple RBAC roles (`admin` + `reader`) against the same server — inside one session without credentials colliding.
+- **Per-Alias Credential Isolation:** Rather than relying on a single global `TYPE QUACK` secret, DuckPack binds credentials per endpoint/alias (`ATTACH ... (TOKEN ..., CLIENT_ID ...)` for direct Quack, and DuckLake's native typed `META_TOKEN`, `META_CLIENT_ID`, and `META_DISABLE_SSL` parameters for DuckLake-on-Quack). This allows mounting multiple independent Quack / DuckLake containers — or multiple RBAC roles (`admin` + `writer` + `reader`) against the same server — inside one session without credentials colliding.
 - **In-Place Cache Invalidation:** Refreshing a Quack catalog invokes DuckDB v2.0's `CALL quack_clear_cache();` so remote schema updates appear without detaching `target_db` or dropping active credentials.
 - **Safe RBAC Activation Order:** During `apply`, `_duckpack_auth` tables and hardened authorization macros are committed **before** `SET GLOBAL quack_authentication_function` and `SET GLOBAL quack_authorization_function` are enabled, preventing half-committed lockout states.
 
@@ -74,4 +75,9 @@ sequenceDiagram
 DuckPack bundles DuckDB v2.0 directly (`duckdb` crate `bundled` feature):
 - `.duckdb` files maintain forward and backward storage compatibility across DuckDB v1.0+ releases.
 - `duckpack --version` and `duckpack.__duckdb_version__` always report the exact embedded engine version.
-- Every crate feature and Python binding shares the same core Rust engine (`src/engine.rs`, `src/diff.rs`, `src/catalog.rs`, `src/workspace.rs`, `src/quack_auth.rs`, `src/ide/`).
+- Every crate feature and Python binding shares the same core Rust engine:
+  - **SQL Safety & Connectors:** `src/sql_utils.rs`, `src/connectors.rs`
+  - **Environment & Project Compilation:** `src/env_store.rs`, `src/project.rs`, `src/workspace.rs`
+  - **Diff, Catalog & Session Orchestration:** `src/diff.rs`, `src/catalog.rs`, `src/session.rs`, `src/engine.rs`
+  - **Quack RBAC & Portable Bundles:** `src/quack_auth.rs`, `src/rbac_bundle.rs`
+  - **Terminal IDE & TUI:** `src/tui.rs`, `src/ide/` (`execution.rs`, `explorer.rs`, `editor.rs`, `modals/`)

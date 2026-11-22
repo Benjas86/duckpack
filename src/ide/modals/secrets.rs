@@ -544,9 +544,7 @@ impl SecretModalState {
                             }
 
                             if let Some(bucket) = crate::connectors::normalize_bucket_uri(&self.bucket) {
-                                unsafe {
-                                    std::env::set_var("DUCKPACK_S3_BUCKET", &bucket);
-                                }
+                                crate::env_store::add_session_cloud_bucket(&bucket);
                             }
 
                             let mut toml_note = String::new();
@@ -924,26 +922,7 @@ impl AddBucketModalState {
                     if let Some(ref old_uri) = self.initial_uri {
                         if old_uri != &normalized {
                             expanded_groups.remove(&format!("bucket:{}", old_uri));
-                            unsafe {
-                                let current = std::env::var("DUCKPACK_S3_BUCKETS")
-                                    .or_else(|_| std::env::var("DUCKPACK_S3_BUCKET"))
-                                    .unwrap_or_default();
-                                let mut new_parts: Vec<&str> = current
-                                    .split(',')
-                                    .map(|s| s.trim())
-                                    .filter(|s| {
-                                        !s.is_empty()
-                                            && *s != old_uri.as_str()
-                                            && *s != old_uri.trim_start_matches("s3://")
-                                    })
-                                    .collect();
-                                if !new_parts.contains(&normalized.as_str()) {
-                                    new_parts.push(&normalized);
-                                }
-                                let joined = new_parts.join(",");
-                                std::env::set_var("DUCKPACK_S3_BUCKETS", &joined);
-                                std::env::set_var("DUCKPACK_S3_BUCKET", &joined);
-                            }
+                            crate::env_store::replace_session_cloud_bucket(old_uri, &normalized);
                         }
                     }
 
@@ -951,20 +930,7 @@ impl AddBucketModalState {
                         let _ = crate::engine::append_cloud_bucket_to_env(project_dir, &normalized);
                     }
 
-                    unsafe {
-                        let current = std::env::var("DUCKPACK_S3_BUCKETS")
-                            .or_else(|_| std::env::var("DUCKPACK_S3_BUCKET"))
-                            .unwrap_or_default();
-                        let new_var = if current.is_empty() {
-                            normalized.clone()
-                        } else if !current.split(',').any(|b| b.trim() == normalized) {
-                            format!("{},{}", current, normalized)
-                        } else {
-                            current
-                        };
-                        std::env::set_var("DUCKPACK_S3_BUCKETS", &new_var);
-                        std::env::set_var("DUCKPACK_S3_BUCKET", &new_var);
-                    }
+                    crate::env_store::add_session_cloud_bucket(&normalized);
 
                     let bucket_key = format!("bucket:{}", normalized);
                     expanded_groups.insert("Secrets & Cloud Buckets".to_string());

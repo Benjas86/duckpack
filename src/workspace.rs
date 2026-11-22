@@ -655,20 +655,7 @@ pub fn apply_workspace_secrets(
                         .as_deref()
                         .and_then(crate::connectors::normalize_bucket_uri)
                     {
-                        let existing = std::env::var("DUCKPACK_S3_BUCKETS").unwrap_or_default();
-                        let already = existing
-                            .split(',')
-                            .any(|p| p.trim().eq_ignore_ascii_case(&b));
-                        if !already {
-                            let updated = if existing.trim().is_empty() {
-                                b
-                            } else {
-                                format!("{},{}", existing.trim_end_matches(','), b)
-                            };
-                            unsafe {
-                                std::env::set_var("DUCKPACK_S3_BUCKETS", &updated);
-                            }
-                        }
+                        crate::env_store::add_session_cloud_bucket(&b);
                     }
                 }
             }

@@ -156,7 +156,7 @@ import duckpack
 | Function | Signature & Behavior |
 | :--- | :--- |
 | **`explore`** | `explore(target=None, project_dir=".", database=None, catalog=None, quack_token=None, insecure=False, open_window=True, wait=True, env=None) -> None`<br>Opens the Terminal IDE against a live `duckdb.DuckDBPyConnection`, file/URI string, or `None` (resolves `duckpack.toml` / Workspace Mode). |
-| **`apply`** | `apply(target=None, project_dir=".", database=None, catalog=None, auto_approve=True, force_drop=False, interactive=False, quack_token=None, insecure=False, open_window=True, wait=True, env=None) -> ApplyResult`<br>Computes diffs and applies declarative migrations. Set `DUCKPACK_ALLOW_LAKE_REWRITE=true` in the environment to permit DuckLake copy-and-swap rewrites. |
+| **`apply`** | `apply(target=None, project_dir=".", database=None, catalog=None, auto_approve=True, force_drop=False, allow_lake_rewrite=False, interactive=False, quack_token=None, insecure=False, open_window=True, wait=True, env=None) -> ApplyResult`<br>Computes diffs and applies declarative migrations. Pass `allow_lake_rewrite=True` (or set `DUCKPACK_ALLOW_LAKE_REWRITE=true`) to permit DuckLake physical copy-and-swap rewrites without mutating process state. |
 | **`diff`** | `diff(target=None, project_dir=".", database=None, catalog=None, quack_token=None, insecure=False, env=None) -> DiffSummary`<br>Detects schema drift without mutating state. |
 | **`build`** | `build(project_dir=".") -> None`<br>Compiles and validates all SQL files against an isolated in-memory Shadow DB. |
 | **`compile`** | `compile(project_dir, out) -> None`<br>Packages project declarations into an immutable `.duckpack` snapshot artifact. |

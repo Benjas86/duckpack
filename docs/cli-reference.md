@@ -129,6 +129,7 @@ Inspect or install the `duckpack` Python package in your active virtual environm
 | `DUCKPACK_ALLOW_LAKE_REWRITE` | Set `true` to permit physical copy-and-swap rewrites on DuckLake catalogs. |
 | `DUCKPACK_S3_BUCKET` / `DUCKPACK_S3_BUCKETS` | Comma-separated cloud bucket URIs (e.g. `s3://lake,r2://analytics`) surfaced in Explorer's **Secrets & Cloud** drawer. |
 | `DUCKPACK_ENV` | Optional environment profile name used by exported post-start scripts (`scripts/quack_rbac_post_start.sh`). |
+| `DUCKPACK_PANIC_LOG` | Set `1` or `true` to opt in to writing Rust panic diagnostics to `panic.log` (created with `0600` permissions on Unix; disabled by default). |
 | Custom `*_env` variables | Any variable referenced via `token_env`, `password_env`, `secret_env`, `key_id_env`, `dsn_env`, `endpoint_env`, `region_env`, `username_env`, or `${VAR}` SQL templates. |
 
 ---

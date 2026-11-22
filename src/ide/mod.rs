@@ -2025,33 +2025,9 @@ pub fn run_ide_loop_with_workspace(
                                                 }
                                             }
                                             NodeType::CloudBucket { bucket } => {
-                                                let current = std::env::var("DUCKPACK_S3_BUCKETS")
-                                                    .or_else(|_| {
-                                                        std::env::var("DUCKPACK_S3_BUCKET")
-                                                    })
-                                                    .unwrap_or_default();
-                                                let parts: Vec<&str> = current
-                                                    .split(',')
-                                                    .map(|s| s.trim())
-                                                    .filter(|s| {
-                                                        !s.is_empty()
-                                                            && *s != bucket.as_str()
-                                                            && *s
-                                                                != bucket
-                                                                    .trim_start_matches("s3://")
-                                                    })
-                                                    .collect();
-                                                let new_val = parts.join(",");
-                                                unsafe {
-                                                    std::env::set_var(
-                                                        "DUCKPACK_S3_BUCKETS",
-                                                        &new_val,
-                                                    );
-                                                    std::env::set_var(
-                                                        "DUCKPACK_S3_BUCKET",
-                                                        &new_val,
-                                                    );
-                                                }
+                                                crate::env_store::remove_session_cloud_bucket(
+                                                    bucket,
+                                                );
                                                 status_msg = format!(
                                                     "Removed bucket '{}' from session view.",
                                                     bucket
