@@ -168,20 +168,28 @@ ATTACH 'quack:localhost:9494' AS q_reader (TOKEN '<reader_token>', CLIENT_ID '<r
 
 Press **`Ctrl+U`** (or select **`🛡️ Quack RBAC & Sessions (Ctrl+U)`** in Explorer) to open the RBAC control panel:
 
+- **Admin-Only Enforcement:** The Quack server enforces RBAC inspection via `_duckpack_quack_authorize` — non-admin roles (`reader` / `writer`) cannot query `quack_active_connections()`, inspect `_duckpack_auth.quack_users`, or perform break-glass actions. If opened with non-admin credentials, `Ctrl+U` displays a locked **`ADMIN ONLY`** notice with all mutating controls disabled.
 - **Multi-Server Target Switching (`[` / `]`):** Cycle across all directly attached Quack servers **and** DuckLake-on-Quack catalogs (connecting lazily on demand to each DuckLake's underlying Quack server without cluttering Explorer).
+- **Self-Lockout Protection:** Your active control session is tagged **`(you)`** in Tab 1, and your active login is tagged **`current login (protected)`** in Tab 2 alongside **`__duckpack_master`** (`★ master env`, `protected break-glass`). You cannot cancel, revoke, disable, or demote your own active session/login or the server's master break-glass entry.
 - **Tab 1 — Live Sessions (`quack_active_connections()`):**
   - `c`: Cancel an active query via client-side `quack_cancel(catalog, connection_id)`
   - `x`: Revoke or restore a session immediately (`_duckpack_auth.quack_sessions.revoked`)
   - `r`: Cycle a live session's role override (`admin` / `writer` / `reader`)
   - `u` / `F5`: Refresh active connections
-- **Tab 2 — Declarative Users & Roles:**
-  - `a`: Add a user (auto-generates a 256-bit cryptographic token into `.env` with `0600` permissions)
-  - `Space`: Enable/disable user (protected by the **Admin Lockout Prevention Guard**)
-  - `r`: Cycle role (`admin` / `writer` / `reader`)
-  - `t`: Rotate 256-bit token in `.env`
-  - `Del`: Remove user (protected by Admin Lockout Prevention Guard)
-  - `d`: Deploy/sync RBAC immediately (`--rbac-only` equivalent)
-  - `e`: Export executable post-start hook (`scripts/quack_rbac_post_start.sh`) and bootstrap SQL (`scripts/quack_rbac_init.sql`)
+  - *DuckLake note:* Unlike direct `ATTACH 'quack:...'` sessions, DuckLake only opens short-lived Quack metadata calls per query/commit — use Tab 2's break-glass controls when you want an immediate user-wide cutoff across reconnects.
+- **Tab 2 — Declarative Users vs. Read-Only Server Audit View:**
+  - **Local Declarative Mode (`[2] Declarative Users`):** Active when the current project's `duckpack.toml` defines `[quack_auth]` (for example, inside your central RBAC repo):
+    - `a`: Add a user (auto-generates a 256-bit cryptographic token into `.env` with `0600` permissions)
+    - `Space`: Enable/disable user (protected by the **Admin Lockout Prevention Guard**)
+    - `r`: Cycle role (`admin` / `writer` / `reader`)
+    - `t`: Rotate 256-bit token in `.env`
+    - `Del`: Remove user (protected by Admin Lockout Prevention Guard)
+    - `g`: Toggle RBAC enabled/disabled
+    - `d`: Deploy/sync RBAC immediately (`--rbac-only` equivalent)
+    - `e`: Export executable post-start hook (`scripts/quack_rbac_post_start.sh`) and bootstrap SQL (`scripts/quack_rbac_init.sql`)
+  - **Remote Audit + Break-Glass Mode (`[2] Server Users`):** Automatically activates when inspecting a server managed by a central `rbac.duckpack` repo (no local `[quack_auth]` users in `duckpack.toml`):
+    - Renders live `_duckpack_auth.quack_users` in a **Read-Only Audit View** — declarative actions (`a`, `t`, `Del`, `g`, `d`, `e`) are blocked so you never accidentally drift or overwrite central RBAC from an analytics repo.
+    - **Break-Glass (`Space` Disable/Enable, `r` Temp Role):** Prompts with a high-visibility **`[y/N]` confirmation banner** reminding you the change is ephemeral until the next central RBAC sync. Disabling a user updates `_duckpack_auth.quack_users.enabled = false` **and** immediately revokes any active sessions matching that user's `client_id_hash` in `_duckpack_auth.quack_sessions` so access is cut off on the very next query.
 
 ---
 
@@ -259,3 +267,79 @@ lifecycle:
 ExecStart=/bin/bash -c "/usr/local/bin/duckdb /var/lib/duckdb/warehouse.duckdb -init <(printf \"LOAD quack; CALL quack_serve('quack:0.0.0.0:9494', token = '%s', disable_ssl = true, allow_other_hostname = true);\\n\" \"${QUACK_MASTER_TOKEN}\") -no-stdin"
 ExecStartPost=/opt/my_project/scripts/quack_rbac_post_start.sh
 ```
+
+---
+
+### Rootless Podman Quadlet Fleet Pattern (Stock DuckDB Image)
+
+When running a fleet of DuckLake-on-Quack containers (`ducklake@hr`, `ducklake@sales`, `ducklake@finance`, ...) with **zero custom container images** and **zero secrets inside Git or containers**, keep `duckpack` and your `0600` env files in host user space and arm each container over loopback via `ExecStartPost`:
+
+![DuckLake + Quack Fleet RBAC Architecture](./assets/ducklake-rbac-fleet-flow.png)
+
+#### 1. Template Quadlet (`~/.config/containers/systemd/ducklake@.container`)
+
+Use systemd's `%h` specifier (never `~` or `$HOME`) in Quadlet paths, and keep per-instance `PublishPort=` in a drop-in or instance override so each catalog binds its own loopback port (e.g., `127.0.0.1:9491:9494` for `hr`):
+
+```ini
+[Unit]
+Description=DuckLake Quack Metadata Catalog (%i)
+After=network-online.target
+
+[Container]
+Image=duckdb/duckdb:latest
+AutoUpdate=registry
+EnvironmentFile=%h/.config/ducklake/%i.env
+# PublishPort set per instance (e.g. drop-in: PublishPort=127.0.0.1:9491:9494)
+
+[Service]
+Restart=always
+ExecStartPost=%h/.local/bin/ducklake-rbac-sync.sh %i
+
+[Install]
+WantedBy=default.target
+```
+
+> **Unquoted `EnvironmentFile=` values:** Write `QUACK_TOKEN=my_bootstrap_token` without surrounding quotes so both systemd `EnvironmentFile=` and `duckpack apply --env-file` parse the exact same token value. For stricter production secret hygiene, you can inject `users.env` at runtime via `systemd-creds` (`LoadCredentialEncrypted=`), Vault, or SOPS instead of leaving a static file on disk.
+
+#### 2. Host Sync Script (`~/.local/bin/ducklake-rbac-sync.sh`, `chmod 700`)
+
+> **Rootless Podman Readiness Gotcha:** Rootless Podman binds the published host TCP port *before* DuckDB finishes booting inside the container, so a `/dev/tcp` readiness loop returns immediately and can fail with `Failure when receiving data from the peer`. Poll `GET /quack` with `curl` instead — Quack returns HTTP `404` as soon as the HTTP listener is actually serving requests.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTANCE="${1:?Usage: $0 <catalog-instance>}"
+CFG_DIR="${HOME}/.config/ducklake"
+DUCKPACK_BIN="${HOME}/.local/bin/duckpack"
+
+# Load shared user tokens + per-instance QUACK_TOKEN / QUACK_PORT (both chmod 600)
+set -a
+source "${CFG_DIR}/users.env"
+source "${CFG_DIR}/${INSTANCE}.env"
+set +a
+
+QUACK_PORT="${QUACK_PORT:-9494}"
+
+# Optional per-catalog override bundle, falling back to shared fleet bundle
+BUNDLE="${CFG_DIR}/${INSTANCE}.rbac.duckpack"
+[[ -f "${BUNDLE}" ]] || BUNDLE="${CFG_DIR}/rbac.duckpack"
+
+# Wait until Quack's HTTP server answers (any non-000 status; GET /quack returns 404)
+for _ in $(seq 1 60); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:${QUACK_PORT}/quack" || true)"
+  [[ "${code}" != "000" ]] && break
+  sleep 0.5
+done
+
+exec "${DUCKPACK_BIN}" apply \
+  --from "${BUNDLE}" \
+  --rbac-only \
+  --db "quack:127.0.0.1:${QUACK_PORT}" \
+  --insecure \
+  --auto-approve
+```
+
+Day-2 operations:
+- **Container restart / image update:** `systemctl --user restart ducklake@hr` automatically re-arms RBAC in ~1 second.
+- **Live user/role update (zero downtime):** copy the updated `rbac.duckpack` to `~/.config/ducklake/` and run `~/.local/bin/ducklake-rbac-sync.sh hr`.
