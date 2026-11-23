@@ -127,7 +127,7 @@ pub fn is_remote(db: &str) -> bool {
 /// Checks if a remote Quack database is attached as `target_db` on the given `DbExecutor`.
 pub fn is_quack_target_attached(exec: &mut dyn DbExecutor) -> bool {
     exec.query_rows(
-        "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+        "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'target_db' AND (lower(type) = 'quack' OR (path LIKE 'quack:%' AND lower(type) != 'ducklake'))",
     )
     .ok()
     .and_then(|(_, rows)| rows.into_iter().next())

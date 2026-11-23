@@ -837,16 +837,30 @@ pub fn discover_quack_control_targets(
     let mut targets: Vec<QuackControlTarget> = Vec::new();
     let mut seen_endpoints: Vec<String> = Vec::new();
 
+    let mut attached_ducklake_quack: Vec<(String, String)> = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT database_name, COALESCE(path, '') FROM duckdb_databases() \
+        "SELECT database_name, lower(type), COALESCE(path, '') FROM duckdb_databases() \
          WHERE internal = false AND (lower(type) = 'quack' OR path LIKE 'quack:%') \
          ORDER BY database_name",
     ) {
         if let Ok(rows) = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         }) {
             for r in rows.flatten() {
-                let (db_name, path) = r;
+                let (db_name, db_type, path) = r;
+                // DuckLake-on-Quack catalogs have type='ducklake' and path='quack:host:port'.
+                // They do NOT expose `<alias>.query(...)` directly — handle them via transient
+                // Quack control connections (`ducklake→quack`), never as direct Quack aliases.
+                if db_type == "ducklake" {
+                    if path.starts_with("quack:") {
+                        attached_ducklake_quack.push((db_name, path));
+                    }
+                    continue;
+                }
                 let ep = if path.starts_with("quack:") {
                     Some(path.clone())
                 } else {
@@ -922,6 +936,29 @@ pub fn discover_quack_control_targets(
                     }
                 }
             }
+        }
+    }
+
+    // Also expose any dynamically attached DuckLake-on-Quack catalogs (e.g. via CLI `--db ducklake:quack:...`
+    // or `Ctrl+A`) that were not already declared in `duckpack.toml`.
+    for (db_name, ep) in attached_ducklake_quack {
+        let label = format!("{} (ducklake→quack)", db_name);
+        if !targets.iter().any(|t| {
+            t.label == label
+                || t.quack_endpoint
+                    .as_deref()
+                    .map(|e| e.eq_ignore_ascii_case(&ep))
+                    .unwrap_or(false)
+        }) {
+            let disable_ssl = should_disable_quack_ssl(&ep, false);
+            targets.push(QuackControlTarget {
+                label,
+                attached_alias: None,
+                quack_endpoint: Some(ep),
+                token_env: Some("QUACK_TOKEN".to_string()),
+                client_id: None,
+                disable_ssl,
+            });
         }
     }
 

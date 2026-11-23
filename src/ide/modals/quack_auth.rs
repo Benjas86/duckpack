@@ -16,9 +16,9 @@ use crate::ide::modals::input::{
 use crate::quack_auth::{
     cancel_quack_session_query, deploy_quack_rbac_now, export_quack_rbac_bootstrap_script,
     export_quack_rbac_post_start_script, generate_and_save_user_token, load_live_quack_sessions,
-    load_quack_auth_config, resolve_user_token, save_quack_auth_config, set_quack_session_override,
-    validate_quack_auth_config, validate_safe_username, LiveQuackSession, QuackAuthConfig,
-    QuackAuthUser, QuackRole,
+    load_live_quack_users, load_quack_auth_config, resolve_user_token, save_quack_auth_config,
+    set_quack_session_override, validate_quack_auth_config, validate_safe_username,
+    LiveQuackSession, LiveQuackUser, QuackAuthConfig, QuackAuthUser, QuackRole,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub(crate) struct QuackAuthModalState {
     pub(crate) env_profile: Option<String>,
     pub(crate) sessions: Vec<LiveQuackSession>,
     pub(crate) session_index: usize,
+    pub(crate) live_server_users: Vec<LiveQuackUser>,
     pub(crate) config: QuackAuthConfig,
     pub(crate) has_config_on_disk: bool,
     pub(crate) user_index: usize,
@@ -64,6 +65,7 @@ impl QuackAuthModalState {
             env_profile: None,
             sessions: Vec::new(),
             session_index: 0,
+            live_server_users: Vec::new(),
             config: QuackAuthConfig {
                 enabled: true,
                 ..Default::default()
@@ -170,15 +172,19 @@ impl QuackAuthModalState {
     pub(crate) fn refresh_sessions_for(&mut self, conn: &Connection, project_dir: &Path) {
         if self.active_target().is_none() && self.quack_alias.is_none() {
             self.sessions.clear();
+            self.live_server_users.clear();
             self.session_index = 0;
             return;
         }
         let cfg = self.config.clone();
         match self.execute_on_active_quack(conn, project_dir, |c, qa| {
-            load_live_quack_sessions(c, qa, Some(&cfg))
+            let sessions = load_live_quack_sessions(c, qa, Some(&cfg))?;
+            let server_users = load_live_quack_users(c, qa).unwrap_or_default();
+            Ok((sessions, server_users))
         }) {
-            Ok(list) => {
+            Ok((list, server_users)) => {
                 self.sessions = list;
+                self.live_server_users = server_users;
                 self.session_index = self
                     .session_index
                     .min(self.sessions.len().saturating_sub(1));
@@ -186,6 +192,7 @@ impl QuackAuthModalState {
             }
             Err(e) => {
                 self.sessions.clear();
+                self.live_server_users.clear();
                 self.error_msg = Some(format!("Session query failed: {}", e));
             }
         }
@@ -976,7 +983,11 @@ impl QuackAuthModalState {
             ),
             Span::raw("  "),
             Span::styled(
-                format!(" [2] Declarative Users ({}) ", self.config.users.len()),
+                if self.config.users.is_empty() && !self.live_server_users.is_empty() {
+                    format!(" [2] Server Users ({}) ", self.live_server_users.len())
+                } else {
+                    format!(" [2] Declarative Users ({}) ", self.config.users.len())
+                },
                 tab2_style,
             ),
             Span::styled(
@@ -1141,6 +1152,63 @@ impl QuackAuthModalState {
     }
 
     fn render_users_table(&self, f: &mut Frame, area: Rect) {
+        if self.config.users.is_empty() && !self.live_server_users.is_empty() {
+            let header = Row::new(vec![
+                Cell::from("Username"),
+                Cell::from("Role"),
+                Cell::from("Status"),
+                Cell::from("Token Hash"),
+                Cell::from("Session Hash"),
+                Cell::from("Source"),
+            ])
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            );
+            let rows: Vec<Row> = self
+                .live_server_users
+                .iter()
+                .map(|u| {
+                    let status_cell = if u.enabled {
+                        Cell::from("● enabled").style(Style::default().fg(Color::Green))
+                    } else {
+                        Cell::from("○ disabled").style(Style::default().fg(Color::LightRed))
+                    };
+                    let tok_cell = if u.has_token_hash { "✓ sha256" } else { "✗ missing" };
+                    let cid_cell = if u.has_client_id_hash { "✓ salted" } else { "○ pending" };
+                    Row::new(vec![
+                        Cell::from(u.username.clone()),
+                        Cell::from(u.role.clone()).style(role_color_style(&u.role)),
+                        status_cell,
+                        Cell::from(tok_cell),
+                        Cell::from(cid_cell),
+                        Cell::from("live server (_duckpack_auth)")
+                            .style(Style::default().fg(Color::DarkGray)),
+                    ])
+                })
+                .collect();
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Length(18),
+                    Constraint::Length(10),
+                    Constraint::Length(12),
+                    Constraint::Length(12),
+                    Constraint::Length(14),
+                    Constraint::Min(24),
+                ],
+            )
+            .header(header)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(" Live Server Users (_duckpack_auth.quack_users — managed remotely) "),
+            );
+            f.render_widget(table, area);
+            return;
+        }
         if self.config.users.is_empty() {
             let msg = Paragraph::new(
                 "\n  No declarative Quack users configured in duckpack.toml yet.\n  Press 'a' to add your first Admin user (auto-generates a 256-bit token in .env with 0600 permissions).",

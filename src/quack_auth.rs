@@ -1466,6 +1466,51 @@ pub fn load_live_quack_sessions(
     Ok(sessions)
 }
 
+/// Snapshot of a user deployed inside `_duckpack_auth.quack_users` on a live Quack server
+/// (used by `Ctrl+U` to inspect server RBAC even in workspaces managed via a central `rbac.duckpack`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveQuackUser {
+    pub username: String,
+    pub role: String,
+    pub enabled: bool,
+    pub has_token_hash: bool,
+    pub has_client_id_hash: bool,
+}
+
+/// Queries deployed RBAC users from `_duckpack_auth.quack_users` on a live Quack server.
+/// Returns `Ok(Vec::new())` cleanly if `_duckpack_auth` is not yet deployed or caller is non-admin.
+pub fn load_live_quack_users(
+    conn: &duckdb::Connection,
+    quack_alias: &str,
+) -> Result<Vec<LiveQuackUser>> {
+    let mut exec: &duckdb::Connection = conn;
+    let inner = "SELECT \
+        COALESCE(CAST(username AS VARCHAR), ''), \
+        COALESCE(CAST(role AS VARCHAR), 'none'), \
+        COALESCE(CAST(enabled AS VARCHAR), 'false'), \
+        CASE WHEN COALESCE(token_sha256, '') <> '' THEN 'true' ELSE 'false' END, \
+        CASE WHEN COALESCE(client_id_hash, '') <> '' THEN 'true' ELSE 'false' END \
+        FROM _duckpack_auth.quack_users ORDER BY username";
+    let sql = crate::sql_utils::wrap_quack_alias_query(quack_alias, inner);
+    let rows = match exec.query_rows(&sql) {
+        Ok((_, rows)) => rows,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut users = Vec::new();
+    for r in rows {
+        if r.len() >= 5 {
+            users.push(LiveQuackUser {
+                username: r[0].clone(),
+                role: r[1].clone(),
+                enabled: r[2].eq_ignore_ascii_case("true") || r[2] == "1",
+                has_token_hash: r[3].eq_ignore_ascii_case("true") || r[3] == "1",
+                has_client_id_hash: r[4].eq_ignore_ascii_case("true") || r[4] == "1",
+            });
+        }
+    }
+    Ok(users)
+}
+
 /// Cancels the currently running query for a live Quack session via the DuckDB v2.0
 /// client-side table function `quack_cancel(catalog, connection_id)`.
 pub fn cancel_quack_session_query(

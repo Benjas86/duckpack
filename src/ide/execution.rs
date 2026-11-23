@@ -217,10 +217,11 @@ pub(crate) fn execute_ide_query(
         .find(|d| d.name == active_tab.target_database)
         .map(|d| {
             d.db_type.eq_ignore_ascii_case("quack")
-                || d.path
-                    .as_deref()
-                    .map(|p| p.starts_with("quack:"))
-                    .unwrap_or(false)
+                || (!d.db_type.eq_ignore_ascii_case("ducklake")
+                    && d.path
+                        .as_deref()
+                        .map(|p| p.starts_with("quack:"))
+                        .unwrap_or(false))
         })
         .unwrap_or(false)
         || (is_quack && active_tab.target_database == "target_db");

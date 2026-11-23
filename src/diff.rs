@@ -315,7 +315,7 @@ pub fn detect_quack_alias(
     if !safe_cat.is_empty() {
         let cat_quack = exec
             .query_rows(&format!(
-                "SELECT count(*) FROM duckdb_databases() WHERE internal = false AND database_name = '{}' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
+                "SELECT count(*) FROM duckdb_databases() WHERE internal = false AND database_name = '{}' AND (lower(type) = 'quack' OR (path LIKE 'quack:%' AND lower(type) != 'ducklake'))",
                 safe_cat
             ))
             .ok()
@@ -350,7 +350,7 @@ pub fn find_any_quack_alias(
         return Some("target_db".to_string());
     }
     exec.query_rows(
-        "SELECT database_name FROM duckdb_databases() WHERE internal = false AND (lower(type) = 'quack' OR path LIKE 'quack:%') LIMIT 1",
+        "SELECT database_name FROM duckdb_databases() WHERE internal = false AND (lower(type) = 'quack' OR (path LIKE 'quack:%' AND lower(type) != 'ducklake')) LIMIT 1",
     )
     .ok()
     .and_then(|(_, rows)| rows.into_iter().next())
