@@ -1528,6 +1528,54 @@ pub fn load_live_quack_rbac_enabled(conn: &duckdb::Connection, quack_alias: &str
     }
 }
 
+/// Resolves the current Quack control connection's `(connection_id, username)` on the live server
+/// so the TUI can tag the caller's own session/login and prevent accidental self-lockout.
+pub fn load_current_quack_identity(
+    conn: &duckdb::Connection,
+    quack_alias: &str,
+) -> (Option<String>, Option<String>) {
+    let mut exec: &duckdb::Connection = conn;
+    let safe_qa_lit = quack_alias.replace('\'', "''");
+    let sid = exec
+        .query_rows(&format!(
+            "SELECT CAST(quack_connection_id('{}') AS VARCHAR)",
+            safe_qa_lit
+        ))
+        .ok()
+        .and_then(|(_, rows)| rows.into_iter().next())
+        .and_then(|r| r.into_iter().next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("NULL"));
+
+    let username = if let Some(ref my_sid) = sid {
+        let safe_sid = my_sid.replace('\'', "''");
+        let inner = format!(
+            "SELECT COALESCE( \
+                (SELECT s.username FROM _duckpack_auth.quack_sessions s WHERE lower(CAST(s.sid AS VARCHAR)) = lower('{safe_sid}') AND COALESCE(s.username, '') <> '' LIMIT 1), \
+                (SELECT u.username FROM quack_active_connections() ac \
+                 JOIN _duckpack_auth.quack_users u \
+                   ON COALESCE(u.client_id_hash, '') <> '' \
+                  AND lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) \
+                 WHERE lower(CAST(ac.connection_id AS VARCHAR)) = lower('{safe_sid}') \
+                 ORDER BY CASE WHEN u.username = '__duckpack_master' THEN 1 ELSE 0 END, u.username \
+                 LIMIT 1), \
+                '' \
+            )"
+        );
+        let sql = crate::sql_utils::wrap_quack_alias_query(quack_alias, &inner);
+        exec.query_rows(&sql)
+            .ok()
+            .and_then(|(_, rows)| rows.into_iter().next())
+            .and_then(|r| r.into_iter().next())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("NULL"))
+    } else {
+        None
+    };
+
+    (sid, username)
+}
+
 /// Builds the server-side break-glass SQL to disable or re-enable a live user in `_duckpack_auth.quack_users`.
 /// When disabling (`enabled = false`), also revokes any currently active sessions belonging to that user
 /// so they are cut off immediately instead of falling back to `default_role`.

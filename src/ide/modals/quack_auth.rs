@@ -16,8 +16,8 @@ use crate::ide::modals::input::{
 use crate::quack_auth::{
     cancel_quack_session_query, deploy_quack_rbac_now, export_quack_rbac_bootstrap_script,
     export_quack_rbac_post_start_script, generate_and_save_user_token,
-    load_live_quack_rbac_enabled, load_live_quack_sessions, load_live_quack_users,
-    load_quack_auth_config, resolve_user_token, save_quack_auth_config,
+    load_current_quack_identity, load_live_quack_rbac_enabled, load_live_quack_sessions,
+    load_live_quack_users, load_quack_auth_config, resolve_user_token, save_quack_auth_config,
     set_live_quack_user_enabled, set_live_quack_user_role, set_quack_session_override,
     validate_quack_auth_config, validate_safe_username, LiveQuackSession, LiveQuackUser,
     QuackAuthConfig, QuackAuthUser, QuackRole,
@@ -55,6 +55,9 @@ pub(crate) struct QuackAuthModalState {
     pub(crate) session_index: usize,
     pub(crate) live_server_users: Vec<LiveQuackUser>,
     pub(crate) live_rbac_enabled: Option<bool>,
+    pub(crate) current_sid: Option<String>,
+    pub(crate) current_username: Option<String>,
+    pub(crate) access_denied: bool,
     pending_break_glass: Option<PendingBreakGlass>,
     pub(crate) config: QuackAuthConfig,
     pub(crate) has_config_on_disk: bool,
@@ -84,6 +87,9 @@ impl QuackAuthModalState {
             session_index: 0,
             live_server_users: Vec::new(),
             live_rbac_enabled: None,
+            current_sid: None,
+            current_username: None,
+            access_denied: false,
             pending_break_glass: None,
             config: QuackAuthConfig {
                 enabled: true,
@@ -107,6 +113,26 @@ impl QuackAuthModalState {
     /// (read-only audit view with guarded break-glass actions).
     fn is_remote_audit_mode(&self) -> bool {
         self.config.users.is_empty() && !self.live_server_users.is_empty()
+    }
+
+    /// True when the remote Quack server rejected RBAC inspection with Authorization/Authentication
+    /// failure and this project has no local `[quack_auth]` config to manage offline.
+    fn is_admin_locked_view(&self) -> bool {
+        self.access_denied && !self.has_config_on_disk
+    }
+
+    fn is_current_username(&self, username: &str) -> bool {
+        self.current_username
+            .as_deref()
+            .map(|me| me.eq_ignore_ascii_case(username))
+            .unwrap_or(false)
+    }
+
+    fn is_current_sid(&self, sid: &str) -> bool {
+        self.current_sid
+            .as_deref()
+            .map(|me| me.eq_ignore_ascii_case(sid))
+            .unwrap_or(false)
     }
 
     pub(crate) fn active_target(&self) -> Option<&crate::workspace::QuackControlTarget> {
@@ -175,6 +201,9 @@ impl QuackAuthModalState {
         self.is_open = true;
         self.adding_user = false;
         self.pending_break_glass = None;
+        self.access_denied = false;
+        self.current_sid = None;
+        self.current_username = None;
         self.status_msg = None;
         self.error_msg = None;
         self.user_index = self
@@ -202,6 +231,9 @@ impl QuackAuthModalState {
             self.sessions.clear();
             self.live_server_users.clear();
             self.live_rbac_enabled = None;
+            self.current_sid = None;
+            self.current_username = None;
+            self.access_denied = false;
             self.session_index = 0;
             return;
         }
@@ -210,12 +242,16 @@ impl QuackAuthModalState {
             let sessions = load_live_quack_sessions(c, qa, Some(&cfg))?;
             let server_users = load_live_quack_users(c, qa).unwrap_or_default();
             let rbac_enabled = load_live_quack_rbac_enabled(c, qa);
-            Ok((sessions, server_users, rbac_enabled))
+            let (my_sid, my_user) = load_current_quack_identity(c, qa);
+            Ok((sessions, server_users, rbac_enabled, my_sid, my_user))
         }) {
-            Ok((list, server_users, rbac_enabled)) => {
+            Ok((list, server_users, rbac_enabled, my_sid, my_user)) => {
                 self.sessions = list;
                 self.live_server_users = server_users;
                 self.live_rbac_enabled = rbac_enabled;
+                self.current_sid = my_sid;
+                self.current_username = my_user;
+                self.access_denied = false;
                 self.session_index = self
                     .session_index
                     .min(self.sessions.len().saturating_sub(1));
@@ -227,10 +263,24 @@ impl QuackAuthModalState {
                 self.error_msg = None;
             }
             Err(e) => {
+                let full_err = format!("{:#}", e);
+                let lower = full_err.to_ascii_lowercase();
+                let is_denied = lower.contains("authorization failed")
+                    || lower.contains("authentication failed");
                 self.sessions.clear();
                 self.live_server_users.clear();
                 self.live_rbac_enabled = None;
-                self.error_msg = Some(format!("Session query failed: {}", e));
+                self.current_sid = None;
+                self.current_username = None;
+                self.access_denied = is_denied;
+                if is_denied {
+                    self.error_msg = Some(
+                        "Admin credentials required — server denied RBAC inspection (Authorization failed)."
+                            .to_string(),
+                    );
+                } else {
+                    self.error_msg = Some(format!("Session query failed: {}", e));
+                }
             }
         }
     }
@@ -664,6 +714,12 @@ impl QuackAuthModalState {
                 let Some(sess) = self.sessions.get(self.session_index).cloned() else {
                     return None;
                 };
+                if self.is_current_sid(&sess.connection_id) {
+                    self.error_msg = Some(
+                        "Cannot cancel your own active control session.".to_string(),
+                    );
+                    return None;
+                }
                 match self.execute_on_active_quack(conn, project_dir, |c, qa| {
                     cancel_quack_session_query(c, qa, &sess.server_id, &sess.connection_id)
                 }) {
@@ -688,6 +744,13 @@ impl QuackAuthModalState {
                 let Some(sess) = self.sessions.get(self.session_index).cloned() else {
                     return None;
                 };
+                if !sess.revoked && self.is_current_sid(&sess.connection_id) {
+                    self.error_msg = Some(
+                        "Cannot revoke your own active session — prevents self-lockout."
+                            .to_string(),
+                    );
+                    return None;
+                }
                 let new_revoked = !sess.revoked;
                 let preserved_role = if sess.role.eq_ignore_ascii_case("none") {
                     self.config.default_role.as_str()
@@ -727,6 +790,13 @@ impl QuackAuthModalState {
                 let Some(sess) = self.sessions.get(self.session_index).cloned() else {
                     return None;
                 };
+                if self.is_current_sid(&sess.connection_id) {
+                    self.error_msg = Some(
+                        "Cannot change role of your own active session — prevents self-lockout."
+                            .to_string(),
+                    );
+                    return None;
+                }
                 let next_role = QuackRole::from_str(&sess.role).next();
                 match self.execute_on_active_quack(conn, project_dir, |c, qa| {
                     set_quack_session_override(
@@ -766,6 +836,12 @@ impl QuackAuthModalState {
         conn: &Connection,
         project_dir: &Path,
     ) -> Option<String> {
+        if self.is_admin_locked_view() {
+            if matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::F(5)) {
+                self.refresh_sessions_for(conn, project_dir);
+            }
+            return None;
+        }
         if self.is_remote_audit_mode() {
             return self.handle_remote_audit_users_key(key, conn, project_dir);
         }
@@ -1052,6 +1128,13 @@ impl QuackAuthModalState {
                     );
                     return None;
                 }
+                if u.enabled && self.is_current_username(&u.username) {
+                    self.error_msg = Some(format!(
+                        "Cannot disable your own active login ('{}') — prevents self-lockout.",
+                        u.username
+                    ));
+                    return None;
+                }
                 self.error_msg = None;
                 self.pending_break_glass = Some(PendingBreakGlass::SetEnabled {
                     username: u.username,
@@ -1068,6 +1151,13 @@ impl QuackAuthModalState {
                         "Cannot change role of '__duckpack_master' (protected server break-glass admin)."
                             .to_string(),
                     );
+                    return None;
+                }
+                if self.is_current_username(&u.username) {
+                    self.error_msg = Some(format!(
+                        "Cannot change role of your own active login ('{}') — prevents self-lockout.",
+                        u.username
+                    ));
                     return None;
                 }
                 let next_role = QuackRole::from_str(&u.role).next();
@@ -1135,7 +1225,9 @@ impl QuackAuthModalState {
         } else {
             "Offline (no Quack attached)".to_string()
         };
-        let rbac_badge = if self.is_remote_audit_mode() {
+        let rbac_badge = if self.is_admin_locked_view() {
+            "ADMIN ONLY"
+        } else if self.is_remote_audit_mode() {
             match self.live_rbac_enabled {
                 Some(true) => "RBAC: ON (remote)",
                 Some(false) => "RBAC: OFF (remote)",
@@ -1289,6 +1381,14 @@ impl QuackAuthModalState {
             " Tab/↑↓: Next Field | ←/→/Space: Role | Enter: Save & Generate Token | Esc: Cancel"
         } else if self.pending_break_glass.is_some() {
             " y / Enter: Confirm Break-Glass Action | n / Esc: Cancel"
+        } else if self.is_admin_locked_view()
+            || (self.access_denied && self.active_tab == QuackAuthTab::LiveSessions)
+        {
+            if self.targets.len() > 1 {
+                " [/]: Switch Target | u/F5: Retry | Esc: Close"
+            } else {
+                " u/F5: Retry | Esc: Close"
+            }
         } else if self.active_tab == QuackAuthTab::LiveSessions {
             " ↑↓/jk: Select | c: Cancel Query | x: Revoke/Restore | r: Cycle Role | u/F5: Refresh | Tab: Users | Esc: Close"
         } else if self.is_remote_audit_mode() {
@@ -1303,7 +1403,32 @@ impl QuackAuthModalState {
         f.render_widget(footer, layout[3]);
     }
 
+    fn render_admin_locked_notice(&self, f: &mut Frame, area: Rect) {
+        let target_lbl = self
+            .active_target()
+            .map(|t| t.label.as_str())
+            .or(self.quack_alias.as_deref())
+            .unwrap_or("Quack server");
+        let msg = Paragraph::new(format!(
+            "\n  🔒 Admin credentials required\n\n  Your current Quack token does not have admin privileges on '{}'.\n  The server enforces this via _duckpack_quack_authorize — non-admin roles (reader / writer)\n  cannot inspect active sessions, view _duckpack_auth.quack_users, or run break-glass actions.\n\n  To manage RBAC, configure an admin token (admin_token_env / token_env) in .env and press u / F5.",
+            target_lbl
+        ))
+        .style(Style::default().fg(Color::Yellow))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" Admin-Only RBAC Control "),
+        );
+        f.render_widget(msg, area);
+    }
+
     fn render_sessions_tab(&self, f: &mut Frame, area: Rect) {
+        if self.access_denied {
+            self.render_admin_locked_notice(f, area);
+            return;
+        }
         if self.quack_alias.is_none() {
             let msg = Paragraph::new(
                 "\n  No Quack server is currently attached.\n  Attach a Quack server via Ctrl+A or start with `duckpack explore --db quack:...`,\n  or press [2] / Tab to manage declarative users & export post-start scripts.",
@@ -1363,9 +1488,14 @@ impl QuackAuthModalState {
                 } else {
                     Style::default().fg(Color::White)
                 };
+                let user_label = if self.is_current_sid(&s.connection_id) {
+                    format!("{} (you)", s.username)
+                } else {
+                    s.username.clone()
+                };
                 Row::new(vec![
                     Cell::from(short_id(&s.connection_id)),
-                    Cell::from(s.username.clone()),
+                    Cell::from(user_label),
                     Cell::from(role_label).style(role_style),
                     Cell::from(s.state.clone()),
                     Cell::from(started_preview),
@@ -1410,6 +1540,10 @@ impl QuackAuthModalState {
     }
 
     fn render_users_table(&self, f: &mut Frame, area: Rect) {
+        if self.is_admin_locked_view() {
+            self.render_admin_locked_notice(f, area);
+            return;
+        }
         if self.is_remote_audit_mode() {
             let header = Row::new(vec![
                 Cell::from("Username"),
@@ -1431,6 +1565,7 @@ impl QuackAuthModalState {
                 .map(|(idx, u)| {
                     let is_sel = idx == self.user_index;
                     let is_master = u.username.eq_ignore_ascii_case("__duckpack_master");
+                    let is_self = self.is_current_username(&u.username);
                     let status_cell = if u.enabled {
                         Cell::from("● enabled").style(Style::default().fg(Color::Green))
                     } else {
@@ -1451,6 +1586,9 @@ impl QuackAuthModalState {
                     let src_cell = if is_master {
                         Cell::from("protected break-glass")
                             .style(Style::default().fg(Color::DarkGray))
+                    } else if is_self {
+                        Cell::from("current login (protected)")
+                            .style(Style::default().fg(Color::Cyan))
                     } else {
                         Cell::from("central RBAC (live)")
                             .style(Style::default().fg(Color::DarkGray))
