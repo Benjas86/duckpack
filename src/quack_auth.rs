@@ -1511,6 +1511,134 @@ pub fn load_live_quack_users(
     Ok(users)
 }
 
+/// Inspects whether DuckPack's global Quack authorization hook is currently active on the live server.
+/// Returns `None` if the server cannot be queried or caller lacks permission to read `current_setting`.
+pub fn load_live_quack_rbac_enabled(conn: &duckdb::Connection, quack_alias: &str) -> Option<bool> {
+    let mut exec: &duckdb::Connection = conn;
+    let sql = crate::sql_utils::wrap_quack_alias_query(
+        quack_alias,
+        "SELECT COALESCE(CAST(current_setting('quack_authorization_function') AS VARCHAR), '')",
+    );
+    let (_, rows) = exec.query_rows(&sql).ok()?;
+    let val = rows.first()?.first()?.trim().to_ascii_lowercase();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val == "_duckpack_quack_authorize")
+    }
+}
+
+/// Builds the server-side break-glass SQL to disable or re-enable a live user in `_duckpack_auth.quack_users`.
+/// When disabling (`enabled = false`), also revokes any currently active sessions belonging to that user
+/// so they are cut off immediately instead of falling back to `default_role`.
+fn build_live_user_enabled_sql(username: &str, enabled: bool, quack_server_mode: bool) -> Result<String> {
+    let trimmed = username.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Username cannot be empty.");
+    }
+    if trimmed.eq_ignore_ascii_case("__duckpack_master") {
+        anyhow::bail!(
+            "Cannot disable '__duckpack_master' (protected server break-glass admin)."
+        );
+    }
+    let safe_user = trimmed.replace('\'', "''");
+    if enabled {
+        Ok(format!(
+            "UPDATE _duckpack_auth.quack_users SET enabled = true WHERE username = '{safe_user}'; \
+             DELETE FROM _duckpack_auth.quack_sessions WHERE username = '{safe_user}' AND revoked = true;"
+        ))
+    } else if quack_server_mode {
+        Ok(format!(
+            "CREATE SCHEMA IF NOT EXISTS _duckpack_auth; \
+             CREATE TABLE IF NOT EXISTS _duckpack_auth.quack_sessions (sid VARCHAR PRIMARY KEY, username VARCHAR, role VARCHAR NOT NULL, revoked BOOLEAN NOT NULL DEFAULT false, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP); \
+             UPDATE _duckpack_auth.quack_users SET enabled = false WHERE username = '{safe_user}'; \
+             DELETE FROM _duckpack_auth.quack_sessions WHERE lower(CAST(sid AS VARCHAR)) IN ( \
+                 SELECT lower(CAST(ac.connection_id AS VARCHAR)) \
+                 FROM quack_active_connections() ac \
+                 JOIN _duckpack_auth.quack_users u \
+                   ON COALESCE(u.client_id_hash, '') <> '' \
+                  AND lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) \
+                 WHERE u.username = '{safe_user}' \
+             ); \
+             INSERT INTO _duckpack_auth.quack_sessions (sid, username, role, revoked) \
+             SELECT DISTINCT CAST(ac.connection_id AS VARCHAR), u.username, 'none', true \
+             FROM quack_active_connections() ac \
+             JOIN _duckpack_auth.quack_users u \
+               ON COALESCE(u.client_id_hash, '') <> '' \
+              AND lower(u.client_id_hash) = lower(CAST(ac.client_id_hash AS VARCHAR)) \
+             WHERE u.username = '{safe_user}';"
+        ))
+    } else {
+        Ok(format!(
+            "UPDATE _duckpack_auth.quack_users SET enabled = false WHERE username = '{safe_user}'; \
+             UPDATE _duckpack_auth.quack_sessions SET role = 'none', revoked = true WHERE username = '{safe_user}';"
+        ))
+    }
+}
+
+/// Builds the server-side break-glass SQL to override a live user's role in `_duckpack_auth.quack_users`.
+fn build_live_user_role_sql(username: &str, role: QuackRole) -> Result<String> {
+    let trimmed = username.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Username cannot be empty.");
+    }
+    if trimmed.eq_ignore_ascii_case("__duckpack_master") {
+        anyhow::bail!(
+            "Cannot change role of '__duckpack_master' (protected server break-glass admin)."
+        );
+    }
+    let safe_user = trimmed.replace('\'', "''");
+    let safe_role = role.as_str().replace('\'', "''");
+    Ok(format!(
+        "UPDATE _duckpack_auth.quack_users SET role = '{safe_role}' WHERE username = '{safe_user}'; \
+         DELETE FROM _duckpack_auth.quack_sessions WHERE username = '{safe_user}' AND revoked = false;"
+    ))
+}
+
+/// Break-glass live toggle for a deployed user in `_duckpack_auth.quack_users` on a Quack server.
+/// Changes are ephemeral and will be reconciled back to declarative state on the next RBAC sync.
+pub fn set_live_quack_user_enabled(
+    conn: &duckdb::Connection,
+    quack_alias: &str,
+    username: &str,
+    enabled: bool,
+) -> Result<()> {
+    let inner = build_live_user_enabled_sql(username, enabled, true)?;
+    let quoted_qa = crate::sql_utils::quote_ident(quack_alias);
+    let sql = format!("CALL {}.query('{}')", quoted_qa, inner.replace('\'', "''"));
+    conn.execute_batch(&sql).with_context(|| {
+        format!(
+            "Failed to {} live user '{}' on '{}'",
+            if enabled { "enable" } else { "disable" },
+            username,
+            quack_alias
+        )
+    })?;
+    Ok(())
+}
+
+/// Break-glass live role override for a deployed user in `_duckpack_auth.quack_users` on a Quack server.
+/// Changes are ephemeral and will be reconciled back to declarative state on the next RBAC sync.
+pub fn set_live_quack_user_role(
+    conn: &duckdb::Connection,
+    quack_alias: &str,
+    username: &str,
+    role: QuackRole,
+) -> Result<()> {
+    let inner = build_live_user_role_sql(username, role)?;
+    let quoted_qa = crate::sql_utils::quote_ident(quack_alias);
+    let sql = format!("CALL {}.query('{}')", quoted_qa, inner.replace('\'', "''"));
+    conn.execute_batch(&sql).with_context(|| {
+        format!(
+            "Failed to set live role '{}' for '{}' on '{}'",
+            role.as_str(),
+            username,
+            quack_alias
+        )
+    })?;
+    Ok(())
+}
+
 /// Cancels the currently running query for a live Quack session via the DuckDB v2.0
 /// client-side table function `quack_cancel(catalog, connection_id)`.
 pub fn cancel_quack_session_query(
@@ -2332,6 +2460,44 @@ mod tests {
         assert!(!check("sid_w", "INSERT INTO \"my-catalog\".\"main\".\"ducklake_table\" VALUES (99);"));
         assert!(!check("sid_w", "CREATE TABLE \"main\".ducklake_inlined_data_1_1 AS SELECT 1;"));
         assert!(!check("sid_w", "CREATE TABLE \"main\".ducklake_inlined_data_1_1(id INT) AS SELECT 1;"));
+
+        // Break-glass SQL helpers: protect __duckpack_master, disable/re-enable user + revoke active sessions, override role
+        assert!(build_live_user_enabled_sql("__duckpack_master", false, false).is_err());
+        assert!(build_live_user_role_sql("__duckpack_master", QuackRole::Reader).is_err());
+
+        let disable_bob = build_live_user_enabled_sql("bob", false, false).unwrap();
+        conn.execute_batch(&disable_bob).unwrap();
+        assert!(!check("sid_w", "SELECT 1;"), "Disabled user active session MUST be revoked immediately");
+        let bob_auth: bool = conn
+            .query_row(
+                "SELECT _duckpack_auth.authenticate('new_sid', 'writer_secret_2222', '');",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!bob_auth, "Disabled user MUST be rejected on new login");
+
+        let enable_bob = build_live_user_enabled_sql("bob", true, false).unwrap();
+        conn.execute_batch(&enable_bob).unwrap();
+        let bob_auth_restored: bool = conn
+            .query_row(
+                "SELECT _duckpack_auth.authenticate('new_sid', 'writer_secret_2222', '');",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(bob_auth_restored, "Re-enabled user MUST authenticate again");
+
+        let demote_bob = build_live_user_role_sql("bob", QuackRole::Reader).unwrap();
+        conn.execute_batch(&demote_bob).unwrap();
+        let bob_role: String = conn
+            .query_row(
+                "SELECT role FROM _duckpack_auth.quack_users WHERE username = 'bob';",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bob_role, "reader");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

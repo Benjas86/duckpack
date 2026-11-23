@@ -15,16 +15,31 @@ use crate::ide::modals::input::{
 };
 use crate::quack_auth::{
     cancel_quack_session_query, deploy_quack_rbac_now, export_quack_rbac_bootstrap_script,
-    export_quack_rbac_post_start_script, generate_and_save_user_token, load_live_quack_sessions,
-    load_live_quack_users, load_quack_auth_config, resolve_user_token, save_quack_auth_config,
-    set_quack_session_override, validate_quack_auth_config, validate_safe_username,
-    LiveQuackSession, LiveQuackUser, QuackAuthConfig, QuackAuthUser, QuackRole,
+    export_quack_rbac_post_start_script, generate_and_save_user_token,
+    load_live_quack_rbac_enabled, load_live_quack_sessions, load_live_quack_users,
+    load_quack_auth_config, resolve_user_token, save_quack_auth_config,
+    set_live_quack_user_enabled, set_live_quack_user_role, set_quack_session_override,
+    validate_quack_auth_config, validate_safe_username, LiveQuackSession, LiveQuackUser,
+    QuackAuthConfig, QuackAuthUser, QuackRole,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QuackAuthTab {
     LiveSessions,
     Users,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingBreakGlass {
+    SetEnabled {
+        username: String,
+        enabled: bool,
+    },
+    SetRole {
+        username: String,
+        from_role: String,
+        to_role: QuackRole,
+    },
 }
 
 /// Interactive `Ctrl+U` modal for Quack RBAC user management and live session monitoring.
@@ -39,6 +54,8 @@ pub(crate) struct QuackAuthModalState {
     pub(crate) sessions: Vec<LiveQuackSession>,
     pub(crate) session_index: usize,
     pub(crate) live_server_users: Vec<LiveQuackUser>,
+    pub(crate) live_rbac_enabled: Option<bool>,
+    pending_break_glass: Option<PendingBreakGlass>,
     pub(crate) config: QuackAuthConfig,
     pub(crate) has_config_on_disk: bool,
     pub(crate) user_index: usize,
@@ -66,6 +83,8 @@ impl QuackAuthModalState {
             sessions: Vec::new(),
             session_index: 0,
             live_server_users: Vec::new(),
+            live_rbac_enabled: None,
+            pending_break_glass: None,
             config: QuackAuthConfig {
                 enabled: true,
                 ..Default::default()
@@ -82,6 +101,12 @@ impl QuackAuthModalState {
             status_msg: None,
             error_msg: None,
         }
+    }
+
+    /// True when Tab 2 is showing remotely managed server users from `_duckpack_auth.quack_users`
+    /// (read-only audit view with guarded break-glass actions).
+    fn is_remote_audit_mode(&self) -> bool {
+        self.config.users.is_empty() && !self.live_server_users.is_empty()
     }
 
     pub(crate) fn active_target(&self) -> Option<&crate::workspace::QuackControlTarget> {
@@ -149,6 +174,7 @@ impl QuackAuthModalState {
 
         self.is_open = true;
         self.adding_user = false;
+        self.pending_break_glass = None;
         self.status_msg = None;
         self.error_msg = None;
         self.user_index = self
@@ -161,6 +187,8 @@ impl QuackAuthModalState {
         } else {
             self.active_tab = QuackAuthTab::Users;
             self.sessions.clear();
+            self.live_server_users.clear();
+            self.live_rbac_enabled = None;
             self.session_index = 0;
             self.status_msg = Some(
                 "No live Quack server attached — manage declarative users & export scripts offline."
@@ -173,6 +201,7 @@ impl QuackAuthModalState {
         if self.active_target().is_none() && self.quack_alias.is_none() {
             self.sessions.clear();
             self.live_server_users.clear();
+            self.live_rbac_enabled = None;
             self.session_index = 0;
             return;
         }
@@ -180,19 +209,27 @@ impl QuackAuthModalState {
         match self.execute_on_active_quack(conn, project_dir, |c, qa| {
             let sessions = load_live_quack_sessions(c, qa, Some(&cfg))?;
             let server_users = load_live_quack_users(c, qa).unwrap_or_default();
-            Ok((sessions, server_users))
+            let rbac_enabled = load_live_quack_rbac_enabled(c, qa);
+            Ok((sessions, server_users, rbac_enabled))
         }) {
-            Ok((list, server_users)) => {
+            Ok((list, server_users, rbac_enabled)) => {
                 self.sessions = list;
                 self.live_server_users = server_users;
+                self.live_rbac_enabled = rbac_enabled;
                 self.session_index = self
                     .session_index
                     .min(self.sessions.len().saturating_sub(1));
+                if self.is_remote_audit_mode() {
+                    self.user_index = self
+                        .user_index
+                        .min(self.live_server_users.len().saturating_sub(1));
+                }
                 self.error_msg = None;
             }
             Err(e) => {
                 self.sessions.clear();
                 self.live_server_users.clear();
+                self.live_rbac_enabled = None;
                 self.error_msg = Some(format!("Session query failed: {}", e));
             }
         }
@@ -421,6 +458,76 @@ impl QuackAuthModalState {
         }
     }
 
+    fn handle_break_glass_confirm_key(
+        &mut self,
+        key: KeyEvent,
+        conn: &Connection,
+        project_dir: &Path,
+    ) -> Option<String> {
+        let Some(action) = self.pending_break_glass.clone() else {
+            return None;
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.pending_break_glass = None;
+                let res = match action {
+                    PendingBreakGlass::SetEnabled { username, enabled } => self
+                        .execute_on_active_quack(conn, project_dir, |c, qa| {
+                            set_live_quack_user_enabled(c, qa, &username, enabled)
+                        })
+                        .map(|_| {
+                            if enabled {
+                                format!(
+                                    "BREAK-GLASS: Re-enabled '{}' live on server (ephemeral — update central RBAC to persist).",
+                                    username
+                                )
+                            } else {
+                                format!(
+                                    "BREAK-GLASS: Disabled '{}' & revoked active sessions (ephemeral — update central RBAC to persist).",
+                                    username
+                                )
+                            }
+                        }),
+                    PendingBreakGlass::SetRole {
+                        username,
+                        from_role,
+                        to_role,
+                    } => self
+                        .execute_on_active_quack(conn, project_dir, |c, qa| {
+                            set_live_quack_user_role(c, qa, &username, to_role)
+                        })
+                        .map(|_| {
+                            format!(
+                                "BREAK-GLASS: Changed '{}' live role {} -> {} (ephemeral — update central RBAC to persist).",
+                                username,
+                                from_role,
+                                to_role.as_str()
+                            )
+                        }),
+                };
+                match res {
+                    Ok(msg) => {
+                        self.refresh_sessions_for(conn, project_dir);
+                        self.error_msg = None;
+                        self.status_msg = Some(msg.clone());
+                        Some(msg)
+                    }
+                    Err(e) => {
+                        self.error_msg = Some(format!("Break-glass action failed: {}", e));
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.pending_break_glass = None;
+                self.error_msg = None;
+                let msg = "Cancelled break-glass action.".to_string();
+                self.status_msg = Some(msg.clone());
+                Some(msg)
+            }
+        }
+    }
+
     /// Handles a key event while the Quack RBAC & Sessions modal is open.
     /// Returns `Some(status_message)` when a notable action completes.
     pub(crate) fn handle_key(
@@ -432,13 +539,18 @@ impl QuackAuthModalState {
         if self.adding_user {
             return self.handle_add_user_key(key, project_dir);
         }
+        if self.pending_break_glass.is_some() {
+            return self.handle_break_glass_confirm_key(key, conn, project_dir);
+        }
 
         match key.code {
             KeyCode::Esc => {
                 self.is_open = false;
+                self.pending_break_glass = None;
                 return Some("Closed Quack RBAC & Session Monitor.".to_string());
             }
             KeyCode::Tab | KeyCode::BackTab => {
+                self.pending_break_glass = None;
                 self.active_tab = match self.active_tab {
                     QuackAuthTab::LiveSessions => QuackAuthTab::Users,
                     QuackAuthTab::Users => {
@@ -450,6 +562,7 @@ impl QuackAuthModalState {
             }
             KeyCode::Char('[') => {
                 if self.targets.len() > 1 {
+                    self.pending_break_glass = None;
                     self.target_index = if self.target_index == 0 {
                         self.targets.len() - 1
                     } else {
@@ -467,6 +580,7 @@ impl QuackAuthModalState {
             }
             KeyCode::Char(']') => {
                 if self.targets.len() > 1 {
+                    self.pending_break_glass = None;
                     self.target_index = (self.target_index + 1) % self.targets.len();
                     self.sync_active_quack_alias();
                     self.refresh_sessions_for(conn, project_dir);
@@ -652,6 +766,9 @@ impl QuackAuthModalState {
         conn: &Connection,
         project_dir: &Path,
     ) -> Option<String> {
+        if self.is_remote_audit_mode() {
+            return self.handle_remote_audit_users_key(key, conn, project_dir);
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.user_index = self.user_index.saturating_sub(1);
@@ -893,6 +1010,98 @@ impl QuackAuthModalState {
         }
     }
 
+    fn handle_remote_audit_users_key(
+        &mut self,
+        key: KeyEvent,
+        conn: &Connection,
+        project_dir: &Path,
+    ) -> Option<String> {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.user_index = self.user_index.saturating_sub(1);
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.live_server_users.is_empty() {
+                    self.user_index =
+                        (self.user_index + 1).min(self.live_server_users.len() - 1);
+                }
+                None
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::F(5) => {
+                self.refresh_sessions_for(conn, project_dir);
+                if self.error_msg.is_none() {
+                    let msg = format!(
+                        "Refreshed {} live server user(s).",
+                        self.live_server_users.len()
+                    );
+                    self.status_msg = Some(msg.clone());
+                    Some(msg)
+                } else {
+                    None
+                }
+            }
+            KeyCode::Char(' ') => {
+                let Some(u) = self.live_server_users.get(self.user_index).cloned() else {
+                    return None;
+                };
+                if u.username.eq_ignore_ascii_case("__duckpack_master") {
+                    self.error_msg = Some(
+                        "Cannot disable '__duckpack_master' (protected server break-glass admin)."
+                            .to_string(),
+                    );
+                    return None;
+                }
+                self.error_msg = None;
+                self.pending_break_glass = Some(PendingBreakGlass::SetEnabled {
+                    username: u.username,
+                    enabled: !u.enabled,
+                });
+                None
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                let Some(u) = self.live_server_users.get(self.user_index).cloned() else {
+                    return None;
+                };
+                if u.username.eq_ignore_ascii_case("__duckpack_master") {
+                    self.error_msg = Some(
+                        "Cannot change role of '__duckpack_master' (protected server break-glass admin)."
+                            .to_string(),
+                    );
+                    return None;
+                }
+                let next_role = QuackRole::from_str(&u.role).next();
+                self.error_msg = None;
+                self.pending_break_glass = Some(PendingBreakGlass::SetRole {
+                    username: u.username,
+                    from_role: u.role,
+                    to_role: next_role,
+                });
+                None
+            }
+            KeyCode::Char('a')
+            | KeyCode::Char('n')
+            | KeyCode::Char('t')
+            | KeyCode::Char('T')
+            | KeyCode::Delete
+            | KeyCode::Backspace
+            | KeyCode::Char('g')
+            | KeyCode::Char('G')
+            | KeyCode::Char('d')
+            | KeyCode::Char('D')
+            | KeyCode::Char('e')
+            | KeyCode::Char('E') => {
+                self.status_msg = None;
+                self.error_msg = Some(
+                    "Read-only audit view: manage users/tokens in your central RBAC repo (break-glass Space / r only)."
+                        .to_string(),
+                );
+                None
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn render(&self, f: &mut Frame) {
         let popup_width = ((f.area().width * 9) / 10)
             .clamp(60, 122)
@@ -926,7 +1135,13 @@ impl QuackAuthModalState {
         } else {
             "Offline (no Quack attached)".to_string()
         };
-        let rbac_badge = if self.config.enabled {
+        let rbac_badge = if self.is_remote_audit_mode() {
+            match self.live_rbac_enabled {
+                Some(true) => "RBAC: ON (remote)",
+                Some(false) => "RBAC: OFF (remote)",
+                None => "RBAC: REMOTE",
+            }
+        } else if self.config.enabled {
             "RBAC: ON"
         } else {
             "RBAC: OFF"
@@ -1003,8 +1218,43 @@ impl QuackAuthModalState {
             QuackAuthTab::Users => self.render_users_tab(f, layout[1]),
         }
 
-        // Status / Error banner
-        if let Some(ref err) = self.error_msg {
+        // Status / Error / Break-Glass Confirmation banner
+        if let Some(ref action) = self.pending_break_glass {
+            let prompt = match action {
+                PendingBreakGlass::SetEnabled { username, enabled } => {
+                    if *enabled {
+                        format!(
+                            " ⚠️ BREAK-GLASS: Re-enable '{}' live on server? Ephemeral until next RBAC sync. Confirm [y/N]",
+                            username
+                        )
+                    } else {
+                        format!(
+                            " ⚠️ BREAK-GLASS: Disable '{}' & revoke active sessions now? Ephemeral until next RBAC sync. Confirm [y/N]",
+                            username
+                        )
+                    }
+                }
+                PendingBreakGlass::SetRole {
+                    username,
+                    from_role,
+                    to_role,
+                } => format!(
+                    " ⚠️ BREAK-GLASS: Override '{}' live role {} -> {}? Ephemeral until next RBAC sync. Confirm [y/N]",
+                    username,
+                    from_role,
+                    to_role.as_str()
+                ),
+            };
+            let p = Paragraph::new(prompt)
+                .style(
+                    Style::default()
+                        .bg(Color::Yellow)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .wrap(Wrap { trim: true });
+            f.render_widget(p, layout[2]);
+        } else if let Some(ref err) = self.error_msg {
             let p = Paragraph::new(format!(" ⚠️ {}", err))
                 .style(
                     Style::default()
@@ -1021,11 +1271,15 @@ impl QuackAuthModalState {
         } else {
             let hint = if self.active_tab == QuackAuthTab::LiveSessions {
                 " Tip: Use 'x' to revoke/restore a session immediately, 'r' to override role, 'c' to cancel query."
+            } else if self.is_remote_audit_mode() {
+                " Read-only audit view (managed via central RBAC). Break-glass: Space = Disable/Enable, r = Temp Role (resets on next sync)."
             } else {
                 " Tip: Changes save to duckpack.toml & .env (0600). Press 'd' to deploy/sync, 'e' to export post-start hook."
             };
             f.render_widget(
-                Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new(hint)
+                    .style(Style::default().fg(Color::DarkGray))
+                    .wrap(Wrap { trim: true }),
                 layout[2],
             );
         }
@@ -1033,8 +1287,12 @@ impl QuackAuthModalState {
         // Footer keybindings
         let footer_text = if self.adding_user {
             " Tab/↑↓: Next Field | ←/→/Space: Role | Enter: Save & Generate Token | Esc: Cancel"
+        } else if self.pending_break_glass.is_some() {
+            " y / Enter: Confirm Break-Glass Action | n / Esc: Cancel"
         } else if self.active_tab == QuackAuthTab::LiveSessions {
             " ↑↓/jk: Select | c: Cancel Query | x: Revoke/Restore | r: Cycle Role | u/F5: Refresh | Tab: Users | Esc: Close"
+        } else if self.is_remote_audit_mode() {
+            " ↑↓/jk: Select | Break-Glass: Space (Disable/Enable) • r (Temp Role) | u/F5: Refresh | Tab: Sessions | Esc: Close"
         } else {
             " a: Add User | Space: Enable/Disable | r: Role | t: Rotate Token | Del: Remove | g: Toggle RBAC | d: Deploy | e: Export Hook"
         };
@@ -1152,7 +1410,7 @@ impl QuackAuthModalState {
     }
 
     fn render_users_table(&self, f: &mut Frame, area: Rect) {
-        if self.config.users.is_empty() && !self.live_server_users.is_empty() {
+        if self.is_remote_audit_mode() {
             let header = Row::new(vec![
                 Cell::from("Username"),
                 Cell::from("Role"),
@@ -1169,23 +1427,51 @@ impl QuackAuthModalState {
             let rows: Vec<Row> = self
                 .live_server_users
                 .iter()
-                .map(|u| {
+                .enumerate()
+                .map(|(idx, u)| {
+                    let is_sel = idx == self.user_index;
+                    let is_master = u.username.eq_ignore_ascii_case("__duckpack_master");
                     let status_cell = if u.enabled {
                         Cell::from("● enabled").style(Style::default().fg(Color::Green))
                     } else {
                         Cell::from("○ disabled").style(Style::default().fg(Color::LightRed))
                     };
-                    let tok_cell = if u.has_token_hash { "✓ sha256" } else { "✗ missing" };
-                    let cid_cell = if u.has_client_id_hash { "✓ salted" } else { "○ pending" };
+                    let tok_cell = if is_master {
+                        Cell::from("★ master env").style(Style::default().fg(Color::Yellow))
+                    } else if u.has_token_hash {
+                        Cell::from("✓ sha256")
+                    } else {
+                        Cell::from("✗ missing").style(Style::default().fg(Color::LightRed))
+                    };
+                    let cid_cell = if u.has_client_id_hash {
+                        Cell::from("✓ salted")
+                    } else {
+                        Cell::from("○ pending").style(Style::default().fg(Color::DarkGray))
+                    };
+                    let src_cell = if is_master {
+                        Cell::from("protected break-glass")
+                            .style(Style::default().fg(Color::DarkGray))
+                    } else {
+                        Cell::from("central RBAC (live)")
+                            .style(Style::default().fg(Color::DarkGray))
+                    };
+                    let row_style = if is_sel {
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
                     Row::new(vec![
                         Cell::from(u.username.clone()),
                         Cell::from(u.role.clone()).style(role_color_style(&u.role)),
                         status_cell,
-                        Cell::from(tok_cell),
-                        Cell::from(cid_cell),
-                        Cell::from("live server (_duckpack_auth)")
-                            .style(Style::default().fg(Color::DarkGray)),
+                        tok_cell,
+                        cid_cell,
+                        src_cell,
                     ])
+                    .style(row_style)
                 })
                 .collect();
             let table = Table::new(
@@ -1194,9 +1480,9 @@ impl QuackAuthModalState {
                     Constraint::Length(18),
                     Constraint::Length(10),
                     Constraint::Length(12),
-                    Constraint::Length(12),
                     Constraint::Length(14),
-                    Constraint::Min(24),
+                    Constraint::Length(14),
+                    Constraint::Min(22),
                 ],
             )
             .header(header)
@@ -1204,7 +1490,7 @@ impl QuackAuthModalState {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray))
-                    .title(" Live Server Users (_duckpack_auth.quack_users — managed remotely) "),
+                    .title(" Live Server Users — Read-Only Audit View (_duckpack_auth.quack_users) "),
             );
             f.render_widget(table, area);
             return;
