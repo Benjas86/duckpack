@@ -159,11 +159,12 @@ pub fn load_ducklake_snapshots(
         safe_db
     );
 
-    if !parse_rows(&sql_with_msg, true, &mut snapshots) {
-        let _ = parse_rows(&sql_basic, false, &mut snapshots);
+    let mut loaded = parse_rows(&sql_with_msg, true, &mut snapshots);
+    if !loaded {
+        loaded = parse_rows(&sql_basic, false, &mut snapshots);
     }
 
-    if snapshots.is_empty() {
+    if !loaded {
         let quoted_db = format!("\"{}\"", db_name.replace('"', "\"\""));
         let method_with_msg = format!(
             "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR), CAST(schema_version AS BIGINT), COALESCE(CAST(changes AS VARCHAR), ''), COALESCE(CAST(commit_message AS VARCHAR), '') FROM {}.snapshots() ORDER BY snapshot_id DESC LIMIT 50",
@@ -173,12 +174,13 @@ pub fn load_ducklake_snapshots(
             "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR), CAST(schema_version AS BIGINT), COALESCE(CAST(changes AS VARCHAR), '') FROM {}.snapshots() ORDER BY snapshot_id DESC LIMIT 50",
             quoted_db
         );
-        if !parse_rows(&method_with_msg, true, &mut snapshots) {
-            let _ = parse_rows(&method_basic, false, &mut snapshots);
+        loaded = parse_rows(&method_with_msg, true, &mut snapshots);
+        if !loaded {
+            loaded = parse_rows(&method_basic, false, &mut snapshots);
         }
     }
 
-    if snapshots.is_empty() && is_quack {
+    if !loaded && is_quack {
         let inner_with_msg = format!(
             "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) AS snapshot_time, CAST(schema_version AS BIGINT) AS schema_version, COALESCE(CAST(changes AS VARCHAR), '') AS changes, COALESCE(CAST(commit_message AS VARCHAR), '') AS commit_message FROM ducklake_snapshots({}) ORDER BY snapshot_id DESC LIMIT 50",
             quote_literal(db_name)
@@ -719,7 +721,13 @@ pub fn load_explorer_metadata(
         raw_dbs.push((active_database.clone(), "duckdb".to_string(), None, false));
     }
 
+    let db_types: HashMap<String, String> = raw_dbs
+        .iter()
+        .map(|(n, t, _, _)| (n.to_ascii_lowercase(), t.to_ascii_lowercase()))
+        .collect();
+
     let mut all_tables: Vec<TableEntry> = Vec::new();
+    let mut tables_query_ok = false;
     if is_quack {
         let quack_tbl_sql = format!(
             "SELECT * FROM target_db.query('{} SELECT t.database_name, COALESCE(fs.full_schema_name, t.schema_name) AS schema_name, t.table_name, t.estimated_size, t.temporary FROM duckdb_tables() t LEFT JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE t.internal = false')",
@@ -731,6 +739,7 @@ pub fn load_explorer_metadata(
         });
         if let Ok(mut stmt) = prep {
             if let Ok(mut rows) = stmt.query([]) {
+                tables_query_ok = true;
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(db), Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
                         if table.starts_with("__duckpack_") {
@@ -761,6 +770,7 @@ pub fn load_explorer_metadata(
     });
     if let Ok(mut stmt) = prep {
         if let Ok(mut rows) = stmt.query([]) {
+            tables_query_ok = true;
             while let Ok(Some(row)) = rows.next() {
                 if let (Ok(db), Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
                     if table.starts_with("__duckpack_") {
@@ -835,38 +845,41 @@ pub fn load_explorer_metadata(
         }
     }
 
-    // Ensure all local temporary tables directly on conn are merged into all_tables under active_database
-    let temp_tbl_sql = format!(
-        "{} SELECT COALESCE(fs.full_schema_name, t.schema_name) AS schema_name, t.table_name, t.estimated_size FROM duckdb_tables() t LEFT JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE (t.temporary = true OR t.database_name = 'temp') AND t.internal = false",
-        FULL_SCHEMAS_CTE
-    );
-    let prep_temp = conn.prepare(&temp_tbl_sql).or_else(|_| {
-        conn.prepare("SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE (temporary = true OR database_name = 'temp') AND internal = false")
-    });
-    if let Ok(mut stmt) = prep_temp {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let (Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
-                    if table.starts_with("__duckpack_") {
-                        continue;
-                    }
-                    let est: Option<i64> = row.get(2).ok();
-                    if !all_tables.iter().any(|t| t.is_temporary && t.name.eq_ignore_ascii_case(&table) && t.schema.eq_ignore_ascii_case(&schema)) {
-                        all_tables.push(TableEntry {
-                            database: active_database.clone(),
-                            schema,
-                            name: table,
-                            row_count: est,
-                            is_temporary: true,
-                        });
+    // When `is_quack` is true, the local `duckdb_tables()` query above skipped `memory`;
+    // merge local session temporary tables directly on `conn`. (Non-quack sessions already fetched them above.)
+    if is_quack {
+        let temp_tbl_sql = format!(
+            "{} SELECT COALESCE(fs.full_schema_name, t.schema_name) AS schema_name, t.table_name, t.estimated_size FROM duckdb_tables() t LEFT JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE (t.temporary = true OR t.database_name = 'temp') AND t.internal = false",
+            FULL_SCHEMAS_CTE
+        );
+        let prep_temp = conn.prepare(&temp_tbl_sql).or_else(|_| {
+            conn.prepare("SELECT schema_name, table_name, estimated_size FROM duckdb_tables() WHERE (temporary = true OR database_name = 'temp') AND internal = false")
+        });
+        if let Ok(mut stmt) = prep_temp {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(table)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        if table.starts_with("__duckpack_") {
+                            continue;
+                        }
+                        let est: Option<i64> = row.get(2).ok();
+                        if !all_tables.iter().any(|t| t.is_temporary && t.name.eq_ignore_ascii_case(&table) && t.schema.eq_ignore_ascii_case(&schema)) {
+                            all_tables.push(TableEntry {
+                                database: active_database.clone(),
+                                schema,
+                                name: table,
+                                row_count: est,
+                                is_temporary: true,
+                            });
+                        }
                     }
                 }
             }
         }
     }
 
-    // Information schema fallback if tables still empty
-    if all_tables.is_empty() {
+    // Information schema fallback ONLY if duckdb_tables() failed (avoid full cross-catalog scans on empty DBs)
+    if !tables_query_ok && all_tables.is_empty() {
         if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('information_schema', 'pg_catalog')") {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {
@@ -884,8 +897,19 @@ pub fn load_explorer_metadata(
         }
     }
 
-    // Query exact live row count for all tables (avoiding stale optimizer estimated_size)
+    // Query exact live row count for local DuckDB / temp tables (O(1) in-process) and `_duckpack_auth`
+    // visibility checks. Remote / lake / external catalogs (`ducklake`, `quack`, `mssql`, `postgres`,
+    // `mysql`, `sqlite`) keep `duckdb_tables().estimated_size` to avoid N serial network/S3 scans at startup.
     for t in &mut all_tables {
+        let is_auth_schema = t.schema.eq_ignore_ascii_case("_duckpack_auth");
+        let db_type = db_types
+            .get(&t.database.to_ascii_lowercase())
+            .map(|s| s.as_str())
+            .unwrap_or("duckdb");
+        let is_local_duckdb = t.is_temporary || db_type == "duckdb";
+        if !is_local_duckdb && !is_auth_schema {
+            continue;
+        }
         let quoted_db = quote_qualified_identifier(&t.database);
         let quoted_schema = quote_qualified_identifier(&t.schema);
         let quoted_table = format!("\"{}\"", t.name.replace('"', "\"\""));
@@ -908,7 +932,7 @@ pub fn load_explorer_metadata(
             Ok(count) => {
                 t.row_count = Some(count);
             }
-            Err(_) if t.schema.eq_ignore_ascii_case("_duckpack_auth") => {
+            Err(_) if is_auth_schema => {
                 t.row_count = None;
             }
             Err(_) => {}
@@ -918,6 +942,7 @@ pub fn load_explorer_metadata(
     all_tables.retain(|t| !(t.schema.eq_ignore_ascii_case("_duckpack_auth") && t.row_count.is_none()));
 
     let mut all_views: Vec<ViewEntry> = Vec::new();
+    let mut views_query_ok = false;
     if is_quack {
         let quack_view_sql = format!(
             "SELECT * FROM target_db.query('{} SELECT v.database_name, COALESCE(fs.full_schema_name, v.schema_name) AS schema_name, v.view_name, v.temporary FROM duckdb_views() v LEFT JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name WHERE v.internal = false')",
@@ -929,6 +954,7 @@ pub fn load_explorer_metadata(
         });
         if let Ok(mut stmt) = prep {
             if let Ok(mut rows) = stmt.query([]) {
+                views_query_ok = true;
                 while let Ok(Some(row)) = rows.next() {
                     if let (Ok(db), Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
                         if name.starts_with("__duckpack_") {
@@ -956,6 +982,7 @@ pub fn load_explorer_metadata(
     });
     if let Ok(mut stmt) = prep {
         if let Ok(mut rows) = stmt.query([]) {
+            views_query_ok = true;
             while let Ok(Some(row)) = rows.next() {
                 if let (Ok(db), Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)) {
                     if name.starts_with("__duckpack_") {
@@ -1021,36 +1048,38 @@ pub fn load_explorer_metadata(
         }
     }
 
-    // Ensure all local temporary views directly on conn are merged into all_views under active_database
-    let temp_view_sql = format!(
-        "{} SELECT COALESCE(fs.full_schema_name, v.schema_name) AS schema_name, v.view_name FROM duckdb_views() v LEFT JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name WHERE (v.temporary = true OR v.database_name = 'temp') AND v.internal = false",
-        FULL_SCHEMAS_CTE
-    );
-    let prep_temp_view = conn.prepare(&temp_view_sql).or_else(|_| {
-        conn.prepare("SELECT schema_name, view_name FROM duckdb_views() WHERE (temporary = true OR database_name = 'temp') AND internal = false")
-    });
-    if let Ok(mut stmt) = prep_temp_view {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
-                    if name.starts_with("__duckpack_") {
-                        continue;
-                    }
-                    if !all_views.iter().any(|v| v.is_temporary && v.name.eq_ignore_ascii_case(&name) && v.schema.eq_ignore_ascii_case(&schema)) {
-                        all_views.push(ViewEntry {
-                            database: active_database.clone(),
-                            schema,
-                            name,
-                            is_temporary: true,
-                        });
+    // When `is_quack` is true, merge local temporary views directly on `conn`.
+    if is_quack {
+        let temp_view_sql = format!(
+            "{} SELECT COALESCE(fs.full_schema_name, v.schema_name) AS schema_name, v.view_name FROM duckdb_views() v LEFT JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name WHERE (v.temporary = true OR v.database_name = 'temp') AND v.internal = false",
+            FULL_SCHEMAS_CTE
+        );
+        let prep_temp_view = conn.prepare(&temp_view_sql).or_else(|_| {
+            conn.prepare("SELECT schema_name, view_name FROM duckdb_views() WHERE (temporary = true OR database_name = 'temp') AND internal = false")
+        });
+        if let Ok(mut stmt) = prep_temp_view {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    if let (Ok(schema), Ok(name)) = (row.get::<_, String>(0), row.get::<_, String>(1)) {
+                        if name.starts_with("__duckpack_") {
+                            continue;
+                        }
+                        if !all_views.iter().any(|v| v.is_temporary && v.name.eq_ignore_ascii_case(&name) && v.schema.eq_ignore_ascii_case(&schema)) {
+                            all_views.push(ViewEntry {
+                                database: active_database.clone(),
+                                schema,
+                                name,
+                                is_temporary: true,
+                            });
+                        }
                     }
                 }
             }
         }
     }
 
-    // Information schema fallback if views still empty
-    if all_views.is_empty() {
+    // Information schema fallback ONLY if duckdb_views() failed (avoid full cross-catalog scans when DB has 0 views)
+    if !views_query_ok && all_views.is_empty() {
         if let Ok(mut stmt) = conn.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'VIEW' AND table_schema NOT IN ('information_schema', 'pg_catalog')") {
             if let Ok(mut rows) = stmt.query([]) {
                 while let Ok(Some(row)) = rows.next() {

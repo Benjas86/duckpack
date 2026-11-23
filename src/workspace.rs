@@ -565,6 +565,20 @@ pub fn apply_workspace_secrets(
     env_profile: Option<&str>,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let cfg = load_workspace_config(project_dir, env_profile)?;
+    Ok(apply_workspace_secrets_from_config(
+        conn,
+        &cfg,
+        project_dir,
+        env_profile,
+    ))
+}
+
+fn apply_workspace_secrets_from_config(
+    conn: &Connection,
+    cfg: &WorkspaceConfig,
+    project_dir: &Path,
+    env_profile: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
     let mut loaded = Vec::new();
     let mut warnings = Vec::new();
 
@@ -667,7 +681,7 @@ pub fn apply_workspace_secrets(
         }
     }
 
-    Ok((loaded, warnings))
+    (loaded, warnings)
 }
 
 /// Resolves the normalized `quack:<host>:<port>` endpoint for either a `quack` attachment
@@ -789,7 +803,8 @@ pub fn apply_workspace_attachments(
     env_profile: Option<&str>,
 ) -> Result<WorkspaceApplyReport> {
     let cfg = load_workspace_config(project_dir, env_profile)?;
-    let (loaded_secrets, secret_warnings) = apply_workspace_secrets(conn, project_dir, env_profile)?;
+    let (loaded_secrets, secret_warnings) =
+        apply_workspace_secrets_from_config(conn, &cfg, project_dir, env_profile);
 
     let mut report = WorkspaceApplyReport {
         loaded_secrets,

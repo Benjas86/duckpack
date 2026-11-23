@@ -243,7 +243,9 @@ pub fn run_ide_loop_with_workspace(
     let queries_dir = project_dir.join("queries");
 
     let mut explorer_mode = ExplorerMode::Database;
-    let (mut git_branch, mut git_status) = get_git_branch_and_status(project_dir);
+    // Lazy-loaded when switching to Project mode (F4) to avoid spawning git subprocesses at startup
+    let (mut git_branch, mut git_status): (Option<String>, std::collections::HashMap<PathBuf, String>) =
+        (None, std::collections::HashMap::new());
     let mut expanded_project_groups: HashSet<String> = vec![
         "proj:schemas",
         "proj:sequences",
@@ -290,7 +292,8 @@ pub fn run_ide_loop_with_workspace(
     let mut schema_ascii_tree = String::new();
     let mut schema_scroll = 0;
     let mut max_schema_scroll = 0;
-    let mut os_clipboard: Option<arboard::Clipboard> = arboard::Clipboard::new().ok();
+    // Lazy-initialized on first copy/paste to avoid Wayland/X11 IPC handshake at startup
+    let mut os_clipboard: Option<arboard::Clipboard> = None;
 
     loop {
         let current_target = &tabs[active_tab_index].target_database;

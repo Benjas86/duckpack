@@ -228,11 +228,17 @@ pub fn duckpack_version() -> String {
     env!("CARGO_PKG_VERSION").replace('-', "_")
 }
 
-/// Returns the version string of the embedded DuckDB C++ engine (e.g. "v1.1.3").
+/// Returns the version string of the embedded DuckDB C++ engine (e.g. "v2.0.0"),
+/// cached process-wide so repeated calls never spin up another in-memory DuckDB instance.
 pub fn embedded_duckdb_version() -> String {
-    Connection::open_in_memory()
-        .and_then(|c| c.query_row("SELECT version();", [], |r| r.get::<_, String>(0)))
-        .unwrap_or_else(|_| "1.1.x".to_string())
+    static CACHED_VER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED_VER
+        .get_or_init(|| {
+            Connection::open_in_memory()
+                .and_then(|c| c.query_row("SELECT version();", [], |r| r.get::<_, String>(0)))
+                .unwrap_or_else(|_| "2.0.x".to_string())
+        })
+        .clone()
 }
 
 /// Diagnoses DuckDB storage version mismatch errors when attempting to open a database file.

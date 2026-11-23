@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "duckpack"
-version = "0.3.5-dev31"
+version = "0.3.5-dev32"
 dependencies = [
  "anyhow",
  "arboard",

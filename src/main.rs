@@ -236,9 +236,14 @@ fn main() -> Result<()> {
             }
         }));
     }
-    let embedded_ver = duckpack::engine::embedded_duckdb_version();
     let dp_ver = duckpack::engine::duckpack_version();
-    let version_str: &'static str = Box::leak(format!("v{} (DuckDB engine: {})", dp_ver, embedded_ver).into_boxed_str());
+    let wants_version = std::env::args_os().any(|a| a == "-V" || a == "--version");
+    let version_str: &'static str = if wants_version {
+        let embedded_ver = duckpack::engine::embedded_duckdb_version();
+        Box::leak(format!("v{} (DuckDB engine: {})", dp_ver, embedded_ver).into_boxed_str())
+    } else {
+        Box::leak(format!("v{}", dp_ver).into_boxed_str())
+    };
     let matches = Cli::command().version(version_str).get_matches();
     let explore_has_explicit_db = matches
         .subcommand_matches("explore")
