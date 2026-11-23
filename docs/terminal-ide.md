@@ -80,7 +80,7 @@ duckpack explore --env staging
 | | `t` | **DuckLake Time-Travel Modal:** `AT (VERSION => N)`, `AT (TIMESTAMP => TIMESTAMPTZ '...')`, `ducklake_table_changes(...)` |
 | | `Ctrl+A` | **Attach Database** modal with Provider Presets & optional `Ctrl+S` save to `duckpack.toml` |
 | | `Ctrl+K` | **Cloud Secrets & S3 Buckets** modal with masked keys & optional `Ctrl+S` save to `duckpack.toml` |
-| | `Ctrl+U` | **Quack RBAC & Live Session Monitor** (`[`/`]` cycles attached Quack & DuckLake-on-Quack servers; read-only server audit view with `[y/N]` break-glass disable/role override, self-lockout protection, and Admin-Only enforcement) |
+| | `Ctrl+U` | **Quack RBAC & Live Session Monitor** (`←`/`→` or `[`/`]` cycles attached Quack & DuckLake-on-Quack servers; read-only server audit view with `[y/N]` break-glass disable/role override, self-lockout protection, and Admin-Only enforcement) |
 | | `d` | **Detach** selected database from session |
 | | `b` | **Cycle Target Catalog** for diff/apply operations |
 | | `r` / `R` | **Refresh Explorer** (also invalidates MSSQL/Postgres/MySQL/MotherDuck/Quack catalog caches & retries failed workspace nodes) |

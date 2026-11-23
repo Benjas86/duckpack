@@ -169,7 +169,7 @@ ATTACH 'quack:localhost:9494' AS q_reader (TOKEN '<reader_token>', CLIENT_ID '<r
 Press **`Ctrl+U`** (or select **`🛡️ Quack RBAC & Sessions (Ctrl+U)`** in Explorer) to open the RBAC control panel:
 
 - **Admin-Only Enforcement:** The Quack server enforces RBAC inspection via `_duckpack_quack_authorize` — non-admin roles (`reader` / `writer`) cannot query `quack_active_connections()`, inspect `_duckpack_auth.quack_users`, or perform break-glass actions. If opened with non-admin credentials, `Ctrl+U` displays a locked **`ADMIN ONLY`** notice with all mutating controls disabled.
-- **Multi-Server Target Switching (`[` / `]`):** Cycle across all directly attached Quack servers **and** DuckLake-on-Quack catalogs (connecting lazily on demand to each DuckLake's underlying Quack server without cluttering Explorer).
+- **Multi-Server Target Switching (`←` / `→` or `[` / `]`):** Cycle across all directly attached Quack servers **and** DuckLake-on-Quack catalogs (connecting lazily on demand to each DuckLake's underlying Quack server without cluttering Explorer).
 - **Self-Lockout Protection:** Your active control session is tagged **`(you)`** in Tab 1, and your active login is tagged **`current login (protected)`** in Tab 2 alongside **`__duckpack_master`** (`★ master env`, `protected break-glass`). You cannot cancel, revoke, disable, or demote your own active session/login or the server's master break-glass entry.
 - **Tab 1 — Live Sessions (`quack_active_connections()`):**
   - `c`: Cancel an active query via client-side `quack_cancel(catalog, connection_id)`

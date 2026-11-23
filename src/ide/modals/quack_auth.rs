@@ -610,7 +610,7 @@ impl QuackAuthModalState {
                 };
                 return None;
             }
-            KeyCode::Char('[') => {
+            KeyCode::Left | KeyCode::Char('[') => {
                 if self.targets.len() > 1 {
                     self.pending_break_glass = None;
                     self.target_index = if self.target_index == 0 {
@@ -628,7 +628,7 @@ impl QuackAuthModalState {
                 }
                 return None;
             }
-            KeyCode::Char(']') => {
+            KeyCode::Right | KeyCode::Char(']') | KeyCode::Char('/') => {
                 if self.targets.len() > 1 {
                     self.pending_break_glass = None;
                     self.target_index = (self.target_index + 1) % self.targets.len();
@@ -1213,7 +1213,7 @@ impl QuackAuthModalState {
                 .map(|t| t.label.as_str())
                 .unwrap_or("unknown");
             format!(
-                "◄ [{}/{}] {} ► ([/]: switch)",
+                "◄ [{}/{}] {} ► (←/→: switch)",
                 self.target_index + 1,
                 self.targets.len(),
                 lbl
@@ -1385,7 +1385,7 @@ impl QuackAuthModalState {
             || (self.access_denied && self.active_tab == QuackAuthTab::LiveSessions)
         {
             if self.targets.len() > 1 {
-                " [/]: Switch Target | u/F5: Retry | Esc: Close"
+                " ←/→: Switch Target | u/F5: Retry | Esc: Close"
             } else {
                 " u/F5: Retry | Esc: Close"
             }
@@ -1509,11 +1509,11 @@ impl QuackAuthModalState {
             rows,
             [
                 Constraint::Length(12),
-                Constraint::Length(16),
+                Constraint::Length(22),
                 Constraint::Length(10),
                 Constraint::Length(10),
                 Constraint::Length(20),
-                Constraint::Min(20),
+                Constraint::Min(18),
             ],
         )
         .header(header)
