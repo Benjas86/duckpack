@@ -1,8 +1,12 @@
-use std::panic;
 use duckpack::diff;
 use duckpack::engine::*;
 use duckpack::ide;
+use duckpack::session::{
+    apply_catalogs_with_executor, open_explore_session, shell_quote, validate_safe_ssh_remote,
+    TerminalGuard,
+};
 use duckpack::tui;
+use std::panic;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -75,6 +79,15 @@ enum Commands {
         /// Disable SSL/TLS verification for Quack connection (plain HTTP)
         #[arg(long, visible_alias = "insecure", alias = "quack-insecure")]
         quack_disable_ssl: bool,
+        /// Sync ONLY the declarative Quack RBAC policy (_duckpack_auth + live client_id_hash + global hooks) without running user schema migrations
+        #[arg(long)]
+        rbac_only: bool,
+        /// Apply RBAC policy from a portable .duckpack bundle compiled with `duckpack compile --rbac-only` (requires no project directory)
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Optional path to an environment file (e.g. /run/secrets/quack.env) loaded before resolving RBAC tokens
+        #[arg(long)]
+        env_file: Option<PathBuf>,
     },
     /// Show schema differences between project and target database
     Diff {
@@ -110,6 +123,12 @@ enum Commands {
         /// The path to output the compiled .duckpack artifact
         #[arg(short, long)]
         out: String,
+        /// Compile ONLY the zero-secret declarative [quack_auth] RBAC bundle (policy + token_env refs, no user schema or tokens)
+        #[arg(long)]
+        rbac_only: bool,
+        /// Embed the zero-secret [quack_auth] RBAC bundle tables alongside compiled schema declarations
+        #[arg(long)]
+        include_rbac: bool,
     },
     /// Deploy a DB project to a remote server via SCP/SSH
     Deploy {
@@ -120,8 +139,8 @@ enum Commands {
         #[arg(short, long)]
         remote: String,
         /// The SSH port to use for remote deployment
-        #[arg(short = 'P', long, default_value = "22")]
-        port: String,
+        #[arg(short = 'P', long, default_value_t = 22)]
+        port: u16,
         /// The connection string or path to the target DuckDB database on the remote server
         #[arg(short, long, default_value = "local.duckdb")]
         db: String,
@@ -145,8 +164,8 @@ enum Commands {
         #[arg(long)]
         remote: Option<String>,
         /// The SSH port to use for remote deployment
-        #[arg(short = 'P', long, default_value = "22")]
-        port: String,
+        #[arg(short = 'P', long, default_value_t = 22)]
+        port: u16,
         /// Automatically install the duckpack CLI binary on the remote server
         #[arg(long)]
         auto_install: bool,
@@ -189,11 +208,47 @@ enum PythonCommands {
 /// The main entry point for the DuckPack CLI.
 /// Parses the arguments and delegates to the appropriate command handler.
 fn main() -> Result<()> {
-    panic::set_hook(Box::new(|info| { let bt = std::backtrace::Backtrace::force_capture(); let _ = std::fs::write("panic.log", format!("Panic: {:?}\n\n{}", info, bt)); }));
-    let embedded_ver = duckpack::engine::embedded_duckdb_version();
+    // M4: Only write panic.log when explicitly opted in via DUCKPACK_PANIC_LOG=1 (mode 0600 on Unix)
+    if std::env::var("DUCKPACK_PANIC_LOG")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        panic::set_hook(Box::new(|info| {
+            let bt = std::backtrace::Backtrace::force_capture();
+            let payload = format!("Panic: {:?}\n\n{}", info, bt);
+            use std::io::Write;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open("panic.log")
+                {
+                    let _ = f.write_all(payload.as_bytes());
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::fs::write("panic.log", payload);
+            }
+        }));
+    }
     let dp_ver = duckpack::engine::duckpack_version();
-    let version_str: &'static str = Box::leak(format!("v{} (DuckDB engine: {})", dp_ver, embedded_ver).into_boxed_str());
+    let wants_version = std::env::args_os().any(|a| a == "-V" || a == "--version");
+    let version_str: &'static str = if wants_version {
+        let embedded_ver = duckpack::engine::embedded_duckdb_version();
+        Box::leak(format!("v{} (DuckDB engine: {})", dp_ver, embedded_ver).into_boxed_str())
+    } else {
+        Box::leak(format!("v{}", dp_ver).into_boxed_str())
+    };
     let matches = Cli::command().version(version_str).get_matches();
+    let explore_has_explicit_db = matches
+        .subcommand_matches("explore")
+        .and_then(|m| m.value_source("db"))
+        == Some(clap::parser::ValueSource::CommandLine);
     let mut cli = Cli::from_arg_matches(&matches)?;
 
     let default_dir = PathBuf::from(".");
@@ -208,6 +263,11 @@ fn main() -> Result<()> {
         Commands::Python { .. } => default_dir,
     };
     let project_dir = &project_dir;
+
+    // Pre-load explicit --env-file (if provided on `apply`) before resolving target tokens/endpoints
+    if let Commands::Apply { env_file: Some(ref ef), .. } = cli.command {
+        duckpack::rbac_bundle::load_env_file_override(ef)?;
+    }
 
     // Apply target/env configuration overrides, defaults, and token resolution via unified TargetResolver
     match &mut cli.command {
@@ -278,12 +338,14 @@ fn main() -> Result<()> {
                     quack_token.as_deref(),
                     *quack_disable_ssl,
                     false,
+                    false,
                     None,
                 );
             }
 
             let configured_catalog = database.clone().or_else(|| resolve_project_catalog(project_dir, cli.env.as_deref()));
             let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+            let _ = duckpack::workspace::apply_workspace_secrets(&target_conn, project_dir, cli.env.as_deref())?;
             let active_catalog = diff::validate_target_catalog_exec(&mut target_conn, configured_catalog.as_deref(), false)?;
             let diff_result = diff::diff_project(project_dir, &mut target_conn, Some(&active_catalog))?;
 
@@ -297,14 +359,46 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Apply { project_dir, db, database, force_drop, allow_lake_rewrite, auto_approve, interactive: _, out, quack_token, quack_disable_ssl } => {
-            if *allow_lake_rewrite {
-                unsafe {
-                    std::env::set_var("DUCKPACK_ALLOW_LAKE_REWRITE", "true");
+        Commands::Apply { project_dir, db, database, force_drop, allow_lake_rewrite, auto_approve, interactive: _, out, quack_token, quack_disable_ssl, rbac_only, from, env_file } => {
+            if let Some(bundle_path) = from {
+                if !*rbac_only {
+                    anyhow::bail!(
+                        "Portable bundle deployment via --from currently requires --rbac-only (e.g. `duckpack apply --from {} --rbac-only --db quack:... --auto-approve`).",
+                        bundle_path.display()
+                    );
                 }
+                let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                let user_count = duckpack::rbac_bundle::deploy_quack_rbac_from_bundle(
+                    &mut target_conn,
+                    database.as_deref(),
+                    bundle_path,
+                    env_file.as_deref(),
+                )?;
+                println!(
+                    "🦆 DuckPack RBAC Bundle: Synced {} declarative user(s) from '{}' and activated Quack authentication/authorization hooks.",
+                    user_count,
+                    bundle_path.display()
+                );
+                return Ok(());
             }
+
             if !project_dir.exists() {
                 eprintln!("Project directory {} does not exist. Run init first.", project_dir.display());
+                return Ok(());
+            }
+
+            if *rbac_only {
+                let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                let _ = duckpack::workspace::apply_workspace_secrets(&target_conn, project_dir, cli.env.as_deref())?;
+                let user_count = duckpack::quack_auth::deploy_quack_rbac_now(
+                    &mut target_conn,
+                    database.as_deref(),
+                    project_dir,
+                )?;
+                println!(
+                    "🦆 DuckPack RBAC: Synced {} declarative user(s) and activated Quack authentication/authorization hooks.",
+                    user_count
+                );
                 return Ok(());
             }
 
@@ -312,39 +406,24 @@ fn main() -> Result<()> {
                 let configured_catalogs = if let Some(d) = database {
                     vec![d.clone()]
                 } else {
-                    let cats = resolve_project_catalogs(project_dir, cli.env.as_deref());
-                    if cats.is_empty() {
-                        let mut init_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
-                        let active = diff::validate_target_catalog_exec(&mut init_conn, None, true)?;
-                        vec![active]
-                    } else {
-                        cats
-                    }
+                    resolve_project_catalogs(project_dir, cli.env.as_deref())
                 };
-
-                let remote = is_remote(db);
-                let mut total_applied = 0;
-                for target_cat in &configured_catalogs {
-                    let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
-                    let active_catalog = diff::validate_target_catalog_exec(&mut target_conn, Some(target_cat), true)?;
-                    let diff_result = diff::diff_project(project_dir, &mut target_conn, Some(&active_catalog))?;
-
-                    let pending_count = diff_result.items.iter().filter(|i| i.selected && !i.ignored).count();
-                    if pending_count == 0 {
-                        println!("Target catalog '{}' is up to date (0 pending changes).", active_catalog);
-                        continue;
-                    }
-
-                    let apply_success = apply_diff_with_executor(&mut target_conn, &diff_result, *force_drop, remote, project_dir, Some(&active_catalog));
-                    if apply_success.is_ok() {
-                        println!("✓ Successfully applied {} change(s) automatically to catalog '{}'!", pending_count, active_catalog);
-                        total_applied += pending_count;
-                    } else {
-                        eprintln!("Error applying schema to catalog '{}': {:?}", active_catalog, apply_success.err());
-                        return Err(anyhow::anyhow!("Apply failed for catalog '{}'", active_catalog));
-                    }
-                }
-                println!("🦆 DuckPack CI/CD: Migration completed. Applied {} total change(s) across {} catalog(s).", total_applied, configured_catalogs.len());
+                let mut target_conn = connect_target_db(db, quack_token.as_deref(), *quack_disable_ssl)?;
+                let _ = duckpack::workspace::apply_workspace_secrets(&target_conn, project_dir, cli.env.as_deref())?;
+                let report = apply_catalogs_with_executor(
+                    &mut target_conn,
+                    project_dir,
+                    &configured_catalogs,
+                    *force_drop,
+                    *allow_lake_rewrite,
+                    is_remote(db),
+                    true,
+                )?;
+                println!(
+                    "🦆 DuckPack CI/CD: Migration completed. Applied {} total change(s) across {} catalog(s).",
+                    report.applied_items.len(),
+                    report.catalog_count
+                );
                 return Ok(());
             }
 
@@ -356,10 +435,20 @@ fn main() -> Result<()> {
                 quack_token.as_deref(),
                 *quack_disable_ssl,
                 *force_drop,
+                *allow_lake_rewrite,
                 out.as_deref(),
             )?;
         }
-        Commands::Compile { project_dir, out } => {
+        Commands::Compile { project_dir, out, rbac_only, include_rbac } => {
+            if *rbac_only {
+                println!("Compiling zero-secret Quack RBAC bundle from {} into: {}", project_dir.display(), out);
+                let user_count = duckpack::rbac_bundle::compile_rbac_bundle(project_dir, Path::new(out))?;
+                println!(
+                    "RBAC bundle compilation complete! Packaged {} declarative user reference(s) (zero secrets) into {}",
+                    user_count, out
+                );
+                return Ok(());
+            }
             println!("Compiling project {} into DuckPack: {}", project_dir.display(), out);
             let _shadow_conn = build_shadow_db(project_dir)?;
             
@@ -368,94 +457,70 @@ fn main() -> Result<()> {
             let mut out_conn = Connection::open(&out).with_context(|| "Failed to create .duckpack file")?;
             println!("Packaging schemas, macros, tables, views, and triggers...");
             compile_project_declarations(&mut out_conn, project_dir)?;
+            if *include_rbac {
+                if let Some(cfg) = duckpack::quack_auth::load_quack_auth_config(project_dir) {
+                    let user_count = duckpack::rbac_bundle::write_rbac_bundle_tables(&out_conn, &cfg)?;
+                    println!("Embedded zero-secret Quack RBAC bundle ({} user reference(s)).", user_count);
+                }
+            }
             println!("Compilation complete! Artifact: {}", out);
         }
         Commands::Explore { project_dir, db, database, remote, port, auto_install, quack_token, quack_disable_ssl } => {
             if let Some(r) = remote {
+                validate_safe_ssh_remote(r)?;
+                let remote_tmp_dir = create_remote_private_temp_dir(r, *port)?;
                 let mut remote_bin = "duckpack".to_string();
-                let mut remote_tmp_bin = None;
-                let rand_suffix = &generate_random_hex_token()[..16];
-                
-                if *auto_install {
-                    println!("Auto-installing DuckPack companion binary for exploration...");
-                    let current_exe = std::env::current_exe().with_context(|| "Failed to get current executable path")?;
-                    let tmp_bin = format!("/tmp/duckpack_bin_{}", rand_suffix);
-                    
-                    let scp_bin_status = std::process::Command::new("scp")
-                        .arg("-P")
-                        .arg(port.to_string())
-                        .arg(&current_exe)
-                        .arg(format!("{}:{}", r, tmp_bin))
-                        .status()?;
-                        
-                    if !scp_bin_status.success() {
-                        anyhow::bail!("Failed to SCP binary to remote server.");
+
+                let explore_res = (|| -> Result<()> {
+                    if *auto_install {
+                        println!("Auto-installing DuckPack companion binary for exploration...");
+                        remote_bin = upload_remote_companion_binary(r, *port, &remote_tmp_dir)?;
                     }
-                    
-                    let chmod_status = std::process::Command::new("ssh")
+
+                    let _ = std::process::Command::new("ssh")
                         .arg("-p")
                         .arg(port.to_string())
+                        .arg("--")
                         .arg(r)
-                        .arg(format!("chmod +x {}", shell_quote(&tmp_bin)))
-                        .status()?;
-                        
-                    if !chmod_status.success() {
-                        anyhow::bail!("Failed to make binary executable on remote server.");
+                        .arg(format!("mkdir -p {}/queries", shell_quote(&remote_tmp_dir)))
+                        .status();
+
+                    // H2/M4: Pass QUACK_TOKEN via 0600 remote .env piped over stdin (never in remote argv/ps)
+                    if let Some(token) = quack_token {
+                        write_remote_private_env_token(r, *port, &remote_tmp_dir, token)?;
                     }
-                    
-                    remote_bin = tmp_bin.clone();
-                    remote_tmp_bin = Some(tmp_bin);
-                }
 
-                let remote_tmp_proj = format!("/tmp/duckpack_explore_{}", rand_suffix);
-                let _ = std::process::Command::new("ssh")
-                    .arg("-p")
-                    .arg(port.to_string())
-                    .arg(r)
-                    .arg(format!("mkdir -p {}/queries", shell_quote(&remote_tmp_proj)))
-                    .status();
-                
-                println!("Launching remote TUI over SSH...");
-                let mut remote_cmd = String::new();
-                if let Some(token) = quack_token {
-                    remote_cmd.push_str(&format!("QUACK_TOKEN={} ", shell_quote(token)));
-                }
-                remote_cmd.push_str(&format!(
-                    "{} explore --project-dir {} --db {}",
-                    shell_quote(&remote_bin),
-                    shell_quote(&remote_tmp_proj),
-                    shell_quote(db)
-                ));
-                if let Some(cat) = database {
-                    remote_cmd.push_str(&format!(" --database {}", shell_quote(cat)));
-                }
-                if *quack_disable_ssl {
-                    remote_cmd.push_str(" --quack-disable-ssl");
-                }
-                let ssh_status = std::process::Command::new("ssh")
-                    .arg("-t") // Force pseudo-terminal for TUI
-                    .arg("-p")
-                    .arg(port.to_string())
-                    .arg(r)
-                    .arg(remote_cmd)
-                    .status()?;
+                    println!("Launching remote TUI over SSH...");
+                    let mut remote_cmd = format!(
+                        "{} explore --project-dir {} --db {}",
+                        shell_quote(&remote_bin),
+                        shell_quote(&remote_tmp_dir),
+                        shell_quote(db)
+                    );
+                    if let Some(cat) = database {
+                        remote_cmd.push_str(&format!(" --database {}", shell_quote(cat)));
+                    }
+                    if *quack_disable_ssl {
+                        remote_cmd.push_str(" --quack-disable-ssl");
+                    }
+                    let ssh_status = std::process::Command::new("ssh")
+                        .arg("-t") // Force pseudo-terminal for TUI
+                        .arg("-p")
+                        .arg(port.to_string())
+                        .arg("--")
+                        .arg(r)
+                        .arg(remote_cmd)
+                        .status()?;
 
-                if !ssh_status.success() {
-                    println!("Remote exploration session ended with error.");
-                }
+                    if !ssh_status.success() {
+                        println!("Remote exploration session ended with error.");
+                    }
+                    Ok(())
+                })();
 
                 println!("Cleaning up remote artifacts...");
-                let mut cleanup_cmd = format!("rm -rf {}", shell_quote(&remote_tmp_proj));
-                if let Some(tmp_bin) = remote_tmp_bin {
-                    cleanup_cmd.push_str(&format!(" {}", shell_quote(&tmp_bin)));
-                }
-                let _ = std::process::Command::new("ssh")
-                    .arg("-p")
-                    .arg(port.to_string())
-                    .arg(r)
-                    .arg(cleanup_cmd)
-                    .status();
-
+                cleanup_remote_temp_dir(r, *port, &remote_tmp_dir);
+                explore_res?;
                 return Ok(());
             }
 
@@ -479,133 +544,124 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            ratatui::crossterm::terminal::enable_raw_mode()?;
-            let mut stdout = std::io::stdout();
-            ratatui::crossterm::execute!(stdout, ratatui::crossterm::terminal::EnterAlternateScreen, ratatui::crossterm::event::EnableMouseCapture)?;
+            let spec = TargetSpec {
+                db: db.clone(),
+                token: quack_token.clone(),
+                disable_ssl: *quack_disable_ssl,
+                catalogs: database.clone().into_iter().collect(),
+                is_quack: db.starts_with("quack:") || db.starts_with("quack://"),
+                is_motherduck: is_remote(db),
+            };
+            let explicit_db = if explore_has_explicit_db {
+                Some(db.as_str())
+            } else {
+                None
+            };
+
+            // Validate workspace TOML hygiene & connect BEFORE entering alternate screen so any error prints cleanly
+            let opened = open_explore_session(
+                &project_dir,
+                cli.env.as_deref(),
+                &spec,
+                explicit_db,
+                database.as_deref(),
+                true,
+            )?;
+
+            let _guard = TerminalGuard::enter()?;
+            let stdout = std::io::stdout();
             let backend = ratatui::backend::CrosstermBackend::new(stdout);
             let mut terminal = ratatui::Terminal::new(backend)?;
 
-            let target_conn = connect_target_db(&db, quack_token.as_deref(), *quack_disable_ssl)?;
-            let configured_catalog = database.clone().or_else(|| resolve_project_catalog(&project_dir, cli.env.as_deref()));
-            if let Some(cat) = configured_catalog {
-                let _ = target_conn.execute_batch(&format!("USE \"{}\";", cat.replace('\"', "\"\"")));
-            }
-
-            if db.starts_with("quack:") {
-                cleanup_orphaned_quack_bridges(&target_conn);
-            }
-
-            let ide_res = ide::run_ide_loop(&mut terminal, &target_conn, &project_dir, &db, *quack_disable_ssl);
-
-            ratatui::crossterm::terminal::disable_raw_mode()?;
-            ratatui::crossterm::execute!(
-                terminal.backend_mut(),
-                ratatui::crossterm::terminal::LeaveAlternateScreen,
-                ratatui::crossterm::event::DisableMouseCapture
+            ide::run_ide_loop_with_workspace(
+                &mut terminal,
+                &opened.conn,
+                &project_dir,
+                &opened.display_db,
+                *quack_disable_ssl,
+                cli.env.as_deref(),
+                opened.ws_report,
             )?;
-
-            ide_res?;
         }
         Commands::Deploy { project_dir, remote, db, port, auto_install } => {
+            validate_safe_ssh_remote(remote)?;
             println!("Deploying {} to {} at {}", project_dir.display(), remote, db);
-            
-            let rand_suffix = &generate_random_hex_token()[..16];
-            let tmp_pack = std::env::temp_dir()
-                .join(format!("duckpack_deploy_{}.duckpack", rand_suffix))
-                .to_string_lossy()
-                .to_string();
-            
+
+            let local_tmp_dir = create_local_private_temp_dir("duckpack_deploy")?;
+            let tmp_pack_path = local_tmp_dir.join("deploy.duckpack");
+            let tmp_pack = tmp_pack_path.to_string_lossy().to_string();
+
             println!("1. Compiling local DuckPack artifact...");
-            let _ = std::fs::remove_file(&tmp_pack);
-            let mut out_conn = Connection::open(&tmp_pack).with_context(|| "Failed to create temp .duckpack file")?;
-            compile_project_declarations(&mut out_conn, project_dir)?;
-            out_conn.close().map_err(|e| anyhow::anyhow!("Failed to close DuckPack: {:?}", e.1))?;
-            
-            let remote_tmp_pack = format!("/tmp/deploy_{}.duckpack", rand_suffix);
-            
-            println!("2. Transferring artifact to remote server (scp)...");
-            let scp_status = std::process::Command::new("scp")
-                .arg("-P")
-                .arg(port.to_string())
-                .arg(&tmp_pack)
-                .arg(format!("{}:{}", remote, remote_tmp_pack))
-                .status()?;
-            
-            if !scp_status.success() {
-                let _ = std::fs::remove_file(&tmp_pack);
-                anyhow::bail!("Failed to SCP artifact to remote server.");
+            let compile_res = (|| -> Result<()> {
+                let mut out_conn = Connection::open(&tmp_pack)
+                    .with_context(|| "Failed to create temp .duckpack file")?;
+                compile_project_declarations(&mut out_conn, project_dir)?;
+                out_conn
+                    .close()
+                    .map_err(|e| anyhow::anyhow!("Failed to close DuckPack: {:?}", e.1))?;
+                Ok(())
+            })();
+            if let Err(e) = compile_res {
+                let _ = std::fs::remove_dir_all(&local_tmp_dir);
+                return Err(e);
             }
-            
-            let mut remote_bin = "duckpack".to_string();
-            let mut remote_tmp_bin = None;
-            
-            if *auto_install {
-                println!("2.5. Auto-installing DuckPack companion binary...");
-                let current_exe = std::env::current_exe().with_context(|| "Failed to get current executable path")?;
-                let tmp_bin = format!("/tmp/duckpack_bin_{}", rand_suffix);
-                
-                let scp_bin_status = std::process::Command::new("scp")
+
+            let remote_tmp_dir = match create_remote_private_temp_dir(remote, *port) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&local_tmp_dir);
+                    return Err(e);
+                }
+            };
+            let remote_tmp_pack = format!("{}/deploy.duckpack", remote_tmp_dir);
+
+            let deploy_res = (|| -> Result<()> {
+                println!("2. Transferring artifact to remote server (scp)...");
+                let scp_status = std::process::Command::new("scp")
                     .arg("-P")
                     .arg(port.to_string())
-                    .arg(&current_exe)
-                    .arg(format!("{}:{}", remote, tmp_bin))
+                    .arg("--")
+                    .arg(&tmp_pack)
+                    .arg(format!("{}:{}", remote, remote_tmp_pack))
                     .status()?;
-                    
-                if !scp_bin_status.success() {
-                    let _ = std::fs::remove_file(&tmp_pack);
-                    anyhow::bail!("Failed to SCP binary to remote server.");
+
+                if !scp_status.success() {
+                    anyhow::bail!("Failed to SCP artifact to remote server.");
                 }
-                
-                // Make the binary executable
-                let chmod_status = std::process::Command::new("ssh")
+
+                let remote_bin = if *auto_install {
+                    println!("2.5. Auto-installing DuckPack companion binary...");
+                    upload_remote_companion_binary(remote, *port, &remote_tmp_dir)?
+                } else {
+                    "duckpack".to_string()
+                };
+
+                println!("3. Executing companion CLI via SSH...");
+                let ssh_status = std::process::Command::new("ssh")
                     .arg("-p")
                     .arg(port.to_string())
+                    .arg("--")
                     .arg(remote)
-                    .arg(format!("chmod +x {}", shell_quote(&tmp_bin)))
+                    .arg(format!(
+                        "{} apply --project-dir {} --db {} --auto-approve",
+                        shell_quote(&remote_bin),
+                        shell_quote(&remote_tmp_pack),
+                        shell_quote(db)
+                    ))
                     .status()?;
-                    
-                if !chmod_status.success() {
-                    let _ = std::fs::remove_file(&tmp_pack);
-                    anyhow::bail!("Failed to make binary executable on remote server.");
+
+                if !ssh_status.success() {
+                    println!("Deployment failed during remote execution.");
+                } else {
+                    println!("Deployment successful!");
                 }
-                
-                remote_bin = tmp_bin.clone();
-                remote_tmp_bin = Some(tmp_bin);
-            }
-            
-            println!("3. Executing companion CLI via SSH...");
-            let ssh_status = std::process::Command::new("ssh")
-                .arg("-p")
-                .arg(port.to_string())
-                .arg(remote)
-                .arg(format!(
-                    "{} apply --project-dir {} --db {} --auto-approve",
-                    shell_quote(&remote_bin),
-                    shell_quote(&remote_tmp_pack),
-                    shell_quote(db)
-                ))
-                .status()?;
-                
-            if !ssh_status.success() {
-                println!("Deployment failed during remote execution.");
-            } else {
-                println!("Deployment successful!");
-            }
-            
+                Ok(())
+            })();
+
             println!("4. Cleaning up temporary artifacts...");
-            let _ = std::fs::remove_file(&tmp_pack);
-            
-            let mut cleanup_cmd = format!("rm -f {}", shell_quote(&remote_tmp_pack));
-            if let Some(tmp_bin) = remote_tmp_bin {
-                cleanup_cmd.push_str(&format!(" {}", shell_quote(&tmp_bin)));
-            }
-            
-            let _ = std::process::Command::new("ssh")
-                .arg("-p")
-                .arg(port.to_string())
-                .arg(remote)
-                .arg(cleanup_cmd)
-                .status();
+            let _ = std::fs::remove_dir_all(&local_tmp_dir);
+            cleanup_remote_temp_dir(remote, *port, &remote_tmp_dir);
+            deploy_res?;
         }
         Commands::Python { command } => {
             match command {
@@ -710,9 +766,123 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Quotes a string as a single-quoted POSIX shell token (`'...'`, escaping embedded `'` as `'\''`).
-fn shell_quote(arg: &str) -> String {
-    format!("'{}'", arg.replace('\'', "'\\''"))
+/// Creates a private (`0700` on Unix) local temporary directory with CSPRNG suffix (M4).
+fn create_local_private_temp_dir(prefix: &str) -> Result<PathBuf> {
+    let suffix = &generate_random_hex_token()[..16];
+    let dir = std::env::temp_dir().join(format!("{}_{}", prefix, suffix));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("Failed to create private temp dir {}", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
+    }
+    Ok(dir)
+}
+
+/// Creates a private (`0700`) temporary directory on the remote SSH host via `mktemp -d` (M4/H2).
+fn create_remote_private_temp_dir(remote: &str, port: u16) -> Result<String> {
+    let out = std::process::Command::new("ssh")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--")
+        .arg(remote)
+        .arg("mktemp -d /tmp/duckpack.XXXXXX")
+        .output()
+        .with_context(|| "Failed to execute ssh mktemp on remote host")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "Failed to create private remote temp directory on {}: {}",
+            remote,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if dir.is_empty() || !dir.starts_with("/tmp/duckpack.") {
+        anyhow::bail!("Unexpected remote mktemp directory output: '{}'", dir);
+    }
+    Ok(dir)
+}
+
+/// Uploads the current `duckpack` binary into the private remote temp dir and marks it executable (H2/M4).
+fn upload_remote_companion_binary(remote: &str, port: u16, remote_dir: &str) -> Result<String> {
+    let current_exe =
+        std::env::current_exe().with_context(|| "Failed to get current executable path")?;
+    let remote_bin = format!("{}/duckpack", remote_dir);
+
+    let scp_status = std::process::Command::new("scp")
+        .arg("-P")
+        .arg(port.to_string())
+        .arg("--")
+        .arg(&current_exe)
+        .arg(format!("{}:{}", remote, remote_bin))
+        .status()?;
+    if !scp_status.success() {
+        anyhow::bail!("Failed to SCP binary to remote server.");
+    }
+
+    let chmod_status = std::process::Command::new("ssh")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--")
+        .arg(remote)
+        .arg(format!("chmod 700 {}", shell_quote(&remote_bin)))
+        .status()?;
+    if !chmod_status.success() {
+        anyhow::bail!("Failed to make binary executable on remote server.");
+    }
+
+    Ok(remote_bin)
+}
+
+/// Writes `QUACK_TOKEN` into a `0600` `.env` inside `remote_dir` via `ssh` stdin so secrets never appear in argv/ps (H2/M4).
+fn write_remote_private_env_token(
+    remote: &str,
+    port: u16,
+    remote_dir: &str,
+    token: &str,
+) -> Result<()> {
+    use std::io::Write;
+    let clean_tok = token.replace(['\r', '\n', '\0'], "");
+    let env_payload = format!("QUACK_TOKEN={}\n", clean_tok);
+    let remote_env = format!("{}/.env", remote_dir);
+    let mut child = std::process::Command::new("ssh")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--")
+        .arg(remote)
+        .arg(format!("umask 077 && cat > {}", shell_quote(&remote_env)))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| "Failed to spawn ssh to write private remote .env")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(env_payload.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("Failed to transfer QUACK_TOKEN securely to remote .env");
+    }
+    Ok(())
+}
+
+/// Recursively removes the private remote temp directory created by `create_remote_private_temp_dir`.
+fn cleanup_remote_temp_dir(remote: &str, port: u16, remote_dir: &str) {
+    if !remote_dir.starts_with("/tmp/duckpack.") {
+        return;
+    }
+    let _ = std::process::Command::new("ssh")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--")
+        .arg(remote)
+        .arg(format!("rm -rf {}", shell_quote(remote_dir)))
+        .status();
 }
 
 /// Resolves the active Python interpreter binary (`$VIRTUAL_ENV/bin/python`, `./.venv/bin/python`, or `python3`).
@@ -826,6 +996,7 @@ fn build_python_install_command(
 /// Launches the interactive visual diff & declarative migration review TUI.
 ///
 /// Can be invoked via `duckpack diff --interactive` (or `-i`) or `duckpack apply` (default mode).
+#[allow(clippy::too_many_arguments)]
 fn run_diff_review_tui(
     project_dir: &PathBuf,
     db: &str,
@@ -834,24 +1005,27 @@ fn run_diff_review_tui(
     quack_token: Option<&str>,
     quack_disable_ssl: bool,
     force_drop: bool,
+    allow_lake_rewrite: bool,
     out: Option<&str>,
 ) -> Result<()> {
     let configured_catalog = database
         .map(String::from)
         .or_else(|| resolve_project_catalog(project_dir, env));
     let conn = connect_target_db(db, quack_token, quack_disable_ssl)?;
+    let _ = duckpack::workspace::apply_workspace_secrets(&conn, project_dir, env)?;
     if db.starts_with("quack:") {
         cleanup_orphaned_quack_bridges(&conn);
     }
 
     if let Some(out_file) = out {
         let mut exec = &conn;
-        let session = tui::DiffReviewSession::new(
+        let session = tui::DiffReviewSession::new_with_options(
             &mut exec,
             project_dir,
             db,
             configured_catalog.as_deref(),
             force_drop,
+            allow_lake_rewrite,
         )?;
         let script = session.render_dry_run_script();
         if let Err(e) = std::fs::write(out_file, script) {
@@ -862,33 +1036,23 @@ fn run_diff_review_tui(
         return Ok(());
     }
 
-    ratatui::crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    ratatui::crossterm::execute!(
-        stdout,
-        ratatui::crossterm::terminal::EnterAlternateScreen,
-        ratatui::crossterm::event::EnableMouseCapture
-    )?;
+    let _guard = TerminalGuard::enter()?;
+    let stdout = std::io::stdout();
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let session_res = tui::run_diff_review_session(
+    let session_res = tui::run_diff_review_session_with_options(
         &mut terminal,
         &conn,
         project_dir,
         db,
         configured_catalog.as_deref(),
         force_drop,
+        allow_lake_rewrite,
         quack_disable_ssl,
     );
-
-    let _ = ratatui::crossterm::terminal::disable_raw_mode();
-    let _ = ratatui::crossterm::execute!(
-        std::io::stdout(),
-        ratatui::crossterm::terminal::LeaveAlternateScreen,
-        ratatui::crossterm::event::DisableMouseCapture
-    );
     let _ = terminal.show_cursor();
+    drop(_guard);
 
     let summary = session_res?;
     if summary.total_applied_count > 0 {

@@ -8,21 +8,31 @@ pub const DUCKDB_DATA_TYPES: &[&str] = &[
     "INT1",
     "SMALLINT",
     "INT2",
+    "INT16",
     "SHORT",
     "INTEGER",
     "INT",
     "INT4",
+    "INT32",
     "SIGNED",
     "BIGINT",
     "INT8",
+    "INT64",
     "LONG",
     "HUGEINT",
+    "INT128",
     "UTINYINT",
+    "UINT8",
     "USMALLINT",
+    "UINT16",
     "UINTEGER",
     "UINT",
+    "UINT32",
     "UBIGINT",
+    "UINT64",
     "UHUGEINT",
+    "UINT128",
+    "BIGNUM",
     // Floats & Decimals
     "FLOAT",
     "FLOAT4",
@@ -35,6 +45,7 @@ pub const DUCKDB_DATA_TYPES: &[&str] = &[
     // Boolean
     "BOOLEAN",
     "BOOL",
+    "LOGICAL",
     // Strings & Binary
     "VARCHAR",
     "CHAR",
@@ -49,6 +60,7 @@ pub const DUCKDB_DATA_TYPES: &[&str] = &[
     "BITSTRING",
     // Temporal
     "DATE",
+    "DATETIME",
     "TIME",
     "TIMETZ",
     "TIMESTAMP",
@@ -56,18 +68,21 @@ pub const DUCKDB_DATA_TYPES: &[&str] = &[
     "TIMESTAMP_S",
     "TIMESTAMP_MS",
     "TIMESTAMP_NS",
+    "TIMESTAMPTZ_NS",
     "ZONE",
     "TIMEZONE",
     "INTERVAL",
     // Complex & DuckDB 2.0+ types
     "UUID",
     "JSON",
+    "ENUM",
     "STRUCT",
+    "TUPLE",
     "MAP",
-    "UNION",
     "LIST",
     "ARRAY",
     "GEOMETRY",
+    "VARIANT",
 ];
 
 /// SQL and DuckDB keywords (DDL, DML, Clauses, Constraints, Control flow).
@@ -85,6 +100,12 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "RETURNING",
     "TRUNCATE",
     "MERGE",
+    "CALL",
+    // Transactions
+    "BEGIN",
+    "TRANSACTION",
+    "COMMIT",
+    "ROLLBACK",
     // Clauses & Joins
     "JOIN",
     "INNER",
@@ -94,6 +115,9 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "OUTER",
     "CROSS",
     "NATURAL",
+    "ASOF",
+    "SEMI",
+    "ANTI",
     "ON",
     "USING",
     "GROUP",
@@ -109,6 +133,8 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "PARTITION",
     "ROWS",
     "RANGE",
+    "PIVOT",
+    "UNPIVOT",
     // Set operations & CTE
     "UNION",
     "INTERSECT",
@@ -129,6 +155,8 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "TYPE",
     "SEQUENCE",
     "TRIGGER",
+    "SECRET",
+    "PERSISTENT",
     "DROP",
     "ALTER",
     "ADD",
@@ -142,6 +170,8 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "ATTACH",
     "DETACH",
     "USE",
+    "INSTALL",
+    "LOAD",
     "PRAGMA",
     "DESCRIBE",
     "SUMMARIZE",
@@ -152,6 +182,19 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "IMPORT",
     "CONNECT",
     "DISCONNECT",
+    // Triggers & Sequences
+    "BEFORE",
+    "AFTER",
+    "FOR",
+    "EACH",
+    "ROW",
+    "STATEMENT",
+    "REFERENCING",
+    "START",
+    "INCREMENT",
+    "MINVALUE",
+    "MAXVALUE",
+    "CYCLE",
     // Constraints & Options
     "PRIMARY",
     "KEY",
@@ -165,8 +208,12 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "RESTRICT",
     "GENERATED",
     "ALWAYS",
+    "VIRTUAL",
+    "STORED",
     "IDENTITY",
     "AUTO_INCREMENT",
+    "DEFERRED",
+    "DEFERRABLE",
     "COLLATE",
     "IF",
     "EXISTS",
@@ -191,7 +238,6 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "TRY_CAST",
     // DuckDB special
     "APPROX",
-    "VARIANT",
     "POSITIONAL",
     "SECURE",
     "LAMBDA",
@@ -203,22 +249,24 @@ pub const SQL_LITERALS: &[&str] = &["TRUE", "FALSE", "NULL"];
 /// Comprehensive regular expression pattern for highlighting SQL keywords, DuckDB data types,
 /// and DDL clauses in the interactive editor (`tui-textarea`).
 pub const SQL_KEYWORD_PATTERN: &str = 
-    "(?i)\\b(SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|RETURNING|TRUNCATE|MERGE|\
-    JOIN|INNER|LEFT|RIGHT|FULL|OUTER|CROSS|NATURAL|ON|USING|GROUP|ORDER|BY|HAVING|LIMIT|\
-    OFFSET|SAMPLE|QUALIFY|WINDOW|OVER|PARTITION|ROWS|RANGE|UNION|INTERSECT|EXCEPT|ALL|\
+    "(?i)\\b(SELECT|FROM|WHERE|INSERT|INTO|VALUES|UPDATE|SET|DELETE|RETURNING|TRUNCATE|MERGE|CALL|\
+    BEGIN|TRANSACTION|COMMIT|ROLLBACK|\
+    JOIN|INNER|LEFT|RIGHT|FULL|OUTER|CROSS|NATURAL|ASOF|SEMI|ANTI|ON|USING|GROUP|ORDER|BY|HAVING|LIMIT|\
+    OFFSET|SAMPLE|QUALIFY|WINDOW|OVER|PARTITION|ROWS|RANGE|PIVOT|UNPIVOT|UNION|INTERSECT|EXCEPT|ALL|\
     DISTINCT|WITH|RECURSIVE|AS|CREATE|TABLE|SCHEMA|VIEW|INDEX|MACRO|FUNCTION|TYPE|\
-    SEQUENCE|TRIGGER|DROP|ALTER|ADD|COLUMN|RENAME|TO|REPLACE|TEMP|TEMPORARY|MATERIALIZED|\
-    ATTACH|DETACH|USE|PRAGMA|DESCRIBE|SUMMARIZE|SHOW|EXPLAIN|COPY|EXPORT|IMPORT|CONNECT|\
-    DISCONNECT|PRIMARY|KEY|FOREIGN|REFERENCES|DEFAULT|CHECK|UNIQUE|CONSTRAINT|CASCADE|\
-    RESTRICT|GENERATED|ALWAYS|IDENTITY|AUTO_INCREMENT|COLLATE|IF|EXISTS|AND|OR|NOT|IN|IS|\
+    SEQUENCE|TRIGGER|SECRET|PERSISTENT|DROP|ALTER|ADD|COLUMN|RENAME|TO|REPLACE|TEMP|TEMPORARY|MATERIALIZED|\
+    ATTACH|DETACH|USE|INSTALL|LOAD|PRAGMA|DESCRIBE|SUMMARIZE|SHOW|EXPLAIN|COPY|EXPORT|IMPORT|CONNECT|\
+    DISCONNECT|BEFORE|AFTER|FOR|EACH|ROW|STATEMENT|REFERENCING|START|INCREMENT|MINVALUE|MAXVALUE|CYCLE|\
+    PRIMARY|KEY|FOREIGN|REFERENCES|DEFAULT|CHECK|UNIQUE|CONSTRAINT|CASCADE|\
+    RESTRICT|GENERATED|ALWAYS|VIRTUAL|STORED|IDENTITY|AUTO_INCREMENT|DEFERRED|DEFERRABLE|COLLATE|IF|EXISTS|AND|OR|NOT|IN|IS|\
     BETWEEN|LIKE|ILIKE|SIMILAR|CASE|WHEN|THEN|ELSE|END|COALESCE|NULLIF|CAST|TRY_CAST|\
-    APPROX|VARIANT|POSITIONAL|SECURE|LAMBDA|TRUE|FALSE|NULL|\
-    TINYINT|INT1|SMALLINT|INT2|SHORT|INTEGER|INT|INT4|SIGNED|BIGINT|INT8|LONG|HUGEINT|\
-    UTINYINT|USMALLINT|UINTEGER|UINT|UBIGINT|UHUGEINT|FLOAT|FLOAT4|REAL|DOUBLE|FLOAT8|\
-    PRECISION|DECIMAL|NUMERIC|BOOLEAN|BOOL|VARCHAR|CHAR|BPCHAR|TEXT|STRING|BLOB|BYTEA|\
-    BINARY|VARBINARY|BIT|BITSTRING|DATE|TIME|TIMETZ|TIMESTAMP|TIMESTAMPTZ|TIMESTAMP_S|\
-    TIMESTAMP_MS|TIMESTAMP_NS|ZONE|TIMEZONE|INTERVAL|UUID|JSON|STRUCT|MAP|UNION|LIST|\
-    ARRAY|GEOMETRY)\\b";
+    APPROX|POSITIONAL|SECURE|LAMBDA|TRUE|FALSE|NULL|\
+    TINYINT|INT1|SMALLINT|INT2|INT16|SHORT|INTEGER|INT|INT4|INT32|SIGNED|BIGINT|INT8|INT64|LONG|HUGEINT|INT128|\
+    UTINYINT|UINT8|USMALLINT|UINT16|UINTEGER|UINT|UINT32|UBIGINT|UINT64|UHUGEINT|UINT128|BIGNUM|\
+    FLOAT|FLOAT4|REAL|DOUBLE|FLOAT8|PRECISION|DECIMAL|NUMERIC|BOOLEAN|BOOL|LOGICAL|\
+    VARCHAR|CHAR|BPCHAR|TEXT|STRING|BLOB|BYTEA|BINARY|VARBINARY|BIT|BITSTRING|\
+    DATE|DATETIME|TIME|TIMETZ|TIMESTAMP|TIMESTAMPTZ|TIMESTAMP_S|TIMESTAMP_MS|TIMESTAMP_NS|TIMESTAMPTZ_NS|\
+    ZONE|TIMEZONE|INTERVAL|UUID|JSON|ENUM|STRUCT|TUPLE|MAP|LIST|ARRAY|GEOMETRY|VARIANT)\\b";
 
 /// Checks if a given word (case-insensitive) matches any DuckDB data type.
 pub fn is_data_type(word: &str) -> bool {
@@ -264,6 +312,27 @@ pub fn highlight_sql(sql: &str) -> Vec<Span<'static>> {
             continue;
         }
 
+        // 1b. Block comment: /* ... */ (supporting DuckDB nested block comments)
+        if chars[i] == '/' && i + 1 < len && chars[i + 1] == '*' {
+            let start = i;
+            let mut depth = 1usize;
+            i += 2;
+            while i < len && depth > 0 {
+                if chars[i] == '/' && i + 1 < len && chars[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                } else if chars[i] == '*' && i + 1 < len && chars[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            let comment: String = chars[start..i].iter().collect();
+            spans.push(Span::styled(comment, Style::default().fg(Color::DarkGray)));
+            continue;
+        }
+
         // 2. String literal: '...' (supporting escaped '' quotes)
         if chars[i] == '\'' {
             let start = i;
@@ -282,6 +351,28 @@ pub fn highlight_sql(sql: &str) -> Vec<Span<'static>> {
             }
             let str_lit: String = chars[start..i].iter().collect();
             spans.push(Span::styled(str_lit, Style::default().fg(Color::Yellow)));
+            continue;
+        }
+
+        // 2b. Quoted identifier: "..." or `...` (never highlight keywords/types inside quoted identifiers)
+        if chars[i] == '"' || chars[i] == '`' {
+            let quote = chars[i];
+            let start = i;
+            i += 1;
+            while i < len {
+                if chars[i] == quote {
+                    if i + 1 < len && chars[i + 1] == quote {
+                        i += 2; // escaped quote
+                    } else {
+                        i += 1; // closing quote
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            let ident: String = chars[start..i].iter().collect();
+            spans.push(Span::raw(ident));
             continue;
         }
 
@@ -454,5 +545,35 @@ mod tests {
 
         let num_span = spans.iter().find(|s| s.content == "42").expect("number span");
         assert_eq!(num_span.style.fg, Some(Color::LightGreen));
+    }
+
+    #[test]
+    fn test_highlight_v2_types_block_comments_and_quoted_identifiers() {
+        let sql = "/* multi /* nested */ comment */ SELECT \"SELECT\", payload::VARIANT FROM t1 UNION ALL SELECT 1;";
+        let spans = highlight_sql(sql);
+
+        let block_comment = spans
+            .iter()
+            .find(|s| s.content.starts_with("/*"))
+            .expect("block comment span");
+        assert_eq!(block_comment.style.fg, Some(Color::DarkGray));
+
+        let quoted_ident = spans
+            .iter()
+            .find(|s| s.content == "\"SELECT\"")
+            .expect("quoted identifier span");
+        assert_eq!(quoted_ident.style.fg, None);
+
+        let variant_span = spans
+            .iter()
+            .find(|s| s.content == "VARIANT")
+            .expect("VARIANT span");
+        assert_eq!(variant_span.style.fg, Some(Color::LightMagenta));
+
+        let union_span = spans
+            .iter()
+            .find(|s| s.content == "UNION")
+            .expect("UNION span");
+        assert_eq!(union_span.style.fg, Some(Color::Cyan));
     }
 }

@@ -1,6 +1,6 @@
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
@@ -9,8 +9,7 @@ use ratatui::{
 
 use crate::catalog::{DatabaseInfo, SnapshotEntry};
 use super::input::{
-    delete_char_at_cursor, delete_char_before_cursor, insert_char_at_cursor,
-    render_text_with_cursor,
+    centered_modal_rect, handle_text_nav_or_delete, insert_char_at_cursor, render_text_input_box,
 };
 
 /// Time-travel query mode in the DuckLake Time-Travel Modal (`t`).
@@ -272,7 +271,7 @@ impl TimeTravelModalState {
                 }
                 let safe_ts = ts.replace('\'', "''");
                 Ok(format!(
-                    "SELECT * FROM {} AT (TIMESTAMP => TIMESTAMP '{}') LIMIT 100;",
+                    "SELECT * FROM {} AT (TIMESTAMP => TIMESTAMPTZ '{}') LIMIT 100;",
                     qualified_table, safe_ts
                 ))
             }
@@ -302,14 +301,7 @@ impl TimeTravelModalState {
     }
 
     pub(crate) fn render(&self, f: &mut Frame) {
-        let popup_width = 86.min(f.area().width.saturating_sub(4));
-        let popup_height = 25.min(f.area().height.saturating_sub(2));
-        let popup_area = Rect {
-            x: (f.area().width.saturating_sub(popup_width)) / 2,
-            y: (f.area().height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
+        let popup_area = centered_modal_rect(f.area(), 86, 25);
         f.render_widget(ratatui::widgets::Clear, popup_area);
 
         let block = Block::default()
@@ -426,88 +418,58 @@ impl TimeTravelModalState {
         // 3: Editable Input Row
         match self.mode {
             TimeTravelMode::Version => {
-                let is_active = self.active_field == 3;
-                let border = if is_active {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                let w = Paragraph::new(render_text_with_cursor(
+                render_text_input_box(
+                    f,
+                    chunks[3],
+                    " Snapshot Version (AT VERSION => N) ",
                     &self.version_input,
                     self.cursor_pos,
-                    is_active,
+                    self.active_field == 3,
                     false,
-                ))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Snapshot Version (AT VERSION => N) ")
-                        .border_style(border),
+                    Color::Yellow,
+                    false,
                 );
-                f.render_widget(w, chunks[3]);
             }
             TimeTravelMode::Timestamp => {
-                let is_active = self.active_field == 3;
-                let border = if is_active {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                let w = Paragraph::new(render_text_with_cursor(
+                render_text_input_box(
+                    f,
+                    chunks[3],
+                    " Snapshot Timestamp (AT TIMESTAMP => TIMESTAMP '...') ",
                     &self.timestamp_input,
                     self.cursor_pos,
-                    is_active,
+                    self.active_field == 3,
                     false,
-                ))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Snapshot Timestamp (AT TIMESTAMP => TIMESTAMP '...') ")
-                        .border_style(border),
+                    Color::Yellow,
+                    false,
                 );
-                f.render_widget(w, chunks[3]);
             }
             TimeTravelMode::TableChanges => {
                 let cols = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .split(chunks[3]);
-                let start_active = self.active_field == 3;
-                let end_active = self.active_field == 4;
-                let start_w = Paragraph::new(render_text_with_cursor(
+                render_text_input_box(
+                    f,
+                    cols[0],
+                    " Start Snapshot Version ",
                     &self.start_version_input,
                     self.cursor_pos,
-                    start_active,
+                    self.active_field == 3,
                     false,
-                ))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Start Snapshot Version ")
-                        .border_style(if start_active {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        }),
+                    Color::Yellow,
+                    false,
                 );
-                let end_w = Paragraph::new(render_text_with_cursor(
+                render_text_input_box(
+                    f,
+                    cols[1],
+                    " End Snapshot Version ",
                     &self.end_version_input,
                     self.cursor_pos,
-                    end_active,
+                    self.active_field == 4,
                     false,
-                ))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" End Snapshot Version ")
-                        .border_style(if end_active {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        }),
+                    Color::Yellow,
+                    false,
                 );
-                f.render_widget(start_w, cols[0]);
-                f.render_widget(end_w, cols[1]);
             }
         }
 
@@ -642,31 +604,13 @@ impl TimeTravelModalState {
                     self.active_field = self.cancel_index();
                 }
             }
-            KeyCode::Home => {
-                if self.is_text_field() {
-                    self.cursor_pos = 0;
-                }
-            }
-            KeyCode::End => {
-                if self.is_text_field() {
-                    self.sync_cursor_to_end();
-                }
-            }
-            KeyCode::Backspace => {
+            KeyCode::Home | KeyCode::End | KeyCode::Backspace | KeyCode::Delete => {
                 if self.is_text_field() {
                     let mut pos = self.cursor_pos;
                     if let Some(buf) = self.active_text_mut() {
-                        delete_char_before_cursor(buf, &mut pos);
+                        handle_text_nav_or_delete(buf, &mut pos, key);
                     }
                     self.cursor_pos = pos;
-                }
-            }
-            KeyCode::Delete => {
-                if self.is_text_field() {
-                    let pos = self.cursor_pos;
-                    if let Some(buf) = self.active_text_mut() {
-                        delete_char_at_cursor(buf, pos);
-                    }
                 }
             }
             KeyCode::Enter => {

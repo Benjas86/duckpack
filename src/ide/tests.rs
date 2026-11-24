@@ -1243,7 +1243,7 @@ fn test_attach_modal_state_providers() {
     assert!(modal.trusted_connection);
     assert_eq!(modal.username, "");
 
-    // Test Postgres URI building
+    // Test Postgres escaped libpq connection string building (L1: safe for special-char passwords)
     modal.reset();
     modal.set_provider(4);
     modal.database = "analytics".to_string();
@@ -1254,10 +1254,10 @@ fn test_attach_modal_state_providers() {
     assert_eq!(pg_alias, "analytics");
     assert_eq!(
         pg_uri,
-        "postgres://postgres:pgpass@localhost:5432/analytics?sslmode=disable"
+        "host=localhost port=5432 dbname=analytics user=postgres password=pgpass sslmode=disable"
     );
 
-    // Test MySQL URI building
+    // Test MySQL key=value connection string building (DuckDB mysql extension syntax)
     modal.reset();
     modal.set_provider(5);
     modal.database = "store".to_string();
@@ -1268,7 +1268,7 @@ fn test_attach_modal_state_providers() {
     assert_eq!(mysql_alias, "store");
     assert_eq!(
         mysql_uri,
-        "mysql://root:mysqlpass@localhost:3306/store?ssl-mode=DISABLED"
+        "host=localhost port=3306 database=store user=root password=mysqlpass ssl_mode=disabled"
     );
 
     // Test Quack Target building
@@ -2184,7 +2184,7 @@ fn test_ducklake_snapshots_explorer_and_time_travel_modal() {
     assert_eq!(modal.mode, TimeTravelMode::Timestamp);
     assert_eq!(
         modal.build_sql().unwrap(),
-        "SELECT * FROM lake_db.gold_orders AT (TIMESTAMP => TIMESTAMP '2026-11-12 18:00:00') LIMIT 100;"
+        "SELECT * FROM lake_db.gold_orders AT (TIMESTAMP => TIMESTAMPTZ '2026-11-12 18:00:00') LIMIT 100;"
     );
 
     // Switch mode to TableChanges and switch table to mart.finance."revenue-daily"
@@ -2216,4 +2216,221 @@ fn test_ducklake_snapshots_explorer_and_time_travel_modal() {
         ))
     );
     assert!(!modal.is_open);
+}
+
+#[test]
+fn test_quack_auth_modal_user_lifecycle_lockout_guard_and_export() {
+    use ratatui::crossterm::event::KeyEvent;
+    let temp_dir = std::env::temp_dir().join(format!(
+        "dp_ide_quack_auth_modal_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+
+    let mut modal = QuackAuthModalState::new();
+    modal.open(&conn, &temp_dir, None);
+    assert!(modal.is_open);
+    assert_eq!(modal.active_tab, QuackAuthTab::Users);
+    assert!(modal.config.users.is_empty());
+
+    // Press 'a' to add first user ("alice" as Admin)
+    modal.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(modal.adding_user);
+    for c in "alice".chars() {
+        modal.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &conn, &temp_dir);
+    }
+    // Tab to Role field (defaults to Reader -> Right -> Admin)
+    modal.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &conn, &temp_dir);
+    assert_eq!(modal.add_field, 1);
+    assert_eq!(modal.new_token_env, "QUACK_USER_ALICE_TOKEN");
+    modal.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &conn, &temp_dir);
+    assert_eq!(modal.new_role, crate::quack_auth::QuackRole::Admin);
+
+    // Enter saves user, generates 256-bit token in .env, and writes duckpack.toml
+    let msg = modal.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(msg.is_some());
+    assert!(!modal.adding_user);
+    assert_eq!(modal.config.users.len(), 1);
+    assert_eq!(modal.config.users[0].username, "alice");
+    assert_eq!(modal.config.users[0].role, crate::quack_auth::QuackRole::Admin);
+    assert!(
+        crate::quack_auth::resolve_user_token(&temp_dir, "QUACK_USER_ALICE_TOKEN").is_some(),
+        "Token must be generated and saved into .env"
+    );
+
+    // Admin Lockout Prevention Guard: trying to disable or demote the sole admin must be blocked!
+    modal.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(modal.config.users[0].enabled, "Sole admin cannot be disabled");
+    assert!(modal.error_msg.as_deref().unwrap_or("").contains("Admin Lockout Prevention Guard"));
+
+    modal.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &conn, &temp_dir);
+    assert_eq!(modal.config.users[0].role, crate::quack_auth::QuackRole::Admin, "Sole admin cannot be demoted");
+
+    // Press 'e' to export post-start shell script and SQL bootstrap script
+    let exp_msg = modal.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(exp_msg.is_some());
+    assert!(temp_dir.join("scripts").join("quack_rbac_post_start.sh").exists());
+    assert!(temp_dir.join("scripts").join("quack_rbac_init.sql").exists());
+
+    // Press 'd' to deploy RBAC locally
+    let dep_msg = modal.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(dep_msg.as_deref().unwrap_or("").contains("Synced 1 Quack RBAC user"));
+
+    // Press Esc to close
+    modal.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &conn, &temp_dir);
+    assert!(!modal.is_open);
+
+    // Verify Ratatui rendering across LiveSessions, Users, and inline Add User form without panicking
+    let backend = ratatui::backend::TestBackend::new(110, 32);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    modal.is_open = true;
+    modal.quack_alias = Some("target_db".to_string());
+    modal.sessions.push(crate::quack_auth::LiveQuackSession {
+        server_id: "srv1".to_string(),
+        connection_id: "sid_1234567890abcdef".to_string(),
+        client_id_hash: "ABCDEF".to_string(),
+        username: "alice".to_string(),
+        role: "admin".to_string(),
+        revoked: false,
+        state: "IDLE".to_string(),
+        query: "SELECT * FROM orders".to_string(),
+        cached_rows: "0".to_string(),
+        query_started_at: "2026-11-19 12:00:00".to_string(),
+    });
+    modal.active_tab = QuackAuthTab::LiveSessions;
+    terminal.draw(|f| modal.render(f)).unwrap();
+    modal.active_tab = QuackAuthTab::Users;
+    terminal.draw(|f| modal.render(f)).unwrap();
+    modal.adding_user = true;
+    terminal.draw(|f| modal.render(f)).unwrap();
+
+    // Verify Explorer renders QuackRbacAction when is_quack = true, and hides it for local DuckDB
+    let meta = load_explorer_metadata(&conn, &temp_dir, false);
+    let expanded_groups = HashSet::new();
+    let expanded_tables = HashSet::new();
+    let local_nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, false);
+    assert!(
+        !local_nodes.iter().any(|n| n.node_type == NodeType::QuackRbacAction),
+        "Local DuckDB explorer should not display QuackRbacAction node"
+    );
+    let quack_nodes = rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, &conn, true);
+    assert!(
+        quack_nodes.iter().any(|n| n.node_type == NodeType::QuackRbacAction),
+        "Quack explorer should display QuackRbacAction node"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_workspace_failed_nodes_ctrl_a_save_and_multi_target_ctrl_u() {
+    use ratatui::crossterm::event::KeyEvent;
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "dp_ide_ws_e2e_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+
+    // 1. Verify Ctrl+A Ctrl+S toggle + persist_to_workspace saves DuckLake-on-Quack cleanly with *_env only
+    let mut attach_modal = AttachModalState::new();
+    attach_modal.reset();
+    attach_modal.set_provider(7); // DuckLake
+    attach_modal.set_ducklake_backend(DuckLakeBackend::Quack);
+    attach_modal.host = "sales-catalog.internal".to_string();
+    attach_modal.port = "9494".to_string();
+    attach_modal.password = "super_secret_sales_tok".to_string();
+    attach_modal.data_path = "s3://lakehouse/sales/".to_string();
+    attach_modal.alias = "sales_lake".to_string();
+    attach_modal.disable_ssl = true;
+    assert!(!attach_modal.save_to_toml);
+    attach_modal.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL), &conn);
+    assert!(attach_modal.save_to_toml);
+
+    let save_msg = attach_modal
+        .persist_to_workspace("sales_lake", &temp_dir, Some("prod"))
+        .unwrap();
+    assert!(save_msg.contains("duckpack.toml"));
+
+    // Persist a second DuckLake-on-Quack catalog directly via workspace API
+    crate::workspace::save_attachment_to_workspace(
+        &temp_dir,
+        Some("prod"),
+        &crate::workspace::WorkspaceAttachment {
+            alias: "finance_lake".to_string(),
+            attach_type: "ducklake".to_string(),
+            backend: Some("quack".to_string()),
+            metadata: Some("quack:finance-catalog.internal:9494".to_string()),
+            data_path: Some("s3://lakehouse/finance/".to_string()),
+            token_env: Some("QUACK_FINANCE_TOKEN".to_string()),
+            insecure: true,
+            ..Default::default()
+        },
+        &[],
+    )
+    .unwrap();
+
+    // Verify no plaintext token ever ended up in duckpack.toml
+    let toml_content = std::fs::read_to_string(temp_dir.join("duckpack.toml")).unwrap();
+    assert!(!toml_content.contains("super_secret_sales_tok"));
+    assert!(toml_content.contains("QUACK_SALES_LAKE_TOKEN"));
+
+    // 2. Verify Ctrl+U discovers BOTH DuckLake-on-Quack targets and cycles them with '[' and ']'
+    let mut q_modal = QuackAuthModalState::new();
+    q_modal.open_with_env(&conn, &temp_dir, Some("sales_lake"), Some("prod"));
+    assert_eq!(q_modal.targets.len(), 2);
+    assert_eq!(q_modal.target_index, 0);
+    assert!(q_modal.targets[0].label.contains("sales_lake"));
+
+    q_modal.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), &conn, &temp_dir);
+    assert_eq!(q_modal.target_index, 1);
+    assert!(q_modal.targets[1].label.contains("finance_lake"));
+
+    q_modal.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), &conn, &temp_dir);
+    assert_eq!(q_modal.target_index, 0);
+
+    // 3. Verify Explorer renders FailedAttachment placeholder nodes for offline & missing-env catalogs
+    let meta = load_explorer_metadata(&conn, &temp_dir, false);
+    let mut items = rebuild_explorer_nodes(&meta, &HashSet::new(), &HashSet::new(), &conn, false);
+    let failed = vec![
+        crate::workspace::FailedAttachment {
+            alias: "hr_lake".to_string(),
+            attach_type: "ducklake".to_string(),
+            kind: crate::workspace::AttachmentIssueKind::MissingEnv(vec![
+                "QUACK_HR_TOKEN".to_string(),
+            ]),
+            entry: crate::workspace::WorkspaceAttachment::default(),
+        },
+        crate::workspace::FailedAttachment {
+            alias: "ops_quack".to_string(),
+            attach_type: "quack".to_string(),
+            kind: crate::workspace::AttachmentIssueKind::ConnectionFailed(
+                "Connection refused".to_string(),
+            ),
+            entry: crate::workspace::WorkspaceAttachment::default(),
+        },
+    ];
+    insert_failed_workspace_nodes(&mut items, &failed);
+    assert!(items.iter().any(|n| {
+        matches!(
+            &n.node_type,
+            NodeType::FailedAttachment { alias, is_missing_env: true } if alias == "hr_lake"
+        ) && n.display.contains("QUACK_HR_TOKEN")
+    }));
+    assert!(items.iter().any(|n| {
+        matches!(
+            &n.node_type,
+            NodeType::FailedAttachment { alias, is_missing_env: false } if alias == "ops_quack"
+        ) && n.display.contains("offline")
+    }));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }

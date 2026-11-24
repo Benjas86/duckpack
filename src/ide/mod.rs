@@ -1,21 +1,22 @@
 pub mod editor;
+pub mod execution;
 pub mod explorer;
 pub mod modals;
 
 pub use crate::catalog::*;
 pub use crate::query::*;
 pub(crate) use editor::{
-    EditorTab, FocusPane, build_paginated_sql, format_duckdb_value, generate_schema_visualizer,
+    EditorTab, FocusPane, generate_schema_visualizer,
 };
 #[cfg(test)]
-pub(crate) use editor::extract_explicit_sql_limit;
+pub(crate) use editor::{build_paginated_sql, extract_explicit_sql_limit, format_duckdb_value};
 pub use editor::{
     calculate_status_height, get_clipboard_text, handle_sql_error_position, set_clipboard_text,
 };
 pub(crate) use explorer::{
     ExplorerMode, NodeType, compute_ide_diff_for_catalog, db_icon,
-    get_git_branch_and_status, rebuild_explorer_nodes, rebuild_project_nodes,
-    render_explorer_node_line,
+    get_git_branch_and_status, insert_failed_workspace_nodes, rebuild_explorer_nodes,
+    rebuild_project_nodes, render_explorer_node_line,
 };
 #[cfg(test)]
 pub(crate) use explorer::{
@@ -24,11 +25,14 @@ pub(crate) use explorer::{
 };
 pub(crate) use modals::{
     AddBucketModalState, AttachModalState, DatabasePickerModalState, ExitConfirmationModalState,
-    InIdeDiffModalState, NewAssetModalState, SecretModalState, TimeTravelModalState,
-    populate_secret_modal_for_edit, render_help_modal, render_schema_visualizer_modal,
+    InIdeDiffModalState, NewAssetModalState, QuackAuthModalState, SecretModalState,
+    TimeTravelModalState, populate_secret_modal_for_edit, render_help_modal,
+    render_schema_visualizer_modal,
 };
 #[cfg(test)]
-pub(crate) use modals::{AttachProvider, CloudProvider, DuckLakeBackend, TimeTravelMode};
+pub(crate) use modals::{
+    AttachProvider, CloudProvider, DuckLakeBackend, QuackAuthTab, TimeTravelMode,
+};
 
 use anyhow::Result;
 use duckdb::Connection;
@@ -90,6 +94,51 @@ fn open_query_in_tabs(
     tabs[*active_tab_index].load_content(&query, None);
 }
 
+fn build_db_explorer_items(
+    meta: &ExplorerMetadata,
+    expanded_groups: &HashSet<String>,
+    expanded_tables: &HashSet<String>,
+    conn: &Connection,
+    is_quack: bool,
+    failed_attachments: &[crate::workspace::FailedAttachment],
+) -> Vec<explorer::ExplorerNode> {
+    let mut items = rebuild_explorer_nodes(meta, expanded_groups, expanded_tables, conn, is_quack);
+    insert_failed_workspace_nodes(&mut items, failed_attachments);
+    items
+}
+
+fn retry_failed_workspace_attachment(
+    alias: &str,
+    failed_attachments: &mut Vec<crate::workspace::FailedAttachment>,
+    conn: &Connection,
+    project_dir: &std::path::Path,
+    env_profile: Option<&str>,
+) -> (bool, String) {
+    let Some(pos) = failed_attachments
+        .iter()
+        .position(|f| f.alias.eq_ignore_ascii_case(alias))
+    else {
+        return (false, format!("Attachment '{}' is not in the retry queue.", alias));
+    };
+    crate::engine::load_env_files(project_dir, env_profile);
+    let _ = crate::workspace::apply_workspace_secrets(conn, project_dir, env_profile);
+    let entry = failed_attachments[pos].entry.clone();
+    match crate::workspace::attach_single_workspace_entry(conn, &entry, project_dir, env_profile) {
+        Ok(()) => {
+            failed_attachments.remove(pos);
+            (
+                true,
+                format!("✓ Reconnected workspace catalog '{}' successfully!", alias),
+            )
+        }
+        Err(kind) => {
+            failed_attachments[pos].kind = kind;
+            let detail = failed_attachments[pos].detail_message();
+            (false, format!("⚠️ {}", detail))
+        }
+    }
+}
+
 /// The main execution loop for the IDE/Explorer feature.
 /// Handles rendering the UI layout, capturing keyboard/mouse events, managing tabs,
 /// and securely executing raw DuckDB queries from the active text buffer.
@@ -99,6 +148,28 @@ pub fn run_ide_loop(
     project_dir: &PathBuf,
     db_path: &str,
     quack_disable_ssl: bool,
+) -> Result<()> {
+    run_ide_loop_with_workspace(
+        terminal,
+        conn,
+        project_dir,
+        db_path,
+        quack_disable_ssl,
+        None,
+        None,
+    )
+}
+
+/// Workspace-aware IDE entrypoint supporting `--env <profile>` persistence and resilient
+/// offline/missing-env placeholder nodes in Explorer.
+pub fn run_ide_loop_with_workspace(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    conn: &Connection,
+    project_dir: &PathBuf,
+    db_path: &str,
+    quack_disable_ssl: bool,
+    env_profile: Option<&str>,
+    workspace_report: Option<crate::workspace::WorkspaceApplyReport>,
 ) -> Result<()> {
     let is_quack = db_path.starts_with("quack:");
     let is_remote_db = is_quack || db_path.starts_with("md:") || db_path.starts_with("motherduck:") || db_path.starts_with("ducklake:");
@@ -120,6 +191,14 @@ pub fn run_ide_loop(
         None
     };
 
+    let mut failed_attachments: Vec<crate::workspace::FailedAttachment> = workspace_report
+        .as_ref()
+        .map(|r| r.failed_attachments.clone())
+        .unwrap_or_default();
+    let initial_ws_summary = workspace_report
+        .as_ref()
+        .and_then(|r| r.status_summary());
+
     let mut meta = load_explorer_metadata(conn, project_dir, is_quack);
     let mut tabs: Vec<EditorTab> = vec![EditorTab::new(meta.active_database.clone())];
     let mut active_tab_index: usize = 0;
@@ -127,7 +206,8 @@ pub fn run_ide_loop(
     let mut exit_confirm_modal = ExitConfirmationModalState::new();
 
     let mut focus = FocusPane::Editor;
-    let mut status_msg = String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit.");
+    let mut status_msg = initial_ws_summary
+        .unwrap_or_else(|| String::from("Ready. Press 'Tab' to switch panes. 'Esc' to exit."));
 
     let mut expanded_groups: HashSet<String> = if meta.databases.len() > 1 {
         let mut set = HashSet::new();
@@ -163,7 +243,9 @@ pub fn run_ide_loop(
     let queries_dir = project_dir.join("queries");
 
     let mut explorer_mode = ExplorerMode::Database;
-    let (mut git_branch, mut git_status) = get_git_branch_and_status(project_dir);
+    // Lazy-loaded when switching to Project mode (F4) to avoid spawning git subprocesses at startup
+    let (mut git_branch, mut git_status): (Option<String>, std::collections::HashMap<PathBuf, String>) =
+        (None, std::collections::HashMap::new());
     let mut expanded_project_groups: HashSet<String> = vec![
         "proj:schemas",
         "proj:sequences",
@@ -181,12 +263,19 @@ pub fn run_ide_loop(
     let mut new_asset_modal = NewAssetModalState::new();
     let mut in_ide_diff_modal = InIdeDiffModalState::new();
     let mut time_travel_modal = TimeTravelModalState::new();
+    let mut quack_auth_modal = QuackAuthModalState::new();
 
     let mut explorer_state = ListState::default();
     let mut explorer_horizontal_scroll: usize = 0;
     let mut explorer_width_percent: u16 = 25;
-    let mut explorer_items =
-        rebuild_explorer_nodes(&meta, &expanded_groups, &expanded_tables, conn, is_quack);
+    let mut explorer_items = build_db_explorer_items(
+        &meta,
+        &expanded_groups,
+        &expanded_tables,
+        conn,
+        is_quack,
+        &failed_attachments,
+    );
 
     if !explorer_items.is_empty() {
         explorer_state.select(Some(0));
@@ -203,7 +292,8 @@ pub fn run_ide_loop(
     let mut schema_ascii_tree = String::new();
     let mut schema_scroll = 0;
     let mut max_schema_scroll = 0;
-    let mut os_clipboard: Option<arboard::Clipboard> = arboard::Clipboard::new().ok();
+    // Lazy-initialized on first copy/paste to avoid Wayland/X11 IPC handshake at startup
+    let mut os_clipboard: Option<arboard::Clipboard> = None;
 
     loop {
         let current_target = &tabs[active_tab_index].target_database;
@@ -626,6 +716,8 @@ pub fn run_ide_loop(
                 in_ide_diff_modal.render(f);
             } else if time_travel_modal.is_open {
                 time_travel_modal.render(f);
+            } else if quack_auth_modal.is_open {
+                quack_auth_modal.render(f);
             }
 
             // Status Bar
@@ -778,12 +870,13 @@ pub fn run_ide_loop(
                             && mouse.column <= current_explorer_rect.left() + 8
                         {
                             explorer_mode = ExplorerMode::Database;
-                            explorer_items = rebuild_explorer_nodes(
+                            explorer_items = build_db_explorer_items(
                                 &meta,
                                 &expanded_groups,
                                 &expanded_tables,
                                 conn,
                                 is_quack,
+                                &failed_attachments,
                             );
                             explorer_state.select(Some(0));
                             status_msg = "Switched to Database Catalog view".to_string();
@@ -1033,6 +1126,17 @@ pub fn run_ide_loop(
                     tabs[active_tab_index].textarea.input(ev.clone());
                 }
             }
+            Event::Paste(pasted_text) => {
+                if attach_modal.is_open {
+                    attach_modal.paste_text(&pasted_text);
+                } else if secret_modal.is_open {
+                    secret_modal.paste_text(&pasted_text);
+                } else if quack_auth_modal.is_open {
+                    quack_auth_modal.paste_text(&pasted_text);
+                } else if focus == FocusPane::Editor {
+                    tabs[active_tab_index].textarea.insert_str(&pasted_text);
+                }
+            }
             Event::Key(key) => {
                 if exit_confirm_modal.is_open {
                     match exit_confirm_modal.handle_key(key) {
@@ -1069,16 +1173,38 @@ pub fn run_ide_loop(
                         trigger_explorer_refresh = true;
                     }
                 } else if attach_modal.is_open {
-                    if let Some(alias) = attach_modal.handle_key(key, conn) {
+                    if key.code == KeyCode::Char('v')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if let Some(text) = get_clipboard_text(&mut os_clipboard) {
+                            attach_modal.paste_text(&text);
+                        }
+                    } else if let Some(alias) = attach_modal.handle_key(key, conn) {
                         tabs[active_tab_index].target_database = alias.clone();
+                        let save_note = if attach_modal.save_to_toml {
+                            match attach_modal.persist_to_workspace(&alias, project_dir, env_profile) {
+                                Ok(msg) => format!(" ({})", msg),
+                                Err(e) => format!(" (⚠️ save to duckpack.toml failed: {})", e),
+                            }
+                        } else {
+                            String::new()
+                        };
                         status_msg = format!(
-                            "Attached database '{}' successfully and switched active tab context.",
-                            alias
+                            "Attached database '{}' successfully and switched active tab context.{}",
+                            alias, save_note
                         );
                         trigger_explorer_refresh = true;
                     }
                 } else if secret_modal.is_open {
-                    if let Some(msg) = secret_modal.handle_key(key, conn, project_dir) {
+                    if key.code == KeyCode::Char('v')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if let Some(text) = get_clipboard_text(&mut os_clipboard) {
+                            secret_modal.paste_text(&text);
+                        }
+                    } else if let Some(msg) =
+                        secret_modal.handle_key_with_env(key, conn, project_dir, env_profile)
+                    {
                         status_msg = msg;
                         trigger_explorer_refresh = true;
                     }
@@ -1108,6 +1234,17 @@ pub fn run_ide_loop(
                         status_msg =
                             format!("Executed DuckLake time-travel query on '{}'", db_name);
                     }
+                } else if quack_auth_modal.is_open {
+                    if key.code == KeyCode::Char('v')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if let Some(text) = get_clipboard_text(&mut os_clipboard) {
+                            quack_auth_modal.paste_text(&text);
+                        }
+                    } else if let Some(msg) = quack_auth_modal.handle_key(key, conn, project_dir) {
+                        status_msg = msg;
+                        trigger_explorer_refresh = true;
+                    }
                 } else if key.code == KeyCode::Char('a')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
@@ -1116,6 +1253,14 @@ pub fn run_ide_loop(
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     secret_modal.reset();
+                } else if key.code == KeyCode::Char('u')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    let tab_cat = tabs
+                        .get(active_tab_index)
+                        .map(|t| t.target_database.as_str())
+                        .filter(|c| !c.is_empty() && *c != "memory");
+                    quack_auth_modal.open_with_env(conn, project_dir, tab_cat, env_profile);
                 } else if show_help || show_schema_visualizer {
                     if key.code == KeyCode::Esc
                         || key.code == KeyCode::Char('q')
@@ -1159,12 +1304,13 @@ pub fn run_ide_loop(
 
                     if key.code == KeyCode::F(3) {
                         explorer_mode = ExplorerMode::Database;
-                        explorer_items = rebuild_explorer_nodes(
+                        explorer_items = build_db_explorer_items(
                             &meta,
                             &expanded_groups,
                             &expanded_tables,
                             conn,
                             is_quack,
+                            &failed_attachments,
                         );
                         explorer_state.select(Some(0));
                         status_msg = "Switched to Database Catalog view".to_string();
@@ -1435,12 +1581,13 @@ pub fn run_ide_loop(
                                 trigger_explorer_action = true;
                             } else if key.code == KeyCode::Char('1') {
                                 explorer_mode = ExplorerMode::Database;
-                                explorer_items = rebuild_explorer_nodes(
+                                explorer_items = build_db_explorer_items(
                                     &meta,
                                     &expanded_groups,
                                     &expanded_tables,
                                     conn,
                                     is_quack,
+                                    &failed_attachments,
                                 );
                                 explorer_state.select(Some(0));
                                 status_msg = "Switched to Database Catalog view".to_string();
@@ -1526,9 +1673,33 @@ pub fn run_ide_loop(
                                     status_msg =
                                         "Project files and git status refreshed.".to_string();
                                 } else {
-                                    refresh_attached_catalog(conn, db_path, quack_disable_ssl);
-                                    trigger_explorer_refresh = true;
-                                    status_msg = "Explorer refreshed.".to_string();
+                                    let selected_failed_alias = explorer_state
+                                        .selected()
+                                        .and_then(|idx| explorer_items.get(idx))
+                                        .and_then(|node| match &node.node_type {
+                                            NodeType::FailedAttachment { alias, .. } => {
+                                                Some(alias.clone())
+                                            }
+                                            _ => None,
+                                        });
+                                    if let Some(alias) = selected_failed_alias {
+                                        let (ok, msg) = retry_failed_workspace_attachment(
+                                            &alias,
+                                            &mut failed_attachments,
+                                            conn,
+                                            project_dir,
+                                            env_profile,
+                                        );
+                                        if ok {
+                                            tabs[active_tab_index].target_database = alias;
+                                        }
+                                        status_msg = msg;
+                                        trigger_explorer_refresh = true;
+                                    } else {
+                                        refresh_attached_catalog(conn, db_path, quack_disable_ssl);
+                                        trigger_explorer_refresh = true;
+                                        status_msg = "Explorer refreshed.".to_string();
+                                    }
                                 }
                             } else if key.code == KeyCode::Char('q')
                                 || key.code == KeyCode::Char('s')
@@ -1636,19 +1807,7 @@ pub fn run_ide_loop(
                                                     format!("Queried table '{}'", display_table);
                                             }
                                             NodeType::CloudFile { path, is_dir } if !*is_dir => {
-                                                let ext = path
-                                                    .rsplit('.')
-                                                    .next()
-                                                    .unwrap_or("")
-                                                    .to_lowercase();
-                                                let read_fn = match ext.as_str() {
-                                                    "parquet" => "read_parquet",
-                                                    "csv" => "read_csv",
-                                                    "json" | "jsonl" | "ndjson" => "read_json",
-                                                    _ => "read_parquet",
-                                                };
-                                                let query =
-                                                    format!("SELECT * FROM {}('{}');", read_fn, path);
+                                                let query = execution::build_cloud_file_select_sql(path);
                                                 open_query_in_tabs(
                                                     &mut tabs,
                                                     &mut active_tab_index,
@@ -1821,7 +1980,10 @@ pub fn run_ide_loop(
                                                         .strip_prefix("db:")
                                                         .unwrap_or(&explorer_items[selected].name);
                                                     match conn.execute(
-                                                        &format!("DETACH {};", db_name),
+                                                        &format!(
+                                                            "DETACH {};",
+                                                            crate::sql_utils::quote_ident(db_name)
+                                                        ),
                                                         [],
                                                     ) {
                                                         Ok(_) => {
@@ -1834,7 +1996,8 @@ pub fn run_ide_loop(
                                                         Err(e) => {
                                                             status_msg = format!(
                                                                 "Failed to detach '{}': {}",
-                                                                db_name, e
+                                                                db_name,
+                                                                crate::sql_utils::redact_connection_credentials(&e.to_string())
                                                             );
                                                         }
                                                     }
@@ -1842,7 +2005,10 @@ pub fn run_ide_loop(
                                             }
                                             NodeType::CloudSecret { name, .. } => {
                                                 match conn.execute(
-                                                    &format!("DROP SECRET IF EXISTS {};", name),
+                                                    &format!(
+                                                        "DROP SECRET IF EXISTS {};",
+                                                        crate::sql_utils::quote_ident(name)
+                                                    ),
                                                     [],
                                                 ) {
                                                     Ok(_) => {
@@ -1855,39 +2021,16 @@ pub fn run_ide_loop(
                                                     Err(e) => {
                                                         status_msg = format!(
                                                             "Failed to drop secret '{}': {}",
-                                                            name, e
+                                                            name,
+                                                            crate::sql_utils::redact_connection_credentials(&e.to_string())
                                                         );
                                                     }
                                                 }
                                             }
                                             NodeType::CloudBucket { bucket } => {
-                                                let current = std::env::var("DUCKPACK_S3_BUCKETS")
-                                                    .or_else(|_| {
-                                                        std::env::var("DUCKPACK_S3_BUCKET")
-                                                    })
-                                                    .unwrap_or_default();
-                                                let parts: Vec<&str> = current
-                                                    .split(',')
-                                                    .map(|s| s.trim())
-                                                    .filter(|s| {
-                                                        !s.is_empty()
-                                                            && *s != bucket.as_str()
-                                                            && *s
-                                                                != bucket
-                                                                    .trim_start_matches("s3://")
-                                                    })
-                                                    .collect();
-                                                let new_val = parts.join(",");
-                                                unsafe {
-                                                    std::env::set_var(
-                                                        "DUCKPACK_S3_BUCKETS",
-                                                        &new_val,
-                                                    );
-                                                    std::env::set_var(
-                                                        "DUCKPACK_S3_BUCKET",
-                                                        &new_val,
-                                                    );
-                                                }
+                                                crate::env_store::remove_session_cloud_bucket(
+                                                    bucket,
+                                                );
                                                 status_msg = format!(
                                                     "Removed bucket '{}' from session view.",
                                                     bucket
@@ -2265,515 +2408,20 @@ pub fn run_ide_loop(
 
         if execute_query || trigger_pagination.is_some() {
             let active_tab = &mut tabs[active_tab_index];
-            if !active_tab.target_database.is_empty() {
-                let _ = conn.execute(
-                    &format!(
-                        "USE \"{}\";",
-                        active_tab.target_database.replace('"', "\"\"")
-                    ),
-                    [],
-                );
-                meta.active_database = active_tab.target_database.clone();
-                for db in &mut meta.databases {
-                    db.is_active = db.name == active_tab.target_database;
-                }
-            }
-
-            let query_to_execute = if let Some(dir) = trigger_pagination {
-                if let Some(bq) = &active_tab.base_query {
-                    if dir == 0 {
-                        active_tab.pagination_offset = 0;
-                    } else {
-                        let new_offset = (active_tab.pagination_offset as i64
-                            + (dir as i64 * active_tab.pagination_limit as i64))
-                            .max(0) as usize;
-                        active_tab.pagination_offset = new_offset;
-                    }
-                    bq.clone()
-                } else {
-                    String::new()
-                }
-            } else {
-                let mut query = if let Some(((start_row, start_col), (end_row, end_col))) =
-                    active_tab.textarea.selection_range()
-                {
-                    let lines = active_tab.textarea.lines();
-                    let mut selected_text = Vec::new();
-                    for row in start_row..=end_row {
-                        if row >= lines.len() {
-                            continue;
-                        }
-                        let chars: Vec<char> = lines[row].chars().collect();
-                        let s = if row == start_row { start_col } else { 0 };
-                        let e = if row == end_row { end_col } else { chars.len() };
-                        let s = s.min(chars.len());
-                        let e = e.min(chars.len());
-                        if s <= e {
-                            selected_text.push(chars[s..e].iter().collect::<String>());
-                        }
-                    }
-                    selected_text.join("\n")
-                } else {
-                    active_tab.textarea.lines().join("\n")
-                };
-                if query.is_empty() {
-                    query = active_tab.textarea.lines().join("\n");
-                }
-                active_tab.pagination_offset = 0;
-                active_tab.base_query = Some(query.clone());
-                query
-            };
-
-            if query_to_execute.trim().is_empty() {
-                if trigger_pagination.is_none() {
-                    status_msg = "Error: Query is empty".to_string();
-                }
-            } else {
-                active_tab.query_results.clear();
-                active_tab.column_names.clear();
-                active_tab.horizontal_scroll = 0;
-
-                active_tab
-                    .textarea
-                    .set_search_pattern(SQL_KEYWORD_PATTERN)
-                    .unwrap_or(());
-                active_tab.textarea.set_search_style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                );
-
-                let is_explicit_remote = is_remote_directive_query(&query_to_execute);
-                let (exec_query, is_paginatable, is_mutation) = if is_explicit_remote {
-                    let (eq, is_pag) = wrap_remote_query(&query_to_execute);
-                    (eq, is_pag, false)
-                } else {
-                    let mut clean_lower = query_to_execute.trim().to_lowercase();
-                    loop {
-                        if clean_lower.starts_with("--") {
-                            if let Some(idx) = clean_lower.find('\n') {
-                                clean_lower = clean_lower[idx..].trim_start().to_string();
-                            } else {
-                                clean_lower = String::new();
-                            }
-                        } else if clean_lower.starts_with("/*") {
-                            if let Some(idx) = clean_lower.find("*/") {
-                                clean_lower = clean_lower[idx + 2..].trim_start().to_string();
-                            } else {
-                                clean_lower = String::new();
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    let is_pag = clean_lower.starts_with("select")
-                        || clean_lower.starts_with("with")
-                        || clean_lower.starts_with("values")
-                        || clean_lower.starts_with("from");
-                    let is_mut = clean_lower.starts_with("insert")
-                        || clean_lower.starts_with("update")
-                        || clean_lower.starts_with("delete")
-                        || clean_lower.starts_with("create")
-                        || clean_lower.starts_with("drop")
-                        || clean_lower.starts_with("alter")
-                        || clean_lower.starts_with("truncate")
-                        || clean_lower.starts_with("attach")
-                        || clean_lower.starts_with("detach")
-                        || clean_lower.starts_with("use")
-                        || clean_lower.starts_with("set")
-                        || clean_lower.starts_with("reset")
-                        || clean_lower.starts_with("copy")
-                        || clean_lower.starts_with("checkpoint")
-                        || clean_lower.starts_with("vacuum")
-                        || clean_lower.starts_with("install")
-                        || clean_lower.starts_with("load");
-                    (query_to_execute.clone(), is_pag, is_mut)
-                };
-
-                if is_mutation {
-                    active_tab.is_paginated = false;
-                    let start_time = std::time::Instant::now();
-                    let mut exec_batch_res = conn.execute_batch(&exec_query);
-                    if let Err(ref e) = exec_batch_res {
-                        let err_str = e.to_string();
-                        let lower_exec = exec_query.trim().to_lowercase();
-                        if let Some(ext) = extract_autoload_extension_name(&err_str) {
-                            if crate::engine::ensure_extension_loaded(conn, &ext).is_ok() {
-                                exec_batch_res = Ok(());
-                            }
-                        } else if lower_exec.starts_with("install ") {
-                            let after = lower_exec["install ".len()..].trim();
-                            let ext = after
-                                .trim_matches(|c| c == '\'' || c == '"' || c == ';')
-                                .split_whitespace()
-                                .next()
-                                .unwrap_or("");
-                            if !ext.is_empty()
-                                && !ext.starts_with("http")
-                                && crate::engine::ensure_extension_loaded(conn, ext).is_ok()
-                            {
-                                exec_batch_res = Ok(());
-                            }
-                        }
-                    }
-                    match exec_batch_res {
-                        Ok(()) => {
-                            active_tab.query_results.clear();
-                            active_tab.column_names.clear();
-                            let elapsed = start_time.elapsed();
-
-                            trigger_explorer_refresh = true;
-                            status_msg =
-                                format!("Statement executed successfully in {:.2?}.", elapsed);
-
-                            let history_path = queries_dir.join(".history.sql");
-                            let timestamp =
-                                chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                            let history_entry = format!(
-                                "-- Executed at {} (Took {:.2?})\n{};\n\n",
-                                timestamp,
-                                elapsed,
-                                query_to_execute.trim()
-                            );
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(history_path)
-                            {
-                                let _ = f.write_all(history_entry.as_bytes());
-                            }
-                        }
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            handle_sql_error_position(
-                                &mut tabs[active_tab_index].textarea,
-                                &err_str,
-                            );
-                            let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
-                            status_msg = format!("Execution Error: {}{}", e, diag);
-                        }
-                    }
-                } else {
-                    let final_query = if is_paginatable {
-                        let (pag_sql, is_paginated) = build_paginated_sql(
-                            &exec_query,
-                            active_tab.pagination_limit,
-                            active_tab.pagination_offset,
-                        );
-                        active_tab.is_paginated = is_paginated;
-                        pag_sql
-                    } else {
-                        active_tab.is_paginated = false;
-                        exec_query.clone()
-                    };
-
-                    let mut prepare_res = conn.prepare(&final_query);
-                    if let Err(ref e) = prepare_res {
-                        let err_str = e.to_string();
-                        if let Some(ext) = extract_autoload_extension_name(&err_str) {
-                            if crate::engine::ensure_extension_loaded(conn, &ext).is_ok() {
-                                prepare_res = conn.prepare(&final_query);
-                            }
-                        }
-                    }
-
-                    match prepare_res {
-                        Ok(mut stmt) => {
-                            let mut exec_rows = Vec::new();
-                            let mut count = 0;
-
-                            let start_time = std::time::Instant::now();
-                            match stmt.query([]) {
-                                Ok(mut rows) => {
-                                    let mut cols = Vec::new();
-                                    if let Some(stmt_ref) = rows.as_ref() {
-                                        for col in stmt_ref.column_names() {
-                                            cols.push(col.to_string());
-                                        }
-                                    }
-                                    active_tab.column_names = cols;
-
-                                    while let Ok(Some(row)) = rows.next() {
-                                        count += 1;
-                                        let mut str_row = Vec::new();
-                                        for i in 0..active_tab.column_names.len() {
-                                            let val: String = match row.get(i) {
-                                                Ok(v) => format_duckdb_value(v),
-                                                Err(_) => "NULL".to_string(),
-                                            };
-                                            str_row.push(val);
-                                        }
-                                        exec_rows.push(str_row);
-                                    }
-                                    active_tab.query_results = exec_rows;
-                                    active_tab.results_state.select(Some(0));
-                                    active_tab.horizontal_scroll = 0;
-                                    let elapsed = start_time.elapsed();
-
-                                    let lower = query_to_execute.to_lowercase();
-                                    let is_catalog_mutation = lower.contains("attach ")
-                                        || lower.contains("detach ")
-                                        || lower.contains("create ")
-                                        || lower.contains("drop ")
-                                        || lower.contains("alter ")
-                                        || lower.contains("use ");
-
-                                    if is_explicit_remote {
-                                        if is_catalog_mutation {
-                                            refresh_attached_catalog(
-                                                conn,
-                                                db_path,
-                                                quack_disable_ssl,
-                                            );
-                                            trigger_explorer_refresh = true;
-                                        }
-                                        let hint = " (Hint: '-- @remote' is deprecated in DuckDB v2.0; queries now execute natively via CONNECT target_db.)";
-                                        if count > 0 {
-                                            status_msg = format!(
-                                                "Remote statement executed successfully. Returned {} rows in {:.2?}.{}",
-                                                count, elapsed, hint
-                                            );
-                                        } else {
-                                            status_msg = format!(
-                                                "Remote statement executed successfully in {:.2?}.{}",
-                                                elapsed, hint
-                                            );
-                                        }
-                                    } else if is_remote_db
-                                        && is_unadorned_secret_or_setting(&query_to_execute)
-                                    {
-                                        status_msg = "⚠️ Applied LOCALLY on DuckPack! Use '-- @remote' at top of query to apply to remote Quack.".to_string();
-                                    } else {
-                                        if is_catalog_mutation {
-                                            refresh_attached_catalog(
-                                                conn,
-                                                db_path,
-                                                quack_disable_ssl,
-                                            );
-                                            trigger_explorer_refresh = true;
-                                        }
-                                        status_msg = format!(
-                                            "Query executed successfully. Returned {} rows in {:.2?}.",
-                                            count, elapsed
-                                        );
-                                    }
-
-                                    let history_path = queries_dir.join(".history.sql");
-                                    let timestamp = chrono::Local::now()
-                                        .format("%Y-%m-%d %H:%M:%S")
-                                        .to_string();
-                                    let sanitized_query =
-                                        if crate::engine::should_redact_sql_history(
-                                            &query_to_execute,
-                                        ) {
-                                            crate::engine::redact_connection_credentials(
-                                                query_to_execute.trim(),
-                                            )
-                                        } else {
-                                            query_to_execute.trim().to_string()
-                                        };
-                                    let history_entry = format!(
-                                        "-- Executed at {} (Took {:.2?})\n{};\n\n",
-                                        timestamp, elapsed, sanitized_query
-                                    );
-                                    use std::io::Write;
-                                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open(&history_path)
-                                    {
-                                        #[cfg(unix)]
-                                        {
-                                            use std::os::unix::fs::PermissionsExt;
-                                            let _ = f.set_permissions(
-                                                std::fs::Permissions::from_mode(0o600),
-                                            );
-                                        }
-                                        let _ = f.write_all(history_entry.as_bytes());
-                                    }
-                                }
-                                Err(e) => {
-                                    let err_str = e.to_string();
-                                    handle_sql_error_position(
-                                        &mut tabs[active_tab_index].textarea,
-                                        &err_str,
-                                    );
-                                    let diag =
-                                        diagnose_remote_credential_error(&err_str, is_remote_db);
-                                    status_msg = format!("Execution Error: {}{}", e, diag);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let mut executed_remote_fallback = false;
-                            let local_err_str = e.to_string();
-                            let is_syntax_error = local_err_str.contains("syntax error at or near");
-                            let lower_q = query_to_execute.to_lowercase();
-                            let is_temp_mutation = lower_q.contains("temp table")
-                                || lower_q.contains("temporary table")
-                                || lower_q.contains("temp view")
-                                || lower_q.contains("temporary view");
-                            if is_quack
-                                && !is_explicit_remote
-                                && !is_syntax_error
-                                && !is_temp_mutation
-                            {
-                                let clean_query = query_to_execute
-                                    .trim()
-                                    .strip_suffix(';')
-                                    .unwrap_or(query_to_execute.trim());
-                                let remote_sql = if is_paginatable {
-                                    let inner = format!(
-                                        "SELECT * FROM target_db.query('{}')",
-                                        clean_query.replace("'", "''")
-                                    );
-                                    if active_tab.is_paginated && active_tab.pagination_limit > 0 {
-                                        format!(
-                                            "{} LIMIT {} OFFSET {}",
-                                            inner,
-                                            active_tab.pagination_limit,
-                                            active_tab.pagination_offset
-                                        )
-                                    } else {
-                                        format!("{};", inner)
-                                    }
-                                } else {
-                                    format!(
-                                        "FROM target_db.query('{}');",
-                                        clean_query.replace("'", "''")
-                                    )
-                                };
-                                match conn.prepare(&remote_sql) {
-                                    Ok(mut remote_stmt) => {
-                                        let start_time = std::time::Instant::now();
-                                        match remote_stmt.query([]) {
-                                            Ok(mut rows) => {
-                                                let mut cols = Vec::new();
-                                                if let Some(stmt_ref) = rows.as_ref() {
-                                                    for col in stmt_ref.column_names() {
-                                                        cols.push(col.to_string());
-                                                    }
-                                                }
-                                                active_tab.column_names = cols;
-                                                let mut exec_rows = Vec::new();
-                                                let mut count = 0;
-                                                while let Ok(Some(row)) = rows.next() {
-                                                    count += 1;
-                                                    let mut str_row = Vec::new();
-                                                    for i in 0..active_tab.column_names.len() {
-                                                        let val: String = match row.get(i) {
-                                                            Ok(v) => format_duckdb_value(v),
-                                                            Err(_) => "NULL".to_string(),
-                                                        };
-                                                        str_row.push(val);
-                                                    }
-                                                    exec_rows.push(str_row);
-                                                }
-                                                active_tab.query_results = exec_rows;
-                                                active_tab.results_state.select(Some(0));
-                                                active_tab.horizontal_scroll = 0;
-                                                let elapsed = start_time.elapsed();
-
-                                                let lower = query_to_execute.to_lowercase();
-                                                let is_catalog_mutation = lower.contains("attach ")
-                                                    || lower.contains("detach ")
-                                                    || lower.contains("create ")
-                                                    || lower.contains("drop ")
-                                                    || lower.contains("alter ")
-                                                    || lower.contains("use ");
-                                                if is_catalog_mutation {
-                                                    refresh_attached_catalog(
-                                                        conn,
-                                                        db_path,
-                                                        quack_disable_ssl,
-                                                    );
-                                                    trigger_explorer_refresh = true;
-                                                }
-                                                if count > 0 {
-                                                    status_msg = format!(
-                                                        "Remote statement executed successfully. Returned {} rows in {:.2?}.",
-                                                        count, elapsed
-                                                    );
-                                                } else {
-                                                    status_msg = format!(
-                                                        "Remote statement executed successfully in {:.2?}.",
-                                                        elapsed
-                                                    );
-                                                }
-                                                executed_remote_fallback = true;
-
-                                                let history_path = queries_dir.join(".history.sql");
-                                                let timestamp = chrono::Local::now()
-                                                    .format("%Y-%m-%d %H:%M:%S")
-                                                    .to_string();
-                                                let sanitized_query =
-                                                    if crate::engine::should_redact_sql_history(
-                                                        &query_to_execute,
-                                                    ) {
-                                                        crate::engine::redact_connection_credentials(
-                                                            query_to_execute.trim(),
-                                                        )
-                                                    } else {
-                                                        query_to_execute.trim().to_string()
-                                                    };
-                                                let history_entry = format!(
-                                                    "-- Executed at {} (Took {:.2?})\n{};\n\n",
-                                                    timestamp, elapsed, sanitized_query
-                                                );
-                                                use std::io::Write;
-                                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                                    .create(true)
-                                                    .append(true)
-                                                    .open(&history_path)
-                                                {
-                                                    #[cfg(unix)]
-                                                    {
-                                                        use std::os::unix::fs::PermissionsExt;
-                                                        let _ = f.set_permissions(
-                                                            std::fs::Permissions::from_mode(0o600),
-                                                        );
-                                                    }
-                                                    let _ = f.write_all(history_entry.as_bytes());
-                                                }
-                                            }
-                                            Err(query_err) => {
-                                                let err_str = query_err.to_string();
-                                                let diag = diagnose_remote_credential_error(
-                                                    &err_str,
-                                                    is_remote_db,
-                                                );
-                                                status_msg = format!(
-                                                    "Execution Error: {}{}",
-                                                    query_err, diag
-                                                );
-                                                executed_remote_fallback = true;
-                                            }
-                                        }
-                                    }
-                                    Err(prep_err) => {
-                                        let err_str = prep_err.to_string();
-                                        let diag = diagnose_remote_credential_error(
-                                            &err_str,
-                                            is_remote_db,
-                                        );
-                                        status_msg = format!("Prepare Error: {}{}", prep_err, diag);
-                                        executed_remote_fallback = true;
-                                    }
-                                }
-                            }
-
-                            if !executed_remote_fallback {
-                                let err_str = e.to_string();
-                                handle_sql_error_position(
-                                    &mut tabs[active_tab_index].textarea,
-                                    &err_str,
-                                );
-                                let diag = diagnose_remote_credential_error(&err_str, is_remote_db);
-                                status_msg = format!("Prepare Error: {}{}", e, diag);
-                            }
-                        }
-                    }
+            if let Some(outcome) = execution::execute_ide_query(
+                conn,
+                active_tab,
+                &mut meta,
+                &queries_dir,
+                db_path,
+                is_quack,
+                is_remote_db,
+                quack_disable_ssl,
+                trigger_pagination,
+            ) {
+                status_msg = outcome.status_msg;
+                if outcome.trigger_explorer_refresh {
+                    trigger_explorer_refresh = true;
                 }
             }
         }
@@ -2803,12 +2451,13 @@ pub fn run_ide_loop(
                 } else {
                     expanded_groups.insert("Tables".to_string());
                 }
-                explorer_items = rebuild_explorer_nodes(
+                explorer_items = build_db_explorer_items(
                     &meta,
                     &expanded_groups,
                     &expanded_tables,
                     conn,
                     is_quack,
+                    &failed_attachments,
                 );
             }
             if let Some(sel) = prev_selected {
@@ -2851,12 +2500,13 @@ pub fn run_ide_loop(
                             } else {
                                 expanded_groups.insert(item_name);
                             }
-                            explorer_items = rebuild_explorer_nodes(
+                            explorer_items = build_db_explorer_items(
                                 &meta,
                                 &expanded_groups,
                                 &expanded_tables,
                                 conn,
                                 is_quack,
+                                &failed_attachments,
                             );
                             explorer_state
                                 .select(Some(selected.min(explorer_items.len().saturating_sub(1))));
@@ -2894,12 +2544,13 @@ pub fn run_ide_loop(
                                 } else {
                                     expanded_groups.insert(item_name);
                                 }
-                                explorer_items = rebuild_explorer_nodes(
+                                explorer_items = build_db_explorer_items(
                                     &meta,
                                     &expanded_groups,
                                     &expanded_tables,
                                     conn,
                                     is_quack,
+                                    &failed_attachments,
                                 );
                                 explorer_state.select(Some(
                                     selected.min(explorer_items.len().saturating_sub(1)),
@@ -2930,12 +2581,13 @@ pub fn run_ide_loop(
                             } else {
                                 expanded_tables.insert(key);
                             }
-                            explorer_items = rebuild_explorer_nodes(
+                            explorer_items = build_db_explorer_items(
                                 &meta,
                                 &expanded_groups,
                                 &expanded_tables,
                                 conn,
                                 is_quack,
+                                &failed_attachments,
                             );
                             explorer_state
                                 .select(Some(selected.min(explorer_items.len().saturating_sub(1))));
@@ -2989,9 +2641,46 @@ pub fn run_ide_loop(
                         NodeType::AddBucketAction => {
                             add_bucket_modal.reset();
                         }
+                        NodeType::QuackRbacAction => {
+                            let tab_cat = tabs
+                                .get(active_tab_index)
+                                .map(|t| t.target_database.as_str())
+                                .filter(|c| !c.is_empty() && *c != "memory");
+                            quack_auth_modal.open_with_env(conn, project_dir, tab_cat, env_profile);
+                        }
+                        NodeType::FailedAttachment { alias, .. } => {
+                            let (ok, msg) = retry_failed_workspace_attachment(
+                                &alias,
+                                &mut failed_attachments,
+                                conn,
+                                project_dir,
+                                env_profile,
+                            );
+                            if ok {
+                                tabs[active_tab_index].target_database = alias.clone();
+                                meta = load_explorer_metadata(conn, project_dir, is_quack);
+                                dictionary = meta.dictionary.clone();
+                                expanded_groups.insert(format!("db:{}", alias));
+                                expanded_groups.insert(format!("{}:Tables", alias));
+                            }
+                            explorer_items = build_db_explorer_items(
+                                &meta,
+                                &expanded_groups,
+                                &expanded_tables,
+                                conn,
+                                is_quack,
+                                &failed_attachments,
+                            );
+                            explorer_state.select(Some(
+                                selected.min(explorer_items.len().saturating_sub(1)),
+                            ));
+                            status_msg = msg;
+                        }
                         NodeType::CloudSecret { name, .. } => {
-                            let query =
-                                format!("SELECT * FROM duckdb_secrets() WHERE name = '{}';", name);
+                            let query = format!(
+                                "SELECT * FROM duckdb_secrets() WHERE name = {};",
+                                crate::sql_utils::quote_literal(&name)
+                            );
                             open_query_in_tabs(&mut tabs, &mut active_tab_index, query, None);
                             focus = FocusPane::Editor;
                             status_msg = format!("Inspecting secret '{}'", name);
@@ -3003,12 +2692,13 @@ pub fn run_ide_loop(
                             } else {
                                 expanded_groups.insert(key);
                             }
-                            explorer_items = rebuild_explorer_nodes(
+                            explorer_items = build_db_explorer_items(
                                 &meta,
                                 &expanded_groups,
                                 &expanded_tables,
                                 conn,
                                 is_quack,
+                                &failed_attachments,
                             );
                             explorer_state
                                 .select(Some(selected.min(explorer_items.len().saturating_sub(1))));
@@ -3021,26 +2711,19 @@ pub fn run_ide_loop(
                                 } else {
                                     expanded_groups.insert(key);
                                 }
-                                explorer_items = rebuild_explorer_nodes(
+                                explorer_items = build_db_explorer_items(
                                     &meta,
                                     &expanded_groups,
                                     &expanded_tables,
                                     conn,
                                     is_quack,
+                                    &failed_attachments,
                                 );
                                 explorer_state.select(Some(
                                     selected.min(explorer_items.len().saturating_sub(1)),
                                 ));
                             } else {
-                                let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
-                                let read_fn = match ext.as_str() {
-                                    "parquet" => "read_parquet",
-                                    "csv" => "read_csv",
-                                    "json" | "jsonl" | "ndjson" => "read_json",
-                                    _ => "read_parquet",
-                                };
-                                let query =
-                                    format!("SELECT * FROM {}('{}');", read_fn, path);
+                                let query = execution::build_cloud_file_select_sql(&path);
                                 let fname = path.split('/').last().unwrap_or(&path).to_string();
                                 open_query_in_tabs(&mut tabs, &mut active_tab_index, query, None);
                                 focus = FocusPane::Editor;

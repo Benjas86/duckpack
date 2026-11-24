@@ -4,7 +4,7 @@ import pytest
 import duckpack
 
 def test_duckpack_version_and_exports():
-    assert duckpack.__version__ == "0.3.0"
+    assert duckpack.__version__ == "0.3.5"
     assert hasattr(duckpack, "explore")
     assert hasattr(duckpack, "apply")
     assert hasattr(duckpack, "diff")
@@ -711,4 +711,80 @@ def test_live_quack_pk_diff_and_apply_idempotency(tmp_path):
             con.execute(f"CALL target_db.query('DROP TABLE IF EXISTS {test_tbl};');")
         except Exception:
             pass
+
+
+def test_workspace_mode_explore_no_local_duckdb_and_multi_attach(tmp_path, capfd):
+    proj_dir = tmp_path / "ws_proj"
+    duckpack.init(str(proj_dir))
+
+    sales_db = proj_dir / "sales.duckdb"
+    c = duckdb.connect(str(sales_db))
+    c.execute("CREATE TABLE ws_sales_orders (id INT, amount DOUBLE);")
+    c.close()
+
+    with open(proj_dir / "duckpack.toml", "w") as f:
+        f.write(
+            """
+[project]
+name = "ws_proj"
+
+[[attach]]
+alias = "sales_cat"
+type = "duckdb"
+path = "sales.duckdb"
+default = true
+
+[[attach]]
+alias = "missing_quack"
+type = "quack"
+host = "127.0.0.1"
+port = 19998
+token_env = "NON_EXISTENT_TEST_TOKEN_999"
+"""
+        )
+
+    duckpack.explore(None, project_dir=str(proj_dir))
+    captured = capfd.readouterr().out
+    assert "ws_sales_orders" in captured
+    assert not (proj_dir / "local.duckdb").exists(), "Workspace mode must not create local.duckdb"
+
+
+def test_notebook_card_omits_remote_token_and_uses_safe_data_cmd_attribute(monkeypatch):
+    from duckpack.notebook import render_notebook_card
+
+    rendered_html = []
+    monkeypatch.setattr("duckpack.notebook.is_notebook_environment", lambda: True)
+    monkeypatch.setattr("IPython.display.display", lambda obj: rendered_html.append(obj.data))
+
+    res = render_notebook_card(
+        "quack:prod.example.com:9494",
+        project_dir="my'dir;alert(1)",
+        mode="explore",
+        quack_token="super_secret_prod_token_999",
+    )
+    assert res is True
+    card = rendered_html[0]
+    # H3: Persistent remote tokens must NEVER be embedded in notebook HTML outputs
+    assert "super_secret_prod_token_999" not in card
+    assert "--quack-token" not in card
+    assert "QUACK_TOKEN" in card
+    # L2: Copy button uses safe data-cmd attribute instead of inline JS string interpolation
+    assert 'data-cmd="' in card
+    assert "navigator.clipboard.writeText(this.dataset.cmd)" in card
+
+
+def test_apply_allow_lake_rewrite_does_not_mutate_process_env(tmp_path):
+    os.environ.pop("DUCKPACK_ALLOW_LAKE_REWRITE", None)
+    proj_dir = str(tmp_path / "m3_proj")
+    duckpack.init(proj_dir)
+    with open(os.path.join(proj_dir, "tables", "items.sql"), "w") as f:
+        f.write("CREATE TABLE items (id INT, label VARCHAR);")
+
+    con = duckdb.connect()
+    res = duckpack.apply(con, proj_dir, allow_lake_rewrite=True)
+    assert res.success is True
+    assert res.applied_count == 1
+    assert "DUCKPACK_ALLOW_LAKE_REWRITE" not in os.environ
+
+
 

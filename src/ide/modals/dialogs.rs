@@ -382,6 +382,10 @@ pub(crate) fn render_help_modal(f: &mut Frame) {
             Span::raw("Cloud Secrets & S3 Buckets (AWS, R2, MinIO)"),
         ]),
         Line::from(vec![
+            Span::styled(" Ctrl+U    ", Style::default().fg(Color::Cyan)),
+            Span::raw("Quack RBAC Users, Live Sessions & Post-Start Hook Export"),
+        ]),
+        Line::from(vec![
             Span::styled(" Ctrl+C/V  ", Style::default().fg(Color::Cyan)),
             Span::raw("Copy / Paste"),
         ]),

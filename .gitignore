@@ -5,6 +5,7 @@
 duck-project.toml
 duckpack.toml
 *.png
+!docs/assets/*.png
 *.duckpack
 /demo_project/*
 .venv/

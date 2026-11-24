@@ -1,3 +1,4 @@
+use crate::sql_utils::{quote_ident, quote_literal};
 use anyhow::Result;
 use duckdb::Connection;
 use regex::Regex;
@@ -18,6 +19,10 @@ pub fn read_sql_with_env<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
 
     let replaced = re.replace_all(&content, |caps: &regex::Captures| {
         let var_name = &caps[1];
+        // H4: Never bake credential/secret env vars into compiled SQL definitions.
+        if crate::env_store::is_sensitive_env_var_name(var_name) {
+            return caps[0].to_string();
+        }
         std::env::var(var_name).unwrap_or_else(|_| caps[0].to_string())
     });
 
@@ -106,6 +111,7 @@ pub struct TableSchema {
     pub create_sql: String,
     pub columns: HashMap<String, String>,
     pub column_defaults: HashMap<String, String>,
+    pub generated_columns: std::collections::HashSet<String>,
     pub constraints: Vec<ConstraintSchema>,
 }
 
@@ -302,26 +308,54 @@ fn is_target_db_quack(exec: &mut dyn crate::engine::DbExecutor) -> bool {
     crate::engine::is_quack_target_attached(exec)
 }
 
-fn detect_quack_alias(exec: &mut dyn crate::engine::DbExecutor, safe_cat: &str) -> Option<String> {
+pub fn detect_quack_alias(
+    exec: &mut dyn crate::engine::DbExecutor,
+    safe_cat: &str,
+) -> Option<String> {
+    if !safe_cat.is_empty() {
+        let cat_quack = exec
+            .query_rows(&format!(
+                "SELECT count(*) FROM duckdb_databases() WHERE internal = false AND database_name = '{}' AND (lower(type) = 'quack' OR (path LIKE 'quack:%' AND lower(type) != 'ducklake'))",
+                safe_cat
+            ))
+            .ok()
+            .and_then(|(_, rows)| rows.into_iter().next())
+            .and_then(|r| r.into_iter().next())
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0)
+            > 0;
+        if cat_quack {
+            return Some(safe_cat.to_string());
+        }
+    }
     if is_target_db_quack(exec) {
         return Some("target_db".to_string());
     }
-    let cat_quack = exec
-        .query_rows(&format!(
-            "SELECT count(*) FROM duckdb_databases() WHERE internal = false AND database_name = '{}' AND (lower(type) = 'quack' OR path LIKE 'quack:%')",
-            safe_cat
-        ))
-        .ok()
-        .and_then(|(_, rows)| rows.into_iter().next())
-        .and_then(|r| r.into_iter().next())
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0)
-        > 0;
-    if cat_quack {
-        Some(safe_cat.to_string())
-    } else {
-        None
+    None
+}
+
+/// Finds the alias of an attached Quack database on `exec`, preferring `preferred_cat` if it is a Quack DB,
+/// then `target_db`, then any attached database with `type = 'quack'`.
+pub fn find_any_quack_alias(
+    exec: &mut dyn crate::engine::DbExecutor,
+    preferred_cat: Option<&str>,
+) -> Option<String> {
+    if let Some(cat) = preferred_cat {
+        let safe = cat.replace('\'', "''");
+        if let Some(found) = detect_quack_alias(exec, &safe) {
+            return Some(found);
+        }
     }
+    if is_target_db_quack(exec) {
+        return Some("target_db".to_string());
+    }
+    exec.query_rows(
+        "SELECT database_name FROM duckdb_databases() WHERE internal = false AND (lower(type) = 'quack' OR (path LIKE 'quack:%' AND lower(type) != 'ducklake')) LIMIT 1",
+    )
+    .ok()
+    .and_then(|(_, rows)| rows.into_iter().next())
+    .and_then(|r| r.into_iter().next())
+    .filter(|s| !s.is_empty())
 }
 
 fn current_database_exec(exec: &mut dyn crate::engine::DbExecutor) -> String {
@@ -598,6 +632,7 @@ pub fn get_schema_exec(
                     create_sql: row[1].clone(),
                     columns: HashMap::new(),
                     column_defaults: HashMap::new(),
+                    generated_columns: std::collections::HashSet::new(),
                     constraints: Vec::new(),
                 },
             );
@@ -606,22 +641,31 @@ pub fn get_schema_exec(
 
     if quack_alias.is_some() || tables.is_empty() {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_tbl = format!(
+            "{} SELECT fs.full_schema_name, t.table_name, t.sql FROM duckdb_tables() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE t.internal = false AND (t.database_name = {} OR t.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_sql = format!(
-            "SELECT CASE WHEN fs.full_schema_name = 'main' THEN t.table_name ELSE fs.full_schema_name || '.' || t.table_name END, \
-             COALESCE(t.sql, '/* Remote table: ' || t.table_name || ' */') \
-             FROM {}.query('{} SELECT fs.full_schema_name, t.table_name, t.sql FROM duckdb_tables() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE t.internal = false AND (t.database_name = ''{}'' OR t.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+            "SELECT CASE WHEN full_schema_name = 'main' THEN table_name ELSE full_schema_name || '.' || table_name END, \
+             COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
+             FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_tbl)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_sql = format!(
                 "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
                  COALESCE(sql, '/* Remote table: ' || table_name || ' */') \
-                 FROM {}.query('SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                 FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
         };
@@ -632,6 +676,7 @@ pub fn get_schema_exec(
                         create_sql: row[1].clone(),
                         columns: HashMap::new(),
                         column_defaults: HashMap::new(),
+                        generated_columns: std::collections::HashSet::new(),
                         constraints: Vec::new(),
                     });
                 }
@@ -642,7 +687,8 @@ pub fn get_schema_exec(
     let col_sql = format!(
         "{} SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, \
          c.column_name, c.data_type, \
-         CASE WHEN c.column_default IS NULL THEN '0' ELSE '1' END, COALESCE(c.column_default, '') \
+         CASE WHEN c.column_default IS NULL THEN '0' ELSE '1' END, COALESCE(c.column_default, ''), \
+         CASE WHEN COALESCE(c.is_generated, false) THEN '1' ELSE '0' END \
          FROM duckdb_columns() c \
          JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name \
          WHERE c.internal = false AND c.database_name = '{}'",
@@ -654,7 +700,8 @@ pub fn get_schema_exec(
         let fallback_col_sql = format!(
             "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
              column_name, data_type, \
-             CASE WHEN column_default IS NULL THEN '0' ELSE '1' END, COALESCE(column_default, '') \
+             CASE WHEN column_default IS NULL THEN '0' ELSE '1' END, COALESCE(column_default, ''), \
+             '0' \
              FROM duckdb_columns() WHERE internal = false AND database_name = '{}'",
             safe_cat
         );
@@ -668,6 +715,9 @@ pub fn get_schema_exec(
                 if row[3] == "1" {
                     table.column_defaults.insert(row[1].clone(), row[4].clone());
                 }
+                if row.get(5).map(|s| s == "1" || s.eq_ignore_ascii_case("true")).unwrap_or(false) {
+                    table.generated_columns.insert(row[1].clone());
+                }
             }
         }
     }
@@ -675,24 +725,35 @@ pub fn get_schema_exec(
     let any_col_empty = tables.values().any(|t| t.columns.is_empty());
     if quack_alias.is_some() || any_col_empty {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_col = format!(
+            "{} SELECT fs.full_schema_name, c.table_name, c.column_name, c.data_type, c.column_default, c.is_generated FROM duckdb_columns() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.internal = false AND (c.database_name = {} OR c.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_col_sql = format!(
-            "SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, \
-             c.column_name, c.data_type, \
-             CASE WHEN c.column_default IS NULL THEN '0' ELSE '1' END, COALESCE(c.column_default, '') \
-             FROM {}.query('{} SELECT fs.full_schema_name, c.table_name, c.column_name, c.data_type, c.column_default FROM duckdb_columns() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.internal = false AND (c.database_name = ''{}'' OR c.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+            "SELECT CASE WHEN full_schema_name = 'main' THEN table_name ELSE full_schema_name || '.' || table_name END, \
+             column_name, data_type, \
+             CASE WHEN column_default IS NULL THEN '0' ELSE '1' END, COALESCE(column_default, ''), \
+             CASE WHEN COALESCE(is_generated, false) THEN '1' ELSE '0' END \
+             FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_col)
         );
         let q_col_rows = if let Ok((_, rows)) = exec.query_rows(&q_col_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, table_name, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_col = format!(
                 "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
                  column_name, data_type, \
-                 CASE WHEN column_default IS NULL THEN '0' ELSE '1' END, COALESCE(column_default, '') \
-                 FROM {}.query('SELECT schema_name, table_name, column_name, data_type, column_default FROM duckdb_columns() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                 CASE WHEN column_default IS NULL THEN '0' ELSE '1' END, COALESCE(column_default, ''), \
+                 '0' \
+                 FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_col).ok().map(|(_, r)| r)
         };
@@ -705,6 +766,9 @@ pub fn get_schema_exec(
                             table.column_defaults.insert(row[1].clone(), row[4].clone());
                         } else {
                             table.column_defaults.remove(&row[1]);
+                        }
+                        if row.get(5).map(|s| s == "1" || s.eq_ignore_ascii_case("true")).unwrap_or(false) {
+                            table.generated_columns.insert(row[1].clone());
                         }
                     }
                 }
@@ -723,7 +787,7 @@ pub fn get_schema_exec(
          COALESCE(array_to_string(c.referenced_column_names, ','), '') \
          FROM duckdb_constraints() c \
          JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name \
-         WHERE (c.database_name = '{}' OR c.database_name = 'target_db') AND c.constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
+         WHERE c.database_name = '{}' AND c.constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
         FULL_SCHEMAS_CTE, safe_cat
     );
     let constr_rows = if let Ok((_, rows)) = exec.query_rows(&constr_sql) {
@@ -738,7 +802,7 @@ pub fn get_schema_exec(
              COALESCE(referenced_table, ''), \
              COALESCE(array_to_string(referenced_column_names, ','), '') \
              FROM duckdb_constraints() \
-             WHERE (database_name = '{}' OR database_name = 'target_db') AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
+             WHERE database_name = '{}' AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')",
             safe_cat
         );
         exec.query_rows(&fallback_constr_sql).ok().map(|(_, r)| r)
@@ -791,22 +855,30 @@ pub fn get_schema_exec(
     }
 
     if let Some(ref q_alias) = quack_alias {
+        let inner_constr = format!(
+            "{} SELECT fs.full_schema_name, c.table_name, c.constraint_type, c.constraint_name, array_to_string(c.constraint_column_names, ',') as constraint_column_names, c.expression, c.referenced_table, array_to_string(c.referenced_column_names, ',') as referenced_column_names FROM duckdb_constraints() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK') AND (c.database_name = {} OR c.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_constr_sql = format!(
-            "SELECT CASE WHEN fs.full_schema_name = 'main' THEN c.table_name ELSE fs.full_schema_name || '.' || c.table_name END, \
+            "SELECT CASE WHEN full_schema_name = 'main' THEN table_name ELSE full_schema_name || '.' || table_name END, \
              constraint_type, \
              COALESCE(constraint_name, ''), \
              COALESCE(constraint_column_names, ''), \
              COALESCE(expression, ''), \
              COALESCE(referenced_table, ''), \
              COALESCE(referenced_column_names, '') \
-             FROM {}.query('{} SELECT fs.full_schema_name, c.table_name, c.constraint_type, c.constraint_name, array_to_string(c.constraint_column_names, '','') as constraint_column_names, c.expression, c.referenced_table, array_to_string(c.referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() c JOIN full_schemas fs ON c.schema_oid = fs.oid AND c.database_name = fs.database_name WHERE c.constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (c.database_name = ''{}'' OR c.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+             FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_constr)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_constr_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, ',') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, ',') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK') AND (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_constr = format!(
                 "SELECT CASE WHEN schema_name = 'main' THEN table_name ELSE schema_name || '.' || table_name END, \
                  constraint_type, \
@@ -815,8 +887,9 @@ pub fn get_schema_exec(
                  COALESCE(expression, ''), \
                  COALESCE(referenced_table, ''), \
                  COALESCE(referenced_column_names, '') \
-                 FROM {}.query('SELECT schema_name, table_name, constraint_type, constraint_name, array_to_string(constraint_column_names, '','') as constraint_column_names, expression, referenced_table, array_to_string(referenced_column_names, '','') as referenced_column_names FROM duckdb_constraints() WHERE constraint_type IN (''PRIMARY KEY'', ''UNIQUE'', ''FOREIGN KEY'', ''CHECK'') AND (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                 FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_constr).ok().map(|(_, r)| r)
         };
@@ -921,22 +994,31 @@ pub fn get_views_exec(
 
     if views.is_empty() {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_v = format!(
+            "{} SELECT fs.full_schema_name, v.view_name, v.sql FROM duckdb_views() v JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name WHERE v.internal = false AND (v.database_name = {} OR v.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_sql = format!(
-            "SELECT CASE WHEN fs.full_schema_name = 'main' THEN v.view_name ELSE fs.full_schema_name || '.' || v.view_name END, \
-             COALESCE(v.sql, '/* Remote view: ' || v.view_name || ' */') \
-             FROM {}.query('{} SELECT fs.full_schema_name, v.view_name, v.sql FROM duckdb_views() v JOIN full_schemas fs ON v.schema_oid = fs.oid AND v.database_name = fs.database_name WHERE v.internal = false AND (v.database_name = ''{}'' OR v.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+            "SELECT CASE WHEN full_schema_name = 'main' THEN view_name ELSE full_schema_name || '.' || view_name END, \
+             COALESCE(sql, '/* Remote view: ' || view_name || ' */') \
+             FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_v)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, view_name, sql FROM duckdb_views() WHERE internal = false AND (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_sql = format!(
                 "SELECT CASE WHEN schema_name = 'main' THEN view_name ELSE schema_name || '.' || view_name END, \
                  COALESCE(sql, '/* Remote view: ' || view_name || ' */') \
-                 FROM {}.query('SELECT schema_name, view_name, sql FROM duckdb_views() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                 FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
         };
@@ -969,10 +1051,10 @@ pub fn get_macros_exec(
 
     let sql = format!(
         "{} SELECT CASE WHEN COALESCE(fs.full_schema_name, f.schema_name) = 'main' THEN f.function_name ELSE COALESCE(fs.full_schema_name, f.schema_name) || '.' || f.function_name END, \
-         COALESCE(f.macro_definition, ''), COALESCE(CAST(f.parameters AS VARCHAR), '') \
+         COALESCE(f.macro_definition, ''), COALESCE(CAST(f.parameters AS VARCHAR), ''), f.function_type \
          FROM duckdb_functions() f \
          LEFT JOIN full_schemas fs ON f.schema_name = fs.schema_name AND f.database_name = fs.database_name \
-         WHERE f.function_type = 'macro' AND f.internal = false AND f.database_name = '{}'",
+         WHERE f.function_type IN ('macro', 'table_macro') AND f.internal = false AND f.database_name = '{}'",
         FULL_SCHEMAS_CTE, safe_cat
     );
     let macro_rows = if let Ok((_, rows)) = exec.query_rows(&sql) {
@@ -980,8 +1062,8 @@ pub fn get_macros_exec(
     } else {
         let fallback_sql = format!(
             "SELECT CASE WHEN schema_name = 'main' THEN function_name ELSE schema_name || '.' || function_name END, \
-             COALESCE(macro_definition, ''), COALESCE(CAST(parameters AS VARCHAR), '') \
-             FROM duckdb_functions() WHERE function_type = 'macro' AND internal = false AND database_name = '{}'",
+             COALESCE(macro_definition, ''), COALESCE(CAST(parameters AS VARCHAR), ''), function_type \
+             FROM duckdb_functions() WHERE function_type IN ('macro', 'table_macro') AND internal = false AND database_name = '{}'",
             safe_cat
         );
         exec.query_rows(&fallback_sql)?.1
@@ -991,7 +1073,20 @@ pub fn get_macros_exec(
     for row in macro_rows {
         if row.len() >= 3 {
             let params_clean = row[2].trim_matches(|c| c == '[' || c == ']');
-            let sql = format!("CREATE MACRO {}({}) AS {};", row[0], params_clean, row[1]);
+            let func_type = row.get(3).map(|s| s.as_str()).unwrap_or("macro");
+            let def_trimmed = row[1].trim();
+            let sql = if func_type.eq_ignore_ascii_case("table_macro") {
+                if def_trimmed.to_uppercase().starts_with("TABLE ") {
+                    format!("CREATE MACRO {}({}) AS {};", row[0], params_clean, def_trimmed)
+                } else {
+                    format!(
+                        "CREATE MACRO {}({}) AS TABLE {};",
+                        row[0], params_clean, def_trimmed
+                    )
+                }
+            } else {
+                format!("CREATE MACRO {}({}) AS {};", row[0], params_clean, def_trimmed)
+            };
             macros.insert(row[0].clone(), sql);
         }
     }
@@ -1043,18 +1138,27 @@ pub fn get_schemas_exec(
 
     if schemas.is_empty() {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_s = format!(
+            "{} SELECT full_schema_name FROM full_schemas WHERE (database_name = {} OR database_name = current_database()) AND full_schema_name NOT IN ('information_schema', 'pg_catalog', 'main') ORDER BY depth ASC",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_sql = format!(
-            "SELECT full_schema_name FROM {}.query('{} SELECT full_schema_name FROM full_schemas WHERE (database_name = ''{}'' OR database_name = current_database()) AND full_schema_name NOT IN (''information_schema'', ''pg_catalog'', ''main'') ORDER BY depth ASC')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+            "SELECT full_schema_name FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_s)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND (database_name = {} OR database_name = current_database()) AND schema_name NOT IN ('information_schema', 'pg_catalog', 'main')",
+                quote_literal(&target_cat)
+            );
             let fallback_q_sql = format!(
-                "SELECT schema_name FROM {}.query('SELECT schema_name FROM duckdb_schemas() WHERE internal = false AND (database_name = ''{}'' OR database_name = current_database()) AND schema_name NOT IN (''information_schema'', ''pg_catalog'', ''main'')')",
-                q_alias, safe_cat
+                "SELECT schema_name FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
         };
@@ -1113,20 +1217,27 @@ pub fn get_sequences_exec(
 
     if sequences.is_empty() {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_seq = format!(
+            "{} SELECT fs.full_schema_name, s.sequence_name, s.sql FROM duckdb_sequences() s JOIN full_schemas fs ON s.schema_oid = fs.oid AND s.database_name = fs.database_name WHERE s.temporary = false AND (s.database_name = {} OR s.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_sql = format!(
-            "SELECT fs.full_schema_name, s.sequence_name, COALESCE(s.sql, '') \
-             FROM {}.query('{} SELECT fs.full_schema_name, s.sequence_name, s.sql FROM duckdb_sequences() s JOIN full_schemas fs ON s.schema_oid = fs.oid AND s.database_name = fs.database_name WHERE s.temporary = false AND (s.database_name = ''{}'' OR s.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+            "SELECT full_schema_name, sequence_name, COALESCE(sql, '') FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_seq)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, sequence_name, sql FROM duckdb_sequences() WHERE temporary = false AND (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_sql = format!(
-                "SELECT schema_name, sequence_name, COALESCE(sql, '') \
-                 FROM {}.query('SELECT schema_name, sequence_name, sql FROM duckdb_sequences() WHERE temporary = false AND (database_name = ''{}'' OR database_name = current_database())')",
-                q_alias, safe_cat
+                "SELECT schema_name, sequence_name, COALESCE(sql, '') FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
         };
@@ -1236,10 +1347,11 @@ pub fn get_triggers_exec(
                 let trg_name = row[1].clone();
                 let table = row[2].clone();
                 let trg_sql = row[3].clone();
+                let table_leaf = QualifiedIdentifier::parse(&table).leaf_name().to_string();
                 let key = if schema == "main" {
-                    trg_name.clone()
+                    format!("{}.{}", table_leaf, trg_name)
                 } else {
-                    format!("{}.{}", schema, trg_name)
+                    format!("{}.{}.{}", schema, table_leaf, trg_name)
                 };
                 triggers.insert(
                     key,
@@ -1256,20 +1368,27 @@ pub fn get_triggers_exec(
 
     if triggers.is_empty() {
         let q_alias = quack_alias.as_deref().unwrap_or("target_db");
+        let inner_trg = format!(
+            "{} SELECT fs.full_schema_name, t.trigger_name, t.table_name, t.sql FROM duckdb_triggers() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE (t.database_name = {} OR t.database_name = current_database())",
+            FULL_SCHEMAS_CTE,
+            quote_literal(&target_cat)
+        );
         let q_sql = format!(
-            "SELECT fs.full_schema_name, t.trigger_name, t.table_name, COALESCE(t.sql, '') \
-             FROM {}.query('{} SELECT fs.full_schema_name, t.trigger_name, t.table_name, t.sql FROM duckdb_triggers() t JOIN full_schemas fs ON t.schema_oid = fs.oid AND t.database_name = fs.database_name WHERE (t.database_name = ''{}'' OR t.database_name = current_database())')",
-            q_alias,
-            FULL_SCHEMAS_CTE.replace('\'', "''"),
-            safe_cat
+            "SELECT full_schema_name, trigger_name, table_name, COALESCE(sql, '') FROM {}.query({})",
+            quote_ident(q_alias),
+            quote_literal(&inner_trg)
         );
         let q_rows = if let Ok((_, rows)) = exec.query_rows(&q_sql) {
             Some(rows)
         } else {
+            let inner_fb = format!(
+                "SELECT schema_name, trigger_name, table_name, sql FROM duckdb_triggers() WHERE (database_name = {} OR database_name = current_database())",
+                quote_literal(&target_cat)
+            );
             let fallback_q_sql = format!(
-                "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') \
-                 FROM {}.query('SELECT schema_name, trigger_name, table_name, sql FROM duckdb_triggers() WHERE database_name = ''{}''')",
-                q_alias, safe_cat
+                "SELECT schema_name, trigger_name, table_name, COALESCE(sql, '') FROM {}.query({})",
+                quote_ident(q_alias),
+                quote_literal(&inner_fb)
             );
             exec.query_rows(&fallback_q_sql).ok().map(|(_, r)| r)
         };
@@ -1280,10 +1399,11 @@ pub fn get_triggers_exec(
                     let trg_name = row[1].clone();
                     let table = row[2].clone();
                     let trg_sql = row[3].clone();
+                    let table_leaf = QualifiedIdentifier::parse(&table).leaf_name().to_string();
                     let key = if schema == "main" {
-                        trg_name.clone()
+                        format!("{}.{}", table_leaf, trg_name)
                     } else {
-                        format!("{}.{}", schema, trg_name)
+                        format!("{}.{}.{}", schema, table_leaf, trg_name)
                     };
                     triggers.insert(
                         key,
@@ -1335,15 +1455,30 @@ pub fn diff_project(
     target_exec: &mut dyn crate::engine::DbExecutor,
     catalog: Option<&str>,
 ) -> Result<DiffResult> {
-    let (_shadow_conn, shadow_snapshot) = CatalogSnapshot::from_project_dir(project_dir)?;
+    let (_shadow_conn, mut shadow_snapshot) = CatalogSnapshot::from_project_dir(project_dir)?;
     let target_snapshot = CatalogSnapshot::introspect(target_exec, catalog)?;
+    // DuckLake 1.1 only supports NOT NULL constraints (no PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK).
+    // Strip unsupported constraints from shadow tables when diffing against a DuckLake target so
+    // projects don't trigger permanent false-positive AddConstraint / RecreateTable drift.
+    if get_ducklake_catalog_info_exec(target_exec, catalog).is_some() {
+        for tbl in shadow_snapshot.tables.values_mut() {
+            tbl.constraints.clear();
+        }
+    }
     let ignore_list = crate::engine::load_ignore_rules(project_dir);
-    Ok(compute_diff_snapshots(
+    let mut diff_result = compute_diff_snapshots(
         &shadow_snapshot,
         &target_snapshot,
         project_dir,
         &ignore_list,
-    ))
+    );
+    crate::quack_auth::append_quack_auth_diff_items(
+        project_dir,
+        target_exec,
+        catalog,
+        &mut diff_result,
+    );
+    Ok(diff_result)
 }
 
 /// The core diffing engine.
@@ -1369,7 +1504,10 @@ pub fn compute_diff(
     let mut diff = DiffResult { items: Vec::new() };
 
     let is_ignored = |name: &str| -> bool {
-        crate::engine::is_object_ignored(name, ignore_list)
+        name == "_duckpack_auth"
+            || name.starts_with("_duckpack_auth.")
+            || name.starts_with("__duckpack_")
+            || crate::engine::is_object_ignored(name, ignore_list)
     };
 
     let mut created_tables = Vec::new();
@@ -1629,7 +1767,11 @@ pub fn compute_diff(
                 let mut common_cols: Vec<String> = shadow_table
                     .columns
                     .keys()
-                    .filter(|col| target_table.columns.contains_key(*col))
+                    .filter(|col| {
+                        target_table.columns.contains_key(*col)
+                            && !shadow_table.generated_columns.contains(*col)
+                            && !target_table.generated_columns.contains(*col)
+                    })
                     .cloned()
                     .collect();
                 common_cols.sort();
@@ -1673,18 +1815,23 @@ pub fn compute_diff(
                     ignored,
                 });
 
-                // Auto-preserve triggers attached to this recreated table
+                // Auto-preserve triggers attached to this recreated table (must match both schema and leaf table name)
+                let target_table_schema = ident.full_schema().unwrap_or_else(|| "main".to_string());
                 for (trg_name, shadow_trg) in shadow_triggers {
                     let trg_table_ident = QualifiedIdentifier::parse(&shadow_trg.table_name);
+                    let trg_schema = trg_table_ident
+                        .full_schema()
+                        .unwrap_or_else(|| shadow_trg.schema_name.clone());
                     if trg_table_ident.leaf_name() == ident.leaf_name()
-                        && (trg_table_ident.full_schema().is_none()
-                            || trg_table_ident.full_schema() == ident.full_schema())
+                        && trg_schema == target_table_schema
                     {
                         if !diff.items.iter().any(|item| {
                             item.item_type == DiffItemType::CreateTrigger
                                 && item.obj_name == *trg_name
                         }) {
-                            let is_trg_ignored = is_ignored(trg_name) || is_ignored(table_name);
+                            let is_trg_ignored = is_ignored(trg_name)
+                                || is_ignored(&shadow_trg.trigger_name)
+                                || is_ignored(table_name);
                             diff.items.push(DiffItem {
                                 item_type: DiffItemType::CreateTrigger,
                                 obj_name: trg_name.clone(),
@@ -1761,20 +1908,31 @@ pub fn compute_diff(
     let mut matched_dropped_tables = std::collections::HashSet::new();
 
     for dropped in &dropped_tables {
+        let dropped_ident = QualifiedIdentifier::parse(dropped);
         for created in &created_tables {
             if matched_created_tables.contains(created) {
                 continue;
             }
-            if strsim::jaro_winkler(dropped, created) > 0.8 {
+            let created_ident = QualifiedIdentifier::parse(created);
+            // DuckDB ALTER TABLE ... RENAME TO only renames within the same schema and requires an unqualified target name.
+            if dropped_ident.full_schema() != created_ident.full_schema() {
+                continue;
+            }
+            if strsim::jaro_winkler(dropped_ident.leaf_name(), created_ident.leaf_name()) > 0.8 {
                 matched_dropped_tables.insert(dropped.clone());
                 matched_created_tables.insert(created.clone());
                 let shadow_table = shadow.get(created).unwrap();
                 let target_table = target.get(dropped).unwrap();
                 let ignored = is_ignored(dropped) || is_ignored(created);
+                let quoted_dropped = quote_qualified_identifier(dropped);
+                let quoted_target_leaf = format!(
+                    "\"{}\"",
+                    created_ident.leaf_name().replace('\"', "\"\"")
+                );
                 diff.items.push(DiffItem {
                     item_type: DiffItemType::RenameTable,
                     obj_name: format!("{} -> {}", dropped, created),
-                    sql: format!("ALTER TABLE {} RENAME TO {};", dropped, created),
+                    sql: format!("ALTER TABLE {} RENAME TO {};", quoted_dropped, quoted_target_leaf),
                     old_def: Some(target_table.create_sql.clone()),
                     new_def: Some(shadow_table.create_sql.clone()),
                     selected: !ignored,
@@ -1806,10 +1964,11 @@ pub fn compute_diff(
     for dropped in &dropped_tables {
         if !matched_dropped_tables.contains(dropped) {
             let ignored = is_ignored(dropped);
+            let quoted_dropped = quote_qualified_identifier(dropped);
             diff.items.push(DiffItem {
                 item_type: DiffItemType::DropTable,
                 obj_name: dropped.clone(),
-                sql: format!("DROP TABLE {}", dropped),
+                sql: format!("DROP TABLE {};", quoted_dropped),
                 old_def: Some(target.get(dropped).unwrap().create_sql.clone()),
                 new_def: Some(String::new()),
                 selected: !ignored,
@@ -1856,10 +2015,11 @@ pub fn compute_diff(
     for name in target_views.keys() {
         if !shadow_views.contains_key(name) {
             let ignored = is_ignored(name);
+            let quoted_name = quote_qualified_identifier(name);
             diff.items.push(DiffItem {
                 item_type: DiffItemType::DropView,
                 obj_name: name.clone(),
-                sql: format!("DROP VIEW {}", name),
+                sql: format!("DROP VIEW {};", quoted_name),
                 old_def: Some(target_views.get(name).unwrap().clone()),
                 new_def: Some(String::new()),
                 selected: !ignored,
@@ -1873,7 +2033,7 @@ pub fn compute_diff(
         let target_def = target_macros.get(name);
 
         if target_def.is_none() || target_def != Some(shadow_def) {
-            let macro_re = Regex::new(r"(?i)^(\s*CREATE\s+)MACRO\b").unwrap();
+            let macro_re = Regex::new(r"(?i)^(\s*CREATE\s+)(?:OR\s+REPLACE\s+)?MACRO\b").unwrap();
             let safe_sql = macro_re
                 .replace(shadow_def, "${1}OR REPLACE MACRO")
                 .to_string();
@@ -1895,10 +2055,11 @@ pub fn compute_diff(
     for name in target_macros.keys() {
         if !shadow_macros.contains_key(name) {
             let ignored = is_ignored(name);
+            let quoted_name = quote_qualified_identifier(name);
             diff.items.push(DiffItem {
                 item_type: DiffItemType::DropMacro,
                 obj_name: name.clone(),
-                sql: format!("DROP MACRO {}", name),
+                sql: format!("DROP MACRO {};", quoted_name),
                 old_def: Some(target_macros.get(name).unwrap().clone()),
                 new_def: Some(String::new()),
                 selected: !ignored,
@@ -1909,34 +2070,29 @@ pub fn compute_diff(
     }
 
     // 5. Triggers
+    let trg_replace_re =
+        Regex::new(r"(?i)^(\s*CREATE\s+)(?:OR\s+REPLACE\s+)?TRIGGER\b").unwrap();
     for (name, shadow_trg) in shadow_triggers {
-        let is_trg_ignored = is_ignored(name) || is_ignored(&shadow_trg.table_name);
+        let qualified_tbl = if shadow_trg.schema_name == "main" {
+            shadow_trg.table_name.clone()
+        } else {
+            format!("{}.{}", shadow_trg.schema_name, shadow_trg.table_name)
+        };
+        let is_trg_ignored = is_ignored(name)
+            || is_ignored(&shadow_trg.trigger_name)
+            || is_ignored(&shadow_trg.table_name)
+            || is_ignored(&qualified_tbl);
         if let Some(target_trg) = target_triggers.get(name) {
             if shadow_trg.sql.trim() != target_trg.sql.trim() {
-                let target_table = if target_trg.schema_name == "main" {
-                    quote_qualified_identifier(&target_trg.table_name)
-                } else {
-                    quote_qualified_identifier(&format!(
-                        "{}.{}",
-                        target_trg.schema_name, target_trg.table_name
-                    ))
-                };
-                let quoted_trg = format!("\"{}\"", target_trg.trigger_name.replace('\"', "\"\""));
-                diff.items.push(DiffItem {
-                    item_type: DiffItemType::DropTrigger,
-                    obj_name: name.clone(),
-                    sql: format!("DROP TRIGGER {} ON {};", quoted_trg, target_table),
-                    old_def: Some(target_trg.sql.clone()),
-                    new_def: None,
-                    selected: !is_trg_ignored,
-                    locked: false,
-                    ignored: is_trg_ignored,
-                });
+                // DuckDB v2.0 natively supports CREATE OR REPLACE TRIGGER
+                let replace_sql = trg_replace_re
+                    .replace(&shadow_trg.sql, "${1}OR REPLACE TRIGGER")
+                    .to_string();
                 diff.items.push(DiffItem {
                     item_type: DiffItemType::CreateTrigger,
                     obj_name: name.clone(),
-                    sql: shadow_trg.sql.clone(),
-                    old_def: None,
+                    sql: replace_sql,
+                    old_def: Some(target_trg.sql.clone()),
                     new_def: Some(shadow_trg.sql.clone()),
                     selected: !is_trg_ignored,
                     locked: false,
@@ -1959,7 +2115,15 @@ pub fn compute_diff(
 
     for (name, target_trg) in target_triggers {
         if !shadow_triggers.contains_key(name) {
-            let is_trg_ignored = is_ignored(name) || is_ignored(&target_trg.table_name);
+            let qualified_tbl = if target_trg.schema_name == "main" {
+                target_trg.table_name.clone()
+            } else {
+                format!("{}.{}", target_trg.schema_name, target_trg.table_name)
+            };
+            let is_trg_ignored = is_ignored(name)
+                || is_ignored(&target_trg.trigger_name)
+                || is_ignored(&target_trg.table_name)
+                || is_ignored(&qualified_tbl);
             let target_table = if target_trg.schema_name == "main" {
                 quote_qualified_identifier(&target_trg.table_name)
             } else {
@@ -2024,6 +2188,7 @@ mod tests {
                 create_sql: "CREATE TABLE users (id INTEGER);".to_string(),
                 columns,
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: Vec::new(),
             },
         );
@@ -2249,6 +2414,7 @@ mod tests {
                 create_sql: "CREATE TABLE users (id INTEGER, name VARCHAR);".to_string(),
                 columns: cols.clone(),
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: Vec::new(),
             },
         );
@@ -2260,6 +2426,7 @@ mod tests {
                     .to_string(),
                 columns: cols,
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: vec![ConstraintSchema {
                     constraint_type: "PRIMARY KEY".to_string(),
                     constraint_name: Some("users_id_pkey".to_string()),
@@ -2319,6 +2486,7 @@ mod tests {
                     .to_string(),
                 columns: cols.clone(),
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: vec![pk.clone()],
             },
         );
@@ -2330,6 +2498,7 @@ mod tests {
                     .to_string(),
                 columns: cols,
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: vec![
                     pk,
                     ConstraintSchema {
@@ -2392,6 +2561,7 @@ mod tests {
                     .to_string(),
                 columns: cols.clone(),
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: vec![pk.clone()],
             },
         );
@@ -2400,6 +2570,7 @@ mod tests {
             create_sql: "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id));".to_string(),
             columns: cols,
             column_defaults: HashMap::new(),
+            generated_columns: HashSet::new(),
             constraints: vec![
                 pk,
                 ConstraintSchema {
@@ -2475,6 +2646,7 @@ mod tests {
                     .to_string(),
                 columns: cols.clone(),
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: vec![pk.clone(), uq],
             },
         );
@@ -2487,6 +2659,7 @@ mod tests {
                     .to_string(),
                 columns: cols,
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: vec![pk],
             },
         );
@@ -2559,6 +2732,7 @@ mod tests {
             create_sql: "CREATE TABLE orders (id INTEGER, processed BOOLEAN, col_drop_def VARCHAR, col_change_def INTEGER);".to_string(),
             columns: cols.clone(),
             column_defaults: target_defs,
+            generated_columns: HashSet::new(),
             constraints: Vec::new(),
         });
 
@@ -2566,6 +2740,7 @@ mod tests {
             create_sql: "CREATE TABLE orders (id INTEGER, processed BOOLEAN DEFAULT false, col_drop_def VARCHAR, col_change_def INTEGER DEFAULT 2);".to_string(),
             columns: cols,
             column_defaults: shadow_defs,
+            generated_columns: HashSet::new(),
             constraints: Vec::new(),
         });
 
@@ -2625,6 +2800,7 @@ mod tests {
                 create_sql: "CREATE TABLE orders (id INTEGER);".to_string(),
                 columns: target_cols,
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: Vec::new(),
             },
         );
@@ -2636,6 +2812,7 @@ mod tests {
                     .to_string(),
                 columns: shadow_cols,
                 column_defaults: shadow_defs,
+                generated_columns: HashSet::new(),
                 constraints: Vec::new(),
             },
         );
@@ -2897,6 +3074,7 @@ mod tests {
                     .to_string(),
                 columns: shadow_cols,
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: shadow_constr,
             },
         );
@@ -2906,6 +3084,7 @@ mod tests {
                 create_sql: "CREATE TABLE finance.reports.kpis (id INTEGER);".to_string(),
                 columns: target_cols,
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: vec![],
             },
         );
@@ -3081,6 +3260,7 @@ mod tests {
                 create_sql: "CREATE TABLE \"../../evil\" (id INT);".to_string(),
                 columns: HashMap::new(),
                 column_defaults: HashMap::new(),
+                generated_columns: HashSet::new(),
                 constraints: Vec::new(),
             },
         );
@@ -3413,5 +3593,211 @@ mod tests {
         assert!(target_snap5.sequences.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_rename_table_same_schema_unqualified_and_cross_schema_no_rename() {
+        let mut target = HashMap::new();
+        let mut shadow = HashMap::new();
+        let mut cols = HashMap::new();
+        cols.insert("id".to_string(), "INTEGER".to_string());
+
+        // Same-schema rename: sales.orders -> sales.orders_v2
+        target.insert(
+            "sales.orders".to_string(),
+            TableSchema {
+                create_sql: "CREATE TABLE sales.orders (id INTEGER);".to_string(),
+                columns: cols.clone(),
+                ..Default::default()
+            },
+        );
+        shadow.insert(
+            "sales.orders_v2".to_string(),
+            TableSchema {
+                create_sql: "CREATE TABLE sales.orders_v2 (id INTEGER);".to_string(),
+                columns: cols.clone(),
+                ..Default::default()
+            },
+        );
+
+        let diff_same = compute_diff(
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &shadow,
+            &target,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[],
+        );
+        assert_eq!(diff_same.items.len(), 1);
+        assert_eq!(diff_same.items[0].item_type, DiffItemType::RenameTable);
+        assert_eq!(
+            diff_same.items[0].sql,
+            "ALTER TABLE \"sales\".\"orders\" RENAME TO \"orders_v2\";"
+        );
+
+        // Cross-schema move: sales.events vs archive.events -> must NOT emit RenameTable
+        let mut target_cross = HashMap::new();
+        let mut shadow_cross = HashMap::new();
+        target_cross.insert(
+            "sales.events".to_string(),
+            TableSchema {
+                create_sql: "CREATE TABLE sales.events (id INTEGER);".to_string(),
+                columns: cols.clone(),
+                ..Default::default()
+            },
+        );
+        shadow_cross.insert(
+            "archive.events".to_string(),
+            TableSchema {
+                create_sql: "CREATE TABLE archive.events (id INTEGER);".to_string(),
+                columns: cols,
+                ..Default::default()
+            },
+        );
+        let diff_cross = compute_diff(
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &shadow_cross,
+            &target_cross,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[],
+        );
+        assert!(
+            !diff_cross
+                .items
+                .iter()
+                .any(|i| i.item_type == DiffItemType::RenameTable),
+            "Cross-schema tables must not emit ALTER TABLE ... RENAME TO"
+        );
+        assert!(diff_cross
+            .items
+            .iter()
+            .any(|i| i.item_type == DiffItemType::CreateTable && i.obj_name == "archive.events"));
+        assert!(diff_cross
+            .items
+            .iter()
+            .any(|i| i.item_type == DiffItemType::DropTable
+                && i.sql == "DROP TABLE \"sales\".\"events\";"));
+    }
+
+    #[test]
+    fn test_modified_trigger_create_or_replace_and_per_table_scoping() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t1 (id INT); CREATE TABLE t2 (id INT); CREATE TABLE log (id INT);\
+             CREATE TRIGGER trg_audit AFTER INSERT ON t1 FOR EACH ROW INSERT INTO log VALUES (NEW.id);\
+             CREATE TRIGGER trg_audit AFTER INSERT ON t2 FOR EACH ROW INSERT INTO log VALUES (NEW.id);",
+        )
+        .unwrap();
+        let trgs = get_triggers(&conn, None).unwrap();
+        assert_eq!(trgs.len(), 2, "Per-table trigger scoping must retain both triggers");
+
+        // Modifying a trigger should emit a single CreateTrigger with CREATE OR REPLACE TRIGGER
+        let mut shadow_trgs = trgs.clone();
+        let t1_key = trgs.keys().find(|k| k.starts_with("t1.")).unwrap().clone();
+        shadow_trgs.get_mut(&t1_key).unwrap().sql =
+            "CREATE TRIGGER trg_audit AFTER INSERT ON t1 FOR EACH ROW INSERT INTO log VALUES (NEW.id + 1);".to_string();
+
+        let diff = compute_diff(
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &shadow_trgs,
+            &trgs,
+            &std::path::PathBuf::new(),
+            &[],
+        );
+        assert_eq!(diff.items.len(), 1);
+        assert_eq!(diff.items[0].item_type, DiffItemType::CreateTrigger);
+        assert!(diff.items[0].sql.contains("CREATE OR REPLACE TRIGGER"));
+        // Verify DuckDB v2.0 actually accepts the generated CREATE OR REPLACE TRIGGER SQL
+        conn.execute_batch(&diff.items[0].sql).unwrap();
+    }
+
+    #[test]
+    fn test_table_macro_introspection_and_generated_column_recreate() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE MACRO recent_items(n) AS TABLE SELECT n AS item_id;\
+             CREATE TABLE calc (x INT, doubled INT GENERATED ALWAYS AS (x * 2) VIRTUAL);",
+        )
+        .unwrap();
+
+        let macros = get_macros(&conn, None).unwrap();
+        assert!(
+            macros.contains_key("recent_items"),
+            "Expected table_macro 'recent_items' in {:?}",
+            macros
+        );
+        assert!(
+            macros["recent_items"].contains("AS TABLE"),
+            "Expected AS TABLE in table macro SQL: {}",
+            macros["recent_items"]
+        );
+
+        // Verify generated column is tracked and omitted from RecreateTable INSERT
+        let target_schema = get_schema(&conn, None).unwrap();
+        assert!(
+            target_schema["calc"].generated_columns.contains("doubled"),
+            "Expected 'doubled' in generated_columns"
+        );
+        let mut shadow_schema = target_schema.clone();
+        shadow_schema.get_mut("calc").unwrap().constraints.push(ConstraintSchema {
+            constraint_type: "CHECK".to_string(),
+            constraint_name: Some("chk_x".to_string()),
+            columns: vec!["x".to_string()],
+            expression: Some("x > 0".to_string()),
+            referenced_table: None,
+            referenced_columns: vec![],
+        });
+        let diff = compute_diff(
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &shadow_schema,
+            &target_schema,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &std::path::PathBuf::new(),
+            &[],
+        );
+        let recreate = diff
+            .items
+            .iter()
+            .find(|i| i.item_type == DiffItemType::RecreateTable)
+            .expect("Expected RecreateTable");
+        assert!(
+            recreate.sql.contains("INSERT INTO calc__duckpack_swap (\"x\") SELECT \"x\" FROM calc;"),
+            "RecreateTable must exclude generated columns from INSERT: {}",
+            recreate.sql
+        );
     }
 }

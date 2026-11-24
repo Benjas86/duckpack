@@ -81,7 +81,10 @@ def _auto_attach_toml_target_if_needed(target, project_dir=".", env=None):
 
     # If no explicit warehouse catalog is specified and db_target is just the local default database file,
     # do NOT auto-attach it to an explicit in-memory connection session.
-    is_remote = any(db_target.startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:"))
+    is_remote = any(
+        db_target.startswith(p)
+        for p in ("quack:", "quack://", "md:", "motherduck:", "ducklake:", "mssql:")
+    )
     if not catalog_alias and not is_remote and env is None:
         return
 
@@ -101,26 +104,75 @@ def _auto_attach_toml_target_if_needed(target, project_dir=".", env=None):
 
     token = cfg.get("token")
     insecure = cfg.get("insecure", False)
+    safe_alias = str(catalog_alias).replace('"', '""')
 
     try:
         if db_target.startswith("quack:") or db_target.startswith("quack://"):
             target.execute("INSTALL quack; LOAD quack;")
+            opts = []
+            if insecure:
+                opts.append("DISABLE_SSL true")
             if token:
                 safe_token = str(token).replace("'", "''")
-                target.execute(f"CREATE SECRET (TYPE QUACK, TOKEN '{safe_token}');")
-            disable_ssl = "true" if insecure else "false"
+                opts.append(f"TOKEN '{safe_token}'")
+                opts.append(f"CLIENT_ID '{safe_token}'")
             safe_db = db_target.replace("'", "''")
-            target.execute(f"ATTACH '{safe_db}' AS \"{catalog_alias}\" (DISABLE_SSL {disable_ssl});")
+            opt_clause = f" ({', '.join(opts)})" if opts else ""
+            target.execute(f"ATTACH '{safe_db}' AS \"{safe_alias}\"{opt_clause};")
+        elif db_target.startswith("mssql:"):
+            target.execute("INSTALL mssql; LOAD mssql;")
+            conn_str = db_target if db_target.lower().startswith("mssql://") else db_target[len("mssql:"):]
+            safe_db = conn_str.replace("'", "''")
+            target.execute(f"ATTACH '{safe_db}' AS \"{safe_alias}\" (TYPE MSSQL);")
+        elif db_target.startswith("ducklake:"):
+            target.execute("INSTALL ducklake; LOAD ducklake;")
+            safe_db = db_target.split(" (", 1)[0].strip().replace("'", "''")
+            target.execute(f"ATTACH '{safe_db}' AS \"{safe_alias}\";")
         elif db_target.startswith("md:") or db_target.startswith("motherduck:"):
             safe_db = db_target.replace("'", "''")
-            target.execute(f"ATTACH '{safe_db}' AS \"{catalog_alias}\";")
+            target.execute(f"ATTACH '{safe_db}' AS \"{safe_alias}\";")
         else:
             safe_db = db_target.replace("'", "''")
-            target.execute(f"ATTACH '{safe_db}' AS \"{catalog_alias}\";")
+            target.execute(f"ATTACH '{safe_db}' AS \"{safe_alias}\";")
 
-        print(f"[DuckPack] Attached '{catalog_alias}' ({db_target}) to Python connection.")
+        print(f"[DuckPack] Attached '{catalog_alias}' to Python connection.")
     except Exception as e:
-        print(f"[DuckPack] Warning: Could not auto-attach '{catalog_alias}' ({db_target}): {e}. Proceeding with in-memory session.")
+        print(f"[DuckPack] Warning: Could not auto-attach '{catalog_alias}': {e}. Proceeding with in-memory session.")
+
+
+_REMOTE_DB_PREFIXES = ("quack:", "quack://", "md:", "motherduck:", "ducklake:", "mssql:")
+
+
+def _resolve_default_target(
+    project_dir,
+    env,
+    active_cat,
+    quack_token,
+    insecure,
+    allow_workspace_mode=False,
+):
+    """Unified TOML/.env target resolver shared by diff(), apply(), and explore()."""
+    cfg = _native_get_target_config(project_dir=project_dir, env=env)
+    if allow_workspace_mode and cfg.get("workspace_mode"):
+        target = None
+    else:
+        target = cfg.get("db") or "local.duckdb"
+        if (
+            not any(str(target).startswith(p) for p in _REMOTE_DB_PREFIXES)
+            and not os.path.isabs(str(target))
+        ):
+            cand = os.path.join(project_dir, str(target))
+            if os.path.exists(cand):
+                target = cand
+    if not active_cat:
+        catalogs = cfg.get("catalogs") or []
+        if catalogs:
+            active_cat = catalogs[0]
+    if quack_token is None:
+        quack_token = cfg.get("token")
+    if not insecure:
+        insecure = cfg.get("insecure", False)
+    return target, active_cat, quack_token, insecure
 
 
 def diff(
@@ -147,20 +199,9 @@ def diff(
     )
 
     if target is None:
-        cfg = _native_get_target_config(project_dir=project_dir, env=env)
-        target = cfg.get("db") or "local.duckdb"
-        if not any(str(target).startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:")) and not os.path.isabs(str(target)):
-            cand = os.path.join(project_dir, str(target))
-            if os.path.exists(cand):
-                target = cand
-        if not active_cat:
-            catalogs = cfg.get("catalogs") or []
-            if catalogs:
-                active_cat = catalogs[0]
-        if quack_token is None:
-            quack_token = cfg.get("token")
-        if not insecure:
-            insecure = cfg.get("insecure", False)
+        target, active_cat, quack_token, insecure = _resolve_default_target(
+            project_dir, env, active_cat, quack_token, insecure, allow_workspace_mode=False
+        )
 
     return _native_diff(
         target,
@@ -179,6 +220,7 @@ def apply(
     catalog=None,
     auto_approve=True,
     force_drop=False,
+    allow_lake_rewrite=False,
     interactive=False,
     quack_token=None,
     insecure=False,
@@ -194,6 +236,7 @@ def apply(
     - database: target database catalog name when multiple databases are attached (alias: catalog)
     - auto_approve: apply migrations automatically without user confirmation
     - force_drop: permit destructive drops (tables/columns/views)
+    - allow_lake_rewrite: permit physical copy-and-swap table rewrites on DuckLake catalogs
     - interactive: launch interactive Ratatui Diff & Apply TUI screen
     - quack_token: auth token for remote Quack connections
     - insecure: disable SSL for local/plain HTTP Quack connections
@@ -204,22 +247,9 @@ def apply(
     )
 
     if target is None:
-        cfg = _native_get_target_config(project_dir=project_dir, env=env)
-        target = cfg.get("db") or "local.duckdb"
-        if not any(str(target).startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:")) and not os.path.isabs(str(target)):
-            cand = os.path.join(project_dir, str(target))
-            if os.path.exists(cand):
-                target = cand
-        if not active_cat:
-            catalogs = cfg.get("catalogs") or []
-            if catalogs:
-                active_cat = catalogs[0]
-        if quack_token is None:
-            quack_token = cfg.get("token")
-        if not insecure:
-            insecure = cfg.get("insecure", False)
-
-    is_tty = bool(sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty())
+        target, active_cat, quack_token, insecure = _resolve_default_target(
+            project_dir, env, active_cat, quack_token, insecure, allow_workspace_mode=False
+        )
 
     # Fast path: automated execution without review
     if auto_approve and not interactive:
@@ -229,6 +259,7 @@ def apply(
             database=active_cat,
             auto_approve=True,
             force_drop=force_drop,
+            allow_lake_rewrite=allow_lake_rewrite,
             interactive=False,
             quack_token=quack_token,
             insecure=insecure,
@@ -256,6 +287,7 @@ def apply(
             database=active_cat,
             auto_approve=False,
             force_drop=force_drop,
+            allow_lake_rewrite=allow_lake_rewrite,
             interactive=True,
             quack_token=quack_token,
             insecure=insecure,
@@ -342,20 +374,9 @@ def explore(
     )
 
     if target is None:
-        cfg = _native_get_target_config(project_dir=project_dir, env=env)
-        target = cfg.get("db") or "local.duckdb"
-        if not any(str(target).startswith(p) for p in ("quack:", "quack://", "md:", "motherduck:")) and not os.path.isabs(str(target)):
-            cand = os.path.join(project_dir, str(target))
-            if os.path.exists(cand):
-                target = cand
-        if not active_cat:
-            catalogs = cfg.get("catalogs") or []
-            if catalogs:
-                active_cat = catalogs[0]
-        if quack_token is None:
-            quack_token = cfg.get("token")
-        if not insecure:
-            insecure = cfg.get("insecure", False)
+        target, active_cat, quack_token, insecure = _resolve_default_target(
+            project_dir, env, active_cat, quack_token, insecure, allow_workspace_mode=True
+        )
     else:
         # If an existing Python connection was passed, auto-attach TOML target if configured
         _auto_attach_toml_target_if_needed(target, project_dir=project_dir, env=env)

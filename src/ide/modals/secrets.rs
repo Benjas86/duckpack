@@ -11,8 +11,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use super::input::{
-    delete_char_at_cursor, delete_char_before_cursor, insert_char_at_cursor,
-    render_text_with_cursor,
+    centered_modal_rect, handle_text_nav_or_delete, insert_char_at_cursor, paste_single_line,
+    render_text_input_box, render_text_with_cursor,
 };
 
 /// Supported cloud storage providers for secrets and bucket exploration.
@@ -51,6 +51,7 @@ pub(crate) struct SecretModalState {
     pub(crate) cursor_pos: usize,
     pub(crate) use_ssl: bool,
     pub(crate) save_to_env: bool,
+    pub(crate) save_to_toml: bool,
     pub(crate) active_field: usize, // 0: provider, 1: name, 2: key_id, 3: secret_key, 4: region, 5: endpoint, 6: bucket, 7: use_ssl, 8: save_to_env, 9: submit, 10: cancel
     pub(crate) error_msg: Option<String>,
 }
@@ -69,6 +70,7 @@ impl SecretModalState {
             cursor_pos: 0,
             use_ssl: true,
             save_to_env: true,
+            save_to_toml: false,
             active_field: 2,
             error_msg: None,
         }
@@ -86,6 +88,7 @@ impl SecretModalState {
         self.cursor_pos = 0;
         self.use_ssl = true;
         self.save_to_env = true;
+        self.save_to_toml = false;
         self.active_field = 2;
         self.error_msg = None;
     }
@@ -120,6 +123,18 @@ impl SecretModalState {
 
     pub(crate) fn sync_cursor_to_end(&mut self) {
         self.cursor_pos = self.active_text().map(|s| s.chars().count()).unwrap_or(0);
+    }
+
+    /// Pastes a single-line string from the system clipboard into the active text field at the cursor.
+    pub(crate) fn paste_text(&mut self, raw: &str) {
+        if !self.is_text_field() {
+            return;
+        }
+        let mut cur = self.cursor_pos;
+        if let Some(buf) = self.active_text_mut() {
+            paste_single_line(buf, &mut cur, raw);
+        }
+        self.cursor_pos = cur;
     }
 
     pub(crate) fn provider(&self) -> CloudProvider {
@@ -174,14 +189,7 @@ impl SecretModalState {
     }
 
     pub(crate) fn render(&self, f: &mut Frame) {
-        let popup_width = 72.min(f.area().width.saturating_sub(4));
-        let popup_height = 26.min(f.area().height.saturating_sub(2));
-        let popup_area = Rect {
-            x: (f.area().width.saturating_sub(popup_width)) / 2,
-            y: (f.area().height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
+        let popup_area = centered_modal_rect(f.area(), 72, 26);
         f.render_widget(ratatui::widgets::Clear, popup_area);
 
         let modal_block = Block::default()
@@ -222,65 +230,39 @@ impl SecretModalState {
         );
         f.render_widget(p0, field_layout[0]);
 
-        let f1_style = if self.active_field == 1 {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let p1 = Paragraph::new(render_text_with_cursor(
+        render_text_input_box(
+            f,
+            field_layout[1],
+            " DuckDB Secret Identifier ",
             &self.name,
             self.cursor_pos,
             self.active_field == 1,
             false,
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" DuckDB Secret Identifier ")
-                .border_style(f1_style),
+            Color::Yellow,
+            true,
         );
-        f.render_widget(p1, field_layout[1]);
-
-        let f2_style = if self.active_field == 2 {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let p2 = Paragraph::new(render_text_with_cursor(
+        render_text_input_box(
+            f,
+            field_layout[2],
+            " Access Key ID (AWS_ACCESS_KEY_ID) ",
             &self.key_id,
             self.cursor_pos,
             self.active_field == 2,
             false,
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Access Key ID (AWS_ACCESS_KEY_ID) ")
-                .border_style(f2_style),
+            Color::Yellow,
+            true,
         );
-        f.render_widget(p2, field_layout[2]);
-
-        let f3_style = if self.active_field == 3 {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let p3 = Paragraph::new(render_text_with_cursor(
+        render_text_input_box(
+            f,
+            field_layout[3],
+            " Secret Access Key (AWS_SECRET_ACCESS_KEY, Masked) ",
             &self.secret_key,
             self.cursor_pos,
             self.active_field == 3,
             true,
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Secret Access Key (AWS_SECRET_ACCESS_KEY, Masked) ")
-                .border_style(f3_style),
+            Color::Yellow,
+            true,
         );
-        f.render_widget(p3, field_layout[3]);
 
         let reg_end_cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -349,7 +331,11 @@ impl SecretModalState {
 
         let toggle_cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([
+                Constraint::Percentage(32),
+                Constraint::Percentage(32),
+                Constraint::Percentage(36),
+            ])
             .split(field_layout[6]);
 
         let f7_ssl_style = if self.active_field == 7 {
@@ -358,7 +344,7 @@ impl SecretModalState {
             Style::default().fg(Color::White)
         };
         let ssl_label = format!(
-            "  [{}] Use SSL / HTTPS (Space)",
+            "  [{}] SSL (Space)",
             if self.use_ssl { "X" } else { " " }
         );
         f.render_widget(Paragraph::new(ssl_label).style(f7_ssl_style), toggle_cols[0]);
@@ -369,10 +355,21 @@ impl SecretModalState {
             Style::default().fg(Color::White)
         };
         let env_label = format!(
-            "  [{}] Persist in .env (Space)",
+            "[{}] Save .env",
             if self.save_to_env { "X" } else { " " }
         );
         f.render_widget(Paragraph::new(env_label).style(f8_env_style), toggle_cols[1]);
+
+        let toml_style = if self.save_to_toml {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let toml_label = format!(
+            "[{}] Save toml (Ctrl+S)",
+            if self.save_to_toml { "X" } else { " " }
+        );
+        f.render_widget(Paragraph::new(toml_label).style(toml_style), toggle_cols[2]);
 
         if let Some(ref err) = self.error_msg {
             f.render_widget(
@@ -421,12 +418,27 @@ impl SecretModalState {
 
     /// Processes a keyboard event in the Cloud Secret modal.
     /// Returns `Some(status_msg)` if a secret was saved and the explorer should refresh.
+    #[allow(dead_code)]
     pub(crate) fn handle_key(
         &mut self,
         key: KeyEvent,
         conn: &Connection,
         project_dir: &Path,
     ) -> Option<String> {
+        self.handle_key_with_env(key, conn, project_dir, None)
+    }
+
+    pub(crate) fn handle_key_with_env(
+        &mut self,
+        key: KeyEvent,
+        conn: &Connection,
+        project_dir: &Path,
+        env_profile: Option<&str>,
+    ) -> Option<String> {
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.save_to_toml = !self.save_to_toml;
+            return None;
+        }
         if key.code == KeyCode::Esc {
             self.is_open = false;
         } else if key.code == KeyCode::Tab || key.code == KeyCode::Down {
@@ -457,26 +469,22 @@ impl SecretModalState {
             && (key.code == KeyCode::Left || key.code == KeyCode::Right)
         {
             self.active_field = if self.active_field == 9 { 10 } else { 9 };
-        } else if self.is_text_field() && key.code == KeyCode::Left {
-            self.cursor_pos = self.cursor_pos.saturating_sub(1);
-        } else if self.is_text_field() && key.code == KeyCode::Right {
-            let len = self.active_text().map(|s| s.chars().count()).unwrap_or(0);
-            self.cursor_pos = (self.cursor_pos + 1).min(len);
-        } else if self.is_text_field() && key.code == KeyCode::Home {
-            self.cursor_pos = 0;
-        } else if self.is_text_field() && key.code == KeyCode::End {
-            self.sync_cursor_to_end();
-        } else if self.is_text_field() && key.code == KeyCode::Backspace {
+        } else if self.is_text_field()
+            && matches!(
+                key.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+            )
+        {
             let mut cur = self.cursor_pos;
             if let Some(t) = self.active_text_mut() {
-                delete_char_before_cursor(t, &mut cur);
+                handle_text_nav_or_delete(t, &mut cur, key);
             }
             self.cursor_pos = cur;
-        } else if self.is_text_field() && key.code == KeyCode::Delete {
-            let cur = self.cursor_pos;
-            if let Some(t) = self.active_text_mut() {
-                delete_char_at_cursor(t, cur);
-            }
         } else if key.code == KeyCode::Char(' ') && self.active_field == 7 {
             self.use_ssl = !self.use_ssl;
         } else if key.code == KeyCode::Char(' ') && self.active_field == 8 {
@@ -502,23 +510,25 @@ impl SecretModalState {
                             .to_string(),
                     );
                 } else {
-                    let _ = conn.execute("INSTALL httpfs; LOAD httpfs;", []);
-                    let secret_body = crate::engine::build_s3_secret_body(
-                        &self.key_id,
-                        &self.secret_key,
-                        &self.region,
-                        &self.endpoint,
-                        self.use_ssl,
-                    );
-                    let persistent_sql = format!(
-                        "CREATE OR REPLACE PERSISTENT SECRET {} ({});",
-                        safe_name, secret_body
-                    );
-                    let create_res = conn.execute(&persistent_sql, []).or_else(|_| {
-                        let temp_sql =
-                            format!("CREATE OR REPLACE SECRET {} ({});", safe_name, secret_body);
-                        conn.execute(&temp_sql, [])
-                    });
+                    let secret_spec = crate::connectors::SecretSpec {
+                        name: safe_name.to_string(),
+                        kind: if self.provider() == CloudProvider::CloudflareR2 {
+                            crate::connectors::SecretKind::R2
+                        } else {
+                            crate::connectors::SecretKind::S3
+                        },
+                        persistent: true,
+                        key_id: Some(self.key_id.clone()),
+                        secret: Some(self.secret_key.clone()),
+                        token: None,
+                        region: Some(self.region.clone()),
+                        endpoint: Some(self.endpoint.clone()),
+                        url_style: None,
+                        use_ssl: Some(self.use_ssl),
+                        scope: None,
+                    };
+                    let create_res = crate::connectors::plan_secret(&secret_spec)
+                        .and_then(|plan| crate::connectors::execute_secret_plan(conn, &plan));
 
                     match create_res {
                         Ok(_) => {
@@ -533,23 +543,67 @@ impl SecretModalState {
                                 );
                             }
 
-                            let mut bucket = self.bucket.trim().to_string();
-                            if !bucket.is_empty() {
-                                if !bucket.starts_with("s3://")
-                                    && !bucket.starts_with("r2://")
-                                    && !bucket.starts_with("gcs://")
+                            if let Some(bucket) = crate::connectors::normalize_bucket_uri(&self.bucket) {
+                                crate::env_store::add_session_cloud_bucket(&bucket);
+                            }
+
+                            let mut toml_note = String::new();
+                            if self.save_to_toml {
+                                let slug = crate::workspace::env_var_slug(safe_name);
+                                let key_env = format!("S3_{}_KEY_ID", slug);
+                                let sec_env = format!("S3_{}_SECRET_KEY", slug);
+                                let mut pairs: Vec<(String, String)> = Vec::new();
+                                let key_id_env = if !self.key_id.trim().is_empty() {
+                                    pairs.push((key_env.clone(), self.key_id.trim().to_string()));
+                                    Some(key_env)
+                                } else {
+                                    None
+                                };
+                                let secret_env = if !self.secret_key.trim().is_empty() {
+                                    pairs.push((sec_env.clone(), self.secret_key.trim().to_string()));
+                                    Some(sec_env)
+                                } else {
+                                    None
+                                };
+                                let bucket_clean = crate::connectors::normalize_bucket_uri(&self.bucket);
+                                let ws_sec = crate::workspace::WorkspaceSecret {
+                                    name: safe_name.to_string(),
+                                    secret_type: if self.provider() == CloudProvider::CloudflareR2 {
+                                        "r2".to_string()
+                                    } else {
+                                        "s3".to_string()
+                                    },
+                                    scope: bucket_clean.clone(),
+                                    key_id_env,
+                                    secret_env,
+                                    region: (!self.region.trim().is_empty())
+                                        .then(|| self.region.trim().to_string()),
+                                    endpoint: (!self.endpoint.trim().is_empty())
+                                        .then(|| self.endpoint.trim().to_string()),
+                                    use_ssl: Some(self.use_ssl),
+                                    bucket: bucket_clean,
+                                    ..Default::default()
+                                };
+                                let pair_refs: Vec<(&str, &str)> = pairs
+                                    .iter()
+                                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                                    .collect();
+                                if crate::workspace::save_secret_to_workspace(
+                                    project_dir,
+                                    env_profile,
+                                    &ws_sec,
+                                    &pair_refs,
+                                )
+                                .is_ok()
                                 {
-                                    bucket = format!("s3://{}", bucket);
-                                }
-                                unsafe {
-                                    std::env::set_var("DUCKPACK_S3_BUCKET", &bucket);
+                                    toml_note = " & saved to duckpack.toml + .env".to_string();
                                 }
                             }
 
                             self.is_open = false;
                             return Some(format!(
-                                "Configured cloud secret '{}' successfully.",
-                                safe_name
+                                "Configured cloud secret '{}' successfully{}.",
+                                safe_name, toml_note
                             ));
                         }
                         Err(e) => {
@@ -578,8 +632,10 @@ pub(crate) fn populate_secret_modal_for_edit(
     secret_name: &str,
     modal: &mut SecretModalState,
 ) {
+    modal.reset();
     modal.is_open = true;
     modal.name = secret_name.to_string();
+    modal.region.clear();
     modal.active_field = 2; // Focus on Key ID by default
     modal.error_msg = None;
 
@@ -866,26 +922,7 @@ impl AddBucketModalState {
                     if let Some(ref old_uri) = self.initial_uri {
                         if old_uri != &normalized {
                             expanded_groups.remove(&format!("bucket:{}", old_uri));
-                            unsafe {
-                                let current = std::env::var("DUCKPACK_S3_BUCKETS")
-                                    .or_else(|_| std::env::var("DUCKPACK_S3_BUCKET"))
-                                    .unwrap_or_default();
-                                let mut new_parts: Vec<&str> = current
-                                    .split(',')
-                                    .map(|s| s.trim())
-                                    .filter(|s| {
-                                        !s.is_empty()
-                                            && *s != old_uri.as_str()
-                                            && *s != old_uri.trim_start_matches("s3://")
-                                    })
-                                    .collect();
-                                if !new_parts.contains(&normalized.as_str()) {
-                                    new_parts.push(&normalized);
-                                }
-                                let joined = new_parts.join(",");
-                                std::env::set_var("DUCKPACK_S3_BUCKETS", &joined);
-                                std::env::set_var("DUCKPACK_S3_BUCKET", &joined);
-                            }
+                            crate::env_store::replace_session_cloud_bucket(old_uri, &normalized);
                         }
                     }
 
@@ -893,20 +930,7 @@ impl AddBucketModalState {
                         let _ = crate::engine::append_cloud_bucket_to_env(project_dir, &normalized);
                     }
 
-                    unsafe {
-                        let current = std::env::var("DUCKPACK_S3_BUCKETS")
-                            .or_else(|_| std::env::var("DUCKPACK_S3_BUCKET"))
-                            .unwrap_or_default();
-                        let new_var = if current.is_empty() {
-                            normalized.clone()
-                        } else if !current.split(',').any(|b| b.trim() == normalized) {
-                            format!("{},{}", current, normalized)
-                        } else {
-                            current
-                        };
-                        std::env::set_var("DUCKPACK_S3_BUCKETS", &new_var);
-                        std::env::set_var("DUCKPACK_S3_BUCKET", &new_var);
-                    }
+                    crate::env_store::add_session_cloud_bucket(&normalized);
 
                     let bucket_key = format!("bucket:{}", normalized);
                     expanded_groups.insert("Secrets & Cloud Buckets".to_string());
@@ -916,10 +940,10 @@ impl AddBucketModalState {
                     return Some(format!("Added bucket '{}' to explorer.", normalized));
                 }
             }
-        } else if key.code == KeyCode::Backspace && self.active_field == 0 {
-            delete_char_before_cursor(&mut self.uri, &mut self.cursor_pos);
-        } else if key.code == KeyCode::Delete && self.active_field == 0 {
-            delete_char_at_cursor(&mut self.uri, self.cursor_pos);
+        } else if self.active_field == 0
+            && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+        {
+            handle_text_nav_or_delete(&mut self.uri, &mut self.cursor_pos, key);
         } else if let KeyCode::Char(c) = key.code {
             if !key.modifiers.contains(KeyModifiers::CONTROL) && self.active_field == 0 {
                 insert_char_at_cursor(&mut self.uri, &mut self.cursor_pos, c);

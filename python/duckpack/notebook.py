@@ -155,7 +155,10 @@ def render_notebook_card(
         cmd_parts.extend(["-d", str(db_arg)])
     if active_cat:
         cmd_parts.extend(["--database", str(active_cat)])
-    if token_arg:
+    # H3: Never persist remote authentication tokens into Jupyter cell HTML outputs (.ipynb files).
+    # Only include the ephemeral loopback token when bridging a live in-memory Python connection.
+    redacted_remote_token = bool(token_arg and not is_in_memory_bridge)
+    if token_arg and is_in_memory_bridge:
         cmd_parts.extend(["--quack-token", str(token_arg)])
     if insecure or is_in_memory_bridge:
         cmd_parts.append("--insecure")
@@ -168,7 +171,6 @@ def render_notebook_card(
 
     terminal_cmd = " ".join(shlex.quote(part) for part in cmd_parts)
     escaped_terminal_cmd = html.escape(terminal_cmd, quote=True)
-    safe_cmd_attr = html.escape(terminal_cmd.replace("\\", "\\\\").replace("'", "\\'"), quote=True)
 
     # Introspect tables for preview
     tables = introspect_schema_summary(target)
@@ -218,6 +220,12 @@ def render_notebook_card(
             <span>Stop with <code>duckpack.stop_server()</code></span>
         </div>
         """
+    elif redacted_remote_token:
+        bridge_status_html = """
+        <div style="margin-top: 10px; font-size: 11px; opacity: 0.8; color: #fcd34d;">
+            🔒 Authentication token omitted from notebook output for safety. Ensure <code>QUACK_TOKEN</code> is set in your terminal environment or <code>.env</code>.
+        </div>
+        """
 
     from . import __version__
     title = "DuckPack Database Explorer" if mode == "explore" else "DuckPack Diff & Apply"
@@ -253,7 +261,7 @@ def render_notebook_card(
         <div>
             <div style="display: flex; align-items: center; justify-content: space-between; background: var(--vscode-terminal-background, #0d1117); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; padding: 10px 14px;">
                 <code style="font-family: var(--vscode-editor-font-family, monospace); font-size: 12.5px; color: #38bdf8; word-break: break-all; user-select: all;">$ {escaped_terminal_cmd}</code>
-                <button onclick="navigator.clipboard.writeText('{safe_cmd_attr}').then(() => {{ this.innerText = '✓ Copied!'; setTimeout(() => this.innerText = '📋 Copy', 2000); }})" style="
+                <button data-cmd="{escaped_terminal_cmd}" onclick="navigator.clipboard.writeText(this.dataset.cmd).then(() => {{ this.innerText = '✓ Copied!'; setTimeout(() => this.innerText = '📋 Copy', 2000); }})" style="
                     background: rgba(255, 255, 255, 0.08);
                     border: 1px solid rgba(255, 255, 255, 0.16);
                     color: #e6edf3;
